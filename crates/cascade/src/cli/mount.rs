@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use cascade_engine::db::StateDb;
+use cascade_engine::config::ConfigResolver;
 use cascade_engine::sync::runner::SyncRunner;
 use cascade_engine::vfs::VfsTree;
 use cascade_presenter_nfs::nfs::server::{NfsServer, NfsServerConfig};
@@ -63,8 +64,11 @@ pub async fn start(mount_point: Option<&str>) -> Result<()> {
     // Create presenter.
     let presenter = Arc::new(cascade_presenter_nfs::NfsPresenter::new(&mount_path));
 
+    // Create config resolver for .cascade file filtering.
+    let config = Arc::new(ConfigResolver::new(mount_path.clone()));
+
     // Start the sync runner (spawns a background task).
-    let sync_runner = SyncRunner::new(db.clone(), vec![backend], presenter.clone());
+    let sync_runner = SyncRunner::new(db.clone(), vec![backend], presenter.clone(), config);
     let sync_handle = tokio::spawn(async move {
         if let Err(e) = sync_runner.run().await {
             tracing::error!(error = %e, "sync runner exited with error");

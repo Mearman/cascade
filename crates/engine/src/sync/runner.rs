@@ -6,6 +6,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 use crate::backend::Backend;
+use crate::config::ConfigResolver;
 use crate::db::StateDb;
 use crate::presenter::VfsPresenter;
 use crate::types::{Change, VfsItem};
@@ -21,6 +22,7 @@ pub struct SyncRunner {
     db: Arc<StateDb>,
     backends: Vec<Arc<dyn Backend>>,
     presenter: Arc<dyn VfsPresenter>,
+    config: Arc<ConfigResolver>,
     cancel_tx: watch::Sender<bool>,
     cancel_rx: watch::Receiver<bool>,
 }
@@ -31,12 +33,14 @@ impl SyncRunner {
         db: Arc<StateDb>,
         backends: Vec<Arc<dyn Backend>>,
         presenter: Arc<dyn VfsPresenter>,
+        config: Arc<ConfigResolver>,
     ) -> Self {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         Self {
             db,
             backends,
             presenter,
+            config,
             cancel_tx,
             cancel_rx,
         }
@@ -117,6 +121,7 @@ impl SyncRunner {
     }
 
     /// Apply a batch of changes to the state database and notify the presenter.
+    /// Files matching `.cascade` ignore rules are skipped.
     async fn apply_changes(
         &self,
         _backend_id: &str,
@@ -127,12 +132,18 @@ impl SyncRunner {
         for change in changes {
             match change {
                 Change::Created(entry) => {
+                    if self.is_ignored_entry(entry) {
+                        continue;
+                    }
                     self.db.upsert_file(entry)?;
                     let item: VfsItem = entry.clone().into();
                     self.presenter.upsert_item(item).await?;
                     count += 1;
                 }
                 Change::Updated { new, .. } => {
+                    if self.is_ignored_entry(new) {
+                        continue;
+                    }
                     self.db.upsert_file(new)?;
                     let item: VfsItem = new.clone().into();
                     self.presenter.upsert_item(item).await?;
@@ -144,6 +155,9 @@ impl SyncRunner {
                     count += 1;
                 }
                 Change::Moved { to, .. } => {
+                    if self.is_ignored_entry(to) {
+                        continue;
+                    }
                     self.db.upsert_file(to)?;
                     let item: VfsItem = to.clone().into();
                     self.presenter.upsert_item(item).await?;
@@ -153,6 +167,15 @@ impl SyncRunner {
         }
 
         Ok(count)
+    }
+
+    /// Check if a file entry should be ignored based on `.cascade` config.
+    fn is_ignored_entry(&self, entry: &crate::types::FileEntry) -> bool {
+        // Build a synthetic path from the entry's parent + name.
+        // Phase 1 uses a flat path; this will be replaced with actual VFS
+        // path resolution once the tree tracks full paths.
+        let path = std::path::Path::new(&entry.name);
+        self.config.is_ignored(path, entry.is_dir)
     }
 
     /// Determine the effective poll interval. Uses the shortest interval
@@ -221,8 +244,9 @@ mod tests {
 
         let backend: Arc<dyn Backend> = Arc::new(NullBackend::new("test"));
         let presenter = Arc::new(MockPresenter::default());
+        let config = Arc::new(ConfigResolver::new(std::path::PathBuf::from("/tmp/test")));
 
-        let runner = SyncRunner::new(db.clone(), vec![backend], presenter.clone());
+        let runner = SyncRunner::new(db.clone(), vec![backend], presenter.clone(), config);
         // Stop immediately — the runner will do one initial sync then exit.
         runner.stop();
         let result = runner.run().await;
