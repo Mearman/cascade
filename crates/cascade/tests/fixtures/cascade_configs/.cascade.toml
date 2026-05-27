@@ -1,0 +1,10 @@
+[[ignore]]
+pattern = "*.log"
+
+[[ignore]]
+pattern = "debug.log"
+negated = true
+
+[cache]
+max_size = "50000000000"
+max_age = "604800"

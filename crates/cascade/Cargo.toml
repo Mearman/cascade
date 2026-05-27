@@ -1,0 +1,25 @@
+[package]
+name = "cascade"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "cascade"
+path = "src/main.rs"
+
+[dependencies]
+cascade-engine = { path = "../engine" }
+cascade-config = { path = "../cascade-config" }
+cascade-expr = { path = "../expr" }
+cascade-backend-gdrive = { path = "../backend-gdrive" }
+cascade-presenter-nfs = { path = "../presenter-nfs" }
+clap.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+shellexpand = "3"
+dirs = "6"
