@@ -1,0 +1,3 @@
+# Un-ignore agent instruction symlinks (global gitignore blocks these)
+!AGENTS.md
+!CLAUDE.md
