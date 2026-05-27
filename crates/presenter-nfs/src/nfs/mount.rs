@@ -3,14 +3,16 @@
 //! Three procedures: MOUNT, DUMP, UNMOUNT.
 //! The mount protocol runs on a separate TCP port from NFS.
 
+use super::context::NfsContext;
 use super::xdr::*;
+use std::sync::Arc;
 
 /// Handle a mount protocol request.
 /// Returns XDR-encoded reply.
-pub fn handle_mount_call(proc: u32, args: &[u8]) -> Vec<u8> {
+pub fn handle_mount_call(proc: u32, args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
     match proc {
         MOUNTPROC_NULL => vec![],
-        MOUNTPROC_MNT => handle_mount(args),
+        MOUNTPROC_MNT => handle_mount(args, ctx),
         MOUNTPROC_DUMP => handle_dump(),
         MOUNTPROC_UMNT => handle_umnt(args),
         MOUNTPROC_UMNTALL => vec![],
@@ -20,7 +22,7 @@ pub fn handle_mount_call(proc: u32, args: &[u8]) -> Vec<u8> {
 }
 
 /// MOUNT procedure — validate path, return root file handle.
-fn handle_mount(args: &[u8]) -> Vec<u8> {
+fn handle_mount(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
     let path_result = decode_string(args);
     let mut reply = Vec::new();
 
@@ -28,7 +30,8 @@ fn handle_mount(args: &[u8]) -> Vec<u8> {
         Ok((path, _)) => {
             tracing::info!(path = %path, "mount request");
             // Accept any path — in Phase 1 there's one root.
-            let fh = NfsFh3::from_item_id("root");
+            let root_key = ctx.root_key();
+            let fh = NfsFh3::from_item_id(&root_key.to_string());
             encode_u32(&mut reply, MNTPROC_OK);
             encode_fh(&mut reply, &fh);
             // No auth flavor list for now (empty).

@@ -8,9 +8,11 @@ use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+use super::context::NfsContext;
 use super::mount;
 use super::procedures;
 use super::xdr::*;
+use std::sync::Arc;
 
 /// NFS server configuration.
 #[derive(Debug)]
@@ -39,14 +41,14 @@ pub struct NfsServer {
 
 impl NfsServer {
     /// Start the NFS server. Returns a handle with the bound address.
-    pub async fn start(config: NfsServerConfig) -> anyhow::Result<Self> {
+    pub async fn start(config: NfsServerConfig, ctx: Arc<NfsContext>) -> anyhow::Result<Self> {
         let listener = TcpListener::bind(config.bind_addr).await?;
         let local_addr = listener.local_addr()?;
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
         tokio::spawn(async move {
-            if let Err(e) = run_server(listener, shutdown_rx).await {
+            if let Err(e) = run_server(listener, shutdown_rx, ctx).await {
                 tracing::error!(error = %e, "NFS server error");
             }
         });
@@ -71,14 +73,16 @@ impl NfsServer {
 async fn run_server(
     listener: TcpListener,
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
+    ctx: Arc<NfsContext>,
 ) -> anyhow::Result<()> {
     loop {
         tokio::select! {
             result = listener.accept() => {
                 let (stream, addr) = result?;
+                let ctx = ctx.clone();
                 tracing::debug!(peer = %addr, "NFS connection accepted");
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream).await {
+                    if let Err(e) = handle_connection(stream, &ctx).await {
                         tracing::warn!(peer = %addr, error = %e, "connection error");
                     }
                 });
@@ -95,7 +99,7 @@ async fn run_server(
 /// NFS over TCP uses a simple framing: 4-byte big-endian length prefix
 /// followed by the RPC message (which includes the RPC call header and
 /// then the NFS/Mount procedure arguments).
-async fn handle_connection(mut stream: tokio::net::TcpStream) -> anyhow::Result<()> {
+async fn handle_connection(mut stream: tokio::net::TcpStream, ctx: &Arc<NfsContext>) -> anyhow::Result<()> {
     loop {
         // Read length-prefixed RPC message.
         let mut len_buf = [0u8; 4];
@@ -117,7 +121,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream) -> anyhow::Result<
         stream.read_exact(&mut msg_buf).await?;
 
         // Parse and dispatch.
-        let reply = dispatch_rpc(&msg_buf);
+        let reply = dispatch_rpc(&msg_buf, ctx);
 
         // Send length-prefixed reply.
         stream.write_all(&(reply.len() as u32).to_be_bytes()).await?;
@@ -129,7 +133,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream) -> anyhow::Result<
 /// Dispatch an RPC call to the correct handler (NFS or Mount).
 /// The input is the RPC call body (after the length prefix).
 /// Returns the complete RPC reply body (without length prefix).
-fn dispatch_rpc(msg: &[u8]) -> Vec<u8> {
+fn dispatch_rpc(msg: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
     // Parse RPC call header:
     //   xid (u32) + call body (msg_type=0 + rpc_version + program + version + procedure + auth)
     let (xid, rest) = match decode_u32(msg) {
@@ -181,8 +185,8 @@ fn dispatch_rpc(msg: &[u8]) -> Vec<u8> {
 
     // Dispatch based on program.
     let result = match program {
-        NFS_PROGRAM if version == NFS_V3 => procedures::handle_nfs_call(procedure, args),
-        MOUNT_PROGRAM if version == MOUNT_V3 => mount::handle_mount_call(procedure, args),
+        NFS_PROGRAM if version == NFS_V3 => procedures::handle_nfs_call(procedure, args, ctx),
+        MOUNT_PROGRAM if version == MOUNT_V3 => mount::handle_mount_call(procedure, args, ctx),
         _ => return make_rpc_error(xid, RPC_REPLY_DENIED),
     };
 
@@ -233,6 +237,9 @@ fn skip_auth(data: &[u8]) -> Option<(&[u8], usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cascade_engine::backend::NullBackend;
+    use cascade_engine::vfs::VfsTree;
+    use std::sync::RwLock;
 
     #[test]
     fn dispatch_null_procedure() {
@@ -247,7 +254,7 @@ mod tests {
         encode_u32(&mut call, RPC_AUTH_NONE);
         encode_u32(&mut call, 0);
 
-        let reply = dispatch_rpc(&call);
+        let reply = dispatch_rpc(&call, &test_ctx());
         let (xid, rest) = decode_u32(&reply).unwrap();
         assert_eq!(xid, 1);
         let (msg_type, rest) = decode_u32(rest).unwrap();
@@ -265,8 +272,16 @@ mod tests {
     #[tokio::test]
     async fn server_starts_and_stops() {
         let config = NfsServerConfig::default();
-        let server = NfsServer::start(config).await.unwrap();
+        let ctx = test_ctx();
+        let server = NfsServer::start(config, ctx).await.unwrap();
         assert!(server.local_addr.port() > 0);
         server.stop().await.unwrap();
+    }
+
+    fn test_ctx() -> Arc<NfsContext> {
+        let vfs = Arc::new(RwLock::new(
+            VfsTree::new(Arc::new(NullBackend::new("test"))),
+        ));
+        Arc::new(NfsContext::new(vfs))
     }
 }

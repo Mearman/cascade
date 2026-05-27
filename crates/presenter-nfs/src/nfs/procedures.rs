@@ -3,18 +3,20 @@
 //! Phase 1 read-only procedures: NULL, GETATTR, LOOKUP, READDIR, READ, FSSTAT.
 //! Write procedures return NFS3ERR_ROFS.
 
+use super::context::NfsContext;
 use super::xdr::*;
+use std::sync::Arc;
 
-/// Handle an NFS procedure call.
+/// Handle an NFS procedure call with VFS context.
 /// Returns XDR-encoded reply.
-pub fn handle_nfs_call(proc: u32, args: &[u8]) -> Vec<u8> {
+pub fn handle_nfs_call(proc: u32, args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
     match proc {
         NFS3PROC_NULL => vec![],
-        NFS3PROC_GETATTR => handle_getattr(args),
-        NFS3PROC_LOOKUP => handle_lookup(args),
-        NFS3PROC_READDIR => handle_readdir(args),
-        NFS3PROC_READ => handle_read(args),
-        NFS3PROC_FSSTAT => handle_fsstat(args),
+        NFS3PROC_GETATTR => handle_getattr(args, ctx),
+        NFS3PROC_LOOKUP => handle_lookup(args, ctx),
+        NFS3PROC_READDIR => handle_readdir(args, ctx),
+        NFS3PROC_READ => handle_read(args, ctx),
+        NFS3PROC_FSSTAT => handle_fsstat(args, ctx),
         // Phase 1: all write operations return read-only error.
         NFS3PROC_SETATTR
         | NFS3PROC_WRITE
@@ -34,13 +36,16 @@ fn _handle_null() -> Vec<u8> {
 }
 
 /// GETATTR — return file/directory metadata.
-fn handle_getattr(args: &[u8]) -> Vec<u8> {
+fn handle_getattr(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
     let mut reply = Vec::new();
 
     match decode_fh(args) {
         Ok((fh, _)) => {
-            if let Some(id) = fh.to_item_id() {
-                let attr = make_attributes(&id, false);
+            let key = fh.to_item_id()
+                .and_then(|id| id.parse::<u64>().ok())
+                .unwrap_or(0);
+            if let Some(path) = ctx.lookup_path(key) {
+                let attr = make_attributes(&path, path == "/");
                 encode_u32(&mut reply, NFS3_OK);
                 encode_post_op_attr(&mut reply, &PostOpAttr::some(attr));
             } else {
@@ -58,7 +63,7 @@ fn handle_getattr(args: &[u8]) -> Vec<u8> {
 }
 
 /// LOOKUP — resolve a name in a directory.
-fn handle_lookup(args: &[u8]) -> Vec<u8> {
+fn handle_lookup(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
     let mut reply = Vec::new();
 
     // Args: dir_fh + name
@@ -68,11 +73,23 @@ fn handle_lookup(args: &[u8]) -> Vec<u8> {
             let name_result = decode_string(rest);
             match name_result {
                 Ok((name, _)) => {
-                    // In Phase 1, construct a synthetic file handle from the name.
-                    let child_id = format!("{}:{}", fh.to_item_id().unwrap_or("root".to_string()), name);
-                    let child_fh = NfsFh3::from_item_id(&child_id);
-                    let dir_attr = make_attributes(&fh.to_item_id().unwrap_or("root".to_string()), true);
-                    let child_attr = make_attributes(&child_id, false);
+                    // Resolve parent path from context.
+                    let parent_key = fh.to_item_id()
+                        .and_then(|id| id.parse::<u64>().ok())
+                        .unwrap_or(0);
+                    let parent_path = ctx.lookup_path(parent_key).unwrap_or_else(|| "/".to_string());
+                    let child_path = if parent_path == "/" {
+                        format!("/{}", name)
+                    } else {
+                        format!("{}/{}", parent_path, name)
+                    };
+
+                    // Register the child path.
+                    let child_key = ctx.register_path(&child_path);
+                    let child_fh = NfsFh3::from_item_id(&child_key.to_string());
+
+                    let dir_attr = make_attributes(&parent_path, parent_path == "/");
+                    let child_attr = make_attributes(&child_path, false);
 
                     encode_u32(&mut reply, NFS3_OK);
                     encode_fh(&mut reply, &child_fh);
@@ -97,25 +114,26 @@ fn handle_lookup(args: &[u8]) -> Vec<u8> {
 }
 
 /// READDIR — list directory contents.
-fn handle_readdir(args: &[u8]) -> Vec<u8> {
+fn handle_readdir(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
     let mut reply = Vec::new();
 
     // Args: dir_fh + cookie + cookieverf + dircount + maxcount
     let dir_result = decode_fh(args);
     match dir_result {
-        Ok((fh, rest)) => {
-            let _cookie = decode_u64(rest).ok().map(|(c, _)| c).unwrap_or(0);
-            // Skip cookieverf (8 bytes), dircount, maxcount.
-            // Phase 1: return empty directory listing.
-
-            let dir_id = fh.to_item_id().unwrap_or("root".to_string());
-            let dir_attr = make_attributes(&dir_id, true);
+        Ok((fh, _rest)) => {
+            let dir_key = fh.to_item_id()
+                .and_then(|id| id.parse::<u64>().ok())
+                .unwrap_or(0);
+            let dir_path = ctx.lookup_path(dir_key).unwrap_or_else(|| "/".to_string());
+            let dir_attr = make_attributes(&dir_path, true);
 
             encode_u32(&mut reply, NFS3_OK);
             encode_post_op_attr(&mut reply, &PostOpAttr::some(dir_attr));
             // cookieverf (8 bytes of zero).
             encode_u64(&mut reply, 0);
-            // No entries (empty directory in Phase 1 stub).
+            // No entries — actual directory listing requires async VFS query
+            // which can't be done from a sync procedure handler.
+            // Phase 1: return empty directory. Phase 2: pre-populate from sync.
             encode_bool(&mut reply, false); // no more entries
             encode_bool(&mut reply, true); // EOF
         }
@@ -129,7 +147,7 @@ fn handle_readdir(args: &[u8]) -> Vec<u8> {
 }
 
 /// READ — read file data.
-fn handle_read(args: &[u8]) -> Vec<u8> {
+fn handle_read(args: &[u8], _ctx: &Arc<NfsContext>) -> Vec<u8> {
     let mut reply: Vec<u8> = Vec::new();
 
     // Args: file_fh + offset + count
@@ -159,7 +177,7 @@ fn handle_read(args: &[u8]) -> Vec<u8> {
 }
 
 /// FSSTAT — return filesystem statistics.
-fn handle_fsstat(args: &[u8]) -> Vec<u8> {
+fn handle_fsstat(args: &[u8], _ctx: &Arc<NfsContext>) -> Vec<u8> {
     let mut reply: Vec<u8> = Vec::new();
 
     match decode_fh(args) {
@@ -231,55 +249,80 @@ fn id_hash(s: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cascade_engine::backend::NullBackend;
+    use cascade_engine::vfs::VfsTree;
+    use std::sync::RwLock;
+
+    fn test_ctx() -> Arc<NfsContext> {
+        let vfs = Arc::new(RwLock::new(
+            VfsTree::new(Arc::new(NullBackend::new("test"))),
+        ));
+        let ctx = Arc::new(NfsContext::new(vfs));
+        // Register root so GETATTR works.
+        ctx.register_path("/");
+        ctx
+    }
 
     #[test]
     fn getattr_valid_fh() {
-        let fh = NfsFh3::from_item_id("gdrive:root");
+        let ctx = test_ctx();
+        let root_key = ctx.root_key();
+        let fh = NfsFh3::from_item_id(&root_key.to_string());
         let mut args = Vec::new();
         encode_fh(&mut args, &fh);
 
-        let reply = handle_nfs_call(NFS3PROC_GETATTR, &args);
+        let reply = handle_nfs_call(NFS3PROC_GETATTR, &args, &ctx);
         let (status, _) = decode_u32(&reply).unwrap();
         assert_eq!(status, NFS3_OK);
     }
 
     #[test]
     fn getattr_invalid_fh() {
+        let ctx = test_ctx();
         let fh = NfsFh3 { data: [0u8; NFS3_FHSIZE] };
         let mut args = Vec::new();
         encode_fh(&mut args, &fh);
 
-        let reply = handle_nfs_call(NFS3PROC_GETATTR, &args);
+        let reply = handle_nfs_call(NFS3PROC_GETATTR, &args, &ctx);
         let (status, _) = decode_u32(&reply).unwrap();
         assert_eq!(status, NFS3ERR_STALE);
     }
 
     #[test]
     fn lookup_resolves_name() {
-        let fh = NfsFh3::from_item_id("gdrive:root");
+        let ctx = test_ctx();
+        let root_key = ctx.root_key();
+        let fh = NfsFh3::from_item_id(&root_key.to_string());
         let mut args = Vec::new();
         encode_fh(&mut args, &fh);
         encode_string(&mut args, "Documents");
 
-        let reply = handle_nfs_call(NFS3PROC_LOOKUP, &args);
+        let reply = handle_nfs_call(NFS3PROC_LOOKUP, &args, &ctx);
         let (status, _) = decode_u32(&reply).unwrap();
         assert_eq!(status, NFS3_OK);
+
+        // Verify child path was registered.
+        let child_key = NfsContext::path_to_key("/Documents");
+        assert_eq!(ctx.lookup_path(child_key), Some("/Documents".to_string()));
     }
 
     #[test]
     fn write_returns_rofs() {
-        let reply = handle_nfs_call(NFS3PROC_CREATE, &[]);
+        let ctx = test_ctx();
+        let reply = handle_nfs_call(NFS3PROC_CREATE, &[], &ctx);
         let (status, _) = decode_u32(&reply).unwrap();
         assert_eq!(status, NFS3ERR_ROFS);
     }
 
     #[test]
     fn fsstat_returns_ok() {
-        let fh = NfsFh3::from_item_id("root");
+        let ctx = test_ctx();
+        let root_key = ctx.root_key();
+        let fh = NfsFh3::from_item_id(&root_key.to_string());
         let mut args = Vec::new();
         encode_fh(&mut args, &fh);
 
-        let reply = handle_nfs_call(NFS3PROC_FSSTAT, &args);
+        let reply = handle_nfs_call(NFS3PROC_FSSTAT, &args, &ctx);
         let (status, _) = decode_u32(&reply).unwrap();
         assert_eq!(status, NFS3_OK);
     }

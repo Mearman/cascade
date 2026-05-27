@@ -6,6 +6,7 @@ use cascade_engine::db::StateDb;
 use cascade_engine::config::ConfigResolver;
 use cascade_engine::sync::runner::SyncRunner;
 use cascade_engine::vfs::VfsTree;
+use cascade_presenter_nfs::nfs::context::NfsContext;
 use cascade_presenter_nfs::nfs::server::{NfsServer, NfsServerConfig};
 
 /// Start the Cascade daemon.
@@ -38,7 +39,7 @@ pub async fn start(mount_point: Option<&str>) -> Result<()> {
     )?;
 
     // Build VFS tree.
-    let _tree = Arc::new(VfsTree::new(backend.clone()));
+    let tree = Arc::new(std::sync::RwLock::new(VfsTree::new(backend.clone())));
     tracing::info!("VFS tree initialised");
 
     // Resolve mount point.
@@ -57,7 +58,8 @@ pub async fn start(mount_point: Option<&str>) -> Result<()> {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         export_path: "/".to_string(),
     };
-    let server = NfsServer::start(server_config).await?;
+    let nfs_ctx = Arc::new(NfsContext::new(tree.clone()));
+    let server = NfsServer::start(server_config, nfs_ctx.clone()).await?;
     let nfs_port = server.local_addr.port();
     tracing::info!(port = nfs_port, "NFS server started");
 
