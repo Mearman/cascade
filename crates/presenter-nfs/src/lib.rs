@@ -1,39 +1,15 @@
 //! NFS presenter — NFSv3 server on loopback.
 //!
-//! Phase 1 provides the trait implementation and protocol structures.
-//! The full NFS server will be completed in the NFS integration phase.
+//! Implements the engine's `VfsPresenter` trait, serving files via NFSv3
+//! to the OS NFS client.
 
 pub mod nfs;
 
 use std::path::Path;
 
 use async_trait::async_trait;
+use cascade_engine::presenter::VfsPresenter;
 use cascade_engine::types::{CacheState, ItemId, VfsItem};
-
-/// Platform-agnostic presenter trait for presenting the VFS to the OS.
-#[async_trait]
-pub trait VfsPresenter: Send + Sync {
-    /// A file was added or updated in the VFS.
-    async fn upsert_item(&self, item: VfsItem) -> anyhow::Result<()>;
-
-    /// A file or directory was deleted from the VFS.
-    async fn delete_item(&self, id: &ItemId) -> anyhow::Result<()>;
-
-    /// A file's cache state changed.
-    async fn update_state(&self, id: &ItemId, state: CacheState) -> anyhow::Result<()>;
-
-    /// Download a file's contents (on-demand). Returns local path.
-    async fn fetch_contents(&self, id: &ItemId) -> anyhow::Result<std::path::PathBuf>;
-
-    /// Evict a file (free up space).
-    async fn evict_item(&self, id: &ItemId) -> anyhow::Result<()>;
-
-    /// Start presenting the VFS at the given mount point.
-    async fn start(&self, mount_point: &Path) -> anyhow::Result<()>;
-
-    /// Stop presenting.
-    async fn stop(&self) -> anyhow::Result<()>;
-}
 
 /// NFS presenter using an NFSv3 server on loopback.
 pub struct NfsPresenter {
@@ -95,13 +71,14 @@ impl VfsPresenter for NfsPresenter {
             port = self.nfs_port,
             "starting NFS presenter"
         );
-        // TODO: Start NFSv3 server on loopback, mount via OS NFS client
+        // The NFS server is started separately in the mount command.
+        // This method is for the presenter trait interface.
         Ok(())
     }
 
     async fn stop(&self) -> anyhow::Result<()> {
         tracing::info!("stopping NFS presenter");
-        // TODO: Unmount NFS, stop server
+        // The NFS server is stopped separately in the mount command.
         Ok(())
     }
 }
