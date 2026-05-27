@@ -80,6 +80,13 @@ pub struct ChangesResponse {
     pub new_start_page_token: Option<String>,
 }
 
+/// File list response from files.list.
+#[derive(Debug, Deserialize)]
+pub struct FileListResponse {
+    pub files: Vec<DriveFile>,
+    pub next_page_token: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

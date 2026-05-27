@@ -35,14 +35,14 @@ pub trait Backend: Send + Sync {
     async fn download(
         &self,
         file: &FileEntry,
-        writer: &mut (dyn tokio::io::AsyncWrite + Unpin),
+        writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
     ) -> anyhow::Result<()>;
 
     /// Upload file content, replacing the existing file or creating a new one.
     async fn upload(
         &self,
         path: &Path,
-        reader: &mut (dyn tokio::io::AsyncRead + Unpin),
+        reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
         parent_id: &FileId,
     ) -> anyhow::Result<FileEntry>;
 
@@ -96,7 +96,7 @@ impl Backend for NullBackend {
     async fn download(
         &self,
         _file: &FileEntry,
-        _writer: &mut (dyn tokio::io::AsyncWrite + Unpin),
+        _writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
     ) -> anyhow::Result<()> {
         anyhow::bail!("null backend has no files")
     }
@@ -104,7 +104,7 @@ impl Backend for NullBackend {
     async fn upload(
         &self,
         _path: &Path,
-        _reader: &mut (dyn tokio::io::AsyncRead + Unpin),
+        _reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
         _parent_id: &FileId,
     ) -> anyhow::Result<FileEntry> {
         anyhow::bail!("null backend cannot upload")
