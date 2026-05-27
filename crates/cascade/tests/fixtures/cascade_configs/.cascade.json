@@ -1,0 +1,9 @@
+{
+    "ignore": [
+        { "pattern": "*.json.bak" },
+        { "pattern": "node_modules", "dir_only": true }
+    ],
+    "pin": [
+        { "path": "Projects/active/" }
+    ]
+}

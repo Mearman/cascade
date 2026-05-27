@@ -1,0 +1,12 @@
+# Cascade gitignore-style config
+# Ignore build artifacts
+target/
+*.log
+*.tmp
+
+# But keep important logs
+!important.log
+
+# Ignore OS files
+.DS_Store
+Thumbs.db

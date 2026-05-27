@@ -1,0 +1,5 @@
+ignore:
+  - pattern: "*.tmp"
+  - pattern: "*.bak"
+pin:
+  - path: "Documents/"
