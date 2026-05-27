@@ -1,0 +1,14 @@
+[package]
+name = "cascade-expr"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pest.workspace = true
+pest_derive.workspace = true
+serde.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
