@@ -73,20 +73,34 @@ pub async fn start(ctx: &CliContext, mount_point: Option<&str>) -> Result<()> {
         p2p_data_dir: None,
     };
     let engine = Engine::new(engine_config).await?;
-    let handle = engine.start()?;
 
-    // Create presenter using engine's VFS.
+    // Create the NFS presenter before starting the engine, so we can wire it
+    // into the sync runner. Remote changes polled from backends will be
+    // forwarded to this presenter so NFS clients see them.
     let presenter = Arc::new(cascade_presenter_nfs::NfsPresenter::with_vfs(
         &mount_path,
         engine.vfs().clone(),
     ));
+
+    // Clone the NFS context before the presenter is moved into the sync runner.
+    let nfs_ctx = presenter.context().clone();
+
+    // Build a sync runner with the real presenter and spawn it.
+    let sync_runner = engine.create_sync_runner(presenter);
+    let sync_handle = tokio::spawn(async move {
+        if let Err(e) = sync_runner.run().await {
+            tracing::error!(error = %e, "sync runner exited with error");
+        }
+    });
+
+    // Start engine background tasks (cache manager).
+    let handle = engine.start()?;
 
     // Start NFS server on loopback, sharing the presenter's context.
     let server_config = NfsServerConfig {
         bind_addr: "127.0.0.1:0".parse()?,
         export_path: "/".to_string(),
     };
-    let nfs_ctx = presenter.context().clone();
     let server = NfsServer::start(server_config, nfs_ctx).await?;
     let nfs_port = server.local_addr.port();
     tracing::info!(port = nfs_port, "NFS server started");
@@ -111,8 +125,8 @@ pub async fn start(ctx: &CliContext, mount_point: Option<&str>) -> Result<()> {
     // Clean up.
     unmount_nfs(&mount_path)?;
     server.stop()?;
+    sync_handle.abort();
     engine.shutdown();
-    handle.sync_handle.abort();
     handle.cache_handle.abort();
 
     let _ = std::fs::remove_file(&ctx.pid_path);
