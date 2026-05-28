@@ -328,6 +328,7 @@ fn unmount_nfs(_mount_point: &Path) -> Result<()> {
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(dead_code)]
 fn is_mounted(_path: &Path) -> bool {
     false
 }
