@@ -4,7 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-cascade-engine = { path = "../engine" }
 tokio = { workspace = true, features = ["net", "rt", "macros", "io-util"] }
 async-trait.workspace = true
 serde.workspace = true
