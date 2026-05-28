@@ -209,14 +209,12 @@ jobs:
     needs: [release, build-macos-arm, build-macos-x86, build-linux-x86, build-linux-arm]
     if: needs.release.outputs.released == 'true'
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
-      - name: Checkout tap
+      - name: Checkout tap via SSH deploy key
         uses: actions/checkout@v4
         with:
           repository: Mearman/homebrew-cascade
-          token: ${{ secrets.TAP_PAT }}
+          ssh-key: ${{ secrets.TAP_DEPLOY_KEY }}
       - name: Download checksums
         env:
           VERSION: ${{ needs.release.outputs.version }}
