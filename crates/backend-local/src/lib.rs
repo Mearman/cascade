@@ -46,7 +46,7 @@ pub struct LocalConfig {
 /// - `root_path` — the directory to adopt (required)
 /// - `mode` — "mirror" or "upload-only" (default: "mirror")
 /// - `id` — backend identifier (default: "local")
-/// - `display_name` — display name (default: "Local Files (<basename>)")
+/// - `display_name` — display name (default: "Local Files (\<basename\>)")
 pub fn create_backend(config: &toml::Value) -> anyhow::Result<Box<dyn Backend>> {
     let root_path = config
         .get("root_path")

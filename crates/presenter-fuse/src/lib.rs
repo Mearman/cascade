@@ -282,11 +282,10 @@ mod tests {
 
     #[tokio::test]
     async fn start_fails_on_non_linux() {
-        let root = ItemId::new("gdrive", "root");
-        let presenter = FusePresenter::new(root);
-
         #[cfg(not(target_os = "linux"))]
         {
+            let root = ItemId::new("gdrive", "root");
+            let presenter = FusePresenter::new(root);
             let result = presenter.start(Path::new("/mnt/test")).await;
             assert!(result.is_err());
             let err = result.unwrap_err().to_string();

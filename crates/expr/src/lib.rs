@@ -1,7 +1,7 @@
 //! Expression language — PEG grammar parser and evaluator.
 //!
 //! Conditional rules in `.cascade` files use a small expression language
-//! evaluated against an [`EvalContext`]. Built with `pest` PEG parser.
+//! evaluated against an [`context::EvalContext`]. Built with `pest` PEG parser.
 
 pub mod ast;
 pub mod context;
