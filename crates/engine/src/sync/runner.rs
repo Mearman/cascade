@@ -12,7 +12,7 @@ use crate::db::StateDb;
 use crate::p2p_bridge::P2pBridge;
 use crate::presenter::VfsPresenter;
 use crate::sync::conflict::{ConflictCheck, check_conflict, conflict_name};
-use crate::types::{CacheState, Change, VfsItem};
+use crate::types::{CacheState, Change, FileId, VfsItem};
 
 /// Default poll interval when the backend doesn't specify one.
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(60);
@@ -88,6 +88,10 @@ impl SyncRunner {
             }
         }
 
+        // Flush any dirty files after initial sync so pending writes
+        // are uploaded before entering the polling loop.
+        self.flush_dirty_files().await;
+
         // Polling loop.
         loop {
             let interval = self.effective_poll_interval().await;
@@ -118,6 +122,10 @@ impl SyncRunner {
                     }
                 }
             }
+
+            // Flush dirty files after each remote sync cycle.
+            // Remote changes are applied first, then local writes are uploaded.
+            self.flush_dirty_files().await;
         }
     }
 
@@ -250,6 +258,100 @@ impl SyncRunner {
         }
         interval
     }
+
+    /// Flush all dirty files: upload each to its owning backend and clear
+    /// the dirty flag on success. Failures are logged and skipped so that
+    /// one failing upload does not block the rest.
+    ///
+    /// Returns the number of files successfully uploaded.
+    async fn flush_dirty_files(&self) -> usize {
+        let dirty_files = match self.db.list_dirty_files() {
+            Ok(files) => files,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to list dirty files");
+                return 0;
+            }
+        };
+
+        let mut flushed = 0;
+
+        for record in &dirty_files {
+            let Some(backend) = self.backends.iter().find(|b| b.id() == record.backend_id) else {
+                tracing::warn!(
+                    file = %record.id,
+                    backend_id = %record.backend_id,
+                    "no backend found for dirty file — skipping"
+                );
+                continue;
+            };
+
+            let Some(local_path_str) = &record.local_path else {
+                tracing::warn!(
+                    file = %record.id,
+                    "dirty file has no local path — skipping"
+                );
+                continue;
+            };
+            let local_path = std::path::PathBuf::from(local_path_str);
+
+            if !local_path.exists() {
+                tracing::warn!(
+                    file = %record.id,
+                    path = %local_path.display(),
+                    "dirty file missing from disk — skipping"
+                );
+                continue;
+            }
+
+            let file = tokio::fs::File::open(&local_path).await;
+            let mut file = match file {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::error!(
+                        file = %record.id,
+                        path = %local_path.display(),
+                        error = %e,
+                        "failed to open dirty file — skipping"
+                    );
+                    continue;
+                }
+            };
+
+            let upload_path = std::path::Path::new(&record.path);
+            let parent_file_id = FileId(record.parent_id.native_id().to_string());
+
+            match backend
+                .upload(upload_path, &mut file, &parent_file_id)
+                .await
+            {
+                Ok(_updated_entry) => {
+                    if let Err(e) = self.db.clear_dirty(&record.id) {
+                        tracing::error!(
+                            file = %record.id,
+                            error = %e,
+                            "failed to clear dirty flag after upload"
+                        );
+                    } else {
+                        flushed += 1;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        file = %record.id,
+                        path = %record.path,
+                        error = %e,
+                        "upload failed for dirty file — will retry next cycle"
+                    );
+                }
+            }
+        }
+
+        if flushed > 0 {
+            tracing::info!(flushed, "dirty file flush complete");
+        }
+
+        flushed
+    }
 }
 
 #[cfg(test)]
@@ -258,7 +360,7 @@ mod tests {
     use crate::backend::NullBackend;
     use crate::db::StateDb;
     use crate::presenter::VfsPresenter;
-    use crate::types::ItemId;
+    use crate::types::{FileEntry, ItemId};
     use async_trait::async_trait;
     use std::path::{Path, PathBuf};
 
@@ -315,5 +417,172 @@ mod tests {
         runner.stop();
         let result = runner.run().await;
         assert!(result.is_ok());
+    }
+
+    /// A mock backend that records upload calls.
+    #[derive(Default)]
+    struct MockBackend {
+        id: String,
+        uploads: std::sync::Mutex<Vec<(String, String)>>, // (path, parent_id)
+    }
+
+    impl MockBackend {
+        fn new(id: impl Into<String>) -> Self {
+            Self {
+                id: id.into(),
+                uploads: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Backend for MockBackend {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn display_name(&self) -> &'static str {
+            "Mock"
+        }
+
+        async fn quota(&self) -> anyhow::Result<Option<crate::types::Quota>> {
+            Ok(None)
+        }
+
+        async fn changes(
+            &self,
+            _cursor: Option<&crate::types::Cursor>,
+        ) -> anyhow::Result<(Vec<Change>, crate::types::Cursor)> {
+            Ok((vec![], crate::types::Cursor("mock".to_string())))
+        }
+
+        async fn metadata(
+            &self,
+            _path: &std::path::Path,
+        ) -> anyhow::Result<crate::types::FileEntry> {
+            anyhow::bail!("not implemented")
+        }
+
+        async fn download(
+            &self,
+            _file: &crate::types::FileEntry,
+            _writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("not implemented")
+        }
+
+        async fn upload(
+            &self,
+            path: &std::path::Path,
+            _reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+            parent_id: &crate::types::FileId,
+        ) -> anyhow::Result<crate::types::FileEntry> {
+            self.uploads
+                .lock()
+                .unwrap()
+                .push((path.to_string_lossy().to_string(), parent_id.0.clone()));
+            Ok(crate::types::FileEntry::file(
+                crate::types::ItemId::new(&self.id, "uploaded"),
+                crate::types::ItemId::new(&self.id, parent_id.0.as_str()),
+                path.to_string_lossy().to_string(),
+            ))
+        }
+
+        async fn create_dir(
+            &self,
+            _path: &std::path::Path,
+        ) -> anyhow::Result<crate::types::FileEntry> {
+            anyhow::bail!("not implemented")
+        }
+
+        async fn delete(&self, _file: &crate::types::FileEntry) -> anyhow::Result<()> {
+            anyhow::bail!("not implemented")
+        }
+
+        async fn move_entry(
+            &self,
+            _src: &std::path::Path,
+            _dst: &std::path::Path,
+        ) -> anyhow::Result<crate::types::FileEntry> {
+            anyhow::bail!("not implemented")
+        }
+
+        async fn poll_interval(&self) -> Option<Duration> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn flush_dirty_files_uploads_and_clears() {
+        let db = Arc::new(StateDb::open_in_memory().unwrap());
+        db.register_backend("mock", "mock", "Mock", None, None)
+            .unwrap();
+
+        // Create a temp file to serve as the local cached content.
+        let tmp = tempfile::tempdir().unwrap();
+        let local_file = tmp.path().join("test.txt");
+        tokio::fs::write(&local_file, b"hello world").await.unwrap();
+
+        // Insert a file record, set it dirty, and give it a local_path.
+        let file_id = ItemId::new("mock", "file1");
+        let parent_id = ItemId::new("mock", "root");
+        let entry = FileEntry::file(file_id.clone(), parent_id, "test.txt".into());
+        db.upsert_file(&entry).unwrap();
+        db.mark_dirty(&file_id).unwrap();
+
+        // Set the local_path and path for the dirty file record.
+        db.set_file_paths(&file_id, "docs/test.txt", &local_file.to_string_lossy())
+            .unwrap();
+
+        let mock_backend = Arc::new(MockBackend::new("mock"));
+        let presenter = Arc::new(MockPresenter::default());
+        let config = Arc::new(ConfigResolver::new(std::path::PathBuf::from("/tmp/test")));
+
+        let runner = SyncRunner::new(db.clone(), vec![mock_backend.clone()], presenter, config);
+
+        let flushed = runner.flush_dirty_files().await;
+        assert_eq!(flushed, 1);
+
+        // Verify the backend received the upload.
+        let uploads = mock_backend.uploads.lock().unwrap();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].0, "docs/test.txt");
+
+        // Verify the dirty flag was cleared.
+        assert_eq!(db.is_dirty(&file_id).unwrap(), Some(false));
+        assert!(db.list_dirty_files().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn flush_dirty_files_skips_on_upload_failure() {
+        let db = Arc::new(StateDb::open_in_memory().unwrap());
+        db.register_backend("null", "null", "Null", None, None)
+            .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let local_file = tmp.path().join("fail.txt");
+        tokio::fs::write(&local_file, b"content").await.unwrap();
+
+        let file_id = ItemId::new("null", "file1");
+        let parent_id = ItemId::new("null", "root");
+        let entry = FileEntry::file(file_id.clone(), parent_id, "fail.txt".into());
+        db.upsert_file(&entry).unwrap();
+        db.mark_dirty(&file_id).unwrap();
+
+        db.set_file_paths(&file_id, "fail.txt", &local_file.to_string_lossy())
+            .unwrap();
+
+        // NullBackend.upload() always fails.
+        let null_backend: Arc<dyn Backend> = Arc::new(NullBackend::new("null"));
+        let presenter = Arc::new(MockPresenter::default());
+        let config = Arc::new(ConfigResolver::new(std::path::PathBuf::from("/tmp/test")));
+
+        let runner = SyncRunner::new(db.clone(), vec![null_backend], presenter, config);
+
+        let flushed = runner.flush_dirty_files().await;
+        assert_eq!(flushed, 0);
+
+        // File should still be dirty — upload failed.
+        assert_eq!(db.is_dirty(&file_id).unwrap(), Some(true));
     }
 }
