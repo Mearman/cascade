@@ -9,8 +9,6 @@ cascade-engine = { path = "../engine" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
 toml = { workspace = true }
 reqwest = { workspace = true }
 chrono = { workspace = true }
@@ -19,7 +17,6 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 url = "2"
-quick-xml = "0.37"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
