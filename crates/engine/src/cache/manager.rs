@@ -9,6 +9,7 @@
 use crate::cache::lifecycle::{EvictionDecision, LifecycleEvaluator};
 use crate::cache::pin::PinMatcher;
 use crate::db::StateDb;
+use crate::p2p_bridge::P2pBridge;
 use crate::types::CacheState;
 use anyhow::Result;
 use std::path::Path;
@@ -41,12 +42,43 @@ impl Default for CacheManagerConfig {
 pub struct CacheManager {
     db: Arc<StateDb>,
     config: CacheManagerConfig,
+    p2p: Option<Arc<P2pBridge>>,
 }
 
 impl CacheManager {
     /// Create a new cache manager.
     pub fn new(db: Arc<StateDb>, config: CacheManagerConfig) -> Self {
-        Self { db, config }
+        Self {
+            db,
+            config,
+            p2p: None,
+        }
+    }
+
+    /// Attach a P2P bridge for content fetching.
+    pub fn with_p2p(mut self, p2p: Arc<P2pBridge>) -> Self {
+        self.p2p = Some(p2p);
+        self
+    }
+
+    /// Try to fetch file contents from P2P peers before falling back to
+    /// cloud. Returns the file data if P2P has it, None otherwise.
+    pub async fn fetch_from_p2p(&self, file: &crate::types::FileEntry) -> Result<Option<Vec<u8>>> {
+        let bridge = match &self.p2p {
+            Some(b) => b,
+            None => return Ok(None),
+        };
+        bridge.try_fetch_from_peers(file).await
+    }
+
+    /// Index downloaded file data into the P2P block store for sharing.
+    pub async fn index_for_p2p(&self, file_id: &crate::types::ItemId, data: &[u8]) -> Result<()> {
+        let bridge = match &self.p2p {
+            Some(b) => b,
+            None => return Ok(()),
+        };
+        bridge.index_file_by_id(file_id, data).await?;
+        Ok(())
     }
 
     /// Pin a path — all files matching the glob will be kept offline.

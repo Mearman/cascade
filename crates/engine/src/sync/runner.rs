@@ -9,6 +9,7 @@ use crate::backend::Backend;
 use crate::cache::pin::PinMatcher;
 use crate::config::ConfigResolver;
 use crate::db::StateDb;
+use crate::p2p_bridge::P2pBridge;
 use crate::presenter::VfsPresenter;
 use crate::sync::conflict::{ConflictCheck, check_conflict, conflict_name};
 use crate::types::{CacheState, Change, VfsItem};
@@ -25,6 +26,7 @@ pub struct SyncRunner {
     backends: Vec<Arc<dyn Backend>>,
     presenter: Arc<dyn VfsPresenter>,
     config: Arc<ConfigResolver>,
+    p2p: Option<P2pBridge>,
     cancel_tx: watch::Sender<bool>,
     cancel_rx: watch::Receiver<bool>,
 }
@@ -43,9 +45,16 @@ impl SyncRunner {
             backends,
             presenter,
             config,
+            p2p: None,
             cancel_tx,
             cancel_rx,
         }
+    }
+
+    /// Attach a P2P bridge for block-level file sharing.
+    pub fn with_p2p(mut self, p2p: P2pBridge) -> Self {
+        self.p2p = Some(p2p);
+        self
     }
 
     /// Perform an initial sync for all backends, then start the polling loop.
@@ -137,6 +146,17 @@ impl SyncRunner {
                     // Auto-pin if the file matches any pin rule.
                     if self.is_pinned_entry(entry) {
                         self.db.update_cache_state(&entry.id, CacheState::Pinned)?;
+                    }
+                    // Index cached files for P2P sharing.
+                    if let Some(bridge) = &self.p2p
+                        && entry.size.is_some_and(|s| s > 0)
+                        && let Err(e) = bridge.index_file(&entry.name, &Vec::new()).await
+                    {
+                        tracing::debug!(
+                            file = %entry.name,
+                            error = %e,
+                            "P2P indexing skipped for file without local data"
+                        );
                     }
                     let item: VfsItem = entry.clone().into();
                     self.presenter.upsert_item(item).await?;
