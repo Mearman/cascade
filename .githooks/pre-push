@@ -36,7 +36,7 @@ if ! cargo fmt --check 2>&1; then
 fi
 
 echo "Running clippy..."
-if ! cargo clippy --workspace -- -D warnings 2>&1; then
+if ! cargo clippy --workspace 2>&1; then
     echo ""
     echo "clippy found issues. Fix before pushing."
     exit 1

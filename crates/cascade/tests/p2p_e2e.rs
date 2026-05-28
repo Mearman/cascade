@@ -122,8 +122,8 @@ async fn e2e_multiple_files_independent_blocks() {
         .unwrap();
     let bridge = P2pBridge::new(engine, db);
 
-    let data_a = vec![0x11; BLOCK_128KB as usize + 100];
-    let data_b = vec![0x22; BLOCK_128KB as usize * 2 + 200];
+    let data_a = vec![0x11; BLOCK_128KB + 100];
+    let data_b = vec![0x22; BLOCK_128KB * 2 + 200];
 
     let id_a = ItemId::new("p2p", "file_a.bin");
     let id_b = ItemId::new("p2p", "file_b.bin");
@@ -158,7 +158,7 @@ async fn e2e_multiple_files_independent_blocks() {
 /// Build test data spanning several blocks (~384 KB).
 fn build_test_data() -> Vec<u8> {
     // Three full blocks + a partial.
-    let size = BLOCK_128KB as usize * 3 + 7890;
+    let size = BLOCK_128KB * 3 + 7890;
     let mut data = Vec::with_capacity(size);
     for i in 0..size {
         data.push((i % 251) as u8); // PRIME_MOD to get varied byte values.

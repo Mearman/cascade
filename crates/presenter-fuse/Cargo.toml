@@ -19,3 +19,6 @@ fuser = "0.17"
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tempfile = "3"
 proptest = "1"
+
+[lints]
+workspace = true

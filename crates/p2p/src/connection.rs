@@ -306,6 +306,7 @@ mod tests {
     use super::*;
     use crate::identity::DeviceIdentity;
 
+    #[allow(dead_code)]
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
     }

@@ -13,3 +13,6 @@ chrono.workspace = true
 libc = "0.2"
 
 [dev-dependencies]
+
+[lints]
+workspace = true

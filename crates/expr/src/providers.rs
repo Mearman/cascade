@@ -139,6 +139,7 @@ impl DiskProvider {
     }
 
     /// Collect disk stats for the filesystem containing the given path.
+    #[allow(unsafe_code)]
     pub fn collect_for_path(path: &str) -> DiskContext {
         #[cfg(unix)]
         {

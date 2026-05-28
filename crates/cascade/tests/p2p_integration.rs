@@ -22,7 +22,7 @@ async fn bridge_index_and_lookup() {
     let db = Arc::new(StateDb::open_in_memory().unwrap());
     let bridge = P2pBridge::new(engine, db);
 
-    let data = vec![0xAA; BLOCK_128KB as usize * 3];
+    let data = vec![0xAA; BLOCK_128KB * 3];
     let blocks = bridge.index_file("hello.bin", &data).await.unwrap();
 
     assert_eq!(blocks.size, data.len() as u64);
@@ -47,7 +47,7 @@ async fn cross_engine_block_sharing_via_shared_store() {
     let db_a = Arc::new(StateDb::open_in_memory().unwrap());
     let bridge_a = P2pBridge::new(engine_a, db_a);
 
-    let data = vec![0x42; BLOCK_128KB as usize * 2 + 1024];
+    let data = vec![0x42; BLOCK_128KB * 2 + 1024];
     let blocks = bridge_a.index_file("shared.bin", &data).await.unwrap();
 
     // Engine B reads from the same block store directory.
@@ -122,7 +122,7 @@ async fn cache_manager_with_p2p() {
     let cache = CacheManager::new(db.clone(), CacheManagerConfig::default()).with_p2p(bridge);
 
     let file_id = ItemId::new("p2p", "cached.bin");
-    let data = vec![0xDD; BLOCK_128KB as usize + 256];
+    let data = vec![0xDD; BLOCK_128KB + 256];
 
     // Index through cache manager.
     cache.index_for_p2p(&file_id, &data).await.unwrap();

@@ -580,13 +580,8 @@ mod tests {
         let entry = backend.metadata(Path::new("test.txt")).await.unwrap();
 
         let mut buf = Vec::new();
-        backend
-            .download(
-                &entry,
-                &mut buf as &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
-            )
-            .await
-            .unwrap();
+        let mut writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send) = &mut buf;
+        backend.download(&entry, &mut writer).await.unwrap();
 
         assert_eq!(buf, b"hello world");
     }

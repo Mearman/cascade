@@ -24,6 +24,7 @@ pub struct FileAttr {
 
 impl FileAttr {
     /// Build attributes for a directory.
+    #[allow(unsafe_code)]
     pub fn directory(inode: u64) -> Self {
         Self {
             inode,
@@ -37,6 +38,7 @@ impl FileAttr {
     }
 
     /// Build attributes for a regular file.
+    #[allow(unsafe_code)]
     pub fn file(inode: u64, size: u64) -> Self {
         Self {
             inode,

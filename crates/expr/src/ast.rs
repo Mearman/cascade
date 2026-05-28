@@ -81,9 +81,9 @@ impl Value {
                 DurationUnit::Minutes => v * 60,
                 DurationUnit::Hours => v * 3600,
                 DurationUnit::Days => v * 86400,
-                DurationUnit::Weeks => v * 604800,
-                DurationUnit::Months => v * 2592000, // 30 days
-                DurationUnit::Years => v * 31536000,
+                DurationUnit::Weeks => v * 604_800,
+                DurationUnit::Months => v * 2_592_000, // 30 days
+                DurationUnit::Years => v * 31_536_000,
             }),
             _ => None,
         }

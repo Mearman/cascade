@@ -1,0 +1,2 @@
+# Cognitive complexity threshold — warn on functions exceeding this.
+cognitive-complexity-threshold = 50
