@@ -126,7 +126,7 @@ impl P2pBridge {
     }
 
     /// Check if we have all blocks for a given hash stored locally.
-    pub async fn has_blocks(&self, hash: &str) -> Result<bool> {
+    pub fn has_blocks(&self, hash: &str) -> Result<bool> {
         // Parse the hex hash into a BlockHash.
         let bytes: Vec<u8> = (0..hash.len())
             .step_by(2)
@@ -174,7 +174,7 @@ mod tests {
 
         // The first block hash should be present.
         let hash_hex = blocks.blocks[0].to_string();
-        assert!(bridge.has_blocks(&hash_hex).await.unwrap());
+        assert!(bridge.has_blocks(&hash_hex).unwrap());
     }
 
     #[tokio::test]

@@ -93,7 +93,7 @@ impl ConfigResolver {
     fn resolve_for_dir(&self, dir: &Path) -> ResolvedConfig {
         // Check cache first.
         {
-            let cache = self.cache.read().unwrap_or_else(|e| e.into_inner());
+            let cache = self.cache.read().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some((_, config)) = cache.iter().find(|(p, _)| p == dir) {
                 return config.clone();
             }
@@ -104,7 +104,7 @@ impl ConfigResolver {
 
         // Cache the result.
         {
-            let mut cache = self.cache.write().unwrap_or_else(|e| e.into_inner());
+            let mut cache = self.cache.write().unwrap_or_else(std::sync::PoisonError::into_inner);
             cache.push((dir.to_path_buf(), config.clone()));
         }
 
@@ -114,7 +114,7 @@ impl ConfigResolver {
     /// Invalidate cached configs for a directory and its children.
     /// Call this when `.cascade` files are created or modified.
     pub fn invalidate(&self, dir: &Path) {
-        let mut cache = self.cache.write().unwrap_or_else(|e| e.into_inner());
+        let mut cache = self.cache.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         cache.retain(|(p, _)| !p.starts_with(dir));
     }
 }
@@ -189,7 +189,7 @@ mod tests {
         let _ = resolver.is_ignored(path, false);
         let _ = resolver.is_ignored(path, false);
 
-        let cache = resolver.cache.read().unwrap_or_else(|e| e.into_inner());
+        let cache = resolver.cache.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(cache.len(), 1);
     }
 
@@ -201,7 +201,7 @@ mod tests {
 
         resolver.invalidate(Path::new("/tmp/test-mount/Documents"));
 
-        let cache = resolver.cache.read().unwrap_or_else(|e| e.into_inner());
+        let cache = resolver.cache.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(cache.is_empty());
     }
 }

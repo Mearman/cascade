@@ -145,7 +145,7 @@ impl Engine {
         let mut tree = self
             .vfs
             .write()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         tree.mount(prefix, backend);
     }
 
@@ -154,7 +154,7 @@ impl Engine {
         let mut tree = self
             .vfs
             .write()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         tree.unmount(prefix);
     }
 
@@ -167,7 +167,7 @@ impl Engine {
         let presenter = Arc::new(NullPresenter);
 
         // Collect all backends from the VFS tree.
-        let tree = self.vfs.read().unwrap_or_else(|e| e.into_inner());
+        let tree = self.vfs.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut backends = vec![tree.root().clone()];
         for (_, backend) in tree.children() {
             backends.push(backend.clone());
