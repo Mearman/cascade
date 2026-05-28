@@ -15,8 +15,8 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  check:
-    name: Check
+  compile:
+    name: Compile
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -24,6 +24,36 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
+      - name: Build workspace
+        run: cargo build --workspace --all-targets
+      - name: Save compilation for downstream jobs
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: compile-${{ github.run_id }}
+
+  check:
+    name: Check
+    needs: compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: rustfmt, clippy
+      - name: Restore compilation
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: compile-${{ github.run_id }}
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
       - name: Format
@@ -39,11 +69,19 @@ jobs:
 
   test:
     name: Test
+    needs: compile
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Restore compilation
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: compile-${{ github.run_id }}
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
       - name: Run tests
