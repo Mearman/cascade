@@ -78,7 +78,7 @@ mod linux {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use fuser::{
-        FileAttr as FuseFileAttr, FileHandle, FileType, Filesystem, INodeNo, KernelConfig,
+        Errno, FileAttr as FuseFileAttr, FileHandle, FileType, Filesystem, INodeNo, KernelConfig,
         LockOwner, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyWrite, Request,
     };
 
@@ -92,7 +92,7 @@ mod linux {
                 FileType::RegularFile
             };
             FuseFileAttr {
-                ino: attr.inode,
+                ino: INodeNo(attr.inode),
                 size: attr.size,
                 blocks: (attr.size + 511) / 512,
                 atime: UNIX_EPOCH,
@@ -122,28 +122,23 @@ mod linux {
         }
 
         fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-            let map = self.inode_map.lock().unwrap();
             let name_str = name.to_string_lossy();
-
-            // TODO: Query the VFS tree for the child with this name under parent.
-            // For now, return ENOENT until engine integration is wired up.
-            tracing::debug!(parent, name = %name_str, "lookup");
-            drop(map);
-            reply.error(libc::ENOENT);
+            tracing::debug!(parent = u64::from(parent), name = %name_str, "lookup");
+            drop(self.inode_map.lock().unwrap());
+            reply.error(Errno::ENOENT);
         }
 
         fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-            let ino_u64: u64 = ino.into();
+            let ino_u64 = u64::from(ino);
             let map = self.inode_map.lock().unwrap();
             if ino_u64 == crate::inode::ROOT_INODE {
                 let attr = FileAttr::directory(ino_u64);
                 reply.attr(&Duration::from_secs(1), attr.into());
                 return;
             }
-            // TODO: Look up VfsItem by inode and convert to attr.
             tracing::debug!(ino = ino_u64, "getattr");
             drop(map);
-            reply.error(libc::ENOENT);
+            reply.error(Errno::ENOENT);
         }
 
         fn readdir(
@@ -154,15 +149,14 @@ mod linux {
             offset: u64,
             mut reply: ReplyDirectory,
         ) {
+            let ino_u64 = u64::from(ino);
             let map = self.inode_map.lock().unwrap();
-            let ino_u64: u64 = ino.into();
             if ino_u64 != crate::inode::ROOT_INODE {
                 drop(map);
-                reply.error(libc::ENOTDIR);
+                reply.error(Errno::ENOTDIR);
                 return;
             }
 
-            // Standard "." and ".." entries for root.
             if offset == 0 {
                 reply.add(ino, 1, FileType::Directory, ".");
             }
@@ -170,7 +164,6 @@ mod linux {
                 reply.add(ino, 2, FileType::Directory, "..");
             }
 
-            // TODO: Iterate VFS children of this directory and add entries.
             tracing::debug!(ino = ino_u64, offset, "readdir");
             drop(map);
             reply.ok();
@@ -187,9 +180,8 @@ mod linux {
             _lock_owner: Option<LockOwner>,
             reply: ReplyData,
         ) {
-            // TODO: Fetch file contents from cache/backend and return the requested range.
             tracing::debug!(ino = u64::from(ino), offset, size, "read");
-            reply.error(libc::ENOENT);
+            reply.error(Errno::ENOENT);
         }
 
         fn write(
@@ -204,9 +196,8 @@ mod linux {
             _lock_owner: Option<LockOwner>,
             reply: ReplyWrite,
         ) {
-            // TODO: Write data to the file at the given offset.
             tracing::debug!(ino = u64::from(ino), offset, len = data.len(), "write");
-            reply.error(libc::EROFS);
+            reply.error(Errno::EROFS);
         }
 
         fn create(
@@ -219,9 +210,8 @@ mod linux {
             _flags: i32,
             reply: fuser::ReplyCreate,
         ) {
-            // TODO: Create a new file in the VFS.
             tracing::debug!(parent = u64::from(parent), name = %name.to_string_lossy(), "create");
-            reply.error(libc::EROFS);
+            reply.error(Errno::EROFS);
         }
 
         fn mkdir(
@@ -233,21 +223,18 @@ mod linux {
             _umask: u32,
             reply: ReplyEntry,
         ) {
-            // TODO: Create a new directory in the VFS.
             tracing::debug!(parent = u64::from(parent), name = %name.to_string_lossy(), "mkdir");
-            reply.error(libc::EROFS);
+            reply.error(Errno::EROFS);
         }
 
         fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: fuser::ReplyEmpty) {
-            // TODO: Delete a file from the VFS.
             tracing::debug!(parent = u64::from(parent), name = %name.to_string_lossy(), "unlink");
-            reply.error(libc::EROFS);
+            reply.error(Errno::EROFS);
         }
 
         fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: fuser::ReplyEmpty) {
-            // TODO: Delete a directory from the VFS.
             tracing::debug!(parent = u64::from(parent), name = %name.to_string_lossy(), "rmdir");
-            reply.error(libc::EROFS);
+            reply.error(Errno::EROFS);
         }
 
         fn rename(
@@ -260,7 +247,6 @@ mod linux {
             _flags: fuser::RenameFlags,
             reply: fuser::ReplyEmpty,
         ) {
-            // TODO: Move/rename in the VFS.
             tracing::debug!(
                 parent = u64::from(parent),
                 name = %name.to_string_lossy(),
@@ -268,7 +254,7 @@ mod linux {
                 newname = %newname.to_string_lossy(),
                 "rename"
             );
-            reply.error(libc::EROFS);
+            reply.error(Errno::EROFS);
         }
 
         fn setattr(
@@ -289,9 +275,8 @@ mod linux {
             _flags: Option<fuser::BsdFileFlags>,
             reply: ReplyAttr,
         ) {
-            // TODO: Update file metadata in the VFS.
             tracing::debug!(ino = u64::from(ino), ?mode, ?uid, ?gid, ?size, "setattr");
-            reply.error(libc::EROFS);
+            reply.error(Errno::EROFS);
         }
     }
 }
