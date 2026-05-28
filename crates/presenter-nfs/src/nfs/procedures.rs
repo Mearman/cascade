@@ -118,7 +118,7 @@ fn handle_readdir(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
     // Args: dir_fh + cookie + cookieverf + dircount + maxcount
     let dir_result = decode_fh(args);
     match dir_result {
-        Ok((fh, _rest)) => {
+        Ok((fh, rest)) => {
             let dir_key = fh
                 .to_item_id()
                 .and_then(|id| id.parse::<u64>().ok())
@@ -126,14 +126,53 @@ fn handle_readdir(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
             let dir_path = ctx.lookup_path(dir_key).unwrap_or_else(|| "/".to_string());
             let dir_attr = make_attributes(&dir_path, true);
 
+            // Decode cookie (skip entries before this offset) and
+            // cookieverf + counts.
+            let cookie = decode_u64(rest).ok().map(|(c, _)| c).unwrap_or(0);
+            // cookieverf is the next 8 bytes — we ignore it for now.
+
+            // Fetch directory listing from the VFS tree synchronously.
+            let entries = match ctx.list_dir_sync(&dir_path) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    tracing::warn!(path = %dir_path, error = %e, "READDIR: failed to list directory");
+                    encode_u32(&mut reply, NFS3ERR_IO);
+                    encode_post_op_attr(&mut reply, &PostOpAttr::some(dir_attr));
+                    return reply;
+                }
+            };
+
             encode_u32(&mut reply, NFS3_OK);
             encode_post_op_attr(&mut reply, &PostOpAttr::some(dir_attr));
             // cookieverf (8 bytes of zero).
             encode_u64(&mut reply, 0);
-            // No entries — actual directory listing requires async VFS query
-            // which can't be done from a sync procedure handler.
-            // Phase 1: return empty directory. Phase 2: pre-populate from sync.
-            encode_bool(&mut reply, false); // no more entries
+
+            // Encode directory entries. NFS cookies are 1-based indices
+            // into the entry list. Skip entries with cookie <= the
+            // requested cookie (client is resuming a previous listing).
+            for (i, entry) in entries.iter().enumerate() {
+                let entry_cookie = (i as u64) + 3; // cookies start at 3 (. and .. take 1,2)
+                if entry_cookie <= cookie {
+                    continue;
+                }
+                // Register the child path so LOOKUP can find it.
+                let child_path = if dir_path == "/" {
+                    format!("/{}", entry.name)
+                } else {
+                    format!("{}/{}", dir_path, entry.name)
+                };
+                ctx.register_path(&child_path);
+
+                let fileid = id_hash(&child_path);
+                // value_follow = true (more entries coming)
+                encode_bool(&mut reply, true);
+                encode_u64(&mut reply, fileid);
+                encode_string(&mut reply, &entry.name);
+                encode_u64(&mut reply, entry_cookie);
+            }
+
+            // No more entries.
+            encode_bool(&mut reply, false);
             encode_bool(&mut reply, true); // EOF
         }
         Err(_) => {
@@ -146,25 +185,51 @@ fn handle_readdir(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
 }
 
 /// READ — read file data.
-fn handle_read(args: &[u8], _ctx: &Arc<NfsContext>) -> Vec<u8> {
+fn handle_read(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
     let mut reply: Vec<u8> = Vec::new();
 
     // Args: file_fh + offset + count
     let file_result = decode_fh(args);
     match file_result {
         Ok((fh, rest)) => {
-            let offset = decode_u64(rest).ok();
-            let count = offset.and_then(|(_, r)| decode_u32(r).ok()).map(|(c, _)| c);
+            let offset = decode_u64(rest).ok().map(|(o, r)| (o, r));
+            let count = offset
+                .and_then(|(_, r)| decode_u32(r).ok())
+                .map(|(c, _)| c);
 
-            let file_id = fh.to_item_id().unwrap_or("root".to_string());
-            let file_attr = make_attributes(&file_id, false);
+            let file_key = fh
+                .to_item_id()
+                .and_then(|id| id.parse::<u64>().ok())
+                .unwrap_or(0);
+            let file_path = ctx.lookup_path(file_key);
 
-            // Phase 1: return empty data.
+            let file_attr = make_attributes(
+                file_path.as_deref().unwrap_or("unknown"),
+                false,
+            );
+
+            // Try to fetch file data synchronously via the VFS.
+            let data = match &file_path {
+                Some(path) => {
+                    match fetch_file_data_sync(ctx, path, offset.map(|(o, _)| o), count) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            tracing::debug!(path = %path, error = %e, "READ: failed to fetch data");
+                            encode_u32(&mut reply, NFS3ERR_IO);
+                            encode_post_op_attr(&mut reply, &PostOpAttr::some(file_attr));
+                            return reply;
+                        }
+                    }
+                }
+                None => Vec::new(),
+            };
+
+            let is_eof = data.is_empty();
             encode_u32(&mut reply, NFS3_OK);
             encode_post_op_attr(&mut reply, &PostOpAttr::some(file_attr));
-            encode_u32(&mut reply, count.unwrap_or(0)); // count of bytes returned
-            encode_bool(&mut reply, false); // not EOF (empty read)
-            encode_u32(&mut reply, 0); // 0 bytes of data
+            encode_u32(&mut reply, data.len() as u32); // count of bytes returned
+            encode_bool(&mut reply, is_eof); // EOF if no data
+            reply.extend_from_slice(&data);
         }
         Err(_) => {
             encode_u32(&mut reply, NFS3ERR_STALE);
@@ -173,6 +238,36 @@ fn handle_read(args: &[u8], _ctx: &Arc<NfsContext>) -> Vec<u8> {
     }
 
     reply
+}
+
+/// Synchronously fetch file data from the VFS backend.
+fn fetch_file_data_sync(
+    ctx: &NfsContext,
+    path: &str,
+    offset: Option<u64>,
+    max_count: Option<u32>,
+) -> anyhow::Result<Vec<u8>> {
+    let rt = tokio::runtime::Handle::current();
+    rt.block_on(async {
+        let (backend, relative) = {
+            let vfs = ctx.vfs().read().unwrap();
+            let (backend, relative) = vfs.resolve(std::path::Path::new(path));
+            (Arc::clone(backend), relative.to_path_buf())
+        };
+        let entry = backend.metadata(&relative).await?;
+        let mut buf = Vec::new();
+        backend.download(&entry, &mut buf).await?;
+
+        // Apply offset and count bounds.
+        let off = offset.unwrap_or(0) as usize;
+        if off >= buf.len() {
+            return Ok(Vec::new());
+        }
+        let remaining = &buf[off..];
+        let max = max_count.map(|c| c as usize).unwrap_or(remaining.len());
+        let end = max.min(remaining.len());
+        Ok(remaining[..end].to_vec())
+    })
 }
 
 /// FSSTAT — return filesystem statistics.
