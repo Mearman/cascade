@@ -12,9 +12,8 @@ use super::context::NfsContext;
 use super::mount;
 use super::procedures;
 use super::xdr::{
-    decode_u32, encode_u32, NFS_PROGRAM, NFS_V3, MOUNT_PROGRAM, MOUNT_V3,
-    RPC_AUTH_NONE, RPC_ACCEPT_SUCCESS, RPC_MSG_CALL, RPC_MSG_REPLY,
-    RPC_REPLY_ACCEPTED, RPC_REPLY_DENIED,
+    MOUNT_PROGRAM, MOUNT_V3, NFS_PROGRAM, NFS_V3, RPC_ACCEPT_SUCCESS, RPC_AUTH_NONE, RPC_MSG_CALL,
+    RPC_MSG_REPLY, RPC_REPLY_ACCEPTED, RPC_REPLY_DENIED, decode_u32, encode_u32,
 };
 use std::sync::Arc;
 
@@ -137,8 +136,7 @@ async fn handle_connection(
             Err(e) => return Err(e.into()),
         }
 
-        let len = usize::try_from(u32::from_be_bytes(len_buf))
-            .unwrap_or(usize::MAX);
+        let len = usize::try_from(u32::from_be_bytes(len_buf)).unwrap_or(usize::MAX);
         if len > 1_048_576 {
             anyhow::bail!("RPC message too large: {len} bytes");
         }
@@ -150,8 +148,7 @@ async fn handle_connection(
         let reply = dispatch_rpc(&msg_buf, ctx);
 
         // Send length-prefixed reply.
-        let reply_len = u32::try_from(reply.len())
-            .unwrap_or(u32::MAX);
+        let reply_len = u32::try_from(reply.len()).unwrap_or(u32::MAX);
         stream.write_all(&reply_len.to_be_bytes()).await?;
         stream.write_all(&reply).await?;
         stream.flush().await?;
@@ -256,14 +253,12 @@ fn skip_auth(data: &[u8]) -> Option<(&[u8], usize)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        dispatch_rpc, NfsServer, NfsServerConfig,
-        decode_u32, encode_u32,
-        NFS_PROGRAM, NFS_V3,
-        RPC_AUTH_NONE, RPC_ACCEPT_SUCCESS, RPC_MSG_CALL, RPC_MSG_REPLY,
-    };
     use super::super::context::NfsContext;
     use super::super::xdr::NFS3PROC_NULL;
+    use super::{
+        NFS_PROGRAM, NFS_V3, NfsServer, NfsServerConfig, RPC_ACCEPT_SUCCESS, RPC_AUTH_NONE,
+        RPC_MSG_CALL, RPC_MSG_REPLY, decode_u32, dispatch_rpc, encode_u32,
+    };
     use cascade_engine::backend::NullBackend;
     use cascade_engine::vfs::VfsTree;
     use std::sync::{Arc, RwLock};

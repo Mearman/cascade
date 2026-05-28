@@ -22,14 +22,15 @@ pub struct DriveFile {
 
 impl DriveFile {
     /// Convert to a Cascade `FileEntry`.
-    #[must_use] pub fn to_file_entry(&self, backend_id: &str) -> Option<FileEntry> {
+    #[must_use]
+    pub fn to_file_entry(&self, backend_id: &str) -> Option<FileEntry> {
         if self.trashed {
             return None;
         }
-        let parent_id = self
-            .parents
-            .first()
-            .map_or_else(|| ItemId::new(backend_id, "root"), |p| ItemId::new(backend_id, p));
+        let parent_id = self.parents.first().map_or_else(
+            || ItemId::new(backend_id, "root"),
+            |p| ItemId::new(backend_id, p),
+        );
 
         let mod_time = self
             .modified_time

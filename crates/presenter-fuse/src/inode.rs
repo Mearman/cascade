@@ -22,7 +22,8 @@ pub struct InodeMap {
 
 impl InodeMap {
     /// Create a new inode map with the root entry pre-allocated at inode 1.
-    #[must_use] pub fn new(root_id: ItemId) -> Self {
+    #[must_use]
+    pub fn new(root_id: ItemId) -> Self {
         let mut map = Self {
             id_to_inode: HashMap::new(),
             inode_to_id: HashMap::new(),
@@ -46,12 +47,14 @@ impl InodeMap {
     }
 
     /// Look up the inode number for an `ItemId`.
-    #[must_use] pub fn get_inode(&self, id: &ItemId) -> Option<u64> {
+    #[must_use]
+    pub fn get_inode(&self, id: &ItemId) -> Option<u64> {
         self.id_to_inode.get(id).copied()
     }
 
     /// Look up the `ItemId` for an inode number.
-    #[must_use] pub fn get_id(&self, inode: u64) -> Option<&ItemId> {
+    #[must_use]
+    pub fn get_id(&self, inode: u64) -> Option<&ItemId> {
         self.inode_to_id.get(&inode)
     }
 
@@ -63,12 +66,14 @@ impl InodeMap {
     }
 
     /// Number of mapped entries.
-    #[must_use] pub fn len(&self) -> usize {
+    #[must_use]
+    pub fn len(&self) -> usize {
         self.id_to_inode.len()
     }
 
     /// Whether the map is empty (it never is — root is always present).
-    #[must_use] pub fn is_empty(&self) -> bool {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
         self.id_to_inode.is_empty()
     }
 }

@@ -87,7 +87,8 @@ impl Manifest {
     /// - `created`: files present on disk but not in the manifest
     /// - `modified`: files present on disk with a changed mtime or size (re-hash confirmed)
     /// - `deleted`: files in the manifest but not present on disk
-    #[must_use] pub fn diff(&self, current: &[FileState]) -> DiffResult {
+    #[must_use]
+    pub fn diff(&self, current: &[FileState]) -> DiffResult {
         let current_paths: HashSet<&str> = current.iter().map(|s| s.path.as_str()).collect();
         let mut created = Vec::new();
         let mut modified = Vec::new();
@@ -144,7 +145,8 @@ impl Manifest {
     }
 
     /// Look up a file state by relative path.
-    #[must_use] pub fn get(&self, path: &str) -> Option<&FileState> {
+    #[must_use]
+    pub fn get(&self, path: &str) -> Option<&FileState> {
         self.entries.get(path)
     }
 
@@ -219,7 +221,8 @@ pub async fn walk_tree(root: &Path) -> anyhow::Result<Vec<FileState>> {
 }
 
 /// Whether a path should be skipped during directory walking.
-#[must_use] pub fn should_skip_entry(path: &Path, root: &Path) -> bool {
+#[must_use]
+pub fn should_skip_entry(path: &Path, root: &Path) -> bool {
     let relative = path.strip_prefix(root).unwrap_or(path);
     let components: Vec<&str> = relative
         .components()

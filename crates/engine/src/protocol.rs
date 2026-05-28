@@ -22,7 +22,8 @@ pub struct Response {
 }
 
 impl Response {
-    #[must_use] pub const fn ok(id: u32, result: serde_json::Value) -> Self {
+    #[must_use]
+    pub const fn ok(id: u32, result: serde_json::Value) -> Self {
         Self {
             id,
             result: Some(result),
@@ -91,8 +92,7 @@ pub fn decode_message<T: for<'de> Deserialize<'de>>(
     let b1 = header.get(1).copied().unwrap_or(0);
     let b2 = header.get(2).copied().unwrap_or(0);
     let b3 = header.get(3).copied().unwrap_or(0);
-    let len = usize::try_from(u32::from_be_bytes([b0, b1, b2, b3]))
-        .unwrap_or(usize::MAX);
+    let len = usize::try_from(u32::from_be_bytes([b0, b1, b2, b3])).unwrap_or(usize::MAX);
     let end = 4 + len;
     if buf.len() < end {
         return Ok(None);

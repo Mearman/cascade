@@ -61,7 +61,8 @@ impl SyncRunner {
     }
 
     /// Attach a P2P bridge for block-level file sharing.
-    #[must_use] pub fn with_p2p(mut self, p2p: P2pBridge) -> Self {
+    #[must_use]
+    pub fn with_p2p(mut self, p2p: P2pBridge) -> Self {
         self.p2p = Some(p2p);
         self
     }

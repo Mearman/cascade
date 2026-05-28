@@ -5,12 +5,12 @@
 
 use super::context::NfsContext;
 use super::xdr::{
-    decode_fh, decode_string, decode_u32, decode_u64, encode_bool, encode_fh, encode_post_op_attr,
-    encode_string, encode_u32, encode_u64, Fattr3, NfsFh3, NfsTime, PostOpAttr, Specdata3,
-    NF3DIR, NF3REG, NFS3ERR_INVAL, NFS3ERR_IO, NFS3ERR_ROFS, NFS3ERR_STALE, NFS3_OK,
+    Fattr3, NF3DIR, NF3REG, NFS3_OK, NFS3ERR_INVAL, NFS3ERR_IO, NFS3ERR_ROFS, NFS3ERR_STALE,
     NFS3PROC_COMMIT, NFS3PROC_CREATE, NFS3PROC_FSSTAT, NFS3PROC_GETATTR, NFS3PROC_LOOKUP,
     NFS3PROC_MKDIR, NFS3PROC_NULL, NFS3PROC_READ, NFS3PROC_READDIR, NFS3PROC_REMOVE,
-    NFS3PROC_RENAME, NFS3PROC_RMDIR, NFS3PROC_SETATTR, NFS3PROC_WRITE,
+    NFS3PROC_RENAME, NFS3PROC_RMDIR, NFS3PROC_SETATTR, NFS3PROC_WRITE, NfsFh3, NfsTime, PostOpAttr,
+    Specdata3, decode_fh, decode_string, decode_u32, decode_u64, encode_bool, encode_fh,
+    encode_post_op_attr, encode_string, encode_u32, encode_u64,
 };
 use std::sync::Arc;
 
@@ -195,17 +195,15 @@ fn handle_read(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
 
         // Try to fetch file data synchronously via the VFS.
         let data = match &file_path {
-            Some(path) => {
-                match fetch_file_data_sync(ctx, path, offset.map(|(o, _)| o), count) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        tracing::debug!(path = %path, error = %e, "READ: failed to fetch data");
-                        encode_u32(&mut reply, NFS3ERR_IO);
-                        encode_post_op_attr(&mut reply, &PostOpAttr::some(file_attr));
-                        return reply;
-                    }
+            Some(path) => match fetch_file_data_sync(ctx, path, offset.map(|(o, _)| o), count) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::debug!(path = %path, error = %e, "READ: failed to fetch data");
+                    encode_u32(&mut reply, NFS3ERR_IO);
+                    encode_post_op_attr(&mut reply, &PostOpAttr::some(file_attr));
+                    return reply;
                 }
-            }
+            },
             None => Vec::new(),
         };
 
@@ -248,8 +246,7 @@ fn fetch_file_data_sync(
         backend.download(&entry, &mut buf).await?;
 
         // Apply offset and count bounds.
-        let off = usize::try_from(offset.unwrap_or(0))
-            .unwrap_or(usize::MAX);
+        let off = usize::try_from(offset.unwrap_or(0)).unwrap_or(usize::MAX);
         if off >= buf.len() {
             return Ok(Vec::new());
         }

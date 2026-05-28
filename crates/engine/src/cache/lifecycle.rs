@@ -30,7 +30,8 @@ impl<'a> LifecycleEvaluator<'a> {
     ///
     /// Policies are checked in priority order (highest first). The first matching
     /// policy determines the outcome. If no policy matches, the file is not evicted.
-    #[must_use] pub fn should_evict(&self, file: &FileEntry, path: &Path) -> EvictionDecision {
+    #[must_use]
+    pub fn should_evict(&self, file: &FileEntry, path: &Path) -> EvictionDecision {
         let path_str = path.to_string_lossy();
         let _now_ts = chrono::Utc::now().timestamp();
 
@@ -92,7 +93,8 @@ impl<'a> LifecycleEvaluator<'a> {
     }
 
     /// Return the current list of policies.
-    #[must_use] pub fn policies(&self) -> &[LifecyclePolicyRecord] {
+    #[must_use]
+    pub fn policies(&self) -> &[LifecyclePolicyRecord] {
         &self.policies
     }
 }

@@ -87,7 +87,8 @@ impl P2pEngine {
     }
 
     /// Create with explicit identity and block store root (for testing).
-    #[must_use] pub fn with_identity(identity: DeviceIdentity, block_store: BlockStore) -> Self {
+    #[must_use]
+    pub fn with_identity(identity: DeviceIdentity, block_store: BlockStore) -> Self {
         Self {
             identity,
             block_store,
@@ -98,12 +99,14 @@ impl P2pEngine {
     }
 
     /// This device's ID (base32-encoded SHA-256 of the TLS certificate).
-    #[must_use] pub fn device_id(&self) -> &str {
+    #[must_use]
+    pub fn device_id(&self) -> &str {
         &self.identity.device_id
     }
 
     /// TCP port for incoming BEP connections.
-    #[must_use] pub const fn listen_port(&self) -> u16 {
+    #[must_use]
+    pub const fn listen_port(&self) -> u16 {
         self.listen_port
     }
 
@@ -113,7 +116,8 @@ impl P2pEngine {
     }
 
     /// Relay URLs used as WAN fallback transports.
-    #[must_use] pub fn relay_urls(&self) -> &[String] {
+    #[must_use]
+    pub fn relay_urls(&self) -> &[String] {
         &self.relay_urls
     }
 
@@ -128,12 +132,14 @@ impl P2pEngine {
     }
 
     /// Access the block store.
-    #[must_use] pub const fn block_store(&self) -> &BlockStore {
+    #[must_use]
+    pub const fn block_store(&self) -> &BlockStore {
         &self.block_store
     }
 
     /// Access the device identity.
-    #[must_use] pub const fn identity(&self) -> &DeviceIdentity {
+    #[must_use]
+    pub const fn identity(&self) -> &DeviceIdentity {
         &self.identity
     }
 
@@ -168,7 +174,8 @@ impl P2pEngine {
     }
 
     /// Access the peer book for P2P gossip-based discovery.
-    #[must_use] pub const fn peer_book(&self) -> &wan::PeerBook {
+    #[must_use]
+    pub const fn peer_book(&self) -> &wan::PeerBook {
         &self.peer_book
     }
 

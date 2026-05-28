@@ -15,7 +15,8 @@ pub struct RateLimiter {
 }
 
 impl RateLimiter {
-    #[must_use] pub const fn new(max_requests_per_100s: u32) -> Self {
+    #[must_use]
+    pub const fn new(max_requests_per_100s: u32) -> Self {
         Self {
             tokens: AtomicU32::new(max_requests_per_100s),
             max_tokens: max_requests_per_100s,
@@ -79,7 +80,8 @@ impl Default for DriveClient {
 }
 
 impl DriveClient {
-    #[must_use] pub fn new() -> Self {
+    #[must_use]
+    pub fn new() -> Self {
         Self::with_urls(
             "https://www.googleapis.com/drive/v3".to_string(),
             "https://www.googleapis.com/upload/drive/v3".to_string(),
@@ -88,7 +90,8 @@ impl DriveClient {
 
     /// Construct a client with custom base URLs — used in integration tests
     /// to point at a mock server instead of the real Drive API.
-    #[must_use] pub fn with_urls(base_url: String, upload_url: String) -> Self {
+    #[must_use]
+    pub fn with_urls(base_url: String, upload_url: String) -> Self {
         Self {
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
@@ -392,7 +395,10 @@ impl DriveClient {
         let url = format!("{}/files/{file_id}?supportsAllDrives=true", self.base_url);
         let mut body = serde_json::Map::new();
         if let Some(name) = new_name {
-            body.insert("name".to_string(), serde_json::Value::String(name.to_string()));
+            body.insert(
+                "name".to_string(),
+                serde_json::Value::String(name.to_string()),
+            );
         }
         let body = serde_json::Value::Object(body);
         // The addParents/removeParents params handle parent change.

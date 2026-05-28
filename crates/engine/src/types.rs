@@ -12,15 +12,18 @@ use serde::{Deserialize, Serialize};
 pub struct ItemId(pub String);
 
 impl ItemId {
-    #[must_use] pub fn new(backend_id: &str, native_id: &str) -> Self {
+    #[must_use]
+    pub fn new(backend_id: &str, native_id: &str) -> Self {
         Self(format!("{backend_id}:{native_id}"))
     }
 
-    #[must_use] pub fn backend_id(&self) -> &str {
+    #[must_use]
+    pub fn backend_id(&self) -> &str {
         self.0.split_once(':').map_or(&self.0, |(b, _)| b)
     }
 
-    #[must_use] pub fn native_id(&self) -> &str {
+    #[must_use]
+    pub fn native_id(&self) -> &str {
         self.0.split_once(':').map_or(&self.0, |(_, n)| n)
     }
 }
@@ -61,7 +64,8 @@ pub struct FileEntry {
 
 impl FileEntry {
     /// Create a file entry.
-    #[must_use] pub const fn file(id: ItemId, parent_id: ItemId, name: String) -> Self {
+    #[must_use]
+    pub const fn file(id: ItemId, parent_id: ItemId, name: String) -> Self {
         Self {
             id,
             parent_id,
@@ -75,7 +79,8 @@ impl FileEntry {
     }
 
     /// Create a directory entry.
-    #[must_use] pub const fn dir(id: ItemId, parent_id: ItemId, name: String) -> Self {
+    #[must_use]
+    pub const fn dir(id: ItemId, parent_id: ItemId, name: String) -> Self {
         Self {
             id,
             parent_id,
@@ -89,13 +94,15 @@ impl FileEntry {
     }
 
     /// Set the file size.
-    #[must_use] pub const fn with_size(mut self, size: Option<u64>) -> Self {
+    #[must_use]
+    pub const fn with_size(mut self, size: Option<u64>) -> Self {
         self.size = size;
         self
     }
 
     /// Set the file hash.
-    #[must_use] pub fn with_hash(mut self, hash: Option<String>) -> Self {
+    #[must_use]
+    pub fn with_hash(mut self, hash: Option<String>) -> Self {
         self.hash = hash;
         self
     }
@@ -126,7 +133,8 @@ pub enum CacheState {
 
 impl CacheState {
     /// Return the string representation.
-    #[must_use] pub const fn as_str(&self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Online => "online",
             Self::Cached => "cached",

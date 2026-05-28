@@ -7,7 +7,8 @@
 use crate::types::{CascadeConfig, IgnoreRule};
 
 /// Parse a gitignore-style `.cascade` file.
-#[must_use] pub fn parse(content: &str) -> CascadeConfig {
+#[must_use]
+pub fn parse(content: &str) -> CascadeConfig {
     let mut config = CascadeConfig::empty();
     let condition_stack: Vec<String> = Vec::new();
 
@@ -36,7 +37,9 @@ use crate::types::{CascadeConfig, IgnoreRule};
         }
 
         // Ignore pattern (gitignore syntax)
-        let (negated, pattern) = trimmed.strip_prefix('!').map_or((false, trimmed), |p| (true, p));
+        let (negated, pattern) = trimmed
+            .strip_prefix('!')
+            .map_or((false, trimmed), |p| (true, p));
 
         let dir_only = pattern.ends_with('/');
 

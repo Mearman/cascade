@@ -25,7 +25,8 @@ pub struct FileAttr {
 impl FileAttr {
     /// Build attributes for a directory.
     #[allow(unsafe_code)]
-    #[must_use] pub fn directory(inode: u64) -> Self {
+    #[must_use]
+    pub fn directory(inode: u64) -> Self {
         Self {
             inode,
             size: 0,
@@ -39,7 +40,8 @@ impl FileAttr {
 
     /// Build attributes for a regular file.
     #[allow(unsafe_code)]
-    #[must_use] pub fn file(inode: u64, size: u64) -> Self {
+    #[must_use]
+    pub fn file(inode: u64, size: u64) -> Self {
         Self {
             inode,
             size,
@@ -53,7 +55,8 @@ impl FileAttr {
 }
 
 /// Convert a `VfsItem` to `FileAttr` using the inode from the map.
-#[must_use] pub fn vfs_item_to_attr(item: &VfsItem, inode: u64) -> FileAttr {
+#[must_use]
+pub fn vfs_item_to_attr(item: &VfsItem, inode: u64) -> FileAttr {
     if item.is_dir {
         FileAttr::directory(inode)
     } else {
@@ -77,7 +80,8 @@ impl std::fmt::Debug for FuseOps {
 
 impl FuseOps {
     /// Create a new `FuseOps` with the given root `ItemId` (no VFS tree).
-    #[must_use] pub fn new(root_id: ItemId) -> Self {
+    #[must_use]
+    pub fn new(root_id: ItemId) -> Self {
         Self {
             inode_map: std::sync::Mutex::new(InodeMap::new(root_id)),
             vfs: Arc::new(RwLock::new(VfsTree::new(Arc::new(
@@ -103,7 +107,10 @@ impl FuseOps {
         let rt = tokio::runtime::Handle::current();
         rt.block_on(async {
             let (backend, relative) = {
-                let vfs = self.vfs.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let vfs = self
+                    .vfs
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let (backend, relative) = vfs.resolve(path);
                 (Arc::clone(backend), relative)
             };
@@ -120,7 +127,10 @@ impl FuseOps {
     ) -> anyhow::Result<Vec<cascade_engine::types::DirEntry>> {
         let rt = tokio::runtime::Handle::current();
         rt.block_on(async {
-            let vfs = self.vfs.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let vfs = self
+                .vfs
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let result = vfs.read_dir(path).await;
             drop(vfs);
             result
@@ -133,7 +143,10 @@ impl FuseOps {
         let rt = tokio::runtime::Handle::current();
         rt.block_on(async {
             let (backend, relative) = {
-                let vfs = self.vfs.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let vfs = self
+                    .vfs
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let (backend, relative) = vfs.resolve(path);
                 (Arc::clone(backend), relative)
             };
@@ -146,7 +159,9 @@ impl FuseOps {
                 return Ok(Vec::new());
             }
             let remaining = buf.get(off..).unwrap_or_default();
-            let end = usize::try_from(size).unwrap_or(usize::MAX).min(remaining.len());
+            let end = usize::try_from(size)
+                .unwrap_or(usize::MAX)
+                .min(remaining.len());
             Ok(remaining.get(..end).unwrap_or_default().to_vec())
         })
     }

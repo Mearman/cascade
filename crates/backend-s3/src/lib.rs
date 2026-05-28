@@ -191,8 +191,8 @@ impl S3Backend {
         body: &[u8],
         extra_headers: &[(&str, &str)],
     ) -> anyhow::Result<reqwest::Response> {
-        let parsed =
-            url::Url::parse(base_url).map_err(|e| anyhow::anyhow!("invalid URL {base_url}: {e}"))?;
+        let parsed = url::Url::parse(base_url)
+            .map_err(|e| anyhow::anyhow!("invalid URL {base_url}: {e}"))?;
 
         let uri_path = parsed.path();
         let payload_hash = sha256_hex(body);
@@ -418,8 +418,8 @@ fn parse_flat_list_response(
 
             if !name.is_empty() {
                 let id = ItemId::new(backend_id, key);
-                let mut entry = FileEntry::file(id, parent_id.clone(), name.to_string())
-                    .with_size(Some(size));
+                let mut entry =
+                    FileEntry::file(id, parent_id.clone(), name.to_string()).with_size(Some(size));
                 entry.mod_time = last_modified;
                 entries.push(entry);
             }
@@ -673,12 +673,15 @@ impl Backend for S3Backend {
         let parent_id = ItemId::new(&self.backend_id, &parent_key);
 
         // Fetch real metadata for the destination object via HEAD.
-        let head_resp = self
-            .signed_request("HEAD", &dst_url, &[], &[], &[])
-            .await?;
+        let head_resp = self.signed_request("HEAD", &dst_url, &[], &[], &[]).await?;
         let head_resp = Self::check_response(head_resp).await?;
-        let dst_entry =
-            parse_head_response(head_resp.headers(), &dst_key, &name, &parent_id, &self.backend_id);
+        let dst_entry = parse_head_response(
+            head_resp.headers(),
+            &dst_key,
+            &name,
+            &parent_id,
+            &self.backend_id,
+        );
 
         tracing::debug!(
             src = %src.display(),
@@ -718,7 +721,9 @@ impl S3Backend {
                 params.push(("continuation-token", token.as_str()));
             }
 
-            let resp = self.signed_request("GET", &base_url, &params, &[], &[]).await?;
+            let resp = self
+                .signed_request("GET", &base_url, &params, &[], &[])
+                .await?;
             let resp = Self::check_response(resp).await?;
             let xml = resp.text().await?;
 
@@ -758,7 +763,9 @@ impl S3Backend {
                 params.push(("continuation-token", token.as_str()));
             }
 
-            let resp = self.signed_request("GET", &base_url, &params, &[], &[]).await?;
+            let resp = self
+                .signed_request("GET", &base_url, &params, &[], &[])
+                .await?;
             let resp = Self::check_response(resp).await?;
             let xml = resp.text().await?;
 

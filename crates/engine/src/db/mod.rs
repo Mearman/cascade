@@ -482,8 +482,8 @@ impl StateDb {
             [&file_id.0],
         )?;
         for (index, hash) in block_hashes.iter().enumerate() {
-            let block_index = i64::try_from(index)
-                .map_err(|e| anyhow::anyhow!("block index overflow: {e}"))?;
+            let block_index =
+                i64::try_from(index).map_err(|e| anyhow::anyhow!("block index overflow: {e}"))?;
             conn.execute(
                 "INSERT INTO p2p_block_index (file_id, block_index, block_hash) VALUES (?1, ?2, ?3)",
                 (&file_id.0, block_index, hash.as_slice()),

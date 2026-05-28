@@ -23,7 +23,8 @@ pub enum ConflictCheck {
 /// A conflict occurs when:
 /// 1. The remote file was modified (hash differs from what we last synced)
 /// 2. The local file is dirty (has unpushed changes)
-#[must_use] pub fn check_conflict(
+#[must_use]
+pub fn check_conflict(
     local_entry: &FileEntry,
     remote_entry: &FileEntry,
     local_dirty: bool,
@@ -51,7 +52,8 @@ pub enum ConflictCheck {
 ///
 /// Format: `{name} ({device} {date}).conflict`
 /// Example: `report.pdf` → `report (work-laptop 2026-05-27).conflict.pdf`
-#[must_use] pub fn conflict_name(original_name: &str, device_name: &str) -> String {
+#[must_use]
+pub fn conflict_name(original_name: &str, device_name: &str) -> String {
     let date = chrono::Utc::now().format("%Y-%m-%d");
     let suffix = format!(" ({device_name} {date}).conflict");
 

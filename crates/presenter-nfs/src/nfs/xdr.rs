@@ -452,8 +452,8 @@ pub fn read_rpc_message(reader: &mut dyn Read) -> io::Result<Vec<u8>> {
 ///
 /// Returns an error if writing fails.
 pub fn write_rpc_message(writer: &mut dyn Write, msg: &[u8]) -> io::Result<()> {
-    let len = u32::try_from(msg.len())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let len =
+        u32::try_from(msg.len()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     writer.write_all(&len.to_be_bytes())?;
     writer.write_all(msg)?;
     writer.flush()?;

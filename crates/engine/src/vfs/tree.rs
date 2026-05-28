@@ -49,7 +49,8 @@ impl VfsTree {
     }
 
     /// Resolve a path to the correct backend and the remaining path within that backend.
-    #[must_use] pub fn resolve(&self, path: &Path) -> (&Arc<dyn Backend>, PathBuf) {
+    #[must_use]
+    pub fn resolve(&self, path: &Path) -> (&Arc<dyn Backend>, PathBuf) {
         for (prefix, backend) in &self.children {
             if let Ok(rest) = path.strip_prefix(prefix) {
                 return (backend, rest.to_path_buf());
@@ -113,12 +114,14 @@ impl VfsTree {
     }
 
     /// Get the root backend.
-    #[must_use] pub fn root(&self) -> &Arc<dyn Backend> {
+    #[must_use]
+    pub fn root(&self) -> &Arc<dyn Backend> {
         &self.root
     }
 
     /// Get all child mounts.
-    #[must_use] pub fn children(&self) -> &[(PathBuf, Arc<dyn Backend>)] {
+    #[must_use]
+    pub fn children(&self) -> &[(PathBuf, Arc<dyn Backend>)] {
         &self.children
     }
 }

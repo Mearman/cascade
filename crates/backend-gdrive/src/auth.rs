@@ -44,7 +44,8 @@ pub struct AuthTokens {
 
 impl AuthTokens {
     /// Check if the access token is expired (with 60s buffer).
-    #[must_use] pub fn is_expired(&self) -> bool {
+    #[must_use]
+    pub fn is_expired(&self) -> bool {
         chrono::Utc::now() + chrono::Duration::seconds(60) >= self.expires_at
     }
 }
@@ -138,8 +139,9 @@ pub async fn poll_for_token(
         }
 
         // Check for pending vs error.
-        let err: ErrorBody = serde_json::from_str(&body)
-            .unwrap_or_else(|_| ErrorBody { error: "unknown".to_string() });
+        let err: ErrorBody = serde_json::from_str(&body).unwrap_or_else(|_| ErrorBody {
+            error: "unknown".to_string(),
+        });
 
         match err.error.as_str() {
             "authorization_pending" => {}

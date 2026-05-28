@@ -68,7 +68,8 @@ impl BlockStore {
     }
 
     /// Check whether a block exists in the store.
-    #[must_use] pub fn has_block(&self, hash: &BlockHash) -> bool {
+    #[must_use]
+    pub fn has_block(&self, hash: &BlockHash) -> bool {
         self.block_path(hash).exists()
     }
 

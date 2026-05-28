@@ -49,9 +49,7 @@ fn resolve_operand(operand: &Operand, ctx: &EvalContext) -> Value {
 fn resolve_identifier(id: &str, ctx: &EvalContext) -> Value {
     match id {
         // File context
-        "FILE.size" => Value::Integer(
-            i64::try_from(ctx.file.size).unwrap_or(i64::MAX),
-        ),
+        "FILE.size" => Value::Integer(i64::try_from(ctx.file.size).unwrap_or(i64::MAX)),
         "FILE.mime" => Value::String(ctx.file.mime.clone()),
         "FILE.ext" => Value::String(ctx.file.ext.clone()),
         "FILE.name" => Value::String(ctx.file.name.clone()),
@@ -69,12 +67,8 @@ fn resolve_identifier(id: &str, ctx: &EvalContext) -> Value {
         "DEVICE.os" => Value::String(ctx.device.os.clone()),
 
         // Disk context
-        "DISK.free" => Value::Integer(
-            i64::try_from(ctx.disk.free_bytes).unwrap_or(i64::MAX),
-        ),
-        "DISK.used" => Value::Integer(
-            i64::try_from(ctx.disk.used_bytes()).unwrap_or(i64::MAX),
-        ),
+        "DISK.free" => Value::Integer(i64::try_from(ctx.disk.free_bytes).unwrap_or(i64::MAX)),
+        "DISK.used" => Value::Integer(i64::try_from(ctx.disk.used_bytes()).unwrap_or(i64::MAX)),
 
         // Network context
         "NETWORK.type" => Value::String(ctx.network.if_type.to_string()),
@@ -85,9 +79,7 @@ fn resolve_identifier(id: &str, ctx: &EvalContext) -> Value {
 
         // Power context
         "POWER.source" => Value::String(ctx.power.source.to_string()),
-        "POWER.battery" => Value::Integer(
-            ctx.power.battery_pct.map_or(0i64, i64::from),
-        ),
+        "POWER.battery" => Value::Integer(ctx.power.battery_pct.map_or(0i64, i64::from)),
 
         // Time context
         "TIME.hour" => Value::Integer(i64::from(ctx.time.hour())),
@@ -97,12 +89,12 @@ fn resolve_identifier(id: &str, ctx: &EvalContext) -> Value {
         }
 
         // Peer context
-        "PEER.online" | "PEER.count" => Value::Integer(
-            i64::try_from(ctx.peer.online_count).unwrap_or(i64::MAX),
-        ),
-        "PEER.has_file" => Value::Integer(
-            i64::try_from(ctx.peer.peers_with_file).unwrap_or(i64::MAX),
-        ),
+        "PEER.online" | "PEER.count" => {
+            Value::Integer(i64::try_from(ctx.peer.online_count).unwrap_or(i64::MAX))
+        }
+        "PEER.has_file" => {
+            Value::Integer(i64::try_from(ctx.peer.peers_with_file).unwrap_or(i64::MAX))
+        }
 
         _ => Value::Integer(0),
     }

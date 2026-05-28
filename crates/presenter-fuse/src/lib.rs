@@ -53,7 +53,8 @@ impl FusePresenter {
     }
 
     /// Create a new FUSE presenter for the given root `ItemId`.
-    #[must_use] pub fn new(root_id: ItemId) -> Self {
+    #[must_use]
+    pub fn new(root_id: ItemId) -> Self {
         let vfs = Arc::new(RwLock::new(VfsTree::new(Arc::new(
             cascade_engine::backend::NullBackend::new("null"),
         ))));
@@ -67,7 +68,8 @@ impl FusePresenter {
     }
 
     /// Get a reference to the inode map (for testing).
-    #[must_use] pub const fn inode_map(&self) -> &Arc<std::sync::Mutex<InodeMap>> {
+    #[must_use]
+    pub const fn inode_map(&self) -> &Arc<std::sync::Mutex<InodeMap>> {
         &self.inode_map
     }
 
@@ -93,7 +95,10 @@ fn safe_filename(id: &str) -> String {
 impl VfsPresenter for FusePresenter {
     async fn upsert_item(&self, item: VfsItem) -> anyhow::Result<()> {
         tracing::debug!(id = %item.id, name = %item.name, "upsert_item");
-        let mut map = self.inode_map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = self
+            .inode_map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.allocate(item.id);
         Ok(())
     }
@@ -102,7 +107,10 @@ impl VfsPresenter for FusePresenter {
         tracing::debug!(id = %id, "delete_item");
         // Remove from inode map.
         {
-            let mut map = self.inode_map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut map = self
+                .inode_map
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             map.remove(id);
         }
         // Remove any cached file on disk.
@@ -132,7 +140,10 @@ impl VfsPresenter for FusePresenter {
         // Resolve the item through the VFS to get metadata and a backend.
         let (entry, backend): (cascade_engine::types::FileEntry, Arc<dyn Backend>) = {
             let (backend, relative) = {
-                let vfs = self.vfs.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let vfs = self
+                    .vfs
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let (backend, relative) = vfs.resolve(Path::new(&id.0));
                 (Arc::clone(backend), relative)
             };

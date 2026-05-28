@@ -30,7 +30,8 @@ pub struct CascadeConfig {
 
 impl CascadeConfig {
     /// An empty config with no rules.
-    #[must_use] pub fn empty() -> Self {
+    #[must_use]
+    pub fn empty() -> Self {
         Self::default()
     }
 
@@ -121,7 +122,8 @@ pub struct ResolvedConfig {
 
 impl ResolvedConfig {
     /// Check if a given path should be ignored.
-    #[must_use] pub fn is_ignored(&self, path: &str, is_dir: bool) -> bool {
+    #[must_use]
+    pub fn is_ignored(&self, path: &str, is_dir: bool) -> bool {
         let mut ignored = false;
         for rule in &self.ignores {
             if (!is_dir || !rule.dir_only) && glob_match(&rule.pattern, path) {

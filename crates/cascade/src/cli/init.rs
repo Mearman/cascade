@@ -23,12 +23,10 @@ pub struct CascadeConfig {
 }
 
 /// Mount configuration.
-#[derive(Debug, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 pub struct MountConfig {
     pub point: String,
 }
-
 
 /// A single backend configuration entry.
 #[derive(Debug, Serialize, Deserialize)]
@@ -96,7 +94,6 @@ pub fn run() -> Result<()> {
     let mount_point = if mount_input.is_empty() {
         default_mount_str
     } else {
-        
         shellexpand::tilde(&mount_input).to_string()
     };
 

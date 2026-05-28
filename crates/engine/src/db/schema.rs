@@ -7,7 +7,8 @@ pub struct SchemaVersion(pub i32);
 
 impl SchemaVersion {
     /// Current schema version.
-    #[must_use] pub const fn current() -> Self {
+    #[must_use]
+    pub const fn current() -> Self {
         Self(1)
     }
 }

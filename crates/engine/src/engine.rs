@@ -167,7 +167,10 @@ impl Engine {
         let presenter = Arc::new(NullPresenter);
 
         // Collect all backends from the VFS tree.
-        let tree = self.vfs.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tree = self
+            .vfs
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut backends = vec![tree.root().clone()];
         for (_, backend) in tree.children() {
             backends.push(backend.clone());
@@ -223,7 +226,8 @@ impl Engine {
     }
 
     /// Get engine status — running state, mounted backends, cache stats.
-    #[must_use] pub fn status(&self) -> EngineStatus {
+    #[must_use]
+    pub fn status(&self) -> EngineStatus {
         let backends = self
             .db
             .list_backends()
@@ -258,12 +262,14 @@ impl Engine {
     }
 
     /// Get the VFS tree (for presenters to use).
-    #[must_use] pub const fn vfs(&self) -> &Arc<RwLock<VfsTree>> {
+    #[must_use]
+    pub const fn vfs(&self) -> &Arc<RwLock<VfsTree>> {
         &self.vfs
     }
 
     /// Get the state database (for presenters to use).
-    #[must_use] pub const fn db(&self) -> &Arc<StateDb> {
+    #[must_use]
+    pub const fn db(&self) -> &Arc<StateDb> {
         &self.db
     }
 }
@@ -380,8 +386,7 @@ mod tests {
     async fn engine_mount_unmount_backend() {
         let engine = make_test_engine().await;
 
-        engine
-            .mount_backend(PathBuf::from("Work"), Arc::new(NullBackend::new("work")));
+        engine.mount_backend(PathBuf::from("Work"), Arc::new(NullBackend::new("work")));
 
         let tree = engine.vfs().read().unwrap();
         assert_eq!(tree.children().len(), 1);

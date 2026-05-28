@@ -224,7 +224,9 @@ fn decode_xor_mapped_address(
             let x_addr = u32::from_be_bytes(
                 value
                     .get(4..8)
-                    .ok_or_else(|| anyhow::anyhow!("XOR-MAPPED-ADDRESS too short for IPv4 address"))?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("XOR-MAPPED-ADDRESS too short for IPv4 address")
+                    })?
                     .try_into()?,
             );
             let addr = x_addr ^ STUN_MAGIC_COOKIE;

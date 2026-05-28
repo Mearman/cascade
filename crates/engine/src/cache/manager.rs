@@ -65,7 +65,8 @@ impl CacheManager {
     }
 
     /// Attach a P2P bridge for content fetching.
-    #[must_use] pub fn with_p2p(mut self, p2p: Arc<P2pBridge>) -> Self {
+    #[must_use]
+    pub fn with_p2p(mut self, p2p: Arc<P2pBridge>) -> Self {
         self.p2p = Some(p2p);
         self
     }
@@ -224,7 +225,8 @@ pub struct EvictionReport {
 
 impl EvictionReport {
     /// Total files evicted.
-    #[must_use] pub const fn total_evicted(&self) -> usize {
+    #[must_use]
+    pub const fn total_evicted(&self) -> usize {
         self.lifecycle_evicted + self.size_evicted
     }
 }

@@ -54,7 +54,8 @@ pub enum PeerConnection {
 
 impl ConnectionManager {
     /// Create a connection manager with our identity and trusted peers.
-    #[must_use] pub const fn new(
+    #[must_use]
+    pub const fn new(
         identity: DeviceIdentity,
         trusted_device_ids: Vec<String>,
         relay_urls: Vec<String>,

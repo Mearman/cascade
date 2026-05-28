@@ -27,7 +27,8 @@ impl std::fmt::Debug for ConfigResolver {
 }
 
 impl ConfigResolver {
-    #[must_use] pub const fn new(mount_root: PathBuf) -> Self {
+    #[must_use]
+    pub const fn new(mount_root: PathBuf) -> Self {
         Self {
             mount_root,
             cache: RwLock::new(Vec::new()),
@@ -93,7 +94,10 @@ impl ConfigResolver {
     fn resolve_for_dir(&self, dir: &Path) -> ResolvedConfig {
         // Check cache first.
         {
-            let cache = self.cache.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let cache = self
+                .cache
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some((_, config)) = cache.iter().find(|(p, _)| p == dir) {
                 return config.clone();
             }
@@ -104,7 +108,10 @@ impl ConfigResolver {
 
         // Cache the result.
         {
-            let mut cache = self.cache.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut cache = self
+                .cache
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             cache.push((dir.to_path_buf(), config.clone()));
         }
 
@@ -114,7 +121,10 @@ impl ConfigResolver {
     /// Invalidate cached configs for a directory and its children.
     /// Call this when `.cascade` files are created or modified.
     pub fn invalidate(&self, dir: &Path) {
-        let mut cache = self.cache.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut cache = self
+            .cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         cache.retain(|(p, _)| !p.starts_with(dir));
     }
 }
@@ -162,7 +172,9 @@ fn star_match(pattern: &str, path: &str) -> bool {
     };
     let remaining = path.get(idx..end).unwrap_or("");
     let mut search_from = 0;
-    let middle = segments.get(1..segments.len().saturating_sub(1)).unwrap_or(&[]);
+    let middle = segments
+        .get(1..segments.len().saturating_sub(1))
+        .unwrap_or(&[]);
     for seg in middle {
         if seg.is_empty() {
             continue;
@@ -189,7 +201,10 @@ mod tests {
         let _ = resolver.is_ignored(path, false);
         let _ = resolver.is_ignored(path, false);
 
-        let cache = resolver.cache.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cache = resolver
+            .cache
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(cache.len(), 1);
     }
 
@@ -201,7 +216,10 @@ mod tests {
 
         resolver.invalidate(Path::new("/tmp/test-mount/Documents"));
 
-        let cache = resolver.cache.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cache = resolver
+            .cache
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(cache.is_empty());
     }
 }

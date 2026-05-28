@@ -43,23 +43,22 @@ fn encode_string(buf: &mut Vec<u8>, s: &str) -> Result<()> {
 }
 
 fn decode_u32(data: &[u8]) -> io::Result<(u32, &[u8])> {
-    let (bytes, rest) = data.split_first_chunk::<4>().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::UnexpectedEof, "need 4 bytes for uint32")
-    })?;
+    let (bytes, rest) = data
+        .split_first_chunk::<4>()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "need 4 bytes for uint32"))?;
     Ok((u32::from_be_bytes(*bytes), rest))
 }
 
 fn decode_u64(data: &[u8]) -> io::Result<(u64, &[u8])> {
-    let (bytes, rest) = data.split_first_chunk::<8>().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::UnexpectedEof, "need 8 bytes for uint64")
-    })?;
+    let (bytes, rest) = data
+        .split_first_chunk::<8>()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "need 8 bytes for uint64"))?;
     Ok((u64::from_be_bytes(*bytes), rest))
 }
 
 fn decode_opaque(data: &[u8]) -> io::Result<(&[u8], &[u8])> {
     let (len, rest) = decode_u32(data)?;
-    let len = usize::try_from(len)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let len = usize::try_from(len).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     if rest.len() < len {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -165,8 +164,7 @@ pub fn encode_message(msg: &BepMessage) -> Result<Vec<u8>> {
         BepMessage::ClusterConfig { folders } => {
             encode_u32(
                 &mut body,
-                u32::try_from(folders.len())
-                    .map_err(|_| anyhow::anyhow!("too many folders"))?,
+                u32::try_from(folders.len()).map_err(|_| anyhow::anyhow!("too many folders"))?,
             );
             for folder in folders {
                 encode_string(&mut body, &folder.id)?;
@@ -177,8 +175,7 @@ pub fn encode_message(msg: &BepMessage) -> Result<Vec<u8>> {
             encode_string(&mut body, folder)?;
             encode_u32(
                 &mut body,
-                u32::try_from(files.len())
-                    .map_err(|_| anyhow::anyhow!("too many files"))?,
+                u32::try_from(files.len()).map_err(|_| anyhow::anyhow!("too many files"))?,
             );
             encode_file_infos(&mut body, files)?;
         }

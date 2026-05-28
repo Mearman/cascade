@@ -38,12 +38,14 @@ impl P2pBridge {
     }
 
     /// Access the underlying P2P engine.
-    #[must_use] pub const fn engine(&self) -> &P2pEngine {
+    #[must_use]
+    pub const fn engine(&self) -> &P2pEngine {
         &self.p2p
     }
 
     /// Access the underlying block store.
-    #[must_use] pub const fn block_store(&self) -> &BlockStore {
+    #[must_use]
+    pub const fn block_store(&self) -> &BlockStore {
         self.p2p.block_store()
     }
 
@@ -152,7 +154,8 @@ impl P2pBridge {
     }
 
     /// Get this device's P2P ID.
-    #[must_use] pub fn device_id(&self) -> &str {
+    #[must_use]
+    pub fn device_id(&self) -> &str {
         self.p2p.device_id()
     }
 }

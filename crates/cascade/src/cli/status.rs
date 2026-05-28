@@ -33,7 +33,8 @@ pub fn show() -> Result<()> {
             let cursor_info = db
                 .get_cursor(&b.id)
                 .ok()
-                .flatten().map_or_else(|| "no cursor".to_string(), |c| format!("cursor: {}", c.0));
+                .flatten()
+                .map_or_else(|| "no cursor".to_string(), |c| format!("cursor: {}", c.0));
             println!(
                 "    {} ({}) — {} [{}]",
                 b.display_name, b.backend_type, b.id, cursor_info
