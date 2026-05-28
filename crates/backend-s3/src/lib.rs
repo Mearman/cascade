@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use cascade_engine::backend::Backend;
 use cascade_engine::types::{Change, Cursor, FileEntry, FileId, ItemId, Quota};
 use chrono::{DateTime, Utc};
-use signing::{SigningParams, sha256_hex, sign, uri_encode};
+use signing::{SigningParams, build_canonical_query_string, sha256_hex, sign, uri_encode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -164,25 +164,9 @@ impl S3Backend {
         )
     }
 
-    /// Build the URL for `ListObjectsV2` with the given prefix and optional
-    /// continuation token.
-    fn list_url(&self, list_prefix: &str, continuation_token: Option<&str>) -> String {
-        let encoded_prefix = uri_encode(list_prefix, true);
-        continuation_token.map_or_else(
-            || {
-                format!(
-                    "{}/{}?list-type=2&delimiter=%2F&prefix={}",
-                    self.config.endpoint, self.config.bucket, encoded_prefix,
-                )
-            },
-            |token| {
-                let encoded_token = uri_encode(token, true);
-                format!(
-                    "{}/{}?list-type=2&delimiter=%2F&prefix={}&continuation-token={}",
-                    self.config.endpoint, self.config.bucket, encoded_prefix, encoded_token,
-                )
-            },
-        )
+    /// Return the base URL for `ListObjectsV2` (no query string).
+    fn list_base_url(&self) -> String {
+        format!("{}/{}", self.config.endpoint, self.config.bucket)
     }
 
     /// Return the host portion of the endpoint URL (for the `Host` header and
@@ -196,27 +180,29 @@ impl S3Backend {
 
     /// Sign and execute an HTTP request, returning the response.
     ///
-    /// `path` is the URL path component (e.g. `"/{bucket}/{key}"`).
-    /// `query_string` is pre-encoded (e.g. `"list-type=2&..."`).
+    /// `base_url` is the URL **without** a query string (e.g. `"https://s3.amazonaws.com/bucket/key"`).
+    /// `query_params` is a slice of raw (unencoded) key-value pairs. The function
+    /// encodes them exactly once — for both `SigV4` signing and the outgoing URL.
     async fn signed_request(
         &self,
         method: &str,
-        url: &str,
-        query_string: &str,
+        base_url: &str,
+        query_params: &[(&str, &str)],
         body: &[u8],
         extra_headers: &[(&str, &str)],
     ) -> anyhow::Result<reqwest::Response> {
-        let parsed = url::Url::parse(url).map_err(|e| anyhow::anyhow!("invalid URL {url}: {e}"))?;
+        let parsed =
+            url::Url::parse(base_url).map_err(|e| anyhow::anyhow!("invalid URL {base_url}: {e}"))?;
 
         let uri_path = parsed.path();
         let payload_hash = sha256_hex(body);
         let host = self.endpoint_host();
         let now = Utc::now();
 
-        let params = SigningParams {
+        let signing_params = SigningParams {
             method,
             uri_path,
-            query_string,
+            query_params,
             host: &host,
             payload_hash: &payload_hash,
             access_key_id: &self.config.access_key_id,
@@ -226,11 +212,20 @@ impl S3Backend {
             now,
         };
 
-        let signed = sign(&params);
+        let signed = sign(&signing_params);
+
+        // Build the full request URL: base + encoded query string (encoding once,
+        // consistent with what SigV4 signed above).
+        let request_url = if query_params.is_empty() {
+            base_url.to_string()
+        } else {
+            let qs = build_canonical_query_string(query_params);
+            format!("{base_url}?{qs}")
+        };
 
         let mut req = self
             .http
-            .request(method.parse::<reqwest::Method>()?, url)
+            .request(method.parse::<reqwest::Method>()?, request_url)
             .header("x-amz-date", &signed.x_amz_date)
             .header("x-amz-content-sha256", &signed.x_amz_content_sha256)
             .header("authorization", &signed.authorization)
@@ -518,7 +513,7 @@ impl Backend for S3Backend {
         let parent_key = self.key_for_path(parent_path);
         let parent_id = ItemId::new(&self.backend_id, &parent_key);
 
-        let resp = self.signed_request("HEAD", &url, "", &[], &[]).await?;
+        let resp = self.signed_request("HEAD", &url, &[], &[], &[]).await?;
         let resp = Self::check_response(resp).await?;
 
         Ok(parse_head_response(
@@ -538,7 +533,7 @@ impl Backend for S3Backend {
         let key = file.id.native_id();
         let url = self.object_url(key);
 
-        let resp = self.signed_request("GET", &url, "", &[], &[]).await?;
+        let resp = self.signed_request("GET", &url, &[], &[], &[]).await?;
         let resp = Self::check_response(resp).await?;
 
         let bytes = resp.bytes().await?;
@@ -577,7 +572,7 @@ impl Backend for S3Backend {
             .signed_request(
                 "PUT",
                 &url,
-                "",
+                &[],
                 &data,
                 &[("content-length", &content_length)],
             )
@@ -607,7 +602,7 @@ impl Backend for S3Backend {
         let url = self.object_url(&key);
 
         let resp = self
-            .signed_request("PUT", &url, "", &[], &[("content-length", "0")])
+            .signed_request("PUT", &url, &[], &[], &[("content-length", "0")])
             .await?;
         Self::check_response(resp).await?;
 
@@ -634,7 +629,7 @@ impl Backend for S3Backend {
         let key = file.id.native_id();
         let url = self.object_url(key);
 
-        let resp = self.signed_request("DELETE", &url, "", &[], &[]).await?;
+        let resp = self.signed_request("DELETE", &url, &[], &[], &[]).await?;
         Self::check_response(resp).await?;
 
         tracing::debug!(file = %file.id, "deleted from S3");
@@ -653,7 +648,7 @@ impl Backend for S3Backend {
             .signed_request(
                 "PUT",
                 &dst_url,
-                "",
+                &[],
                 &[],
                 &[("x-amz-copy-source", &copy_source)],
             )
@@ -663,7 +658,7 @@ impl Backend for S3Backend {
         // Delete the source.
         let src_url = self.object_url(&src_key);
         let del_resp = self
-            .signed_request("DELETE", &src_url, "", &[], &[])
+            .signed_request("DELETE", &src_url, &[], &[], &[])
             .await?;
         Self::check_response(del_resp).await?;
 
@@ -679,7 +674,7 @@ impl Backend for S3Backend {
 
         // Fetch real metadata for the destination object via HEAD.
         let head_resp = self
-            .signed_request("HEAD", &dst_url, "", &[], &[])
+            .signed_request("HEAD", &dst_url, &[], &[], &[])
             .await?;
         let head_resp = Self::check_response(head_resp).await?;
         let dst_entry =
@@ -712,24 +707,18 @@ impl S3Backend {
             format!("{base_prefix}/")
         };
 
+        let base_url = self.list_base_url();
         let mut entries = Vec::new();
         let mut continuation_token: Option<String> = None;
 
         loop {
-            let encoded_prefix = uri_encode(&prefix_with_slash, true);
-            let query = continuation_token.as_deref().map_or_else(
-                || format!("list-type=2&prefix={encoded_prefix}"),
-                |token| {
-                    let encoded_token = uri_encode(token, true);
-                    format!(
-                        "list-type=2&prefix={encoded_prefix}&continuation-token={encoded_token}"
-                    )
-                },
-            );
+            let mut params: Vec<(&str, &str)> =
+                vec![("list-type", "2"), ("prefix", &prefix_with_slash)];
+            if let Some(ref token) = continuation_token {
+                params.push(("continuation-token", token.as_str()));
+            }
 
-            let url = format!("{}/{}?{}", self.config.endpoint, self.config.bucket, query);
-
-            let resp = self.signed_request("GET", &url, &query, &[], &[]).await?;
+            let resp = self.signed_request("GET", &base_url, &params, &[], &[]).await?;
             let resp = Self::check_response(resp).await?;
             let xml = resp.text().await?;
 
@@ -748,36 +737,28 @@ impl S3Backend {
 
     /// List objects under `path` with delimiter `/` (one level deep).
     ///
-    /// This is a public-facing method exposed through `Backend::changes` and
-    /// used internally. It returns both file entries and directory entries.
-    ///
-    /// # Known limitation — continuation token double-encoding
-    ///
-    /// `list_url` URI-encodes query parameters when building the URL. The query
-    /// string is then extracted via `split_once('?')` and passed to
-    /// `signed_request` → `sign` → `build_canonical_query_string`, which
-    /// URI-encodes the values a second time. For most tokens this is harmless,
-    /// but tokens containing `+`, `=`, or other reserved characters will be
-    /// double-encoded, producing an invalid `SigV4` signature. The proper fix is
-    /// to separate raw parameter construction from URL construction so that the
-    /// canonical query string is built from unencoded key/value pairs.
+    /// Returns both file entries and directory entries. Used by `Backend::changes`
+    /// and internally by the engine for directory traversal.
     pub async fn list(&self, path: &Path) -> anyhow::Result<Vec<FileEntry>> {
         let list_prefix = self.list_prefix_for_path(path);
         let parent_key = self.key_for_path(path);
         let parent_id = ItemId::new(&self.backend_id, &parent_key);
 
+        let base_url = self.list_base_url();
         let mut entries = Vec::new();
         let mut continuation_token: Option<String> = None;
 
         loop {
-            let url = self.list_url(&list_prefix, continuation_token.as_deref());
+            let mut params: Vec<(&str, &str)> = vec![
+                ("list-type", "2"),
+                ("delimiter", "/"),
+                ("prefix", &list_prefix),
+            ];
+            if let Some(ref token) = continuation_token {
+                params.push(("continuation-token", token.as_str()));
+            }
 
-            // Build the query string for signing (everything after `?`).
-            let query = url
-                .split_once('?')
-                .map_or_else(String::new, |(_, qs)| qs.to_string());
-
-            let resp = self.signed_request("GET", &url, &query, &[], &[]).await?;
+            let resp = self.signed_request("GET", &base_url, &params, &[], &[]).await?;
             let resp = Self::check_response(resp).await?;
             let xml = resp.text().await?;
 

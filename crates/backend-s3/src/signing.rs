@@ -81,7 +81,9 @@ pub(crate) fn uri_encode(value: &str, encode_slash: bool) -> String {
 pub(crate) struct SigningParams<'a> {
     pub method: &'a str,
     pub uri_path: &'a str,
-    pub query_string: &'a str,
+    /// Raw (unencoded) query parameters. `sign` encodes them via
+    /// `build_canonical_query_string`.
+    pub query_params: &'a [(&'a str, &'a str)],
     pub host: &'a str,
     pub payload_hash: &'a str,
     pub access_key_id: &'a str,
@@ -110,7 +112,7 @@ pub(crate) fn sign(params: &SigningParams<'_>) -> SignedHeaders {
     let canonical_uri = uri_encode(params.uri_path, false);
 
     // Canonical query string: percent-encode and sort by key then value.
-    let canonical_querystring = build_canonical_query_string(params.query_string);
+    let canonical_querystring = build_canonical_query_string(params.query_params);
 
     // Canonical headers (must be lowercase, trimmed, sorted).
     let canonical_headers = format!(
@@ -160,19 +162,18 @@ pub(crate) fn sign(params: &SigningParams<'_>) -> SignedHeaders {
     }
 }
 
-/// Sort and encode query string parameters into the canonical form required by `SigV4`.
-fn build_canonical_query_string(query_string: &str) -> String {
-    if query_string.is_empty() {
+/// Sort and encode raw query parameters into the canonical form required by `SigV4`.
+///
+/// Each `(key, value)` pair must be **unencoded**. This function applies
+/// `uri_encode` to each key and value exactly once, then sorts and joins.
+pub(crate) fn build_canonical_query_string(params: &[(&str, &str)]) -> String {
+    if params.is_empty() {
         return String::new();
     }
 
-    let mut pairs: Vec<(String, String)> = query_string
-        .split('&')
-        .filter(|s| !s.is_empty())
-        .map(|pair| {
-            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-            (uri_encode(k, true), uri_encode(v, true))
-        })
+    let mut pairs: Vec<(String, String)> = params
+        .iter()
+        .map(|(k, v)| (uri_encode(k, true), uri_encode(v, true)))
         .collect();
 
     pairs.sort_unstable();
@@ -211,13 +212,24 @@ mod tests {
 
     #[test]
     fn canonical_query_string_sorted() {
-        let qs = "b=2&a=1";
-        assert_eq!(build_canonical_query_string(qs), "a=1&b=2");
+        assert_eq!(
+            build_canonical_query_string(&[("b", "2"), ("a", "1")]),
+            "a=1&b=2"
+        );
     }
 
     #[test]
     fn canonical_query_string_empty() {
-        assert_eq!(build_canonical_query_string(""), "");
+        assert_eq!(build_canonical_query_string(&[]), "");
+    }
+
+    #[test]
+    fn canonical_query_string_encodes_once() {
+        // Slash in a value must appear as %2F, not %252F (double-encoded).
+        assert_eq!(
+            build_canonical_query_string(&[("delimiter", "/")]),
+            "delimiter=%2F"
+        );
     }
 
     #[test]
