@@ -258,6 +258,7 @@ mod tests {
     use super::*;
     use cascade_engine::backend::NullBackend;
 
+    #[allow(dead_code)]
     fn test_vfs() -> Arc<RwLock<VfsTree>> {
         Arc::new(RwLock::new(VfsTree::new(Arc::new(NullBackend::new(
             "test-backend",
