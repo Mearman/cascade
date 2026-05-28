@@ -78,8 +78,8 @@ mod linux {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use fuser::{
-        FileAttr as FuseFileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyData,
-        ReplyDirectory, ReplyEntry, ReplyWrite, Request,
+        FileAttr as FuseFileAttr, FileHandle, FileType, Filesystem, INodeNo, KernelConfig,
+        LockOwner, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyWrite, Request,
     };
 
     use super::*;
@@ -121,7 +121,7 @@ mod linux {
             tracing::info!("FUSE filesystem destroyed");
         }
 
-        fn lookup(&self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
             let map = self.inode_map.lock().unwrap();
             let name_str = name.to_string_lossy();
 
@@ -132,15 +132,16 @@ mod linux {
             reply.error(libc::ENOENT);
         }
 
-        fn getattr(&self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+        fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+            let ino_u64: u64 = ino.into();
             let map = self.inode_map.lock().unwrap();
-            if ino == crate::inode::ROOT_INODE {
-                let attr = FileAttr::directory(ino);
+            if ino_u64 == crate::inode::ROOT_INODE {
+                let attr = FileAttr::directory(ino_u64);
                 reply.attr(&Duration::from_secs(1), attr.into());
                 return;
             }
             // TODO: Look up VfsItem by inode and convert to attr.
-            tracing::debug!(ino, "getattr");
+            tracing::debug!(ino = ino_u64, "getattr");
             drop(map);
             reply.error(libc::ENOENT);
         }
@@ -148,13 +149,14 @@ mod linux {
         fn readdir(
             &self,
             _req: &Request,
-            ino: u64,
-            _fh: u64,
+            ino: INodeNo,
+            _fh: FileHandle,
             offset: u64,
             mut reply: ReplyDirectory,
         ) {
             let map = self.inode_map.lock().unwrap();
-            if ino != crate::inode::ROOT_INODE {
+            let ino_u64: u64 = ino.into();
+            if ino_u64 != crate::inode::ROOT_INODE {
                 drop(map);
                 reply.error(libc::ENOTDIR);
                 return;
@@ -169,7 +171,7 @@ mod linux {
             }
 
             // TODO: Iterate VFS children of this directory and add entries.
-            tracing::debug!(ino, offset, "readdir");
+            tracing::debug!(ino = ino_u64, offset, "readdir");
             drop(map);
             reply.ok();
         }
@@ -177,40 +179,40 @@ mod linux {
         fn read(
             &self,
             _req: &Request,
-            ino: u64,
-            _fh: u64,
+            ino: INodeNo,
+            _fh: FileHandle,
             offset: u64,
             size: u32,
             _flags: fuser::OpenFlags,
-            _lock_owner: Option<fuser::LockOwner>,
+            _lock_owner: Option<LockOwner>,
             reply: ReplyData,
         ) {
             // TODO: Fetch file contents from cache/backend and return the requested range.
-            tracing::debug!(ino, offset, size, "read");
+            tracing::debug!(ino: u64 = ino.into(), offset, size, "read");
             reply.error(libc::ENOENT);
         }
 
         fn write(
             &self,
             _req: &Request,
-            ino: u64,
-            _fh: u64,
+            ino: INodeNo,
+            _fh: FileHandle,
             offset: u64,
             data: &[u8],
             _write_flags: fuser::WriteFlags,
             _flags: fuser::OpenFlags,
-            _lock_owner: Option<fuser::LockOwner>,
+            _lock_owner: Option<LockOwner>,
             reply: ReplyWrite,
         ) {
             // TODO: Write data to the file at the given offset.
-            tracing::debug!(ino, offset, len = data.len(), "write");
+            tracing::debug!(ino: u64 = ino.into(), offset, len = data.len(), "write");
             reply.error(libc::EROFS);
         }
 
         fn create(
             &self,
             _req: &Request,
-            parent: u64,
+            parent: INodeNo,
             name: &OsStr,
             _mode: u32,
             _umask: u32,
@@ -218,51 +220,51 @@ mod linux {
             reply: fuser::ReplyCreate,
         ) {
             // TODO: Create a new file in the VFS.
-            tracing::debug!(parent, name = %name.to_string_lossy(), "create");
+            tracing::debug!(parent: u64 = parent.into(), name = %name.to_string_lossy(), "create");
             reply.error(libc::EROFS);
         }
 
         fn mkdir(
             &self,
             _req: &Request,
-            parent: u64,
+            parent: INodeNo,
             name: &OsStr,
             _mode: u32,
             _umask: u32,
             reply: ReplyEntry,
         ) {
             // TODO: Create a new directory in the VFS.
-            tracing::debug!(parent, name = %name.to_string_lossy(), "mkdir");
+            tracing::debug!(parent: u64 = parent.into(), name = %name.to_string_lossy(), "mkdir");
             reply.error(libc::EROFS);
         }
 
-        fn unlink(&self, _req: &Request, parent: u64, name: &OsStr, reply: fuser::ReplyEmpty) {
+        fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: fuser::ReplyEmpty) {
             // TODO: Delete a file from the VFS.
-            tracing::debug!(parent, name = %name.to_string_lossy(), "unlink");
+            tracing::debug!(parent: u64 = parent.into(), name = %name.to_string_lossy(), "unlink");
             reply.error(libc::EROFS);
         }
 
-        fn rmdir(&self, _req: &Request, parent: u64, name: &OsStr, reply: fuser::ReplyEmpty) {
+        fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: fuser::ReplyEmpty) {
             // TODO: Delete a directory from the VFS.
-            tracing::debug!(parent, name = %name.to_string_lossy(), "rmdir");
+            tracing::debug!(parent: u64 = parent.into(), name = %name.to_string_lossy(), "rmdir");
             reply.error(libc::EROFS);
         }
 
         fn rename(
             &self,
             _req: &Request,
-            parent: u64,
+            parent: INodeNo,
             name: &OsStr,
-            newparent: u64,
+            newparent: INodeNo,
             newname: &OsStr,
             _flags: fuser::RenameFlags,
             reply: fuser::ReplyEmpty,
         ) {
             // TODO: Move/rename in the VFS.
             tracing::debug!(
-                parent,
+                parent: u64 = parent.into(),
                 name = %name.to_string_lossy(),
-                newparent,
+                newparent: u64 = newparent.into(),
                 newname = %newname.to_string_lossy(),
                 "rename"
             );
@@ -272,7 +274,7 @@ mod linux {
         fn setattr(
             &self,
             _req: &Request,
-            ino: u64,
+            ino: INodeNo,
             mode: Option<u32>,
             uid: Option<u32>,
             gid: Option<u32>,
@@ -280,7 +282,7 @@ mod linux {
             _atime: Option<fuser::TimeOrNow>,
             _mtime: Option<fuser::TimeOrNow>,
             _ctime: Option<SystemTime>,
-            _fh: Option<u64>,
+            _fh: Option<FileHandle>,
             _crtime: Option<SystemTime>,
             _chgtime: Option<SystemTime>,
             _bkuptime: Option<SystemTime>,
@@ -288,7 +290,7 @@ mod linux {
             reply: ReplyAttr,
         ) {
             // TODO: Update file metadata in the VFS.
-            tracing::debug!(ino, ?mode, ?uid, ?gid, ?size, "setattr");
+            tracing::debug!(ino: u64 = ino.into(), ?mode, ?uid, ?gid, ?size, "setattr");
             reply.error(libc::EROFS);
         }
     }
