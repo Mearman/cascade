@@ -132,7 +132,10 @@ impl VfsPresenter for NfsPresenter {
         }
 
         // Resolve the item through the VFS to get metadata and a backend.
-        let (entry, backend): (cascade_engine::types::FileEntry, Arc<dyn cascade_engine::backend::Backend>) = {
+        let (entry, backend): (
+            cascade_engine::types::FileEntry,
+            Arc<dyn cascade_engine::backend::Backend>,
+        ) = {
             let (backend, relative) = {
                 let vfs = self.context.vfs().read().unwrap();
                 let (backend, relative) = vfs.resolve(std::path::Path::new(&id.0));

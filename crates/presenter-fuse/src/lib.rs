@@ -170,10 +170,8 @@ impl VfsPresenter for FusePresenter {
         {
             tracing::info!(mount_point = %mount_display, "starting FUSE presenter");
 
-            let ops = crate::ops::FuseOps::new_with_vfs(
-                self.root_id.clone(),
-                Arc::clone(&self.vfs),
-            );
+            let ops =
+                crate::ops::FuseOps::new_with_vfs(self.root_id.clone(), Arc::clone(&self.vfs));
             let mp = mount_point.to_path_buf();
 
             // Spawn the FUSE session in a background task.

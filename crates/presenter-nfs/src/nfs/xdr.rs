@@ -525,7 +525,16 @@ mod proptests {
                 )
             })
             .prop_map(
-                |(ftype, mode, nlink, uid, gid, size, used, (sd1, sd2, fsid, fileid, (at_s, at_ns, mt_s, mt_ns, ct_s, ct_ns)))| {
+                |(
+                    ftype,
+                    mode,
+                    nlink,
+                    uid,
+                    gid,
+                    size,
+                    used,
+                    (sd1, sd2, fsid, fileid, (at_s, at_ns, mt_s, mt_ns, ct_s, ct_ns)),
+                )| {
                     Fattr3 {
                         ftype,
                         mode,

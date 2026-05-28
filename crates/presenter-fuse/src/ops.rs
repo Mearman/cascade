@@ -118,12 +118,7 @@ impl FuseOps {
 
     /// Synchronously read file data from the backend.
     #[allow(dead_code)] // Used in #[cfg(target_os = "linux")] Filesystem impl
-    fn read_sync(
-        &self,
-        path: &std::path::Path,
-        offset: u64,
-        size: u32,
-    ) -> anyhow::Result<Vec<u8>> {
+    fn read_sync(&self, path: &std::path::Path, offset: u64, size: u32) -> anyhow::Result<Vec<u8>> {
         let rt = tokio::runtime::Handle::current();
         rt.block_on(async {
             let (backend, relative) = {
@@ -233,13 +228,7 @@ mod linux {
             }
         }
 
-        fn getattr(
-            &self,
-            _req: &Request,
-            ino: INodeNo,
-            _fh: Option<FileHandle>,
-            reply: ReplyAttr,
-        ) {
+        fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
             let ino_u64 = u64::from(ino);
             let map = self.inode_map.lock().unwrap();
 
@@ -417,13 +406,7 @@ mod linux {
             reply.error(Errno::EROFS);
         }
 
-        fn unlink(
-            &self,
-            _req: &Request,
-            parent: INodeNo,
-            name: &OsStr,
-            reply: fuser::ReplyEmpty,
-        ) {
+        fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: fuser::ReplyEmpty) {
             tracing::debug!(
                 parent = u64::from(parent),
                 name = %name.to_string_lossy(),
@@ -432,13 +415,7 @@ mod linux {
             reply.error(Errno::EROFS);
         }
 
-        fn rmdir(
-            &self,
-            _req: &Request,
-            parent: INodeNo,
-            name: &OsStr,
-            reply: fuser::ReplyEmpty,
-        ) {
+        fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: fuser::ReplyEmpty) {
             tracing::debug!(
                 parent = u64::from(parent),
                 name = %name.to_string_lossy(),

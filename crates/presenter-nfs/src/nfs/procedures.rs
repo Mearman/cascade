@@ -193,9 +193,7 @@ fn handle_read(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
     match file_result {
         Ok((fh, rest)) => {
             let offset = decode_u64(rest).ok().map(|(o, r)| (o, r));
-            let count = offset
-                .and_then(|(_, r)| decode_u32(r).ok())
-                .map(|(c, _)| c);
+            let count = offset.and_then(|(_, r)| decode_u32(r).ok()).map(|(c, _)| c);
 
             let file_key = fh
                 .to_item_id()
@@ -203,10 +201,7 @@ fn handle_read(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
                 .unwrap_or(0);
             let file_path = ctx.lookup_path(file_key);
 
-            let file_attr = make_attributes(
-                file_path.as_deref().unwrap_or("unknown"),
-                false,
-            );
+            let file_attr = make_attributes(file_path.as_deref().unwrap_or("unknown"), false);
 
             // Try to fetch file data synchronously via the VFS.
             let data = match &file_path {

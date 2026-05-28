@@ -101,10 +101,7 @@ impl NfsContext {
     }
 
     /// Synchronous wrapper for fetching file metadata.
-    pub fn metadata_sync(
-        &self,
-        path: &str,
-    ) -> anyhow::Result<cascade_engine::types::FileEntry> {
+    pub fn metadata_sync(&self, path: &str) -> anyhow::Result<cascade_engine::types::FileEntry> {
         let rt = tokio::runtime::Handle::current();
         rt.block_on(self.metadata(path))
     }
