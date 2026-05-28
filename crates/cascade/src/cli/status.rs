@@ -1,7 +1,7 @@
 use anyhow::{Context as _, Result};
 use cascade_engine::db::StateDb;
 
-use super::{is_process_alive, CliContext};
+use super::{CliContext, is_process_alive};
 
 /// Show overall mount status.
 pub fn show(ctx: &CliContext) -> Result<()> {
@@ -15,10 +15,13 @@ pub fn show(ctx: &CliContext) -> Result<()> {
     // Read and parse the PID.
     let raw = std::fs::read_to_string(&ctx.pid_path)
         .with_context(|| format!("failed to read {}", ctx.pid_path.display()))?;
-    let pid: u32 = raw
-        .trim()
-        .parse()
-        .with_context(|| format!("invalid PID in {}: {:?}", ctx.pid_path.display(), raw.trim()))?;
+    let pid: u32 = raw.trim().parse().with_context(|| {
+        format!(
+            "invalid PID in {}: {:?}",
+            ctx.pid_path.display(),
+            raw.trim()
+        )
+    })?;
 
     // Verify the process is actually alive.
     if !is_process_alive(pid) {

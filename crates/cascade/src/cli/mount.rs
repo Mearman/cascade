@@ -7,7 +7,7 @@ use cascade_engine::engine::{Engine, EngineConfig};
 use cascade_presenter_nfs::nfs::server::{NfsServer, NfsServerConfig};
 
 use super::init::{BackendConfig, CascadeConfig};
-use super::{is_process_alive, CliContext};
+use super::{CliContext, is_process_alive};
 
 /// Start the Cascade daemon.
 pub async fn start(ctx: &CliContext, mount_point: Option<&str>) -> Result<()> {
@@ -21,9 +21,7 @@ pub async fn start(ctx: &CliContext, mount_point: Option<&str>) -> Result<()> {
             .with_context(|| format!("failed to read {}", ctx.pid_path.display()))?;
         if let Ok(pid) = raw.trim().parse::<u32>() {
             if is_process_alive(pid) {
-                anyhow::bail!(
-                    "Cascade is already running (PID {pid}). Run `cascade stop` first."
-                );
+                anyhow::bail!("Cascade is already running (PID {pid}). Run `cascade stop` first.");
             }
             // Stale PID file — clean it up and continue.
             let _ = std::fs::remove_file(&ctx.pid_path);
@@ -133,10 +131,13 @@ pub fn stop(ctx: &CliContext) -> anyhow::Result<()> {
 
     let raw = std::fs::read_to_string(&ctx.pid_path)
         .with_context(|| format!("failed to read {}", ctx.pid_path.display()))?;
-    let pid_u32: u32 = raw
-        .trim()
-        .parse()
-        .with_context(|| format!("invalid PID in {}: {:?}", ctx.pid_path.display(), raw.trim()))?;
+    let pid_u32: u32 = raw.trim().parse().with_context(|| {
+        format!(
+            "invalid PID in {}: {:?}",
+            ctx.pid_path.display(),
+            raw.trim()
+        )
+    })?;
     let pid_signed =
         i32::try_from(pid_u32).with_context(|| format!("PID {pid_u32} overflows i32"))?;
     let pid = nix::unistd::Pid::from_raw(pid_signed);

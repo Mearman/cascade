@@ -6,8 +6,8 @@ use cascade_engine::cache::manager::CacheManagerConfig;
 use cascade_engine::db::StateDb;
 use std::sync::Arc;
 
-use super::init::{BackendConfig, CascadeConfig};
 use super::CliContext;
+use super::init::{BackendConfig, CascadeConfig};
 
 /// Open the state database.
 fn open_db(ctx: &CliContext) -> Result<StateDb> {
@@ -166,7 +166,12 @@ pub fn evict(ctx: &CliContext, all: bool) -> Result<()> {
 }
 
 /// Add a backend configuration.
-pub fn backend_add(ctx: &CliContext, backend_type: &str, name: Option<&str>, mount_path: Option<&str>) -> Result<()> {
+pub fn backend_add(
+    ctx: &CliContext,
+    backend_type: &str,
+    name: Option<&str>,
+    mount_path: Option<&str>,
+) -> Result<()> {
     std::fs::create_dir_all(&ctx.config_dir)?;
 
     let backend_name = name.unwrap_or(backend_type);
@@ -306,9 +311,10 @@ pub fn backend_add(ctx: &CliContext, backend_type: &str, name: Option<&str>, mou
         backend_type: backend_type.to_string(),
         account: None,
     };
-    main_config
-        .backends
-        .insert(backend_name.to_string(), toml::Value::try_from(&backend_entry)?);
+    main_config.backends.insert(
+        backend_name.to_string(),
+        toml::Value::try_from(&backend_entry)?,
+    );
     let main_config_str = toml::to_string_pretty(&main_config)?;
     std::fs::write(&main_config_path, &main_config_str)?;
 
