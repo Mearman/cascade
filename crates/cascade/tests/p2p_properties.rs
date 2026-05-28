@@ -48,7 +48,7 @@ fn different_data_different_hash() {
 #[test]
 fn bep_message_round_trip() {
     proptest!(|(msg in bep_message_strategy())| {
-        let encoded = encode_message(&msg);
+        let encoded = encode_message(&msg).unwrap();
         let decoded = decode_message(&encoded).unwrap();
         assert_eq!(decoded, msg);
     });

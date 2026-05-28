@@ -49,7 +49,7 @@ fn parse_and_evaluate_compound_or() {
     let mut ctx = EvalContext::default();
     assert!(!eval::evaluate(&expr, &ctx));
 
-    ctx.file.cached = true;
+    ctx.file.flags = ctx.file.flags.with_cached(true);
     assert!(eval::evaluate(&expr, &ctx));
 }
 
@@ -98,8 +98,8 @@ fn file_context_from_entry_builds_correctly() {
     assert_eq!(fc.size, 2048);
     assert_eq!(fc.ext, "jpg");
     assert_eq!(fc.mime, "image/jpeg");
-    assert!(fc.cached);
-    assert!(!fc.pinned);
+    assert!(fc.flags.cached());
+    assert!(!fc.flags.pinned());
 }
 
 #[test]

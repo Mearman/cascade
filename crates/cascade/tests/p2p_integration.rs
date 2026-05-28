@@ -30,7 +30,7 @@ async fn bridge_index_and_lookup() {
 
     // All block hashes should be queryable.
     for hash in &blocks.blocks {
-        assert!(bridge.has_blocks(&hash.to_string()).await.unwrap());
+        assert!(bridge.has_blocks(&hash.to_string()).unwrap());
     }
 }
 

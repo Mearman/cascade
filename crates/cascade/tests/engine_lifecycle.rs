@@ -32,7 +32,7 @@ async fn full_engine_lifecycle() {
     assert_eq!(status.backends.len(), 1);
 
     // Start background tasks.
-    let handle = engine.start().await.unwrap();
+    let handle = engine.start().unwrap();
 
     // Pin a path.
     engine.pin("Documents/**", true).unwrap();
@@ -40,7 +40,7 @@ async fn full_engine_lifecycle() {
     assert_eq!(pins.len(), 1);
 
     // Shut down.
-    engine.shutdown().await.unwrap();
+    engine.shutdown();
     handle.sync_handle.abort();
     handle.cache_handle.abort();
 
@@ -70,9 +70,9 @@ async fn engine_start_stop_idempotent() {
     let engine = make_engine_with_backends(vec![Arc::new(NullBackend::new("test"))]).await;
 
     // Start and shutdown twice — should not panic or deadlock.
-    let handle = engine.start().await.unwrap();
+    let handle = engine.start().unwrap();
     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-    engine.shutdown().await.unwrap();
+    engine.shutdown();
     handle.sync_handle.abort();
     handle.cache_handle.abort();
 }
@@ -101,19 +101,17 @@ async fn engine_mount_unmount_during_runtime() {
     let engine = make_engine_with_backends(vec![Arc::new(NullBackend::new("root"))]).await;
 
     // Mount a second backend.
-    engine
-        .mount_backend(
-            PathBuf::from("Projects"),
-            Arc::new(NullBackend::new("projects")),
-        )
-        .await;
+    engine.mount_backend(
+        PathBuf::from("Projects"),
+        Arc::new(NullBackend::new("projects")),
+    );
 
     let tree = engine.vfs().read().unwrap();
     assert_eq!(tree.children().len(), 1);
     drop(tree);
 
     // Unmount it.
-    engine.unmount_backend(Path::new("Projects")).await.unwrap();
+    engine.unmount_backend(Path::new("Projects"));
 
     let tree = engine.vfs().read().unwrap();
     assert!(tree.children().is_empty());
