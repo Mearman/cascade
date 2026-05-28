@@ -273,6 +273,10 @@ pub fn backend_add(
         }
         _ => {
             // Write minimal config with the backend type.
+            eprintln!(
+                "Warning: '{backend_type}' is not a supported backend type. \
+                 Config written but `cascade start` will reject it."
+            );
             let mut config = toml::Table::new();
             config.insert(
                 "type".to_string(),
@@ -377,14 +381,13 @@ pub fn backend_remove(ctx: &CliContext, name: &str) -> Result<()> {
 }
 
 /// Display name for a backend type.
-fn backend_type_display(backend_type: &str) -> &'static str {
+///
+/// Returns the human-readable name for known types, or the raw type string
+/// for unrecognised types (forward-compatible with future backends).
+fn backend_type_display(backend_type: &str) -> &str {
     match backend_type {
         "gdrive" => "Google Drive",
         "s3" => "S3 Compatible",
-        "webdav" => "WebDAV",
-        "dropbox" => "Dropbox",
-        "onedrive" => "OneDrive",
-        "local" => "Local Filesystem",
-        _ => "Unknown",
+        _ => backend_type,
     }
 }
