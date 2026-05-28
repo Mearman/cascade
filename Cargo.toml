@@ -58,8 +58,8 @@ futures-core = "0.3"
 unsafe_code = "deny"
 unused_imports = "deny"
 dead_code = "deny"
-missing_debug_implementations = "warn"
-missing_copy_implementations = "warn"
+missing_debug_implementations = "deny"
+missing_copy_implementations = "deny"
 trivial_casts = "deny"
 trivial_numeric_casts = "deny"
 unused_must_use = "deny"
@@ -67,11 +67,18 @@ unused_variables = "deny"
 unreachable_patterns = "deny"
 
 [workspace.lints.clippy]
-pedantic = { level = "warn", priority = -1 }
-nursery = { level = "warn", priority = -1 }
-cargo = { level = "warn", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
 
-# Pedantic lints that are too noisy to keep as warnings — promote to allow.
+# Lints allowed because they are metadata/doc concerns not worth enforcing at this stage.
+cargo_common_metadata = "allow"
+multiple_crate_versions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+significant_drop_tightening = "allow"
+
+# Style lints that are too noisy for the current codebase shape.
 module_name_repetitions = "allow"
 too_many_arguments = "allow"
 too_many_lines = "allow"
@@ -80,9 +87,8 @@ default_trait_access = "allow"
 needless_pass_by_value = "allow"
 return_self_not_must_use = "allow"
 
-# Explicitly deny things that are warn-by-default under pedantic/cargo.
-# These are set to warn for now — tighten to deny incrementally as the codebase matures.
-unwrap_used = "warn"
-expect_used = "warn"
-indexing_slicing = "warn"
-string_slice = "warn"
+# Correctness lints — deny outright.
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+string_slice = "deny"
