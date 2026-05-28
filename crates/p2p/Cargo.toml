@@ -1,0 +1,23 @@
+[package]
+name = "cascade-p2p"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cascade-engine = { path = "../engine" }
+tokio = { workspace = true, features = ["net", "rt", "macros", "io-util"] }
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+sha2 = "0.10"
+rcgen = "0.13"
+data-encoding = "2"
+rusqlite.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+tempfile = "3"
