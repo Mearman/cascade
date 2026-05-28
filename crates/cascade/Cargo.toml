@@ -26,6 +26,7 @@ dirs = "6"
 
 [dev-dependencies]
 cascade-p2p = { path = "../p2p" }
+cascade-presenter-fuse = { path = "../presenter-fuse" }
 tempfile = "3"
 proptest = "1"
 async-trait = "0.1"
