@@ -1,0 +1,22 @@
+[package]
+name = "cascade-backend-local"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cascade-engine = { path = "../engine" }
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+sha2 = "0.10"
+walkdir = "2"
+fs2 = "0.4"
+toml.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+tempfile = "3"
