@@ -3,7 +3,11 @@
 //! Tokens are stored in the macOS Keychain via the `security` command.
 //! The device code flow is used for initial authorisation — no local
 //! web server required.
+//!
+//! Token persistence (`save_tokens` / `load_tokens`) is only available on
+//! macOS. On other platforms both functions return an error immediately.
 
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
@@ -46,13 +50,22 @@ impl AuthTokens {
 }
 
 /// `OAuth2` configuration for Google Drive.
-#[derive(Debug)]
 pub struct OAuthConfig {
     pub client_id: String,
     pub client_secret: String,
 }
 
+impl std::fmt::Debug for OAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthConfig")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"[REDACTED]")
+            .finish()
+    }
+}
+
 /// Keychain service name for storing tokens.
+#[cfg(target_os = "macos")]
 const KEYCHAIN_SERVICE: &str = "com.cascade.gdrive";
 
 /// Initiate the device code flow. Returns the URL and user code.
@@ -175,7 +188,10 @@ pub async fn refresh_access_token(
     })
 }
 
-/// Save tokens to macOS Keychain.
+/// Save tokens to the macOS Keychain.
+///
+/// Only available on macOS. Returns an error on other platforms.
+#[cfg(target_os = "macos")]
 pub fn save_tokens(account: &str, tokens: &AuthTokens) -> anyhow::Result<()> {
     let json = serde_json::to_string(tokens)?;
 
@@ -209,7 +225,15 @@ pub fn save_tokens(account: &str, tokens: &AuthTokens) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Load tokens from macOS Keychain.
+#[cfg(not(target_os = "macos"))]
+pub fn save_tokens(_account: &str, _tokens: &AuthTokens) -> anyhow::Result<()> {
+    anyhow::bail!("token storage via Keychain is only supported on macOS")
+}
+
+/// Load tokens from the macOS Keychain.
+///
+/// Only available on macOS. Returns an error on other platforms.
+#[cfg(target_os = "macos")]
 pub fn load_tokens(account: &str) -> anyhow::Result<Option<AuthTokens>> {
     let output = Command::new("security")
         .args([
@@ -230,6 +254,11 @@ pub fn load_tokens(account: &str) -> anyhow::Result<Option<AuthTokens>> {
         }
         _ => Ok(None),
     }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn load_tokens(_account: &str) -> anyhow::Result<Option<AuthTokens>> {
+    anyhow::bail!("token storage via Keychain is only supported on macOS")
 }
 
 #[cfg(test)]
