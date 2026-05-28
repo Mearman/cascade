@@ -4,15 +4,11 @@ use anyhow::Result;
 use cascade_engine::cache::manager::CacheManager;
 use cascade_engine::cache::manager::CacheManagerConfig;
 use cascade_engine::db::StateDb;
-use std::path::Path;
 use std::sync::Arc;
 
 /// Open the state database from the default path.
 fn open_db() -> Result<StateDb> {
-    let db_path = dirs::data_dir()
-        .unwrap_or_else(|| Path::new("/tmp").to_path_buf())
-        .join("cascade")
-        .join("state.db");
+    let db_path = config_dir().join("state.db");
     StateDb::open(&db_path)
 }
 
