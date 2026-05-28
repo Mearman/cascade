@@ -200,6 +200,7 @@ dependencies = [
  "cascade-engine",
  "chrono",
  "fs2",
+ "proptest",
  "serde",
  "serde_json",
  "sha2",
@@ -286,8 +287,10 @@ dependencies = [
  "async-trait",
  "cascade-engine",
  "chrono",
+ "proptest",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]

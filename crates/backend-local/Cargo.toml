@@ -20,6 +20,8 @@ toml.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tempfile = "3"
+proptest = "1"
+cascade-engine = { path = "../engine" }
 
 [lints]
 workspace = true
