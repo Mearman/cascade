@@ -391,3 +391,226 @@ fn backend_type_display(backend_type: &str) -> &str {
         _ => backend_type,
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+    use cascade_engine::types::{CacheState, FileEntry, ItemId};
+    use tempfile::TempDir;
+
+    fn make_ctx(dir: &TempDir) -> CliContext {
+        let config_dir = dir.path().to_path_buf();
+        CliContext {
+            db_path: config_dir.join("state.db"),
+            pid_path: config_dir.join("cascade.pid"),
+            config_dir,
+        }
+    }
+
+    fn seed_backend(ctx: &CliContext) -> StateDb {
+        let db = StateDb::open(&ctx.db_path).unwrap();
+        db.register_backend("test", "gdrive", "Test Backend", None, None)
+            .unwrap();
+        db
+    }
+
+    fn seed_file(db: &StateDb, name: &str, state: CacheState) {
+        let file_id = ItemId::new("test", name);
+        let parent_id = ItemId::new("test", "root");
+        let entry = FileEntry::file(file_id.clone(), parent_id, name.to_string());
+        db.upsert_file(&entry).unwrap();
+        db.update_cache_state(&file_id, state).unwrap();
+    }
+
+    // ── pin / unpin / pin_list ──
+
+    #[test]
+    fn pin_adds_rule_to_db() {
+        let dir = TempDir::new().unwrap();
+        let ctx = make_ctx(&dir);
+        seed_backend(&ctx);
+
+        pin(&ctx, "Documents/Accounts").unwrap();
+
+        let db = StateDb::open(&ctx.db_path).unwrap();
+        let rules = db.list_pin_rules().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].path_glob, "Documents/Accounts");
+        assert!(rules[0].recursive);
+    }
+
+    #[test]
+    fn unpin_removes_existing_rule() {
+        let dir = TempDir::new().unwrap();
+        let ctx = make_ctx(&dir);
+        seed_backend(&ctx);
+
+        pin(&ctx, "Photos").unwrap();
+        unpin(&ctx, "Photos").unwrap();
+
+        let db = StateDb::open(&ctx.db_path).unwrap();
+        assert!(db.list_pin_rules().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unpin_nonexistent_path_succeeds() {
+        let dir = TempDir::new().unwrap();
+        let ctx = make_ctx(&dir);
+        seed_backend(&ctx);
+
+        // Unpinning a path that was never pinned should succeed (prints
+        // "Not pinned: ...").
+        unpin(&ctx, "no/such/path").unwrap();
+    }
+
+    #[test]
+    fn pin_list_empty() {
+        let dir = TempDir::new().unwrap();
+        let ctx = make_ctx(&dir);
+        seed_backend(&ctx);
+
+        pin_list(&ctx).unwrap();
+    }
+
+    #[test]
+    fn pin_list_shows_rules() {
+        let dir = TempDir::new().unwrap();
+        let ctx = make_ctx(&dir);
+        seed_backend(&ctx);
+
+        pin(&ctx, "Docs").unwrap();
+        pin(&ctx, "Photos").unwrap();
+
+        pin_list(&ctx).unwrap();
+    }
+
+    // ── cache_status ──
+
+    #[test]
+    fn cache_status_empty_db() {
+        let dir = TempDir::new().unwrap();
+        let ctx = make_ctx(&dir);
+        seed_backend(&ctx);
+
+        cache_status(&ctx).unwrap();
+    }
+
+    #[test]
+    fn cache_status_with_files() {
+        let dir = TempDir::new().unwrap();
+        let ctx = make_ctx(&dir);
+        let db = seed_backend(&ctx);
+
+        seed_file(&db, "file1.txt", CacheState::Online);
+        seed_file(&db, "file2.txt", CacheState::Cached);
+        seed_file(&db, "file3.txt", CacheState::Pinned);
+
+        cache_status(&ctx).unwrap();
+    }
+
+    // ── evict ──
+
+    #[test]
+    fn evict_with_no_files() {
+        let dir = TempDir::new().unwrap();
+        let ctx = make_ctx(&dir);
+        seed_backend(&ctx);
+
+        evict(&ctx, false).unwrap();
+    }
+
+    #[test]
+    fn evict_all_with_cached_files() {
+        let dir = TempDir::new().unwrap();
+        let ctx = make_ctx(&dir);
+        let db = seed_backend(&ctx);
+
+        seed_file(&db, "cached1.txt", CacheState::Cached);
+        seed_file(&db, "cached2.txt", CacheState::Cached);
+        seed_file(&db, "pinned.txt", CacheState::Pinned);
+
+        evict(&ctx, true).unwrap();
+    }
+
+    // ── clear ──
+
+    #[test]
+    fn clear_reverts_cached_files_to_online() {
+        let dir = TempDir::new().unwrap();
+        let ctx = make_ctx(&dir);
+        let db = seed_backend(&ctx);
+
+        seed_file(&db, "dir/file1.txt", CacheState::Cached);
+        seed_file(&db, "dir/file2.txt", CacheState::Cached);
+        seed_file(&db, "other.txt", CacheState::Cached);
+
+        drop(db);
+        clear(&ctx, "dir").unwrap();
+
+        let db = StateDb::open(&ctx.db_path).unwrap();
+        let file1_id = ItemId::new("test", "dir/file1.txt");
+        let file2_id = ItemId::new("test", "dir/file2.txt");
+        let other_id = ItemId::new("test", "other.txt");
+
+        assert_eq!(
+            db.get_cache_state(&file1_id).unwrap(),
+            Some(CacheState::Online)
+        );
+        assert_eq!(
+            db.get_cache_state(&file2_id).unwrap(),
+            Some(CacheState::Online)
+        );
+        // "other.txt" should remain cached — it doesn't match the prefix.
+        assert_eq!(
+            db.get_cache_state(&other_id).unwrap(),
+            Some(CacheState::Cached)
+        );
+    }
+
+    #[test]
+    fn clear_with_no_matching_files() {
+        let dir = TempDir::new().unwrap();
+        let ctx = make_ctx(&dir);
+        let db = seed_backend(&ctx);
+
+        seed_file(&db, "unrelated.txt", CacheState::Cached);
+
+        drop(db);
+        clear(&ctx, "no/match").unwrap();
+    }
+
+    // ── backend_remove ──
+
+    #[test]
+    fn backend_remove_errors_when_config_missing() {
+        let dir = TempDir::new().unwrap();
+        let ctx = make_ctx(&dir);
+
+        let result = backend_remove(&ctx, "nonexistent");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn backend_remove_deletes_config_and_db_entry() {
+        let dir = TempDir::new().unwrap();
+        let ctx = make_ctx(&dir);
+
+        let db = seed_backend(&ctx);
+
+        let config_path = ctx.config_dir.join("test.toml");
+        std::fs::write(&config_path, "type = \"gdrive\"\n").unwrap();
+
+        let main_config_path = ctx.config_dir.join("config.toml");
+        std::fs::write(&main_config_path, "[mount]\npoint = \"/tmp/cloud\"\n").unwrap();
+
+        drop(db);
+        backend_remove(&ctx, "test").unwrap();
+
+        assert!(!config_path.exists());
+
+        let db = StateDb::open(&ctx.db_path).unwrap();
+        let backends = db.list_backends().unwrap();
+        assert!(backends.is_empty());
+    }
+}

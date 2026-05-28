@@ -57,3 +57,43 @@ pub async fn authenticate(ctx: &CliContext, name: &str) -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn make_ctx(dir: &TempDir) -> CliContext {
+        let config_dir = dir.path().to_path_buf();
+        CliContext {
+            db_path: config_dir.join("state.db"),
+            pid_path: config_dir.join("cascade.pid"),
+            config_dir,
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticate_errors_when_config_missing() {
+        let dir = TempDir::new().unwrap();
+        let ctx = make_ctx(&dir);
+
+        // No .toml file for "missing" backend — should fail with a context
+        // error rather than panic.
+        let result = authenticate(&ctx, "missing").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn authenticate_errors_for_non_gdrive_backend() {
+        let dir = TempDir::new().unwrap();
+        let ctx = make_ctx(&dir);
+
+        // Write an S3 backend config — auth only supports gdrive.
+        let config_path = ctx.config_dir.join("mybackup.toml");
+        std::fs::write(&config_path, "type = \"s3\"\n").unwrap();
+
+        let result = authenticate(&ctx, "mybackup").await;
+        assert!(result.is_err());
+    }
+}

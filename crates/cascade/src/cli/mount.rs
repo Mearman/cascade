@@ -317,3 +317,42 @@ fn unmount_nfs(_mount_point: &Path) -> Result<()> {
 fn is_mounted(_path: &Path) -> bool {
     false
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn make_ctx(dir: &TempDir) -> CliContext {
+        let config_dir = dir.path().to_path_buf();
+        CliContext {
+            db_path: config_dir.join("state.db"),
+            pid_path: config_dir.join("cascade.pid"),
+            config_dir,
+        }
+    }
+
+    #[test]
+    fn stop_succeeds_when_no_pid_file() {
+        let dir = TempDir::new().unwrap();
+        let ctx = make_ctx(&dir);
+
+        // No PID file exists — should print "not running" and succeed.
+        stop(&ctx).unwrap();
+    }
+
+    #[test]
+    fn stop_cleans_up_stale_pid_file() {
+        let dir = TempDir::new().unwrap();
+        let ctx = make_ctx(&dir);
+
+        // PID 999999999 is not a real process.
+        std::fs::write(&ctx.pid_path, "999999999").unwrap();
+
+        stop(&ctx).unwrap();
+
+        // The stale PID file should have been removed.
+        assert!(!ctx.pid_path.exists());
+    }
+}

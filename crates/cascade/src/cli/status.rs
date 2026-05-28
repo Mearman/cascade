@@ -84,3 +84,134 @@ pub fn backend_list(ctx: &CliContext) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn make_ctx(dir: &TempDir) -> CliContext {
+        let config_dir = dir.path().to_path_buf();
+        CliContext {
+            db_path: config_dir.join("state.db"),
+            pid_path: config_dir.join("cascade.pid"),
+            config_dir,
+        }
+    }
+
+    #[test]
+    fn show_reports_not_running_when_no_pid_file() {
+        let dir = TempDir::new().unwrap();
+        let ctx = make_ctx(&dir);
+
+        // Should succeed — prints "not running" rather than erroring.
+        show(&ctx).unwrap();
+    }
+
+    #[test]
+    fn show_reports_running_with_valid_pid_file() {
+        let dir = TempDir::new().unwrap();
+        let ctx = make_ctx(&dir);
+
+        // Write the current process PID — it is definitely alive.
+        std::fs::write(&ctx.pid_path, std::process::id().to_string()).unwrap();
+
+        // Seed a backend in the DB so the output lists it.
+        let db = StateDb::open(&ctx.db_path).unwrap();
+        db.register_backend(
+            "test-gdrive",
+            "gdrive",
+            "Google Drive (test)",
+            Some("/mnt/cloud"),
+            None,
+        )
+        .unwrap();
+
+        show(&ctx).unwrap();
+    }
+
+    #[test]
+    fn show_reports_stale_pid_when_process_dead() {
+        let dir = TempDir::new().unwrap();
+        let ctx = make_ctx(&dir);
+
+        // PID 999999999 is extremely unlikely to be a real process.
+        std::fs::write(&ctx.pid_path, "999999999").unwrap();
+
+        show(&ctx).unwrap();
+    }
+
+    #[test]
+    fn show_lists_registered_backends() {
+        let dir = TempDir::new().unwrap();
+        let ctx = make_ctx(&dir);
+
+        std::fs::write(&ctx.pid_path, std::process::id().to_string()).unwrap();
+
+        let db = StateDb::open(&ctx.db_path).unwrap();
+        db.register_backend("s3-backup", "s3", "S3 (backup)", None, None)
+            .unwrap();
+        db.register_backend(
+            "gdrive-work",
+            "gdrive",
+            "Google Drive (work)",
+            Some("Work"),
+            None,
+        )
+        .unwrap();
+
+        show(&ctx).unwrap();
+    }
+
+    #[test]
+    fn show_handles_corrupt_pid_file() {
+        let dir = TempDir::new().unwrap();
+        let ctx = make_ctx(&dir);
+
+        std::fs::write(&ctx.pid_path, "not-a-number").unwrap();
+
+        // Should return an error — the PID is unparseable.
+        assert!(show(&ctx).is_err());
+    }
+
+    #[test]
+    fn backend_list_with_no_db() {
+        let dir = TempDir::new().unwrap();
+        let ctx = make_ctx(&dir);
+
+        // No state.db file exists yet.
+        backend_list(&ctx).unwrap();
+    }
+
+    #[test]
+    fn backend_list_with_empty_db() {
+        let dir = TempDir::new().unwrap();
+        let ctx = make_ctx(&dir);
+
+        // Create the DB but don't register any backends.
+        let _db = StateDb::open(&ctx.db_path).unwrap();
+
+        backend_list(&ctx).unwrap();
+    }
+
+    #[test]
+    fn backend_list_shows_registered_backends() {
+        let dir = TempDir::new().unwrap();
+        let ctx = make_ctx(&dir);
+
+        let db = StateDb::open(&ctx.db_path).unwrap();
+        db.register_backend(
+            "personal",
+            "gdrive",
+            "Google Drive (personal)",
+            Some("/Personal"),
+            None,
+        )
+        .unwrap();
+        db.register_backend("backup", "s3", "S3 (backup)", None, None)
+            .unwrap();
+
+        backend_list(&ctx).unwrap();
+    }
+}
