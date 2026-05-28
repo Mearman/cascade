@@ -1,0 +1,25 @@
+#!/bin/bash
+# Pre-push hook: run clippy and tests.
+# Takes longer but only runs before pushing, not every commit.
+
+set -euo pipefail
+
+# Use the mise-managed toolchain directly.
+export PATH="$HOME/.rustup/toolchains/1.89.0-aarch64-apple-darwin/bin:$PATH"
+export RUSTUP_TOOLCHAIN=1.89.0-aarch64-apple-darwin
+
+echo "Running clippy..."
+if ! cargo clippy --workspace -- -D warnings 2>&1; then
+    echo ""
+    echo "clippy found issues. Fix before pushing."
+    exit 1
+fi
+
+echo "Running tests..."
+if ! cargo test --workspace 2>&1; then
+    echo ""
+    echo "Tests failed. Fix before pushing."
+    exit 1
+fi
+
+echo "All checks passed."

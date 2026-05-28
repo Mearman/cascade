@@ -1,0 +1,15 @@
+#!/bin/bash
+# Pre-commit hook: check formatting only.
+# Fast — runs in ~1s on a workspace this size.
+
+set -euo pipefail
+
+# Use the mise-managed toolchain directly.
+export PATH="$HOME/.rustup/toolchains/1.89.0-aarch64-apple-darwin/bin:$PATH"
+export RUSTUP_TOOLCHAIN=1.89.0-aarch64-apple-darwin
+
+if ! cargo fmt --check 2>&1; then
+    echo ""
+    echo "cargo fmt found differences. Run 'cargo fmt' to fix."
+    exit 1
+fi
