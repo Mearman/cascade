@@ -1,0 +1,287 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --workspace -- -D warnings
+      - name: Check
+        run: cargo check --workspace
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
+      - name: Run tests
+        run: cargo test --workspace
+
+  release:
+    name: Release
+    needs: [check, test]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      released: ${{ steps.release.outputs.released }}
+      version: ${{ steps.release.outputs.version }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install release-plz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: release-plz
+      - name: Run release-plz
+        id: release
+        run: release-plz release --git-token ${{ secrets.GITHUB_TOKEN }}
+
+  build-macos-arm:
+    name: Build macOS ARM
+    needs: release
+    if: needs.release.outputs.released == 'true'
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.version }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --target aarch64-apple-darwin -p cascade
+      - name: Package archive
+        run: |
+          mkdir -p dist
+          cp target/aarch64-apple-darwin/release/cascade dist/cascade
+          cd dist
+          tar czf cascade-aarch64-macos.tar.gz cascade
+          shasum -a 256 cascade-aarch64-macos.tar.gz | awk '{print $1}' > cascade-aarch64-macos.tar.gz.sha256
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.release.outputs.version }}
+          files: dist/cascade-aarch64-macos.tar.gz*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-macos-x86:
+    name: Build macOS x86_64
+    needs: release
+    if: needs.release.outputs.released == 'true'
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.version }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --target x86_64-apple-darwin -p cascade
+      - name: Package archive
+        run: |
+          mkdir -p dist
+          cp target/x86_64-apple-darwin/release/cascade dist/cascade
+          cd dist
+          tar czf cascade-x86_64-macos.tar.gz cascade
+          shasum -a 256 cascade-x86_64-macos.tar.gz | awk '{print $1}' > cascade-x86_64-macos.tar.gz.sha256
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.release.outputs.version }}
+          files: dist/cascade-x86_64-macos.tar.gz*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-linux-x86:
+    name: Build Linux x86_64
+    needs: release
+    if: needs.release.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.version }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
+      - name: Build
+        run: cargo build --release --target x86_64-unknown-linux-gnu -p cascade
+      - name: Package archive
+        run: |
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-gnu/release/cascade dist/cascade
+          cd dist
+          tar czf cascade-x86_64-linux.tar.gz cascade
+          sha256sum cascade-x86_64-linux.tar.gz | awk '{print $1}' > cascade-x86_64-linux.tar.gz.sha256
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.release.outputs.version }}
+          files: dist/cascade-x86_64-linux.tar.gz*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-linux-arm:
+    name: Build Linux ARM64
+    needs: release
+    if: needs.release.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.version }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cross-compilation toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Build
+        run: cargo build --release --target aarch64-unknown-linux-gnu -p cascade
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      - name: Package archive
+        run: |
+          mkdir -p dist
+          cp target/aarch64-unknown-linux-gnu/release/cascade dist/cascade
+          cd dist
+          tar czf cascade-aarch64-linux.tar.gz cascade
+          sha256sum cascade-aarch64-linux.tar.gz | awk '{print $1}' > cascade-aarch64-linux.tar.gz.sha256
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.release.outputs.version }}
+          files: dist/cascade-aarch64-linux.tar.gz*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  update-tap:
+    name: Update Homebrew tap
+    needs: [release, build-macos-arm, build-macos-x86, build-linux-x86, build-linux-arm]
+    if: needs.release.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout tap
+        uses: actions/checkout@v4
+        with:
+          repository: Mearman/homebrew-cascade
+          token: ${{ secrets.TAP_PAT }}
+      - name: Download checksums
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          TAG_URL="https://github.com/Mearman/cascade/releases/download/${VERSION}"
+          curl -sL "${TAG_URL}/cascade-aarch64-macos.tar.gz.sha256" | awk '{print $1}' > sha-macos-arm
+          curl -sL "${TAG_URL}/cascade-x86_64-macos.tar.gz.sha256" | awk '{print $1}' > sha-macos-x86
+          curl -sL "${TAG_URL}/cascade-x86_64-linux.tar.gz.sha256" | awk '{print $1}' > sha-linux-x86
+          curl -sL "${TAG_URL}/cascade-aarch64-linux.tar.gz.sha256" | awk '{print $1}' > sha-linux-arm
+      - name: Generate formula
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          VERSION_NUM="${VERSION#v}"
+          MACOS_ARM_SHA=$(cat sha-macos-arm)
+          MACOS_X86_SHA=$(cat sha-macos-x86)
+          LINUX_X86_SHA=$(cat sha-linux-x86)
+          LINUX_ARM_SHA=$(cat sha-linux-arm)
+
+          mkdir -p Formula
+          cat > Formula/cascade.rb <<EOF
+          # Auto-generated by CI — do not edit manually.
+          # Regenerated on each semantic release from Mearman/cascade.
+
+          class Cascade < Formula
+            desc "Cross-platform cloud storage filesystem client"
+            homepage "https://github.com/Mearman/cascade"
+            version "${VERSION_NUM}"
+            license "MIT"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/Mearman/cascade/releases/download/${VERSION}/cascade-aarch64-macos.tar.gz"
+                sha256 "${MACOS_ARM_SHA}"
+              else
+                url "https://github.com/Mearman/cascade/releases/download/${VERSION}/cascade-x86_64-macos.tar.gz"
+                sha256 "${MACOS_X86_SHA}"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm?
+                url "https://github.com/Mearman/cascade/releases/download/${VERSION}/cascade-aarch64-linux.tar.gz"
+                sha256 "${LINUX_ARM_SHA}"
+              else
+                url "https://github.com/Mearman/cascade/releases/download/${VERSION}/cascade-x86_64-linux.tar.gz"
+                sha256 "${LINUX_X86_SHA}"
+              end
+            end
+
+            def install
+              bin.install "cascade"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("\#{bin}/cascade --version")
+            end
+          end
+          EOF
+      - name: Commit and push
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/cascade.rb
+          git diff --cached --quiet || git commit -m "chore: update formula to ${VERSION}"
+          git push

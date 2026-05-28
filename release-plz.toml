@@ -1,0 +1,47 @@
+[workspace]
+# Parse conventional commits to determine version bumps.
+# feat → minor, fix → patch, feat!/fix!/BREAKING CHANGE → major.
+changelog_update = true
+
+[workspace.dependencies]
+# release-plz manages version bumps in all workspace crates.
+# Each crate inherits version from workspace.package.version.
+version_group = "workspace"
+
+[[package]]
+name = "cascade"
+# The binary crate is the release boundary.
+# Only trigger a release when this crate has user-facing changes.
+release = true
+
+[[package]]
+name = "cascade-engine"
+release = false
+
+[[package]]
+name = "cascade-config"
+release = false
+
+[[package]]
+name = "cascade-expr"
+release = false
+
+[[package]]
+name = "cascade-backend-gdrive"
+release = false
+
+[[package]]
+name = "cascade-backend-local"
+release = false
+
+[[package]]
+name = "cascade-presenter-nfs"
+release = false
+
+[[package]]
+name = "cascade-presenter-fuse"
+release = false
+
+[[package]]
+name = "cascade-p2p"
+release = false

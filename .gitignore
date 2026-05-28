@@ -3,3 +3,7 @@
 !CLAUDE.md
 !.githooks/
 /target/
+# Build artefacts
+*.d
+*.o
+.worktrees/
