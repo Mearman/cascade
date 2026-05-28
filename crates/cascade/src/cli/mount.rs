@@ -23,9 +23,7 @@ pub async fn start(mount_point: Option<&str>) -> Result<()> {
 
     // Create backends from config.
     if main_config.backends.is_empty() {
-        anyhow::bail!(
-            "No backends configured. Run `cascade init` to set up."
-        );
+        anyhow::bail!("No backends configured. Run `cascade init` to set up.");
     }
 
     let mut backends: Vec<Arc<dyn cascade_engine::backend::Backend>> = Vec::new();
@@ -86,6 +84,9 @@ pub async fn start(mount_point: Option<&str>) -> Result<()> {
     // Mount NFS via OS mount command.
     mount_nfs(&mount_path, nfs_port)?;
 
+    let pid_path = config_dir.join("cascade.pid");
+    std::fs::write(&pid_path, std::process::id().to_string())?;
+
     println!("Cascade started.");
     println!("  Mount point: {}", mount_path.display());
     println!("  NFS port: {nfs_port}");
@@ -105,15 +106,66 @@ pub async fn start(mount_point: Option<&str>) -> Result<()> {
     handle.sync_handle.abort();
     handle.cache_handle.abort();
 
+    let _ = std::fs::remove_file(&pid_path);
+
     tracing::info!("Cascade stopped.");
     Ok(())
 }
 
 /// Stop the Cascade daemon.
-pub fn stop() {
-    // Phase 1: find the running process and signal it.
-    // For now, the user runs Ctrl+C on the foreground process.
+pub fn stop() -> anyhow::Result<()> {
+    let config_dir = dirs::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from(".cascade"))
+        .join("cascade");
+    let pid_path = config_dir.join("cascade.pid");
+
+    if !pid_path.exists() {
+        println!("Cascade is not running.");
+        return Ok(());
+    }
+
+    let raw = std::fs::read_to_string(&pid_path)
+        .with_context(|| format!("failed to read {}", pid_path.display()))?;
+    let pid_u32: u32 = raw
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid PID in {}: {:?}", pid_path.display(), raw.trim()))?;
+    let pid_signed =
+        i32::try_from(pid_u32).with_context(|| format!("PID {pid_u32} overflows i32"))?;
+    let pid = nix::unistd::Pid::from_raw(pid_signed);
+
+    match nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM) {
+        Ok(()) => {}
+        Err(nix::errno::Errno::ESRCH) => {
+            // Process no longer exists — clean up stale PID file.
+            let _ = std::fs::remove_file(&pid_path);
+            println!("Cascade is not running.");
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "failed to send SIGTERM to PID {pid_u32}: {e}"
+            ));
+        }
+    }
+
+    // Wait up to 5 seconds for the process to exit (10 × 500 ms polls).
+    let mut exited = false;
+    for _ in 0..10 {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if nix::sys::signal::kill(pid, None) == Err(nix::errno::Errno::ESRCH) {
+            exited = true;
+            break;
+        }
+    }
+
+    if !exited {
+        eprintln!("Warning: process {pid_u32} did not exit within 5 seconds after SIGTERM.");
+    }
+
+    let _ = std::fs::remove_file(&pid_path);
     println!("Cascade stopped.");
+    Ok(())
 }
 
 /// Instantiate a backend by type, using its per-backend TOML config.

@@ -147,12 +147,9 @@ impl Cli {
         match self.command {
             Commands::Init => init::run(),
             Commands::Start { mount_point } => mount::start(mount_point.as_deref()).await,
-            Commands::Stop => {
-                mount::stop();
-                Ok(())
-            }
+            Commands::Stop => mount::stop(),
             Commands::Restart => {
-                mount::stop();
+                mount::stop()?;
                 mount::start(None).await
             }
             Commands::Status => status::show(),

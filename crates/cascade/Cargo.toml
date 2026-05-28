@@ -25,6 +25,7 @@ toml.workspace = true
 shellexpand = "3"
 dirs = "6"
 reqwest.workspace = true
+nix = { workspace = true }
 
 [dev-dependencies]
 cascade-p2p = { path = "../p2p" }
