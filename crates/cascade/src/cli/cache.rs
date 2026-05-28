@@ -134,21 +134,113 @@ pub fn backend_add(backend_type: &str, name: Option<&str>, mount_path: Option<&s
         anyhow::bail!("Backend '{backend_name}' already exists. Remove it first.");
     }
 
-    // Write minimal config with the backend type.
-    let mut config = toml::Table::new();
-    config.insert(
-        "type".to_string(),
-        toml::Value::String(backend_type.to_string()),
-    );
-    if let Some(mp) = mount_path {
-        config.insert(
-            "mount_path".to_string(),
-            toml::Value::String(mp.to_string()),
-        );
-    }
+    // Collect type-specific credentials and write the full config file.
+    match backend_type {
+        "s3" => {
+            println!("\nS3 configuration:");
 
-    let config_str = toml::to_string_pretty(&config)?;
-    std::fs::write(&config_path, &config_str)?;
+            let endpoint = read_input("Endpoint URL (e.g. https://s3.amazonaws.com)")?;
+            if endpoint.is_empty() {
+                anyhow::bail!("endpoint is required");
+            }
+
+            let bucket = read_input("Bucket name")?;
+            if bucket.is_empty() {
+                anyhow::bail!("bucket is required");
+            }
+
+            let region_input = read_input("Region (e.g. us-east-1)")?;
+            let region = if region_input.is_empty() {
+                "us-east-1".to_string()
+            } else {
+                region_input
+            };
+
+            let access_key_id = read_input("Access key ID")?;
+            if access_key_id.is_empty() {
+                anyhow::bail!("access_key_id is required");
+            }
+
+            let secret_access_key = read_input("Secret access key")?;
+            if secret_access_key.is_empty() {
+                anyhow::bail!("secret_access_key is required");
+            }
+
+            let mut full_config = toml::Table::new();
+            full_config.insert(
+                "type".to_string(),
+                toml::Value::String(backend_type.to_string()),
+            );
+            if let Some(mp) = mount_path {
+                full_config.insert(
+                    "mount_path".to_string(),
+                    toml::Value::String(mp.to_string()),
+                );
+            }
+            full_config.insert("endpoint".to_string(), toml::Value::String(endpoint));
+            full_config.insert("bucket".to_string(), toml::Value::String(bucket));
+            full_config.insert("region".to_string(), toml::Value::String(region));
+            full_config.insert(
+                "access_key_id".to_string(),
+                toml::Value::String(access_key_id),
+            );
+            full_config.insert(
+                "secret_access_key".to_string(),
+                toml::Value::String(secret_access_key),
+            );
+            let config_str = toml::to_string_pretty(&full_config)?;
+            std::fs::write(&config_path, &config_str)?;
+        }
+        "gdrive" => {
+            println!("\nGoogle Drive requires OAuth credentials (client_id and client_secret).");
+            println!("You can set these up at https://console.cloud.google.com/");
+
+            let client_id = read_input("Client ID")?;
+            if client_id.is_empty() {
+                anyhow::bail!("client_id is required");
+            }
+
+            let client_secret = read_input("Client secret")?;
+            if client_secret.is_empty() {
+                anyhow::bail!("client_secret is required");
+            }
+
+            let mut full_config = toml::Table::new();
+            full_config.insert(
+                "type".to_string(),
+                toml::Value::String("gdrive".to_string()),
+            );
+            if let Some(mp) = mount_path {
+                full_config.insert(
+                    "mount_path".to_string(),
+                    toml::Value::String(mp.to_string()),
+                );
+            }
+            full_config.insert("client_id".to_string(), toml::Value::String(client_id));
+            full_config.insert(
+                "client_secret".to_string(),
+                toml::Value::String(client_secret),
+            );
+            let config_str = toml::to_string_pretty(&full_config)?;
+            std::fs::write(&config_path, &config_str)?;
+        }
+        _ => {
+            // Write minimal config with the backend type.
+            let mut config = toml::Table::new();
+            config.insert(
+                "type".to_string(),
+                toml::Value::String(backend_type.to_string()),
+            );
+            if let Some(mp) = mount_path {
+                config.insert(
+                    "mount_path".to_string(),
+                    toml::Value::String(mp.to_string()),
+                );
+            }
+            let config_str = toml::to_string_pretty(&config)?;
+            std::fs::write(&config_path, &config_str)?;
+        }
+    }
 
     // Register in the state DB.
     let db = open_db()?;
@@ -166,17 +258,27 @@ pub fn backend_add(backend_type: &str, name: Option<&str>, mount_path: Option<&s
     }
     println!("  Config: {}", config_path.display());
 
-    // Type-specific instructions.
+    // Type-specific follow-up instructions.
     match backend_type {
         "gdrive" => {
             println!("\nRun `cascade backend auth {backend_name}` to authenticate.");
         }
+        "s3" => {}
         _ => {
             println!("\nEdit {} to add credentials.", config_path.display());
         }
     }
 
     Ok(())
+}
+
+fn read_input(prompt: &str) -> Result<String> {
+    use std::io::Write as _;
+    print!("{prompt}: ");
+    std::io::stdout().flush()?;
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    Ok(input.trim().to_string())
 }
 
 /// Remove a backend configuration.
