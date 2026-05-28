@@ -69,6 +69,7 @@ pub fn pin_list() -> Result<()> {
 }
 
 /// Show cache status.
+#[allow(clippy::cast_precision_loss)]
 pub fn cache_status() -> Result<()> {
     let db = open_db()?;
     let db = Arc::new(db);

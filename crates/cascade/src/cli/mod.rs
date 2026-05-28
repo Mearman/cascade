@@ -139,12 +139,15 @@ impl Cli {
         match self.command {
             Commands::Init => init::run(),
             Commands::Start { mount_point } => mount::start(mount_point.as_deref()).await,
-            Commands::Stop => mount::stop().await,
+            Commands::Stop => {
+                mount::stop();
+                Ok(())
+            }
             Commands::Restart => {
-                mount::stop().await?;
+                mount::stop();
                 mount::start(None).await
             }
-            Commands::Status => status::show().await,
+            Commands::Status => status::show(),
             Commands::Pin { path } => cache::pin(&path),
             Commands::Unpin { path } => cache::unpin(&path),
             Commands::PinList => cache::pin_list(),
@@ -160,9 +163,9 @@ impl Cli {
                     Ok(())
                 }
             },
-            Commands::ConfigShow { path } => config::show(&path).await,
-            Commands::ConfigValidate => config::validate().await,
-            Commands::BackendList => status::backend_list().await,
+            Commands::ConfigShow { path } => config::show(&path),
+            Commands::ConfigValidate => config::validate(),
+            Commands::BackendList => status::backend_list(),
             Commands::BackendAdd {
                 backend_type,
                 name,

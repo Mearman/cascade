@@ -3,7 +3,7 @@ use cascade_engine::db::StateDb;
 use std::path::PathBuf;
 
 /// Show overall mount status.
-pub async fn show() -> Result<()> {
+pub fn show() -> Result<()> {
     let config_dir = dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from(".cascade"))
         .join("cascade");
@@ -14,7 +14,7 @@ pub async fn show() -> Result<()> {
 
     if !running {
         println!("Cascade is not running.");
-        println!("  State database not found at {db_path:?}");
+        println!("  State database not found at {}", db_path.display());
         return Ok(());
     }
 
@@ -23,7 +23,7 @@ pub async fn show() -> Result<()> {
 
     println!("Cascade Status");
     println!("  Running: true");
-    println!("  State DB: {db_path:?}");
+    println!("  State DB: {}", db_path.display());
 
     if backends.is_empty() {
         println!("  No backends registered.");
@@ -51,7 +51,7 @@ pub async fn show() -> Result<()> {
 }
 
 /// List configured backends.
-pub async fn backend_list() -> Result<()> {
+pub fn backend_list() -> Result<()> {
     let config_dir = dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from(".cascade"))
         .join("cascade");

@@ -61,7 +61,9 @@ pub fn run() -> Result<()> {
     if choice_idx == 0 || choice_idx > BACKEND_TYPES.len() {
         anyhow::bail!("selection out of range");
     }
-    let (backend_type, _backend_display_name) = BACKEND_TYPES[choice_idx - 1];
+    let &(backend_type, _backend_display_name) = BACKEND_TYPES
+        .get(choice_idx - 1)
+        .ok_or_else(|| anyhow::anyhow!("selection out of range"))?;
     println!();
 
     // Step 2: Name the backend.
@@ -75,13 +77,14 @@ pub fn run() -> Result<()> {
     println!();
 
     // Step 3: Provider-specific setup.
-    let mut account = None;
-    if backend_type == "gdrive" {
+    let account = if backend_type == "gdrive" {
         println!("Google Drive authentication required.");
         println!("Run `cascade backend auth {name}` after init to complete OAuth setup.");
         println!();
-        account = Some(name.clone());
-    }
+        Some(name.clone())
+    } else {
+        None
+    };
 
     // Step 4: Mount point.
     let default_mount = dirs::home_dir()

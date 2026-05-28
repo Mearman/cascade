@@ -23,11 +23,14 @@ pub async fn start(mount_point: Option<&str>) -> Result<()> {
     let backend: Arc<dyn cascade_engine::backend::Backend> = Arc::from(backend);
 
     // Resolve mount point.
-    let mount_path = mount_point.map(resolve_mount_path).unwrap_or_else(|| {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join("Cloud")
-    });
+    let mount_path = mount_point.map_or_else(
+        || {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .join("Cloud")
+        },
+        resolve_mount_path,
+    );
 
     std::fs::create_dir_all(&mount_path)?;
 
@@ -41,7 +44,7 @@ pub async fn start(mount_point: Option<&str>) -> Result<()> {
         p2p_data_dir: None,
     };
     let engine = Engine::new(engine_config).await?;
-    let handle = engine.start().await?;
+    let handle = engine.start()?;
 
     // Create presenter using engine's VFS.
     let presenter = Arc::new(cascade_presenter_nfs::NfsPresenter::with_vfs(
@@ -51,7 +54,7 @@ pub async fn start(mount_point: Option<&str>) -> Result<()> {
 
     // Start NFS server on loopback, sharing the presenter's context.
     let server_config = NfsServerConfig {
-        bind_addr: "127.0.0.1:0".parse().unwrap(),
+        bind_addr: "127.0.0.1:0".parse()?,
         export_path: "/".to_string(),
     };
     let nfs_ctx = presenter.context().clone();
@@ -76,8 +79,8 @@ pub async fn start(mount_point: Option<&str>) -> Result<()> {
 
     // Clean up.
     unmount_nfs(&mount_path)?;
-    server.stop().await?;
-    engine.shutdown().await?;
+    server.stop()?;
+    engine.shutdown();
     handle.sync_handle.abort();
     handle.cache_handle.abort();
 
@@ -86,11 +89,10 @@ pub async fn start(mount_point: Option<&str>) -> Result<()> {
 }
 
 /// Stop the Cascade daemon.
-pub async fn stop() -> Result<()> {
+pub fn stop() {
     // Phase 1: find the running process and signal it.
     // For now, the user runs Ctrl+C on the foreground process.
     println!("Cascade stopped.");
-    Ok(())
 }
 
 /// Resolve a mount point path, expanding ~ and environment variables.

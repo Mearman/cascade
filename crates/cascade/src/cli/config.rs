@@ -3,7 +3,7 @@ use cascade_config::merge;
 use std::path::Path;
 
 /// Show the resolved .cascade config for a directory.
-pub async fn show(path: &str) -> Result<()> {
+pub fn show(path: &str) -> Result<()> {
     let dir = Path::new(path);
     if !dir.exists() {
         anyhow::bail!("directory does not exist: {path}");
@@ -48,10 +48,10 @@ pub async fn show(path: &str) -> Result<()> {
 }
 
 /// Validate all .cascade files in the current tree.
-pub async fn validate() -> Result<()> {
+pub fn validate() -> Result<()> {
     let current = std::env::current_dir()?;
 
-    println!("Validating .cascade files under: {current:?}");
+    println!("Validating .cascade files under: {}", current.display());
 
     walk_and_validate(&current)?;
 
@@ -63,10 +63,10 @@ fn walk_and_validate(dir: &Path) -> Result<()> {
     if let Some(config) = cascade_config::parse::load_dir(dir) {
         for rule in &config.ignore {
             if rule.pattern.is_empty() {
-                anyhow::bail!("empty ignore pattern in {:?}", dir.join(".cascade"));
+                anyhow::bail!("empty ignore pattern in {}", dir.join(".cascade").display());
             }
         }
-        println!("  OK: {dir:?}");
+        println!("  OK: {}", dir.display());
     }
 
     if let Ok(entries) = std::fs::read_dir(dir) {
