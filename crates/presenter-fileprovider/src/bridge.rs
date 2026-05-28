@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::{Context, Result, bail};
-use cascade_engine::protocol::{Request, Response, encode_message};
+#[cfg(target_os = "macos")]
+use cascade_engine::protocol::encode_message;
+use cascade_engine::protocol::{Request, Response};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
