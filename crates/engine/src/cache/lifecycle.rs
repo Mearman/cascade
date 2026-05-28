@@ -22,7 +22,7 @@ impl<'a> LifecycleEvaluator<'a> {
     ///
     /// Policies are checked in priority order (highest first). The first matching
     /// policy determines the outcome. If no policy matches, the file is not evicted.
-    pub fn should_evict(&self, file: &FileEntry, path: &Path) -> EvictionDecision {
+    #[must_use] pub fn should_evict(&self, file: &FileEntry, path: &Path) -> EvictionDecision {
         let path_str = path.to_string_lossy();
         let _now_ts = chrono::Utc::now().timestamp();
 
@@ -84,7 +84,7 @@ impl<'a> LifecycleEvaluator<'a> {
     }
 
     /// Return the current list of policies.
-    pub fn policies(&self) -> &[LifecyclePolicyRecord] {
+    #[must_use] pub fn policies(&self) -> &[LifecyclePolicyRecord] {
         &self.policies
     }
 }
@@ -125,7 +125,7 @@ fn path_matches_policy(pattern: &str, path: &str) -> bool {
     if pattern.contains('*') {
         return simple_star_match(pattern, path);
     }
-    path == pattern || path.starts_with(&format!("{}/", pattern))
+    path == pattern || path.starts_with(&format!("{pattern}/"))
 }
 
 fn simple_star_match(pattern: &str, path: &str) -> bool {

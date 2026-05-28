@@ -18,7 +18,7 @@ impl<'a> PinMatcher<'a> {
     }
 
     /// Check if a path matches any pin rule.
-    pub fn is_pinned(&self, path: &Path) -> bool {
+    #[must_use] pub fn is_pinned(&self, path: &Path) -> bool {
         let path_str = path.to_string_lossy();
         self.rules.iter().any(|rule| {
             if rule.recursive {
@@ -50,7 +50,7 @@ impl<'a> PinMatcher<'a> {
     }
 
     /// Return the current list of rules.
-    pub fn rules(&self) -> &[PinRuleRecord] {
+    #[must_use] pub fn rules(&self) -> &[PinRuleRecord] {
         &self.rules
     }
 }

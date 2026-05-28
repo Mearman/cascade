@@ -1,14 +1,14 @@
 pub mod schema;
 
 use crate::db::schema::SchemaVersion;
-use crate::types::*;
+use crate::types::{FileEntry, ItemId, CacheState, Cursor};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 use std::path::Path;
 use std::sync::Mutex;
 
-/// SQLite state database. Stores file metadata, backend config,
+/// `SQLite` state database. Stores file metadata, backend config,
 /// pin rules, lifecycle policies, config cache, sync cursors, and P2P state.
 pub struct StateDb {
     conn: Mutex<Connection>,
@@ -51,7 +51,7 @@ impl StateDb {
         let conn = self
             .conn
             .lock()
-            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
 
         let current_version = Self::get_version(&conn)?;
         let target_version = SchemaVersion::current();
@@ -94,7 +94,7 @@ impl StateDb {
         let conn = self
             .conn
             .lock()
-            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
         conn.execute(
             "INSERT OR REPLACE INTO files (
                 id, backend_id, path, parent_id, name, is_dir, size,
@@ -123,7 +123,7 @@ impl StateDb {
         let conn = self
             .conn
             .lock()
-            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
         let mut stmt = conn.prepare(
             "SELECT id, parent_id, name, is_dir, size, mime_type, mod_time, remote_hash
              FROM files WHERE id = ?1",
@@ -156,7 +156,7 @@ impl StateDb {
         let conn = self
             .conn
             .lock()
-            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
         conn.execute("DELETE FROM files WHERE id = ?1", [&id.0])?;
         Ok(())
     }
@@ -166,7 +166,7 @@ impl StateDb {
         let conn = self
             .conn
             .lock()
-            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
         let now = chrono::Utc::now().timestamp();
         conn.execute(
             "UPDATE files SET cache_state = ?1, last_access = ?2 WHERE id = ?3",
@@ -180,7 +180,7 @@ impl StateDb {
         let conn = self
             .conn
             .lock()
-            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
         let result: Option<String> = conn
             .query_row(
                 "SELECT cache_state FROM files WHERE id = ?1",
@@ -202,7 +202,7 @@ impl StateDb {
         let conn = self
             .conn
             .lock()
-            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
         conn.execute(
             "INSERT OR REPLACE INTO sync_cursors (backend_id, cursor) VALUES (?1, ?2)",
             (backend_id, &cursor.0),
@@ -215,7 +215,7 @@ impl StateDb {
         let conn = self
             .conn
             .lock()
-            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
         let result = conn
             .query_row(
                 "SELECT cursor FROM sync_cursors WHERE backend_id = ?1",
@@ -240,7 +240,7 @@ impl StateDb {
         let conn = self
             .conn
             .lock()
-            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
         conn.execute(
             "INSERT OR REPLACE INTO backends (id, backend_type, display_name, mount_path, config)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -254,7 +254,7 @@ impl StateDb {
         let conn = self
             .conn
             .lock()
-            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
         let mut stmt = conn
             .prepare("SELECT id, backend_type, display_name, mount_path, config FROM backends")?;
 
@@ -285,7 +285,7 @@ impl StateDb {
         let conn = self
             .conn
             .lock()
-            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
         conn.execute(
             "INSERT OR REPLACE INTO pin_rules (path_glob, recursive, conditions) VALUES (?1, ?2, ?3)",
             (path_glob, recursive, conditions),
@@ -298,7 +298,7 @@ impl StateDb {
         let conn = self
             .conn
             .lock()
-            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
         let rows = conn.execute("DELETE FROM pin_rules WHERE path_glob = ?1", [path_glob])?;
         Ok(rows > 0)
     }
@@ -308,7 +308,7 @@ impl StateDb {
         let conn = self
             .conn
             .lock()
-            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
         let mut stmt =
             conn.prepare("SELECT id, path_glob, recursive, conditions FROM pin_rules")?;
         let rules = stmt
@@ -338,7 +338,7 @@ impl StateDb {
         let conn = self
             .conn
             .lock()
-            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
         conn.execute(
             "INSERT INTO lifecycle_policies (path_glob, max_age, max_file_size, priority, conditions)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -352,7 +352,7 @@ impl StateDb {
         let conn = self
             .conn
             .lock()
-            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
         let mut stmt = conn.prepare(
             "SELECT id, path_glob, max_age, max_file_size, priority, conditions
              FROM lifecycle_policies ORDER BY priority DESC",
@@ -377,7 +377,7 @@ impl StateDb {
         let conn = self
             .conn
             .lock()
-            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
         let rows = conn.execute("DELETE FROM lifecycle_policies WHERE id = ?1", [id])?;
         Ok(rows > 0)
     }
@@ -389,7 +389,7 @@ impl StateDb {
         let conn = self
             .conn
             .lock()
-            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
         let mut stmt = conn.prepare(
             "SELECT id, parent_id, name, is_dir, size, mime_type, mod_time, remote_hash
              FROM files WHERE cache_state = ?1",
@@ -418,7 +418,7 @@ impl StateDb {
         let conn = self
             .conn
             .lock()
-            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
         let size: i64 = conn
             .query_row(
                 "SELECT COALESCE(SUM(size), 0) FROM files WHERE cache_state IN ('cached', 'pinned')",
@@ -429,12 +429,12 @@ impl StateDb {
         Ok(size)
     }
 
-    /// Find eviction candidates: cached (not pinned) files ordered by last_access ascending (LRU).
+    /// Find eviction candidates: cached (not pinned) files ordered by `last_access` ascending (LRU).
     pub fn eviction_candidates(&self, limit: usize) -> Result<Vec<FileEntry>> {
         let conn = self
             .conn
             .lock()
-            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
         let mut stmt = conn.prepare(
             "SELECT id, parent_id, name, is_dir, size, mime_type, mod_time, remote_hash
              FROM files
@@ -469,7 +469,7 @@ impl StateDb {
         let conn = self
             .conn
             .lock()
-            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
         // Remove any previous index for this file.
         conn.execute(
             "DELETE FROM p2p_block_index WHERE file_id = ?1",
@@ -489,7 +489,7 @@ impl StateDb {
         let conn = self
             .conn
             .lock()
-            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
         let mut stmt = conn.prepare(
             "SELECT block_hash FROM p2p_block_index WHERE file_id = ?1 ORDER BY block_index ASC",
         )?;
@@ -514,7 +514,7 @@ impl StateDb {
         let conn = self
             .conn
             .lock()
-            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
         conn.execute(
             "INSERT OR REPLACE INTO p2p_peers (device_id, addresses, last_seen, online) VALUES (?1, ?2, ?3, TRUE)",
             (device_id, address, last_seen.timestamp()),
@@ -527,7 +527,7 @@ impl StateDb {
         let conn = self
             .conn
             .lock()
-            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
         let mut stmt =
             conn.prepare("SELECT device_id, name, addresses, last_seen, online FROM p2p_peers")?;
         let peers = stmt

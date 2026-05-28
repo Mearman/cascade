@@ -152,11 +152,11 @@ impl Cli {
                 CacheCommands::Status => cache::cache_status(),
                 CacheCommands::Evict { all } => cache::evict(all),
                 CacheCommands::Warm { path } => {
-                    println!("Cache warming: {}", path);
+                    println!("Cache warming: {path}");
                     Ok(())
                 }
                 CacheCommands::Clear { path } => {
-                    println!("Cache cleared: {}", path);
+                    println!("Cache cleared: {path}");
                     Ok(())
                 }
             },

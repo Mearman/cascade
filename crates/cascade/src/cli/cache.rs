@@ -81,10 +81,10 @@ pub fn cache_status() -> Result<()> {
     println!("  Pinned:  {} files", stats.pinned_count);
 
     let total_mb = stats.total_bytes as f64 / (1024.0 * 1024.0);
-    print!("  Total:   {:.1} MB", total_mb);
+    print!("  Total:   {total_mb:.1} MB");
     if let Some(max) = stats.max_bytes {
         let max_mb = max as f64 / (1024.0 * 1024.0);
-        println!(" / {:.1} MB limit", max_mb);
+        println!(" / {max_mb:.1} MB limit");
     } else {
         println!();
     }

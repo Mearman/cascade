@@ -11,9 +11,9 @@ pub const ROOT_INODE: u64 = 1;
 
 /// Bidirectional map between VFS `ItemId` and FUSE inode numbers.
 pub struct InodeMap {
-    /// ItemId → inode number.
+    /// `ItemId` → inode number.
     id_to_inode: HashMap<ItemId, u64>,
-    /// Inode number → ItemId.
+    /// Inode number → `ItemId`.
     inode_to_id: HashMap<u64, ItemId>,
     /// Next available inode number.
     next_inode: u64,
@@ -21,7 +21,7 @@ pub struct InodeMap {
 
 impl InodeMap {
     /// Create a new inode map with the root entry pre-allocated at inode 1.
-    pub fn new(root_id: ItemId) -> Self {
+    #[must_use] pub fn new(root_id: ItemId) -> Self {
         let mut map = Self {
             id_to_inode: HashMap::new(),
             inode_to_id: HashMap::new(),
@@ -32,7 +32,7 @@ impl InodeMap {
         map
     }
 
-    /// Allocate an inode for the given ItemId. If one already exists, returns it.
+    /// Allocate an inode for the given `ItemId`. If one already exists, returns it.
     pub fn allocate(&mut self, id: ItemId) -> u64 {
         if let Some(&inode) = self.id_to_inode.get(&id) {
             return inode;
@@ -44,17 +44,17 @@ impl InodeMap {
         inode
     }
 
-    /// Look up the inode number for an ItemId.
-    pub fn get_inode(&self, id: &ItemId) -> Option<u64> {
+    /// Look up the inode number for an `ItemId`.
+    #[must_use] pub fn get_inode(&self, id: &ItemId) -> Option<u64> {
         self.id_to_inode.get(id).copied()
     }
 
-    /// Look up the ItemId for an inode number.
-    pub fn get_id(&self, inode: u64) -> Option<&ItemId> {
+    /// Look up the `ItemId` for an inode number.
+    #[must_use] pub fn get_id(&self, inode: u64) -> Option<&ItemId> {
         self.inode_to_id.get(&inode)
     }
 
-    /// Remove an ItemId and its associated inode from the map.
+    /// Remove an `ItemId` and its associated inode from the map.
     pub fn remove(&mut self, id: &ItemId) {
         if let Some(inode) = self.id_to_inode.remove(id) {
             self.inode_to_id.remove(&inode);
@@ -62,12 +62,12 @@ impl InodeMap {
     }
 
     /// Number of mapped entries.
-    pub fn len(&self) -> usize {
+    #[must_use] pub fn len(&self) -> usize {
         self.id_to_inode.len()
     }
 
     /// Whether the map is empty (it never is — root is always present).
-    pub fn is_empty(&self) -> bool {
+    #[must_use] pub fn is_empty(&self) -> bool {
         self.id_to_inode.is_empty()
     }
 }

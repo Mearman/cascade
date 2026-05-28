@@ -1,11 +1,11 @@
-use crate::types::*;
+use crate::types::{VfsItem, ItemId, CacheState};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::path::Path;
 
 /// Platform-agnostic interface for presenting the VFS to the OS.
 /// Compile-time selection: File Provider on macOS, FUSE on Linux,
-/// WinFSP on Windows, NFS as universal fallback.
+/// `WinFSP` on Windows, NFS as universal fallback.
 #[async_trait]
 pub trait VfsPresenter: Send + Sync {
     /// A file was added or updated in the VFS.

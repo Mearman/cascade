@@ -136,7 +136,7 @@ impl LocalBackend {
         }
     }
 
-    /// Convert a FileState into a FileEntry.
+    /// Convert a `FileState` into a `FileEntry`.
     fn state_to_entry(&self, state: &FileState, is_dir: bool) -> FileEntry {
         let path = Path::new(&state.path);
         let parent_relative = path.parent().unwrap_or(Path::new(""));
@@ -169,7 +169,7 @@ impl LocalBackend {
         entry
     }
 
-    /// Build a FileEntry for a directory at the given relative path.
+    /// Build a `FileEntry` for a directory at the given relative path.
     fn dir_entry(&self, relative_path: &str) -> FileEntry {
         let path = Path::new(relative_path);
         let parent_relative = path.parent().unwrap_or(Path::new(""));

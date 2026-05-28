@@ -1,6 +1,6 @@
-//! NFS presenter — NFSv3 server on loopback.
+//! NFS presenter — `NFSv3` server on loopback.
 //!
-//! Implements the engine's `VfsPresenter` trait, serving files via NFSv3
+//! Implements the engine's `VfsPresenter` trait, serving files via `NFSv3`
 //! to the OS NFS client.
 
 pub mod nfs;
@@ -17,7 +17,7 @@ use nfs::xdr::NfsFh3;
 /// Directory used for cached file contents.
 const CACHE_DIR_NAME: &str = "cascade/cache";
 
-/// NFS presenter using an NFSv3 server on loopback.
+/// NFS presenter using an `NFSv3` server on loopback.
 pub struct NfsPresenter {
     #[allow(dead_code)] // Used for mount/unmount commands
     mount_point: PathBuf,
@@ -45,7 +45,7 @@ impl NfsPresenter {
     }
 
     /// Create with default mount point.
-    pub fn default_mount() -> Self {
+    #[must_use] pub fn default_mount() -> Self {
         Self {
             mount_point: PathBuf::from("/mnt/cascade"),
             nfs_port: 0,
@@ -58,13 +58,13 @@ impl NfsPresenter {
         }
     }
 
-    pub fn with_port(mut self, port: u16) -> Self {
+    #[must_use] pub const fn with_port(mut self, port: u16) -> Self {
         self.nfs_port = port;
         self
     }
 
     /// Get a reference to the NFS context (for testing).
-    pub fn context(&self) -> &Arc<NfsContext> {
+    #[must_use] pub const fn context(&self) -> &Arc<NfsContext> {
         &self.context
     }
 
@@ -81,7 +81,7 @@ fn dirs_cache_dir() -> PathBuf {
         .join(CACHE_DIR_NAME)
 }
 
-/// Sanitise an ItemId into a filesystem-safe filename.
+/// Sanitise an `ItemId` into a filesystem-safe filename.
 fn safe_filename(id: &str) -> String {
     id.replace([':', '/', '\\'], "_")
 }
@@ -139,7 +139,7 @@ impl VfsPresenter for NfsPresenter {
             let (backend, relative) = {
                 let vfs = self.context.vfs().read().unwrap();
                 let (backend, relative) = vfs.resolve(std::path::Path::new(&id.0));
-                (Arc::clone(backend), relative.to_path_buf())
+                (Arc::clone(backend), relative)
             };
             // Lock is dropped here, before the await.
             let entry = backend.metadata(&relative).await?;
@@ -190,7 +190,7 @@ impl VfsPresenter for NfsPresenter {
     }
 }
 
-/// Adapter from `tokio::fs::File` (AsyncWrite) to the
+/// Adapter from `tokio::fs::File` (`AsyncWrite`) to the
 /// `dyn AsyncWrite + Unpin + Send` that the Backend trait expects.
 struct WriterAdapter {
     inner: tokio::fs::File,
@@ -222,9 +222,9 @@ impl tokio::io::AsyncWrite for WriterAdapter {
 
 impl Unpin for WriterAdapter {}
 
-/// Build a VFS path string from a VfsItem's id.
+/// Build a VFS path string from a `VfsItem`'s id.
 /// Uses the item's own id as a path key — this matches the convention
-/// where ItemId encodes the backend path.
+/// where `ItemId` encodes the backend path.
 fn format_vfs_path(item: &VfsItem) -> String {
     if item.id.0.starts_with('/') {
         item.id.0.clone()

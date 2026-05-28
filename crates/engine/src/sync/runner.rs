@@ -52,7 +52,7 @@ impl SyncRunner {
     }
 
     /// Attach a P2P bridge for block-level file sharing.
-    pub fn with_p2p(mut self, p2p: P2pBridge) -> Self {
+    #[must_use] pub fn with_p2p(mut self, p2p: P2pBridge) -> Self {
         self.p2p = Some(p2p);
         self
     }
@@ -82,7 +82,7 @@ impl SyncRunner {
         loop {
             let interval = self.effective_poll_interval().await;
             tokio::select! {
-                _ = tokio::time::sleep(interval) => {}
+                () = tokio::time::sleep(interval) => {}
                 _ = self.cancel_rx.changed() => {
                     tracing::info!("sync runner cancelled");
                     return Ok(());

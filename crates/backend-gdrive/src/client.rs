@@ -14,7 +14,7 @@ pub struct RateLimiter {
 }
 
 impl RateLimiter {
-    pub fn new(max_requests_per_100s: u32) -> Self {
+    #[must_use] pub const fn new(max_requests_per_100s: u32) -> Self {
         Self {
             tokens: AtomicU32::new(max_requests_per_100s),
             max_tokens: max_requests_per_100s,
@@ -69,7 +69,7 @@ impl Default for DriveClient {
 }
 
 impl DriveClient {
-    pub fn new() -> Self {
+    #[must_use] pub fn new() -> Self {
         Self::with_urls(
             "https://www.googleapis.com/drive/v3".to_string(),
             "https://www.googleapis.com/upload/drive/v3".to_string(),
@@ -78,7 +78,7 @@ impl DriveClient {
 
     /// Construct a client with custom base URLs — used in integration tests
     /// to point at a mock server instead of the real Drive API.
-    pub fn with_urls(base_url: String, upload_url: String) -> Self {
+    #[must_use] pub fn with_urls(base_url: String, upload_url: String) -> Self {
         Self {
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))

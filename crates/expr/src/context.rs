@@ -31,11 +31,11 @@ pub struct FileContext {
 }
 
 impl FileContext {
-    pub fn age(&self) -> chrono::Duration {
+    #[must_use] pub fn age(&self) -> chrono::Duration {
         Utc::now() - self.modified
     }
 
-    pub fn year(&self) -> i32 {
+    #[must_use] pub fn year(&self) -> i32 {
         self.modified.year()
     }
 }
@@ -58,7 +58,7 @@ pub struct DiskContext {
 }
 
 impl DiskContext {
-    pub fn used_bytes(&self) -> u64 {
+    #[must_use] pub const fn used_bytes(&self) -> u64 {
         self.total_bytes - self.free_bytes
     }
 }
@@ -123,11 +123,11 @@ pub struct TimeContext {
 }
 
 impl TimeContext {
-    pub fn hour(&self) -> u32 {
+    #[must_use] pub fn hour(&self) -> u32 {
         self.now.hour()
     }
 
-    pub fn is_weekday(&self) -> bool {
+    #[must_use] pub fn is_weekday(&self) -> bool {
         use chrono::Datelike;
         self.now.weekday().number_from_monday() <= 5
     }

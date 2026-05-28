@@ -14,7 +14,7 @@ pub async fn show() -> Result<()> {
 
     if !running {
         println!("Cascade is not running.");
-        println!("  State database not found at {:?}", db_path);
+        println!("  State database not found at {db_path:?}");
         return Ok(());
     }
 
@@ -23,7 +23,7 @@ pub async fn show() -> Result<()> {
 
     println!("Cascade Status");
     println!("  Running: true");
-    println!("  State DB: {:?}", db_path);
+    println!("  State DB: {db_path:?}");
 
     if backends.is_empty() {
         println!("  No backends registered.");
@@ -33,15 +33,13 @@ pub async fn show() -> Result<()> {
             let cursor_info = db
                 .get_cursor(&b.id)
                 .ok()
-                .flatten()
-                .map(|c| format!("cursor: {}", c.0))
-                .unwrap_or_else(|| "no cursor".to_string());
+                .flatten().map_or_else(|| "no cursor".to_string(), |c| format!("cursor: {}", c.0));
             println!(
                 "    {} ({}) — {} [{}]",
                 b.display_name, b.backend_type, b.id, cursor_info
             );
             if let Some(mp) = &b.mount_path {
-                println!("      Mount: {}", mp);
+                println!("      Mount: {mp}");
             }
         }
     }
@@ -74,7 +72,7 @@ pub async fn backend_list() -> Result<()> {
         for b in &backends {
             println!("  {} ({}) — {}", b.display_name, b.backend_type, b.id);
             if let Some(mp) = &b.mount_path {
-                println!("    Mount path: {}", mp);
+                println!("    Mount path: {mp}");
             }
         }
     }

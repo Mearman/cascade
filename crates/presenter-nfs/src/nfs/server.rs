@@ -1,4 +1,4 @@
-//! NFSv3 server — TCP listener on loopback with RPC dispatch.
+//! `NFSv3` server — TCP listener on loopback with RPC dispatch.
 //!
 //! Listens for NFS and Mount protocol RPC messages, dispatches to the
 //! appropriate handler, and returns XDR-encoded replies.
@@ -11,7 +11,7 @@ use tokio::net::TcpListener;
 use super::context::NfsContext;
 use super::mount;
 use super::procedures;
-use super::xdr::*;
+use super::xdr::{decode_u32, RPC_REPLY_DENIED, RPC_MSG_CALL, NFS_PROGRAM, NFS_V3, MOUNT_PROGRAM, MOUNT_V3, encode_u32, RPC_MSG_REPLY, RPC_REPLY_ACCEPTED, RPC_AUTH_NONE, RPC_ACCEPT_SUCCESS};
 use std::sync::Arc;
 
 /// NFS server configuration.
@@ -221,7 +221,7 @@ fn make_rpc_error(xid: u32, reject_stat: u32) -> Vec<u8> {
     reply
 }
 
-/// Skip the RPC opaque_auth (flavor + length + body).
+/// Skip the RPC `opaque_auth` (flavor + length + body).
 /// Returns the rest of the message after auth and the absolute offset where args begin.
 fn skip_auth(data: &[u8]) -> Option<(&[u8], usize)> {
     let (_flavor, rest) = decode_u32(data).ok()?;

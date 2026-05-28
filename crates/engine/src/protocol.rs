@@ -22,7 +22,7 @@ pub struct Response {
 }
 
 impl Response {
-    pub fn ok(id: u32, result: serde_json::Value) -> Self {
+    #[must_use] pub const fn ok(id: u32, result: serde_json::Value) -> Self {
         Self {
             id,
             result: Some(result),
@@ -78,7 +78,7 @@ pub fn encode_message(msg: &impl Serialize) -> anyhow::Result<Vec<u8>> {
 }
 
 /// Decode a length-prefixed message from a buffer.
-/// Returns (consumed_bytes, decoded_value) or None if incomplete.
+/// Returns (`consumed_bytes`, `decoded_value`) or None if incomplete.
 pub fn decode_message<T: for<'de> Deserialize<'de>>(
     buf: &[u8],
 ) -> anyhow::Result<Option<(usize, T)>> {

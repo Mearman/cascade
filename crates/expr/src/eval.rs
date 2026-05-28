@@ -13,7 +13,7 @@ pub fn parse_expr(input: &str) -> anyhow::Result<Expr> {
 }
 
 /// Evaluate an expression against a context.
-pub fn evaluate(expr: &Expr, ctx: &EvalContext) -> bool {
+#[must_use] pub fn evaluate(expr: &Expr, ctx: &EvalContext) -> bool {
     match expr {
         Expr::Or(exprs) => exprs.iter().any(|e| evaluate(e, ctx)),
         Expr::And(exprs) => exprs.iter().all(|e| evaluate(e, ctx)),
@@ -48,7 +48,7 @@ fn resolve_identifier(id: &str, ctx: &EvalContext) -> Value {
         "FILE.mime" => Value::String(ctx.file.mime.clone()),
         "FILE.ext" => Value::String(ctx.file.ext.clone()),
         "FILE.name" => Value::String(ctx.file.name.clone()),
-        "FILE.year" => Value::Integer(ctx.file.year() as i64),
+        "FILE.year" => Value::Integer(i64::from(ctx.file.year())),
         "FILE.shared" => Value::Boolean(ctx.file.shared),
         "FILE.starred" => Value::Boolean(ctx.file.starred),
         "FILE.dirty" => Value::Boolean(ctx.file.dirty),
@@ -72,13 +72,13 @@ fn resolve_identifier(id: &str, ctx: &EvalContext) -> Value {
 
         // Power context
         "POWER.source" => Value::String(ctx.power.source.to_string()),
-        "POWER.battery" => Value::Integer(ctx.power.battery_pct.map(|p| p as i64).unwrap_or(0)),
+        "POWER.battery" => Value::Integer(ctx.power.battery_pct.map_or(0, |p| p as i64)),
 
         // Time context
-        "TIME.hour" => Value::Integer(ctx.time.hour() as i64),
+        "TIME.hour" => Value::Integer(i64::from(ctx.time.hour())),
         "TIME.day" => {
             use chrono::Datelike;
-            Value::Integer(ctx.time.now.weekday().number_from_monday() as i64)
+            Value::Integer(i64::from(ctx.time.now.weekday().number_from_monday()))
         }
 
         // Peer context
@@ -95,10 +95,10 @@ fn compare(left: &Value, op: &Operator, right: &Value) -> bool {
     match op {
         Operator::Eq => value_eq(left, right),
         Operator::Ne => !value_eq(left, right),
-        Operator::Lt => value_ord(left, right).map(|o| o.is_lt()).unwrap_or(false),
-        Operator::Le => value_ord(left, right).map(|o| o.is_le()).unwrap_or(false),
-        Operator::Gt => value_ord(left, right).map(|o| o.is_gt()).unwrap_or(false),
-        Operator::Ge => value_ord(left, right).map(|o| o.is_ge()).unwrap_or(false),
+        Operator::Lt => value_ord(left, right).is_some_and(std::cmp::Ordering::is_lt),
+        Operator::Le => value_ord(left, right).is_some_and(std::cmp::Ordering::is_le),
+        Operator::Gt => value_ord(left, right).is_some_and(std::cmp::Ordering::is_gt),
+        Operator::Ge => value_ord(left, right).is_some_and(std::cmp::Ordering::is_ge),
         Operator::Matches => string_matches(left, right),
         Operator::Contains => string_contains(left, right),
         Operator::In => value_in(left, right),
@@ -200,7 +200,7 @@ fn string_contains(haystack: &Value, needle: &Value) -> bool {
     }
 }
 
-fn value_in(_item: &Value, _collection: &Value) -> bool {
+const fn value_in(_item: &Value, _collection: &Value) -> bool {
     // Placeholder — would check list membership
     false
 }

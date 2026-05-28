@@ -25,7 +25,7 @@ use crate::vfs::VfsTree;
 
 /// Configuration for creating an Engine instance.
 pub struct EngineConfig {
-    /// Path to the SQLite state database file.
+    /// Path to the `SQLite` state database file.
     pub db_path: PathBuf,
     /// Mount point for the VFS.
     pub mount_point: PathBuf,
@@ -193,7 +193,7 @@ impl Engine {
     }
 
     /// Get engine status — running state, mounted backends, cache stats.
-    pub fn status(&self) -> EngineStatus {
+    #[must_use] pub fn status(&self) -> EngineStatus {
         let backends = self
             .db
             .list_backends()
@@ -228,12 +228,12 @@ impl Engine {
     }
 
     /// Get the VFS tree (for presenters to use).
-    pub fn vfs(&self) -> &Arc<RwLock<VfsTree>> {
+    #[must_use] pub const fn vfs(&self) -> &Arc<RwLock<VfsTree>> {
         &self.vfs
     }
 
     /// Get the state database (for presenters to use).
-    pub fn db(&self) -> &Arc<StateDb> {
+    #[must_use] pub const fn db(&self) -> &Arc<StateDb> {
         &self.db
     }
 }

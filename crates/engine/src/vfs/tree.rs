@@ -1,4 +1,4 @@
-//! VfsTree — composes multiple backends with longest-prefix routing.
+//! `VfsTree` — composes multiple backends with longest-prefix routing.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11,7 +11,7 @@ pub struct VfsTree {
     /// The root backend — handles paths not covered by any child.
     root: Arc<dyn Backend>,
 
-    /// Sorted list of (path_prefix, backend) bindings.
+    /// Sorted list of (`path_prefix`, backend) bindings.
     /// Sorted longest-prefix-first so the first match wins.
     children: Vec<(PathBuf, Arc<dyn Backend>)>,
 }
@@ -40,7 +40,7 @@ impl VfsTree {
     }
 
     /// Resolve a path to the correct backend and the remaining path within that backend.
-    pub fn resolve(&self, path: &Path) -> (&Arc<dyn Backend>, PathBuf) {
+    #[must_use] pub fn resolve(&self, path: &Path) -> (&Arc<dyn Backend>, PathBuf) {
         for (prefix, backend) in &self.children {
             if let Ok(rest) = path.strip_prefix(prefix) {
                 return (backend, rest.to_path_buf());
@@ -104,12 +104,12 @@ impl VfsTree {
     }
 
     /// Get the root backend.
-    pub fn root(&self) -> &Arc<dyn Backend> {
+    #[must_use] pub fn root(&self) -> &Arc<dyn Backend> {
         &self.root
     }
 
     /// Get all child mounts.
-    pub fn children(&self) -> &[(PathBuf, Arc<dyn Backend>)] {
+    #[must_use] pub fn children(&self) -> &[(PathBuf, Arc<dyn Backend>)] {
         &self.children
     }
 }

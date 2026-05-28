@@ -1,6 +1,6 @@
 //! Google Drive backend.
 //!
-//! Uses the Drive API v3 with OAuth2 device code flow.
+//! Uses the Drive API v3 with `OAuth2` device code flow.
 //! Full read/write support: upload, create directory, trash, move/rename.
 //! Change detection via the Changes API (cursor-based).
 
@@ -24,8 +24,8 @@ use client::DriveClient;
 /// Create a Google Drive backend from config.
 ///
 /// Config keys expected:
-/// - `client_id` — Google OAuth2 client ID
-/// - `client_secret` — Google OAuth2 client secret
+/// - `client_id` — Google `OAuth2` client ID
+/// - `client_secret` — Google `OAuth2` client secret
 /// - `account` — account identifier for Keychain storage (defaults to "default")
 ///
 /// Optional keys used in integration tests:
@@ -118,11 +118,11 @@ impl GdriveBackend {
 
 #[async_trait]
 impl Backend for GdriveBackend {
-    fn id(&self) -> &str {
+    fn id(&self) -> &'static str {
         "gdrive"
     }
 
-    fn display_name(&self) -> &str {
+    fn display_name(&self) -> &'static str {
         "Google Drive"
     }
 

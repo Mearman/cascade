@@ -6,12 +6,12 @@ use std::path::Path;
 pub async fn show(path: &str) -> Result<()> {
     let dir = Path::new(path);
     if !dir.exists() {
-        anyhow::bail!("directory does not exist: {}", path);
+        anyhow::bail!("directory does not exist: {path}");
     }
 
     let resolved = merge::resolve(dir, dir);
 
-    println!("Resolved config for: {}", path);
+    println!("Resolved config for: {path}");
     println!();
 
     if resolved.ignores.is_empty() {
@@ -37,10 +37,10 @@ pub async fn show(path: &str) -> Result<()> {
     if let Some(cache) = &resolved.cache {
         println!("  Cache:");
         if let Some(max) = &cache.max_size {
-            println!("    Max size: {}", max);
+            println!("    Max size: {max}");
         }
         if let Some(age) = &cache.max_age {
-            println!("    Max age: {}", age);
+            println!("    Max age: {age}");
         }
     }
 
@@ -51,7 +51,7 @@ pub async fn show(path: &str) -> Result<()> {
 pub async fn validate() -> Result<()> {
     let current = std::env::current_dir()?;
 
-    println!("Validating .cascade files under: {:?}", current);
+    println!("Validating .cascade files under: {current:?}");
 
     walk_and_validate(&current)?;
 
@@ -66,7 +66,7 @@ fn walk_and_validate(dir: &Path) -> Result<()> {
                 anyhow::bail!("empty ignore pattern in {:?}", dir.join(".cascade"));
             }
         }
-        println!("  OK: {:?}", dir);
+        println!("  OK: {dir:?}");
     }
 
     if let Ok(entries) = std::fs::read_dir(dir) {

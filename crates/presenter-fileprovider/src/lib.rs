@@ -50,7 +50,7 @@ impl FileProviderPresenter {
         &self.mount_point
     }
 
-    pub fn bridge(&self) -> &FileProviderBridge {
+    pub const fn bridge(&self) -> &FileProviderBridge {
         &self.bridge
     }
 }
@@ -125,7 +125,7 @@ impl VfsPresenter for FileProviderPresenter {
     }
 }
 
-fn ensure_file_provider_available() -> Result<()> {
+const fn ensure_file_provider_available() -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         Ok(())

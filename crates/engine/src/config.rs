@@ -19,7 +19,7 @@ pub struct ConfigResolver {
 }
 
 impl ConfigResolver {
-    pub fn new(mount_root: PathBuf) -> Self {
+    #[must_use] pub const fn new(mount_root: PathBuf) -> Self {
         Self {
             mount_root,
             cache: RwLock::new(Vec::new()),

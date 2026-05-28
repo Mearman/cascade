@@ -14,10 +14,10 @@
 //! assert!(cascade_expr::eval::evaluate(&expr, &ctx));
 //! ```
 
-use crate::context::*;
+use crate::context::{EvalContext, FileContext, PeerContext, DeviceContext, DiskContext, NetworkContext, NetworkType, PowerContext, PowerSource, TimeContext};
 
-/// Collect a full EvalContext with all providers using default values.
-pub fn collect_default() -> EvalContext {
+/// Collect a full `EvalContext` with all providers using default values.
+#[must_use] pub fn collect_default() -> EvalContext {
     EvalContext {
         file: FileContext::default_for_eval(),
         device: DeviceProvider::collect(),
@@ -29,8 +29,8 @@ pub fn collect_default() -> EvalContext {
     }
 }
 
-/// Build an EvalContext for a specific file, filling system context from providers.
-pub fn for_file(file: &FileContext) -> EvalContext {
+/// Build an `EvalContext` for a specific file, filling system context from providers.
+#[must_use] pub fn for_file(file: &FileContext) -> EvalContext {
     EvalContext {
         file: file.clone(),
         device: DeviceProvider::collect(),
@@ -45,8 +45,8 @@ pub fn for_file(file: &FileContext) -> EvalContext {
 // ── File context helper ──
 
 impl FileContext {
-    /// Create a FileContext suitable for expression evaluation from a file entry.
-    pub fn from_entry(
+    /// Create a `FileContext` suitable for expression evaluation from a file entry.
+    #[must_use] pub fn from_entry(
         name: &str,
         size: u64,
         mime_type: Option<&str>,
@@ -97,7 +97,7 @@ impl FileContext {
 pub struct DeviceProvider;
 
 impl DeviceProvider {
-    pub fn collect() -> DeviceContext {
+    #[must_use] pub fn collect() -> DeviceContext {
         DeviceContext {
             id: device_id(),
             name: hostname(),
@@ -112,9 +112,7 @@ fn hostname() -> String {
     std::process::Command::new("hostname")
         .output()
         .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string())
+        .and_then(|o| String::from_utf8(o.stdout).ok()).map_or_else(|| "unknown".to_string(), |s| s.trim().to_string())
 }
 
 fn device_id() -> String {
@@ -134,20 +132,20 @@ pub struct DiskProvider;
 
 impl DiskProvider {
     /// Collect disk stats for the root filesystem.
-    pub fn collect_root() -> DiskContext {
+    #[must_use] pub fn collect_root() -> DiskContext {
         Self::collect_for_path("/")
     }
 
     /// Collect disk stats for the filesystem containing the given path.
     #[allow(unsafe_code)]
-    pub fn collect_for_path(path: &str) -> DiskContext {
+    #[must_use] pub fn collect_for_path(path: &str) -> DiskContext {
         #[cfg(unix)]
         {
             let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
             let c_path = std::ffi::CString::new(path).unwrap_or_default();
-            let result = unsafe { libc::statfs(c_path.as_ptr(), &mut stat) };
+            let result = unsafe { libc::statfs(c_path.as_ptr(), &raw mut stat) };
             if result == 0 {
-                let block_size = stat.f_bsize as u64;
+                let block_size = u64::from(stat.f_bsize);
                 DiskContext {
                     total_bytes: stat.f_blocks * block_size,
                     free_bytes: stat.f_bavail * block_size,
@@ -176,7 +174,7 @@ impl DiskProvider {
 pub struct NetworkProvider;
 
 impl NetworkProvider {
-    pub fn collect() -> NetworkContext {
+    #[must_use] pub fn collect() -> NetworkContext {
         // Determine the default route's interface type.
         let if_type = detect_network_type();
         let metered = detect_metered();
@@ -225,7 +223,7 @@ fn detect_network_type() -> NetworkType {
     }
 }
 
-fn detect_metered() -> bool {
+const fn detect_metered() -> bool {
     // Conservative: assume metered on cellular, not on others.
     false
 }
@@ -236,7 +234,7 @@ fn detect_metered() -> bool {
 pub struct PowerProvider;
 
 impl PowerProvider {
-    pub fn collect() -> PowerContext {
+    #[must_use] pub fn collect() -> PowerContext {
         #[cfg(target_os = "macos")]
         {
             let output = std::process::Command::new("pmset")
@@ -288,7 +286,7 @@ impl PowerProvider {
 pub struct TimeProvider;
 
 impl TimeProvider {
-    pub fn collect() -> TimeContext {
+    #[must_use] pub fn collect() -> TimeContext {
         TimeContext {
             now: chrono::Utc::now(),
         }

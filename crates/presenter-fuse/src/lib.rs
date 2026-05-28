@@ -23,12 +23,12 @@ const CACHE_DIR_NAME: &str = "cascade/cache";
 
 /// FUSE presenter wrapping an inode map and VFS tree reference.
 pub struct FusePresenter {
-    /// The root ItemId for the VFS tree.
+    /// The root `ItemId` for the VFS tree.
     #[allow(dead_code)] // Used on Linux in start()
     root_id: ItemId,
     /// Mount point path.
     mount_point: PathBuf,
-    /// Inode map for translating between FUSE inodes and VFS ItemIds.
+    /// Inode map for translating between FUSE inodes and VFS `ItemIds`.
     inode_map: Arc<std::sync::Mutex<InodeMap>>,
     /// VFS tree for resolving paths to backends.
     vfs: Arc<RwLock<VfsTree>>,
@@ -37,7 +37,7 @@ pub struct FusePresenter {
 }
 
 impl FusePresenter {
-    /// Create a new FUSE presenter for the given root ItemId and VFS tree.
+    /// Create a new FUSE presenter for the given root `ItemId` and VFS tree.
     pub fn with_vfs(root_id: ItemId, vfs: Arc<RwLock<VfsTree>>) -> Self {
         let inode_map = Arc::new(std::sync::Mutex::new(InodeMap::new(root_id.clone())));
         let cache_dir = dirs_cache_dir();
@@ -50,8 +50,8 @@ impl FusePresenter {
         }
     }
 
-    /// Create a new FUSE presenter for the given root ItemId.
-    pub fn new(root_id: ItemId) -> Self {
+    /// Create a new FUSE presenter for the given root `ItemId`.
+    #[must_use] pub fn new(root_id: ItemId) -> Self {
         let vfs = Arc::new(RwLock::new(VfsTree::new(Arc::new(
             cascade_engine::backend::NullBackend::new("null"),
         ))));
@@ -65,7 +65,7 @@ impl FusePresenter {
     }
 
     /// Get a reference to the inode map (for testing).
-    pub fn inode_map(&self) -> &Arc<std::sync::Mutex<InodeMap>> {
+    #[must_use] pub const fn inode_map(&self) -> &Arc<std::sync::Mutex<InodeMap>> {
         &self.inode_map
     }
 
@@ -82,7 +82,7 @@ fn dirs_cache_dir() -> PathBuf {
         .join(CACHE_DIR_NAME)
 }
 
-/// Sanitise an ItemId into a filesystem-safe filename.
+/// Sanitise an `ItemId` into a filesystem-safe filename.
 fn safe_filename(id: &str) -> String {
     id.replace([':', '/', '\\'], "_")
 }
@@ -92,7 +92,7 @@ impl VfsPresenter for FusePresenter {
     async fn upsert_item(&self, item: VfsItem) -> anyhow::Result<()> {
         tracing::debug!(id = %item.id, name = %item.name, "upsert_item");
         let mut map = self.inode_map.lock().unwrap();
-        map.allocate(item.id.clone());
+        map.allocate(item.id);
         Ok(())
     }
 
@@ -132,7 +132,7 @@ impl VfsPresenter for FusePresenter {
             let (backend, relative) = {
                 let vfs = self.vfs.read().unwrap();
                 let (backend, relative) = vfs.resolve(Path::new(&id.0));
-                (Arc::clone(backend), relative.to_path_buf())
+                (Arc::clone(backend), relative)
             };
             // Lock is dropped before the await.
             let entry = backend.metadata(&relative).await?;
@@ -221,7 +221,7 @@ impl VfsPresenter for FusePresenter {
     }
 }
 
-/// Adapter from `tokio::fs::File` (AsyncWrite) to the
+/// Adapter from `tokio::fs::File` (`AsyncWrite`) to the
 /// `dyn AsyncWrite + Unpin + Send` that the Backend trait expects.
 struct WriterAdapter {
     inner: tokio::fs::File,

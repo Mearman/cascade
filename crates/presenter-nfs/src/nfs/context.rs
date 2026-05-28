@@ -36,10 +36,10 @@ impl NfsContext {
     }
 
     /// Convert a VFS path to a file handle key.
-    pub fn path_to_key(path: &str) -> u64 {
+    #[must_use] pub fn path_to_key(path: &str) -> u64 {
         let mut hash: u64 = 5381;
         for byte in path.bytes() {
-            hash = hash.wrapping_mul(33).wrapping_add(byte as u64);
+            hash = hash.wrapping_mul(33).wrapping_add(u64::from(byte));
         }
         hash
     }
@@ -63,12 +63,12 @@ impl NfsContext {
     }
 
     /// Access the underlying VFS tree (for download operations).
-    pub fn vfs(&self) -> &Arc<RwLock<VfsTree>> {
+    pub const fn vfs(&self) -> &Arc<RwLock<VfsTree>> {
         &self.vfs
     }
 
     /// Get the root file handle key.
-    pub fn root_key(&self) -> u64 {
+    pub const fn root_key(&self) -> u64 {
         self.root_fh_key
     }
 
@@ -85,7 +85,7 @@ impl NfsContext {
         let (backend, relative) = {
             let vfs = self.vfs.read().unwrap();
             let (backend, relative) = vfs.resolve(std::path::Path::new(path));
-            (Arc::clone(backend), relative.to_path_buf())
+            (Arc::clone(backend), relative)
         };
         backend.metadata(&relative).await
     }

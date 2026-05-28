@@ -24,17 +24,11 @@ pub struct CascadeConfig {
 
 /// Mount configuration.
 #[derive(Debug, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct MountConfig {
     pub point: String,
 }
 
-impl Default for MountConfig {
-    fn default() -> Self {
-        Self {
-            point: String::new(),
-        }
-    }
-}
 
 /// A single backend configuration entry.
 #[derive(Debug, Serialize, Deserialize)]
@@ -94,13 +88,13 @@ pub fn run() -> Result<()> {
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("Cloud");
     let default_mount_str = default_mount.to_string_lossy().to_string();
-    println!("Mount point [{}]:", default_mount_str);
+    println!("Mount point [{default_mount_str}]:");
     let mount_input = read_input("Mount point")?;
     let mount_point = if mount_input.is_empty() {
         default_mount_str
     } else {
-        let expanded = shellexpand::tilde(&mount_input).to_string();
-        expanded
+        
+        shellexpand::tilde(&mount_input).to_string()
     };
 
     // Step 5: Write config.

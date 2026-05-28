@@ -77,7 +77,7 @@ impl Backend for NullBackend {
         &self.id
     }
 
-    fn display_name(&self) -> &str {
+    fn display_name(&self) -> &'static str {
         "P2P Only"
     }
 

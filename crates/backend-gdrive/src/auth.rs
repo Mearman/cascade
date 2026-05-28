@@ -1,4 +1,4 @@
-//! OAuth2 device code + refresh flow for Google Drive.
+//! `OAuth2` device code + refresh flow for Google Drive.
 //!
 //! Tokens are stored in the macOS Keychain via the `security` command.
 //! The device code flow is used for initial authorisation — no local
@@ -8,7 +8,7 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
-/// OAuth2 token response from Google.
+/// `OAuth2` token response from Google.
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
     access_token: String,
@@ -40,12 +40,12 @@ pub struct AuthTokens {
 
 impl AuthTokens {
     /// Check if the access token is expired (with 60s buffer).
-    pub fn is_expired(&self) -> bool {
+    #[must_use] pub fn is_expired(&self) -> bool {
         chrono::Utc::now() + chrono::Duration::seconds(60) >= self.expires_at
     }
 }
 
-/// OAuth2 configuration for Google Drive.
+/// `OAuth2` configuration for Google Drive.
 pub struct OAuthConfig {
     pub client_id: String,
     pub client_secret: String,

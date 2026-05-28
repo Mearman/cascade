@@ -25,17 +25,17 @@ pub struct P2pBridge {
 
 impl P2pBridge {
     /// Create a new P2P bridge.
-    pub fn new(p2p: P2pEngine, db: Arc<StateDb>) -> Self {
+    pub const fn new(p2p: P2pEngine, db: Arc<StateDb>) -> Self {
         Self { p2p, db }
     }
 
     /// Access the underlying P2P engine.
-    pub fn engine(&self) -> &P2pEngine {
+    #[must_use] pub const fn engine(&self) -> &P2pEngine {
         &self.p2p
     }
 
     /// Access the underlying block store.
-    pub fn block_store(&self) -> &BlockStore {
+    #[must_use] pub const fn block_store(&self) -> &BlockStore {
         self.p2p.block_store()
     }
 
@@ -100,7 +100,7 @@ impl P2pBridge {
         Ok(blocks)
     }
 
-    /// Index a file's data using an existing ItemId from the DB.
+    /// Index a file's data using an existing `ItemId` from the DB.
     pub async fn index_file_by_id(&self, file_id: &ItemId, data: &[u8]) -> Result<FileBlocks> {
         let blocks = self.p2p.index_data(data).await?;
 
@@ -138,7 +138,7 @@ impl P2pBridge {
     }
 
     /// Get this device's P2P ID.
-    pub fn device_id(&self) -> &str {
+    #[must_use] pub fn device_id(&self) -> &str {
         self.p2p.device_id()
     }
 }

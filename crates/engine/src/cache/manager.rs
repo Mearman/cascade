@@ -47,7 +47,7 @@ pub struct CacheManager {
 
 impl CacheManager {
     /// Create a new cache manager.
-    pub fn new(db: Arc<StateDb>, config: CacheManagerConfig) -> Self {
+    pub const fn new(db: Arc<StateDb>, config: CacheManagerConfig) -> Self {
         Self {
             db,
             config,
@@ -56,7 +56,7 @@ impl CacheManager {
     }
 
     /// Attach a P2P bridge for content fetching.
-    pub fn with_p2p(mut self, p2p: Arc<P2pBridge>) -> Self {
+    #[must_use] pub fn with_p2p(mut self, p2p: Arc<P2pBridge>) -> Self {
         self.p2p = Some(p2p);
         self
     }
@@ -217,7 +217,7 @@ pub struct EvictionReport {
 
 impl EvictionReport {
     /// Total files evicted.
-    pub fn total_evicted(&self) -> usize {
+    #[must_use] pub const fn total_evicted(&self) -> usize {
         self.lifecycle_evicted + self.size_evicted
     }
 }

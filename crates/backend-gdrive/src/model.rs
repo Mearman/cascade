@@ -21,8 +21,8 @@ pub struct DriveFile {
 }
 
 impl DriveFile {
-    /// Convert to a Cascade FileEntry.
-    pub fn to_file_entry(&self, backend_id: &str) -> Option<FileEntry> {
+    /// Convert to a Cascade `FileEntry`.
+    #[must_use] pub fn to_file_entry(&self, backend_id: &str) -> Option<FileEntry> {
         if self.trashed {
             return None;
         }

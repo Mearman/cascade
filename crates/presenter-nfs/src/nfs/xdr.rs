@@ -1,8 +1,8 @@
 //! XDR codec for NFS data structures (RFC 1813).
 //!
-//! Encodes and decodes NFSv3 wire format:
+//! Encodes and decodes `NFSv3` wire format:
 //! - Primitive types: uint32, uint64, int32, bool, opaque<>, string<>
-//! - NFS-specific types: file handles (nfs_fh3), file attributes (fattr3)
+//! - NFS-specific types: file handles (`nfs_fh3`), file attributes (fattr3)
 //! - Fixed and variable-length arrays
 
 use std::io::{self, Read, Write};
@@ -112,8 +112,8 @@ pub struct NfsFh3 {
 }
 
 impl NfsFh3 {
-    /// Create a file handle from an ItemId string, padding with zeros.
-    pub fn from_item_id(id: &str) -> Self {
+    /// Create a file handle from an `ItemId` string, padding with zeros.
+    #[must_use] pub fn from_item_id(id: &str) -> Self {
         let mut data = [0u8; NFS3_FHSIZE];
         let bytes = id.as_bytes();
         let len = bytes.len().min(NFS3_FHSIZE);
@@ -121,8 +121,8 @@ impl NfsFh3 {
         Self { data }
     }
 
-    /// Extract the ItemId string from the file handle (up to first null byte).
-    pub fn to_item_id(&self) -> Option<String> {
+    /// Extract the `ItemId` string from the file handle (up to first null byte).
+    #[must_use] pub fn to_item_id(&self) -> Option<String> {
         let end = self
             .data
             .iter()
@@ -188,14 +188,14 @@ pub struct NfsTime {
 }
 
 impl NfsTime {
-    pub fn epoch() -> Self {
+    #[must_use] pub const fn epoch() -> Self {
         Self {
             seconds: 0,
             nseconds: 0,
         }
     }
 
-    pub fn from_epoch(secs: i64) -> Self {
+    #[must_use] pub const fn from_epoch(secs: i64) -> Self {
         Self {
             seconds: secs as u32,
             nseconds: 0,
@@ -211,14 +211,14 @@ pub struct PostOpAttr {
 }
 
 impl PostOpAttr {
-    pub fn some(attr: Fattr3) -> Self {
+    #[must_use] pub const fn some(attr: Fattr3) -> Self {
         Self {
             attributes_follow: true,
             attributes: Some(attr),
         }
     }
 
-    pub fn none() -> Self {
+    #[must_use] pub const fn none() -> Self {
         Self {
             attributes_follow: false,
             attributes: None,
@@ -240,7 +240,7 @@ pub fn encode_u64(buf: &mut Vec<u8>, val: u64) {
 
 /// Encode a bool in XDR format.
 pub fn encode_bool(buf: &mut Vec<u8>, val: bool) {
-    encode_u32(buf, if val { 1 } else { 0 });
+    encode_u32(buf, u32::from(val));
 }
 
 /// Encode a variable-length opaque in XDR format (length + padded data).

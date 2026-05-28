@@ -25,7 +25,7 @@ pub struct FileAttr {
 impl FileAttr {
     /// Build attributes for a directory.
     #[allow(unsafe_code)]
-    pub fn directory(inode: u64) -> Self {
+    #[must_use] pub fn directory(inode: u64) -> Self {
         Self {
             inode,
             size: 0,
@@ -39,7 +39,7 @@ impl FileAttr {
 
     /// Build attributes for a regular file.
     #[allow(unsafe_code)]
-    pub fn file(inode: u64, size: u64) -> Self {
+    #[must_use] pub fn file(inode: u64, size: u64) -> Self {
         Self {
             inode,
             size,
@@ -52,8 +52,8 @@ impl FileAttr {
     }
 }
 
-/// Convert a VfsItem to FileAttr using the inode from the map.
-pub fn vfs_item_to_attr(item: &VfsItem, inode: u64) -> FileAttr {
+/// Convert a `VfsItem` to `FileAttr` using the inode from the map.
+#[must_use] pub fn vfs_item_to_attr(item: &VfsItem, inode: u64) -> FileAttr {
     if item.is_dir {
         FileAttr::directory(inode)
     } else {
@@ -63,15 +63,15 @@ pub fn vfs_item_to_attr(item: &VfsItem, inode: u64) -> FileAttr {
 
 /// State shared between FUSE operation handlers.
 pub struct FuseOps {
-    /// Inode ↔ ItemId mapping.
+    /// Inode ↔ `ItemId` mapping.
     pub inode_map: std::sync::Mutex<InodeMap>,
     /// VFS tree for resolving paths to backends.
     pub vfs: Arc<RwLock<VfsTree>>,
 }
 
 impl FuseOps {
-    /// Create a new FuseOps with the given root ItemId (no VFS tree).
-    pub fn new(root_id: ItemId) -> Self {
+    /// Create a new `FuseOps` with the given root `ItemId` (no VFS tree).
+    #[must_use] pub fn new(root_id: ItemId) -> Self {
         Self {
             inode_map: std::sync::Mutex::new(InodeMap::new(root_id)),
             vfs: Arc::new(RwLock::new(VfsTree::new(Arc::new(
@@ -80,7 +80,7 @@ impl FuseOps {
         }
     }
 
-    /// Create a new FuseOps with the given root ItemId and VFS tree.
+    /// Create a new `FuseOps` with the given root `ItemId` and VFS tree.
     pub fn new_with_vfs(root_id: ItemId, vfs: Arc<RwLock<VfsTree>>) -> Self {
         Self {
             inode_map: std::sync::Mutex::new(InodeMap::new(root_id)),
@@ -99,7 +99,7 @@ impl FuseOps {
             let (backend, relative) = {
                 let vfs = self.vfs.read().unwrap();
                 let (backend, relative) = vfs.resolve(path);
-                (Arc::clone(backend), relative.to_path_buf())
+                (Arc::clone(backend), relative)
             };
             backend.metadata(&relative).await
         })
@@ -129,7 +129,7 @@ impl FuseOps {
             let (backend, relative) = {
                 let vfs = self.vfs.read().unwrap();
                 let (backend, relative) = vfs.resolve(path);
-                (Arc::clone(backend), relative.to_path_buf())
+                (Arc::clone(backend), relative)
             };
             let entry = backend.metadata(&relative).await?;
             let mut buf = Vec::new();

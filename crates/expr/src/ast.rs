@@ -38,7 +38,7 @@ pub enum Operand {
 }
 
 /// A literal value.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Value {
     Integer(i64),
     Boolean(bool),
@@ -73,9 +73,9 @@ pub enum SizeUnit {
 
 impl Value {
     /// Convert to seconds (for duration values).
-    pub fn to_seconds(&self) -> Option<i64> {
+    #[must_use] pub fn to_seconds(&self) -> Option<i64> {
         match self {
-            Value::Duration(v, unit) => Some(match unit {
+            Self::Duration(v, unit) => Some(match unit {
                 DurationUnit::Milliseconds => v / 1000,
                 DurationUnit::Seconds => *v,
                 DurationUnit::Minutes => v * 60,
@@ -90,9 +90,9 @@ impl Value {
     }
 
     /// Convert to bytes (for size values).
-    pub fn to_bytes(&self) -> Option<i64> {
+    #[must_use] pub fn to_bytes(&self) -> Option<i64> {
         match self {
-            Value::Size(v, unit) => Some(match unit {
+            Self::Size(v, unit) => Some(match unit {
                 SizeUnit::Bytes => *v,
                 SizeUnit::Kilobytes => v * 1024,
                 SizeUnit::Megabytes => v * 1024 * 1024,
@@ -107,10 +107,10 @@ impl Value {
 impl std::fmt::Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Value::Integer(v) => write!(f, "{v}"),
-            Value::Boolean(v) => write!(f, "{v}"),
-            Value::String(v) => write!(f, "\"{v}\""),
-            Value::Duration(v, unit) => {
+            Self::Integer(v) => write!(f, "{v}"),
+            Self::Boolean(v) => write!(f, "{v}"),
+            Self::String(v) => write!(f, "\"{v}\""),
+            Self::Duration(v, unit) => {
                 let s = match unit {
                     DurationUnit::Milliseconds => "ms",
                     DurationUnit::Seconds => "s",
@@ -123,7 +123,7 @@ impl std::fmt::Display for Value {
                 };
                 write!(f, "{v}{s}")
             }
-            Value::Size(v, unit) => {
+            Self::Size(v, unit) => {
                 let s = match unit {
                     SizeUnit::Bytes => "B",
                     SizeUnit::Kilobytes => "KB",
@@ -133,7 +133,7 @@ impl std::fmt::Display for Value {
                 };
                 write!(f, "{v}{s}")
             }
-            Value::Percentage(v) => write!(f, "{v}%"),
+            Self::Percentage(v) => write!(f, "{v}%"),
         }
     }
 }
