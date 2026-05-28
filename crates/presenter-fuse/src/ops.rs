@@ -188,7 +188,7 @@ mod linux {
             reply: ReplyData,
         ) {
             // TODO: Fetch file contents from cache/backend and return the requested range.
-            tracing::debug!(ino: u64 = ino.into(), offset, size, "read");
+            tracing::debug!(ino = u64::from(ino), offset, size, "read");
             reply.error(libc::ENOENT);
         }
 
@@ -205,7 +205,7 @@ mod linux {
             reply: ReplyWrite,
         ) {
             // TODO: Write data to the file at the given offset.
-            tracing::debug!(ino: u64 = ino.into(), offset, len = data.len(), "write");
+            tracing::debug!(ino = u64::from(ino), offset, len = data.len(), "write");
             reply.error(libc::EROFS);
         }
 
@@ -220,7 +220,7 @@ mod linux {
             reply: fuser::ReplyCreate,
         ) {
             // TODO: Create a new file in the VFS.
-            tracing::debug!(parent: u64 = parent.into(), name = %name.to_string_lossy(), "create");
+            tracing::debug!(parent = u64::from(parent), name = %name.to_string_lossy(), "create");
             reply.error(libc::EROFS);
         }
 
@@ -234,19 +234,19 @@ mod linux {
             reply: ReplyEntry,
         ) {
             // TODO: Create a new directory in the VFS.
-            tracing::debug!(parent: u64 = parent.into(), name = %name.to_string_lossy(), "mkdir");
+            tracing::debug!(parent = u64::from(parent), name = %name.to_string_lossy(), "mkdir");
             reply.error(libc::EROFS);
         }
 
         fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: fuser::ReplyEmpty) {
             // TODO: Delete a file from the VFS.
-            tracing::debug!(parent: u64 = parent.into(), name = %name.to_string_lossy(), "unlink");
+            tracing::debug!(parent = u64::from(parent), name = %name.to_string_lossy(), "unlink");
             reply.error(libc::EROFS);
         }
 
         fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: fuser::ReplyEmpty) {
             // TODO: Delete a directory from the VFS.
-            tracing::debug!(parent: u64 = parent.into(), name = %name.to_string_lossy(), "rmdir");
+            tracing::debug!(parent = u64::from(parent), name = %name.to_string_lossy(), "rmdir");
             reply.error(libc::EROFS);
         }
 
@@ -262,9 +262,9 @@ mod linux {
         ) {
             // TODO: Move/rename in the VFS.
             tracing::debug!(
-                parent: u64 = parent.into(),
+                parent = u64::from(parent),
                 name = %name.to_string_lossy(),
-                newparent: u64 = newparent.into(),
+                newparent = u64::from(newparent),
                 newname = %newname.to_string_lossy(),
                 "rename"
             );
@@ -290,7 +290,7 @@ mod linux {
             reply: ReplyAttr,
         ) {
             // TODO: Update file metadata in the VFS.
-            tracing::debug!(ino: u64 = ino.into(), ?mode, ?uid, ?gid, ?size, "setattr");
+            tracing::debug!(ino = u64::from(ino), ?mode, ?uid, ?gid, ?size, "setattr");
             reply.error(libc::EROFS);
         }
     }
