@@ -74,6 +74,12 @@ pub fn run() -> Result<()> {
     };
     println!();
 
+    // Prepare config directory early — needed by both provider branches.
+    let config_dir = dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from(".cascade"))
+        .join("cascade");
+    std::fs::create_dir_all(&config_dir)?;
+
     // Step 3: Provider-specific setup.
     let account = if backend_type == "gdrive" {
         println!("Google Drive authentication required.");
@@ -81,6 +87,58 @@ pub fn run() -> Result<()> {
         println!();
         Some(name.clone())
     } else {
+        // S3-compatible backend: collect credentials interactively.
+        println!("S3 configuration:");
+        println!();
+
+        let endpoint = read_input("Endpoint URL (e.g. https://s3.amazonaws.com)")?;
+        if endpoint.is_empty() {
+            anyhow::bail!("endpoint URL must not be empty");
+        }
+
+        let bucket = read_input("Bucket name")?;
+        if bucket.is_empty() {
+            anyhow::bail!("bucket name must not be empty");
+        }
+
+        let region_input = read_input("Region (e.g. us-east-1)")?;
+        let region = if region_input.is_empty() {
+            "us-east-1".to_string()
+        } else {
+            region_input
+        };
+
+        let access_key_id = read_input("Access key ID")?;
+        if access_key_id.is_empty() {
+            anyhow::bail!("access key ID must not be empty");
+        }
+
+        let secret_access_key = read_input("Secret access key")?;
+        if secret_access_key.is_empty() {
+            anyhow::bail!("secret access key must not be empty");
+        }
+
+        println!();
+
+        // Write per-backend credentials file: ~/.config/cascade/{name}.toml
+        let mut backend_table = toml::Table::new();
+        backend_table.insert("type".to_string(), toml::Value::String("s3".to_string()));
+        backend_table.insert("endpoint".to_string(), toml::Value::String(endpoint));
+        backend_table.insert("bucket".to_string(), toml::Value::String(bucket));
+        backend_table.insert("region".to_string(), toml::Value::String(region));
+        backend_table.insert(
+            "access_key_id".to_string(),
+            toml::Value::String(access_key_id),
+        );
+        backend_table.insert(
+            "secret_access_key".to_string(),
+            toml::Value::String(secret_access_key),
+        );
+
+        let backend_toml = toml::to_string_pretty(&backend_table)?;
+        let backend_config_path = config_dir.join(format!("{name}.toml"));
+        std::fs::write(&backend_config_path, &backend_toml)?;
+
         None
     };
 
@@ -98,11 +156,6 @@ pub fn run() -> Result<()> {
     };
 
     // Step 5: Write config.
-    let config_dir = dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from(".cascade"))
-        .join("cascade");
-    std::fs::create_dir_all(&config_dir)?;
-
     let config_path = config_dir.join("config.toml");
 
     // Build TOML config.
