@@ -159,14 +159,10 @@ mod linux {
             }
 
             if offset == 0 {
-                if !reply.add(ino, 1, FileType::Directory, ".") {
-                    return;
-                }
+                let _ = reply.add(ino, 1, FileType::Directory, ".");
             }
             if offset <= 1 {
-                if !reply.add(ino, 2, FileType::Directory, "..") {
-                    return;
-                }
+                let _ = reply.add(ino, 2, FileType::Directory, "..");
             }
 
             tracing::debug!(ino = ino_u64, offset, "readdir");
