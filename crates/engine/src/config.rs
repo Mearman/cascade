@@ -4,6 +4,8 @@
 //! then applies ignore rules when processing backend changes.
 
 use cascade_config::ResolvedConfig;
+use cascade_expr::context::EvalContext;
+use cascade_expr::eval;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
@@ -26,14 +28,59 @@ impl ConfigResolver {
 
     /// Check if a file at the given path should be ignored based on the
     /// resolved `.cascade` config for its parent directory.
+    ///
+    /// If an `EvalContext` is provided, conditional rules (those with `conditions`
+    /// in the `.cascade` file) are evaluated against it. Rules with conditions
+    /// that evaluate to false are skipped.
     pub fn is_ignored(&self, file_path: &Path, is_dir: bool) -> bool {
+        self.is_ignored_with_context(file_path, is_dir, None)
+    }
+
+    /// Check if a file should be ignored, evaluating conditional rules against
+    /// the provided context.
+    pub fn is_ignored_with_context(
+        &self,
+        file_path: &Path,
+        is_dir: bool,
+        ctx: Option<&EvalContext>,
+    ) -> bool {
         let parent = file_path.parent().unwrap_or(Path::new("/"));
         let config = self.resolve_for_dir(parent);
+
+        // If no context, use the standard is_ignored (which ignores conditions).
+        let Some(ctx) = ctx else {
+            let name = file_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            return config.is_ignored(&name, is_dir);
+        };
+
+        // With context: evaluate each rule's conditions.
         let name = file_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        config.is_ignored(&name, is_dir)
+
+        let mut ignored = false;
+        for rule in &config.ignores {
+            // Evaluate conditions.
+            let conditions_met =
+                rule.conditions.is_empty() || rule.conditions.iter().all(|cond| {
+                    match eval::parse_expr(cond) {
+                        Ok(expr) => eval::evaluate(&expr, ctx),
+                        Err(e) => {
+                            tracing::warn!(expr = %cond, error = %e, "failed to parse condition");
+                            false
+                        }
+                    }
+                });
+
+            if conditions_met && (!is_dir || !rule.dir_only) && glob_match(&rule.pattern, &name) {
+                ignored = !rule.negated;
+            }
+        }
+        ignored
     }
 
     /// Resolve the config for a directory, using the cache if available.
@@ -64,6 +111,59 @@ impl ConfigResolver {
         let mut cache = self.cache.write().unwrap();
         cache.retain(|(p, _)| !p.starts_with(dir));
     }
+}
+
+/// Simple glob matching. Supports `*` (any non-slash) and `**` (any including slashes).
+fn glob_match(pattern: &str, path: &str) -> bool {
+    if pattern.contains("**") {
+        let parts: Vec<&str> = pattern.split("**").collect();
+        if parts.len() == 2 {
+            let (prefix, suffix) = (parts[0], parts[1]);
+            let prefix_ok = prefix.is_empty() || path.starts_with(prefix);
+            let suffix_ok = suffix.is_empty() || path.ends_with(suffix);
+            return prefix_ok && suffix_ok;
+        }
+    }
+    if pattern.contains('*') {
+        return star_match(pattern, path);
+    }
+    pattern == path || path.ends_with(&format!("/{pattern}"))
+}
+
+fn star_match(pattern: &str, path: &str) -> bool {
+    let segments: Vec<&str> = pattern.split('*').collect();
+    if segments.len() == 1 {
+        return pattern == path;
+    }
+    let first = segments[0];
+    let last = segments[segments.len() - 1];
+    let mut idx = 0;
+    if !first.is_empty() {
+        if !path[idx..].starts_with(first) {
+            return false;
+        }
+        idx += first.len();
+    }
+    if !last.is_empty() && !path.ends_with(last) {
+        return false;
+    }
+    let remaining = if last.is_empty() {
+        &path[idx..]
+    } else {
+        &path[idx..path.len() - last.len()]
+    };
+    let mut search_from = 0;
+    for seg in &segments[1..segments.len() - 1] {
+        if seg.is_empty() {
+            continue;
+        }
+        if let Some(pos) = remaining[search_from..].find(seg) {
+            search_from += pos + seg.len();
+        } else {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]

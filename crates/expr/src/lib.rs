@@ -6,6 +6,7 @@
 pub mod ast;
 pub mod context;
 pub mod eval;
+pub mod providers;
 
 // Pest generates the parser from grammar.pest at compile time.
 use pest_derive::Parser;
