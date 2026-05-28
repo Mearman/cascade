@@ -15,6 +15,7 @@ use crate::sync::conflict::{ConflictCheck, check_conflict, conflict_name};
 use crate::types::{CacheState, Change, FileId, VfsItem};
 
 /// Default poll interval when the backend doesn't specify one.
+#[allow(unknown_lints, clippy::duration_suboptimal_units)]
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Orchestrates change polling across all registered backends.
