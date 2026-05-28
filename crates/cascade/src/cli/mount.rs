@@ -113,6 +113,7 @@ pub async fn start(mount_point: Option<&str>) -> Result<()> {
 }
 
 /// Stop the Cascade daemon.
+#[cfg(unix)]
 pub fn stop() -> anyhow::Result<()> {
     let config_dir = dirs::config_dir()
         .unwrap_or_else(|| std::path::PathBuf::from(".cascade"))
@@ -166,6 +167,12 @@ pub fn stop() -> anyhow::Result<()> {
     let _ = std::fs::remove_file(&pid_path);
     println!("Cascade stopped.");
     Ok(())
+}
+
+/// Stop the Cascade daemon.
+#[cfg(not(unix))]
+pub fn stop() -> anyhow::Result<()> {
+    anyhow::bail!("cascade stop is not supported on this platform yet");
 }
 
 /// Instantiate a backend by type, using its per-backend TOML config.
