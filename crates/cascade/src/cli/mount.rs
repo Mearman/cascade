@@ -7,6 +7,36 @@ use cascade_presenter_nfs::nfs::server::{NfsServer, NfsServerConfig};
 
 use super::init::{BackendConfig, CascadeConfig};
 
+/// Check whether the process with the given PID is alive.
+///
+/// On Unix, sends signal 0 (no-op) via `kill(2)` — returns `true` if the call
+/// succeeds (process exists and we have permission to signal it), `false` if
+/// `ESRCH` is returned (no such process), and `false` for any other error.
+///
+/// On non-Unix platforms, a reliable cross-process liveness check is not
+/// available without an OS-specific crate, so the presence of the PID file is
+/// treated as sufficient and this function always returns `true`.
+fn is_process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid_signed) = i32::try_from(pid) else {
+            return false;
+        };
+        let nix_pid = nix::unistd::Pid::from_raw(pid_signed);
+        match nix::sys::signal::kill(nix_pid, None) {
+            Ok(()) => true,
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // No reliable cross-platform liveness check without an OS crate.
+        // Treat presence of PID file as sufficient.
+        let _ = pid;
+        true
+    }
+}
+
 /// Start the Cascade daemon.
 pub async fn start(mount_point: Option<&str>) -> Result<()> {
     tracing::info!("Starting Cascade daemon");
@@ -16,6 +46,22 @@ pub async fn start(mount_point: Option<&str>) -> Result<()> {
         .unwrap_or_else(|| PathBuf::from(".cascade"))
         .join("cascade");
     std::fs::create_dir_all(&config_dir)?;
+
+    // Bail early if the daemon is already running.
+    let pid_path = config_dir.join("cascade.pid");
+    if pid_path.exists() {
+        let raw = std::fs::read_to_string(&pid_path)
+            .with_context(|| format!("failed to read {}", pid_path.display()))?;
+        if let Ok(pid) = raw.trim().parse::<u32>() {
+            if is_process_alive(pid) {
+                anyhow::bail!(
+                    "Cascade is already running (PID {pid}). Run `cascade stop` first."
+                );
+            }
+            // Stale PID file — clean it up and continue.
+            let _ = std::fs::remove_file(&pid_path);
+        }
+    }
     let db_path = config_dir.join("state.db");
 
     // Read main config.toml written by `cascade init`.
@@ -84,7 +130,6 @@ pub async fn start(mount_point: Option<&str>) -> Result<()> {
     // Mount NFS via OS mount command.
     mount_nfs(&mount_path, nfs_port)?;
 
-    let pid_path = config_dir.join("cascade.pid");
     std::fs::write(&pid_path, std::process::id().to_string())?;
 
     println!("Cascade started.");
