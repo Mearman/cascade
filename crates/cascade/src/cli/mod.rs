@@ -5,8 +5,91 @@ pub mod init;
 pub mod mount;
 pub mod status;
 
-use anyhow::Result;
+use std::path::PathBuf;
+
+use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
+
+// ---------------------------------------------------------------------------
+// CliContext — shared context for all CLI commands
+// ---------------------------------------------------------------------------
+
+/// Shared context derived once from the parsed CLI arguments.
+///
+/// Every command receives `&CliContext` instead of calling `dirs::config_dir()`
+/// independently. This makes `--config` functional and makes commands testable
+/// with a temporary directory.
+#[derive(Debug)]
+pub struct CliContext {
+    /// Root config directory (e.g. `~/.config/cascade/`).
+    pub config_dir: PathBuf,
+    /// Path to the `SQLite` state database.
+    pub db_path: PathBuf,
+    /// Path to the PID file.
+    pub pid_path: PathBuf,
+}
+
+impl CliContext {
+    /// Resolve paths from the `--config` flag value.
+    ///
+    /// The `config_flag` is the raw string from `--config` (may contain `~`).
+    /// If it points to a file, its parent directory is used as the config dir.
+    /// If it points to a directory, that directory is used directly.
+    pub fn resolve(config_flag: &str) -> Result<Self> {
+        let expanded = shellexpand::tilde(config_flag).to_string();
+        let path = PathBuf::from(expanded);
+
+        let config_dir = if path.is_file() {
+            path.parent()
+                .context("--config path has no parent directory")?
+                .to_path_buf()
+        } else {
+            path
+        };
+
+        Ok(Self {
+            db_path: config_dir.join("state.db"),
+            pid_path: config_dir.join("cascade.pid"),
+            config_dir,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// is_process_alive — shared liveness check
+// ---------------------------------------------------------------------------
+
+/// Check whether the process with the given PID is alive.
+///
+/// On Unix, sends signal 0 (no-op) via `kill(2)` — returns `true` if the call
+/// succeeds (process exists and we have permission to signal it), `false` if
+/// `ESRCH` is returned (no such process), and `false` for any other error.
+///
+/// On non-Unix platforms, a reliable cross-process liveness check is not
+/// available without an OS-specific crate, so the presence of the PID file is
+/// treated as sufficient and this function always returns `true`.
+pub fn is_process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid_signed) = i32::try_from(pid) else {
+            return false;
+        };
+        let nix_pid = nix::unistd::Pid::from_raw(pid_signed);
+        match nix::sys::signal::kill(nix_pid, None) {
+            Ok(()) => true,
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Clap definitions
+// ---------------------------------------------------------------------------
 
 #[derive(Parser)]
 #[command(name = "cascade")]
@@ -16,11 +99,11 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
 
-    /// Config file path
-    #[arg(long, global = true, default_value = "~/.config/cascade/config.toml")]
+    /// Config directory path (or path to config.toml)
+    #[arg(long, global = true, default_value = "~/.config/cascade")]
     pub config: String,
 
-    /// Increase verbosity
+    /// Increase verbosity (-v = debug, -vv = trace)
     #[arg(long, short, global = true, action = clap::ArgAction::Count)]
     pub verbose: u8,
 
@@ -143,35 +226,35 @@ pub enum CacheCommands {
 }
 
 impl Cli {
-    pub async fn run(self) -> Result<()> {
+    pub async fn run(self, ctx: &CliContext) -> Result<()> {
         match self.command {
-            Commands::Init => init::run(),
-            Commands::Start { mount_point } => mount::start(mount_point.as_deref()).await,
-            Commands::Stop => mount::stop(),
+            Commands::Init => init::run(ctx),
+            Commands::Start { mount_point } => mount::start(ctx, mount_point.as_deref()).await,
+            Commands::Stop => mount::stop(ctx),
             Commands::Restart => {
-                mount::stop()?;
-                mount::start(None).await
+                mount::stop(ctx)?;
+                mount::start(ctx, None).await
             }
-            Commands::Status => status::show(),
-            Commands::Pin { path } => cache::pin(&path),
-            Commands::Unpin { path } => cache::unpin(&path),
-            Commands::PinList => cache::pin_list(),
+            Commands::Status => status::show(ctx),
+            Commands::Pin { path } => cache::pin(ctx, &path),
+            Commands::Unpin { path } => cache::unpin(ctx, &path),
+            Commands::PinList => cache::pin_list(ctx),
             Commands::Cache { command } => match command {
-                CacheCommands::Status => cache::cache_status(),
-                CacheCommands::Evict { all } => cache::evict(all),
-                CacheCommands::Warm { path } => cache::warm(&path),
-                CacheCommands::Clear { path } => cache::clear(&path),
+                CacheCommands::Status => cache::cache_status(ctx),
+                CacheCommands::Evict { all } => cache::evict(ctx, all),
+                CacheCommands::Warm { path } => cache::warm(ctx, &path),
+                CacheCommands::Clear { path } => cache::clear(ctx, &path),
             },
             Commands::ConfigShow { path } => config::show(&path),
             Commands::ConfigValidate => config::validate(),
-            Commands::BackendList => status::backend_list(),
+            Commands::BackendList => status::backend_list(ctx),
             Commands::BackendAdd {
                 backend_type,
                 name,
                 mount_path,
-            } => cache::backend_add(&backend_type, name.as_deref(), mount_path.as_deref()),
-            Commands::BackendRemove { name } => cache::backend_remove(&name),
-            Commands::BackendAuth { name } => auth::authenticate(&name).await,
+            } => cache::backend_add(ctx, &backend_type, name.as_deref(), mount_path.as_deref()),
+            Commands::BackendRemove { name } => cache::backend_remove(ctx, &name),
+            Commands::BackendAuth { name } => auth::authenticate(ctx, &name).await,
         }
     }
 }

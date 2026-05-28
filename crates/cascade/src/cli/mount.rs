@@ -1,4 +1,5 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
@@ -6,52 +7,18 @@ use cascade_engine::engine::{Engine, EngineConfig};
 use cascade_presenter_nfs::nfs::server::{NfsServer, NfsServerConfig};
 
 use super::init::{BackendConfig, CascadeConfig};
-
-/// Check whether the process with the given PID is alive.
-///
-/// On Unix, sends signal 0 (no-op) via `kill(2)` — returns `true` if the call
-/// succeeds (process exists and we have permission to signal it), `false` if
-/// `ESRCH` is returned (no such process), and `false` for any other error.
-///
-/// On non-Unix platforms, a reliable cross-process liveness check is not
-/// available without an OS-specific crate, so the presence of the PID file is
-/// treated as sufficient and this function always returns `true`.
-fn is_process_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        let Ok(pid_signed) = i32::try_from(pid) else {
-            return false;
-        };
-        let nix_pid = nix::unistd::Pid::from_raw(pid_signed);
-        match nix::sys::signal::kill(nix_pid, None) {
-            Ok(()) => true,
-            Err(_) => false,
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        // No reliable cross-platform liveness check without an OS crate.
-        // Treat presence of PID file as sufficient.
-        let _ = pid;
-        true
-    }
-}
+use super::{is_process_alive, CliContext};
 
 /// Start the Cascade daemon.
-pub async fn start(mount_point: Option<&str>) -> Result<()> {
+pub async fn start(ctx: &CliContext, mount_point: Option<&str>) -> Result<()> {
     tracing::info!("Starting Cascade daemon");
 
-    // Resolve config directory and database path.
-    let config_dir = dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from(".cascade"))
-        .join("cascade");
-    std::fs::create_dir_all(&config_dir)?;
+    std::fs::create_dir_all(&ctx.config_dir)?;
 
     // Bail early if the daemon is already running.
-    let pid_path = config_dir.join("cascade.pid");
-    if pid_path.exists() {
-        let raw = std::fs::read_to_string(&pid_path)
-            .with_context(|| format!("failed to read {}", pid_path.display()))?;
+    if ctx.pid_path.exists() {
+        let raw = std::fs::read_to_string(&ctx.pid_path)
+            .with_context(|| format!("failed to read {}", ctx.pid_path.display()))?;
         if let Ok(pid) = raw.trim().parse::<u32>() {
             if is_process_alive(pid) {
                 anyhow::bail!(
@@ -59,13 +26,12 @@ pub async fn start(mount_point: Option<&str>) -> Result<()> {
                 );
             }
             // Stale PID file — clean it up and continue.
-            let _ = std::fs::remove_file(&pid_path);
+            let _ = std::fs::remove_file(&ctx.pid_path);
         }
     }
-    let db_path = config_dir.join("state.db");
 
     // Read main config.toml written by `cascade init`.
-    let main_config = load_main_config(&config_dir)?;
+    let main_config = load_main_config(&ctx.config_dir)?;
 
     // Create backends from config.
     if main_config.backends.is_empty() {
@@ -78,7 +44,7 @@ pub async fn start(mount_point: Option<&str>) -> Result<()> {
             .clone()
             .try_into()
             .with_context(|| format!("invalid config for backend `{name}`"))?;
-        let per_backend_config = load_backend_config(&config_dir, name)?;
+        let per_backend_config = load_backend_config(&ctx.config_dir, name)?;
         let backend = create_backend(name, &backend_cfg.backend_type, &per_backend_config)?;
         backends.push(Arc::from(backend));
     }
@@ -101,7 +67,7 @@ pub async fn start(mount_point: Option<&str>) -> Result<()> {
 
     // Create and start the engine.
     let engine_config = EngineConfig {
-        db_path,
+        db_path: ctx.db_path.clone(),
         mount_point: mount_path.clone(),
         backends,
         cache_dir: None,
@@ -130,7 +96,7 @@ pub async fn start(mount_point: Option<&str>) -> Result<()> {
     // Mount NFS via OS mount command.
     mount_nfs(&mount_path, nfs_port)?;
 
-    std::fs::write(&pid_path, std::process::id().to_string())?;
+    std::fs::write(&ctx.pid_path, std::process::id().to_string())?;
 
     println!("Cascade started.");
     println!("  Mount point: {}", mount_path.display());
@@ -151,7 +117,7 @@ pub async fn start(mount_point: Option<&str>) -> Result<()> {
     handle.sync_handle.abort();
     handle.cache_handle.abort();
 
-    let _ = std::fs::remove_file(&pid_path);
+    let _ = std::fs::remove_file(&ctx.pid_path);
 
     tracing::info!("Cascade stopped.");
     Ok(())
@@ -159,23 +125,18 @@ pub async fn start(mount_point: Option<&str>) -> Result<()> {
 
 /// Stop the Cascade daemon.
 #[cfg(unix)]
-pub fn stop() -> anyhow::Result<()> {
-    let config_dir = dirs::config_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from(".cascade"))
-        .join("cascade");
-    let pid_path = config_dir.join("cascade.pid");
-
-    if !pid_path.exists() {
+pub fn stop(ctx: &CliContext) -> anyhow::Result<()> {
+    if !ctx.pid_path.exists() {
         println!("Cascade is not running.");
         return Ok(());
     }
 
-    let raw = std::fs::read_to_string(&pid_path)
-        .with_context(|| format!("failed to read {}", pid_path.display()))?;
+    let raw = std::fs::read_to_string(&ctx.pid_path)
+        .with_context(|| format!("failed to read {}", ctx.pid_path.display()))?;
     let pid_u32: u32 = raw
         .trim()
         .parse()
-        .with_context(|| format!("invalid PID in {}: {:?}", pid_path.display(), raw.trim()))?;
+        .with_context(|| format!("invalid PID in {}: {:?}", ctx.pid_path.display(), raw.trim()))?;
     let pid_signed =
         i32::try_from(pid_u32).with_context(|| format!("PID {pid_u32} overflows i32"))?;
     let pid = nix::unistd::Pid::from_raw(pid_signed);
@@ -184,7 +145,7 @@ pub fn stop() -> anyhow::Result<()> {
         Ok(()) => {}
         Err(nix::errno::Errno::ESRCH) => {
             // Process no longer exists — clean up stale PID file.
-            let _ = std::fs::remove_file(&pid_path);
+            let _ = std::fs::remove_file(&ctx.pid_path);
             println!("Cascade is not running.");
             return Ok(());
         }
@@ -209,14 +170,14 @@ pub fn stop() -> anyhow::Result<()> {
         eprintln!("Warning: process {pid_u32} did not exit within 5 seconds after SIGTERM.");
     }
 
-    let _ = std::fs::remove_file(&pid_path);
+    let _ = std::fs::remove_file(&ctx.pid_path);
     println!("Cascade stopped.");
     Ok(())
 }
 
 /// Stop the Cascade daemon.
 #[cfg(not(unix))]
-pub fn stop() -> anyhow::Result<()> {
+pub fn stop(_ctx: &CliContext) -> anyhow::Result<()> {
     anyhow::bail!("cascade stop is not supported on this platform yet");
 }
 
@@ -279,7 +240,6 @@ fn resolve_mount_path(path: &str) -> PathBuf {
 /// Mount NFS filesystem using the OS mount command (macOS).
 #[cfg(target_os = "macos")]
 fn mount_nfs(mount_point: &Path, port: u16) -> Result<()> {
-    // Create the mount point directory.
     if !mount_point.exists() {
         std::fs::create_dir_all(mount_point)?;
     }
@@ -287,7 +247,6 @@ fn mount_nfs(mount_point: &Path, port: u16) -> Result<()> {
     let nfs_spec = format!("127.0.0.1:{port}:/");
     tracing::info!(spec = %nfs_spec, mount = %mount_point.display(), "mounting NFS");
 
-    // macOS mount_nfs.
     let output = std::process::Command::new("/sbin/mount_nfs")
         .arg("-o")
         .arg("rw,resvport")
@@ -297,7 +256,6 @@ fn mount_nfs(mount_point: &Path, port: u16) -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // mount_nfs may fail if already mounted — check.
         if is_mounted(mount_point) {
             tracing::warn!(path = %mount_point.display(), "already mounted");
             return Ok(());
@@ -351,7 +309,7 @@ fn mount_nfs(_mount_point: &Path, _port: u16) -> Result<()> {
 
 #[cfg(not(target_os = "macos"))]
 fn unmount_nfs(_mount_point: &Path) -> Result<()> {
-    Ok(()) // no-op: nothing was mounted
+    Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]

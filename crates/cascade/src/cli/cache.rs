@@ -7,23 +7,16 @@ use cascade_engine::db::StateDb;
 use std::sync::Arc;
 
 use super::init::{BackendConfig, CascadeConfig};
+use super::CliContext;
 
-/// Open the state database from the default path.
-fn open_db() -> Result<StateDb> {
-    let db_path = config_dir().join("state.db");
-    StateDb::open(&db_path)
-}
-
-/// Resolve the config directory.
-fn config_dir() -> std::path::PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from(".cascade"))
-        .join("cascade")
+/// Open the state database.
+fn open_db(ctx: &CliContext) -> Result<StateDb> {
+    StateDb::open(&ctx.db_path)
 }
 
 /// Pin a path.
-pub fn pin(path: &str) -> Result<()> {
-    let db = open_db()?;
+pub fn pin(ctx: &CliContext, path: &str) -> Result<()> {
+    let db = open_db(ctx)?;
     let db = Arc::new(db);
     let manager = CacheManager::new(db, CacheManagerConfig::default());
 
@@ -34,8 +27,8 @@ pub fn pin(path: &str) -> Result<()> {
 }
 
 /// Unpin a path.
-pub fn unpin(path: &str) -> Result<()> {
-    let db = open_db()?;
+pub fn unpin(ctx: &CliContext, path: &str) -> Result<()> {
+    let db = open_db(ctx)?;
     let db = Arc::new(db);
     let manager = CacheManager::new(db, CacheManagerConfig::default());
 
@@ -48,8 +41,8 @@ pub fn unpin(path: &str) -> Result<()> {
 }
 
 /// List all pinned paths.
-pub fn pin_list() -> Result<()> {
-    let db = open_db()?;
+pub fn pin_list(ctx: &CliContext) -> Result<()> {
+    let db = open_db(ctx)?;
     let db = Arc::new(db);
     let manager = CacheManager::new(db, CacheManagerConfig::default());
 
@@ -67,8 +60,8 @@ pub fn pin_list() -> Result<()> {
 }
 
 /// Pre-warm a path by pinning it so files are downloaded on the next sync.
-pub fn warm(path: &str) -> Result<()> {
-    let db = open_db()?;
+pub fn warm(ctx: &CliContext, path: &str) -> Result<()> {
+    let db = open_db(ctx)?;
     let db = Arc::new(db);
     let manager = CacheManager::new(db, CacheManagerConfig::default());
 
@@ -85,10 +78,10 @@ pub fn warm(path: &str) -> Result<()> {
 /// transitions every cached file whose path matches `path` as a prefix to the
 /// `Online` state. The background worker will then skip those files until they
 /// are accessed or re-pinned.
-pub fn clear(path: &str) -> Result<()> {
+pub fn clear(ctx: &CliContext, path: &str) -> Result<()> {
     use cascade_engine::types::CacheState;
 
-    let db = open_db()?;
+    let db = open_db(ctx)?;
     let db = Arc::new(db);
     let manager = CacheManager::new(Arc::clone(&db), CacheManagerConfig::default());
 
@@ -120,8 +113,8 @@ pub fn clear(path: &str) -> Result<()> {
 
 /// Show cache status.
 #[allow(clippy::cast_precision_loss)]
-pub fn cache_status() -> Result<()> {
-    let db = open_db()?;
+pub fn cache_status(ctx: &CliContext) -> Result<()> {
+    let db = open_db(ctx)?;
     let db = Arc::new(db);
     let manager = CacheManager::new(db, CacheManagerConfig::default());
 
@@ -144,8 +137,8 @@ pub fn cache_status() -> Result<()> {
 }
 
 /// Run eviction.
-pub fn evict(all: bool) -> Result<()> {
-    let db = open_db()?;
+pub fn evict(ctx: &CliContext, all: bool) -> Result<()> {
+    let db = open_db(ctx)?;
     let db = Arc::new(db);
     let config = if all {
         CacheManagerConfig {
@@ -173,12 +166,11 @@ pub fn evict(all: bool) -> Result<()> {
 }
 
 /// Add a backend configuration.
-pub fn backend_add(backend_type: &str, name: Option<&str>, mount_path: Option<&str>) -> Result<()> {
-    let config_dir = config_dir();
-    std::fs::create_dir_all(&config_dir)?;
+pub fn backend_add(ctx: &CliContext, backend_type: &str, name: Option<&str>, mount_path: Option<&str>) -> Result<()> {
+    std::fs::create_dir_all(&ctx.config_dir)?;
 
     let backend_name = name.unwrap_or(backend_type);
-    let config_path = config_dir.join(format!("{backend_name}.toml"));
+    let config_path = ctx.config_dir.join(format!("{backend_name}.toml"));
 
     if config_path.exists() {
         anyhow::bail!("Backend '{backend_name}' already exists. Remove it first.");
@@ -293,7 +285,7 @@ pub fn backend_add(backend_type: &str, name: Option<&str>, mount_path: Option<&s
     }
 
     // Register in the state DB.
-    let db = open_db()?;
+    let db = open_db(ctx)?;
     db.register_backend(
         backend_name,
         backend_type,
@@ -303,7 +295,7 @@ pub fn backend_add(backend_type: &str, name: Option<&str>, mount_path: Option<&s
     )?;
 
     // Update config.toml so `cascade start` can discover this backend.
-    let main_config_path = config_dir.join("config.toml");
+    let main_config_path = ctx.config_dir.join("config.toml");
     let mut main_config: CascadeConfig = if main_config_path.exists() {
         let raw = std::fs::read_to_string(&main_config_path)?;
         toml::from_str(&raw)?
@@ -350,9 +342,8 @@ fn read_input(prompt: &str) -> Result<String> {
 }
 
 /// Remove a backend configuration.
-pub fn backend_remove(name: &str) -> Result<()> {
-    let config_dir = config_dir();
-    let config_path = config_dir.join(format!("{name}.toml"));
+pub fn backend_remove(ctx: &CliContext, name: &str) -> Result<()> {
+    let config_path = ctx.config_dir.join(format!("{name}.toml"));
 
     if !config_path.exists() {
         anyhow::bail!("Backend '{name}' not found.");
@@ -361,7 +352,7 @@ pub fn backend_remove(name: &str) -> Result<()> {
     std::fs::remove_file(&config_path)?;
 
     // Remove from config.toml so `cascade start` no longer tries to load it.
-    let main_config_path = config_dir.join("config.toml");
+    let main_config_path = ctx.config_dir.join("config.toml");
     if main_config_path.exists() {
         let raw = std::fs::read_to_string(&main_config_path)?;
         let mut main_config: CascadeConfig = toml::from_str(&raw)?;
@@ -371,7 +362,7 @@ pub fn backend_remove(name: &str) -> Result<()> {
     }
 
     // Remove from the state DB.
-    let db = open_db()?;
+    let db = open_db(ctx)?;
     db.remove_backend(name)?;
 
     println!("Removed backend: {name}");

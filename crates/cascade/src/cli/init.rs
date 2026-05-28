@@ -14,6 +14,8 @@ use anyhow::Result;
 use cascade_engine::db::StateDb;
 use serde::{Deserialize, Serialize};
 
+use super::CliContext;
+
 /// Top-level configuration persisted to `~/.config/cascade/config.toml`.
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct CascadeConfig {
@@ -42,7 +44,7 @@ pub struct BackendConfig {
 const BACKEND_TYPES: &[(&str, &str)] = &[("gdrive", "Google Drive"), ("s3", "S3-compatible")];
 
 /// Run the interactive init wizard.
-pub fn run() -> Result<()> {
+pub fn run(ctx: &CliContext) -> Result<()> {
     println!("Welcome to Cascade! Let's set up your first cloud storage backend.");
     println!();
 
@@ -75,11 +77,8 @@ pub fn run() -> Result<()> {
     };
     println!();
 
-    // Prepare config directory early — needed by both provider branches.
-    let config_dir = dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from(".cascade"))
-        .join("cascade");
-    std::fs::create_dir_all(&config_dir)?;
+    // Prepare config directory.
+    std::fs::create_dir_all(&ctx.config_dir)?;
 
     // Step 3: Provider-specific setup.
     // Writes ~/.config/cascade/{name}.toml with credentials for the chosen provider.
@@ -118,7 +117,7 @@ pub fn run() -> Result<()> {
         backend_table.insert("account".to_string(), toml::Value::String(name.clone()));
 
         let backend_toml = toml::to_string_pretty(&backend_table)?;
-        let backend_config_path = config_dir.join(format!("{name}.toml"));
+        let backend_config_path = ctx.config_dir.join(format!("{name}.toml"));
         std::fs::write(&backend_config_path, &backend_toml)?;
 
         println!(
@@ -177,7 +176,7 @@ pub fn run() -> Result<()> {
         );
 
         let backend_toml = toml::to_string_pretty(&backend_table)?;
-        let backend_config_path = config_dir.join(format!("{name}.toml"));
+        let backend_config_path = ctx.config_dir.join(format!("{name}.toml"));
         std::fs::write(&backend_config_path, &backend_toml)?;
     }
     let account: Option<String> = None;
@@ -196,7 +195,7 @@ pub fn run() -> Result<()> {
     };
 
     // Step 5: Write config.
-    let config_path = config_dir.join("config.toml");
+    let config_path = ctx.config_dir.join("config.toml");
 
     // Build TOML config.
     let backend_config = BackendConfig {
@@ -217,7 +216,7 @@ pub fn run() -> Result<()> {
 
     // Register the backend in the state DB so `cascade status` and
     // `cascade backend-list` can discover it.
-    let db_path = config_dir.join("state.db");
+    let db_path = ctx.db_path.clone();
     let db = StateDb::open(&db_path)?;
     db.register_backend(
         &name,

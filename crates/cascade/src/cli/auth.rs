@@ -1,21 +1,13 @@
 //! `cascade backend auth` — run the `OAuth2` device-code flow for a named backend.
 
-use std::path::PathBuf;
-
 use anyhow::Context as _;
 use cascade_backend_gdrive::auth::{OAuthConfig, poll_for_token, save_tokens, start_device_code};
 
-/// Compute the cascade config directory.
-fn config_dir() -> anyhow::Result<PathBuf> {
-    dirs::config_dir()
-        .ok_or_else(|| anyhow::anyhow!("could not determine config directory"))
-        .map(|p| p.join("cascade"))
-}
+use super::CliContext;
 
 /// Authenticate a named backend via the `OAuth2` device-code flow.
-pub async fn authenticate(name: &str) -> anyhow::Result<()> {
-    let config_dir = config_dir()?;
-    let config_path = config_dir.join(format!("{name}.toml"));
+pub async fn authenticate(ctx: &CliContext, name: &str) -> anyhow::Result<()> {
+    let config_path = ctx.config_dir.join(format!("{name}.toml"));
 
     let raw = std::fs::read_to_string(&config_path)
         .with_context(|| format!("backend '{}' not found ({})", name, config_path.display()))?;
