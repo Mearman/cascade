@@ -259,7 +259,9 @@ fn invalid_json_body_produces_decode_error() {
 #[cfg(not(target_os = "macos"))]
 #[tokio::test]
 async fn presenter_operations_fail_outside_macos() {
+    use cascade_engine::presenter::VfsPresenter;
     use cascade_presenter_fileprovider::FileProviderPresenter;
+    use std::path::Path;
 
     let presenter = FileProviderPresenter::new("/tmp/cascade-test.sock");
     let id = ItemId::new("gdrive", "file1");
