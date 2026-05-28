@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 /// A parsed expression.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Expr {
-    Or(Vec<Expr>),
-    And(Vec<Expr>),
-    Not(Box<Expr>),
+    Or(Vec<Self>),
+    And(Vec<Self>),
+    Not(Box<Self>),
     Comparison {
         left: Operand,
         operator: Operator,

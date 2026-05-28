@@ -150,7 +150,7 @@ impl DiskProvider {
             let result = unsafe { libc::statfs(c_path.as_ptr(), &raw mut stat) };
             if result == 0 {
                 #[cfg(target_os = "linux")]
-                let block_size = stat.f_bsize as u64;
+                let block_size = stat.f_bsize.unsigned_abs() as u64;
                 #[cfg(not(target_os = "linux"))]
                 let block_size = u64::from(stat.f_bsize);
                 DiskContext {
@@ -195,6 +195,7 @@ impl NetworkProvider {
     }
 }
 
+#[allow(clippy::missing_const_for_fn)]
 fn detect_network_type() -> NetworkType {
     #[cfg(target_os = "macos")]
     {
@@ -245,6 +246,7 @@ pub struct PowerProvider;
 
 impl PowerProvider {
     #[must_use]
+    #[allow(clippy::missing_const_for_fn)]
     pub fn collect() -> PowerContext {
         #[cfg(target_os = "macos")]
         {
