@@ -6,6 +6,7 @@ use serde::Deserialize;
 
 /// A file or folder from the Drive API.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DriveFile {
     pub id: String,
     pub name: String,
@@ -52,12 +53,14 @@ impl DriveFile {
 
 /// About (quota) response from the Drive API.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AboutResponse {
     pub storage_quota: Option<StorageQuota>,
 }
 
 /// Storage quota from the Drive API.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StorageQuota {
     pub limit: Option<String>,
     pub usage: Option<String>,
@@ -65,6 +68,7 @@ pub struct StorageQuota {
 
 /// A change from the Drive API Changes stream.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DriveChange {
     pub kind: Option<String>,
     pub file_id: Option<String>,
@@ -74,6 +78,7 @@ pub struct DriveChange {
 
 /// Changes list response.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ChangesResponse {
     pub changes: Vec<DriveChange>,
     pub next_page_token: Option<String>,
@@ -82,6 +87,7 @@ pub struct ChangesResponse {
 
 /// File list response from files.list.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FileListResponse {
     pub files: Vec<DriveFile>,
     pub next_page_token: Option<String>,

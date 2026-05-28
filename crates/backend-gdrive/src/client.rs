@@ -59,7 +59,6 @@ pub struct DriveClient {
     http: reqwest::Client,
     rate_limiter: RateLimiter,
     base_url: String,
-    #[allow(dead_code)] // Phase 2 upload support
     upload_url: String,
 }
 
@@ -71,14 +70,23 @@ impl Default for DriveClient {
 
 impl DriveClient {
     pub fn new() -> Self {
+        Self::with_urls(
+            "https://www.googleapis.com/drive/v3".to_string(),
+            "https://www.googleapis.com/upload/drive/v3".to_string(),
+        )
+    }
+
+    /// Construct a client with custom base URLs — used in integration tests
+    /// to point at a mock server instead of the real Drive API.
+    pub fn with_urls(base_url: String, upload_url: String) -> Self {
         Self {
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
                 .unwrap_or_default(),
             rate_limiter: RateLimiter::new(10_000),
-            base_url: "https://www.googleapis.com/drive/v3".to_string(),
-            upload_url: "https://www.googleapis.com/upload/drive/v3".to_string(),
+            base_url,
+            upload_url,
         }
     }
 
@@ -199,6 +207,7 @@ impl DriveClient {
             )
             .await?;
         #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
         struct StartPageToken {
             start_page_token: String,
         }
