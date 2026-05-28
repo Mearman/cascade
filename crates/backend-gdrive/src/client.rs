@@ -224,6 +224,177 @@ impl DriveClient {
         let changes = resp.json::<ChangesResponse>().await?;
         Ok(changes)
     }
+
+    // ── Write operations ──
+
+    /// Upload file content (create or update).
+    /// Uses the multipart upload endpoint for new files.
+    pub async fn upload_file(
+        &self,
+        file_name: &str,
+        parent_id: &str,
+        data: &[u8],
+        token: &str,
+    ) -> anyhow::Result<DriveFile> {
+        self.rate_limiter.acquire().await;
+
+        // Multipart upload: metadata + content.
+        let metadata = serde_json::json!({
+            "name": file_name,
+            "parents": [parent_id]
+        });
+
+        let boundary = "cascade_upload_boundary";
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice("Content-Type: application/json; charset=UTF-8\r\n\r\n".as_bytes());
+        body.extend_from_slice(metadata.to_string().as_bytes());
+        body.extend_from_slice(format!("\r\n--{boundary}\r\n").as_bytes());
+        body.extend_from_slice("Content-Type: application/octet-stream\r\n\r\n".as_bytes());
+        body.extend_from_slice(data);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+        let url = format!(
+            "{}/files?uploadType=multipart&supportsAllDrives=true",
+            self.upload_url
+        );
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(token)
+            .header(
+                "Content-Type",
+                format!("multipart/related; boundary={boundary}"),
+            )
+            .body(body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if status.is_client_error() || status.is_server_error() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Drive upload error {status}: {body}");
+        }
+        let file = resp.json::<DriveFile>().await?;
+        Ok(file)
+    }
+
+    /// Update an existing file's content.
+    pub async fn update_file(
+        &self,
+        file_id: &str,
+        data: &[u8],
+        token: &str,
+    ) -> anyhow::Result<DriveFile> {
+        self.rate_limiter.acquire().await;
+        let url = format!(
+            "{}/files/{file_id}?uploadType=media&supportsAllDrives=true",
+            self.upload_url
+        );
+        let resp = self
+            .http
+            .patch(&url)
+            .bearer_auth(token)
+            .header("Content-Type", "application/octet-stream")
+            .body(data.to_vec())
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if status.is_client_error() || status.is_server_error() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Drive update error {status}: {body}");
+        }
+        let file = resp.json::<DriveFile>().await?;
+        Ok(file)
+    }
+
+    /// Create a directory.
+    pub async fn create_directory(
+        &self,
+        name: &str,
+        parent_id: &str,
+        token: &str,
+    ) -> anyhow::Result<DriveFile> {
+        self.rate_limiter.acquire().await;
+        let url = format!("{}/files?supportsAllDrives=true", self.base_url);
+        let body = serde_json::json!({
+            "name": name,
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [parent_id]
+        });
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if status.is_client_error() || status.is_server_error() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Drive create_dir error {status}: {body}");
+        }
+        let file = resp.json::<DriveFile>().await?;
+        Ok(file)
+    }
+
+    /// Trash (soft-delete) a file.
+    pub async fn trash_file(&self, file_id: &str, token: &str) -> anyhow::Result<()> {
+        self.rate_limiter.acquire().await;
+        let url = format!("{}/files/{file_id}?supportsAllDrives=true", self.base_url);
+        let resp = self
+            .http
+            .patch(&url)
+            .bearer_auth(token)
+            .json(&serde_json::json!({"trashed": true}))
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if status.is_client_error() || status.is_server_error() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Drive trash error {status}: {body}");
+        }
+        Ok(())
+    }
+
+    /// Move a file to a new parent and/or rename it.
+    pub async fn move_file(
+        &self,
+        file_id: &str,
+        new_parent_id: &str,
+        new_name: Option<&str>,
+        token: &str,
+    ) -> anyhow::Result<DriveFile> {
+        self.rate_limiter.acquire().await;
+        let url = format!("{}/files/{file_id}?supportsAllDrives=true", self.base_url);
+        let mut body = serde_json::json!({});
+        if let Some(name) = new_name {
+            body["name"] = serde_json::Value::String(name.to_string());
+        }
+        // The addParents/removeParents params handle parent change.
+        let resp = self
+            .http
+            .patch(&url)
+            .bearer_auth(token)
+            .query(&[
+                ("addParents", new_parent_id),
+                ("removeParents", ""), // API removes all current parents when addParents + removeParents specified
+            ])
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if status.is_client_error() || status.is_server_error() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Drive move error {status}: {body}");
+        }
+        let file = resp.json::<DriveFile>().await?;
+        Ok(file)
+    }
 }
 
 #[cfg(test)]

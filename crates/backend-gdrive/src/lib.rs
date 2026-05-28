@@ -1,6 +1,7 @@
-//! Google Drive backend (Phase 1: read-only).
+//! Google Drive backend.
 //!
 //! Uses the Drive API v3 with OAuth2 device code flow.
+//! Full read/write support: upload, create directory, trash, move/rename.
 //! Change detection via the Changes API (cursor-based).
 
 pub mod auth;
@@ -229,23 +230,87 @@ impl Backend for GdriveBackend {
 
     async fn upload(
         &self,
-        _path: &Path,
-        _reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
-        _parent_id: &cascade_engine::types::FileId,
+        path: &Path,
+        reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+        parent_id: &cascade_engine::types::FileId,
     ) -> anyhow::Result<FileEntry> {
-        anyhow::bail!("Google Drive upload not supported in Phase 1 (read-only)")
+        let token = self.access_token().await?;
+
+        // Read all data from the reader.
+        let mut data = Vec::<u8>::new();
+        tokio::io::AsyncReadExt::read_to_end(reader, &mut data).await?;
+
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("untitled");
+
+        let file = self
+            .drive
+            .upload_file(file_name, parent_id.0.as_str(), &data, &token)
+            .await?;
+
+        file.to_file_entry("gdrive")
+            .ok_or_else(|| anyhow::anyhow!("upload returned trashed file"))
     }
 
-    async fn create_dir(&self, _path: &Path) -> anyhow::Result<FileEntry> {
-        anyhow::bail!("Google Drive create_dir not supported in Phase 1 (read-only)")
+    async fn create_dir(&self, path: &Path) -> anyhow::Result<FileEntry> {
+        let token = self.access_token().await?;
+
+        let dir_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("New Folder");
+
+        // Resolve parent directory.
+        let parent = path.parent().unwrap_or(Path::new("/"));
+        let parent_id = if parent == Path::new("") || parent == Path::new("/") {
+            "root".to_string()
+        } else {
+            let parent_entry = self.metadata(parent).await?;
+            parent_entry.id.native_id().to_string()
+        };
+
+        let file = self
+            .drive
+            .create_directory(dir_name, &parent_id, &token)
+            .await?;
+
+        file.to_file_entry("gdrive")
+            .ok_or_else(|| anyhow::anyhow!("create_dir returned trashed file"))
     }
 
-    async fn delete(&self, _file: &FileEntry) -> anyhow::Result<()> {
-        anyhow::bail!("Google Drive delete not supported in Phase 1 (read-only)")
+    async fn delete(&self, file: &FileEntry) -> anyhow::Result<()> {
+        let token = self.access_token().await?;
+        let file_id = file.id.native_id();
+        self.drive.trash_file(file_id, &token).await
     }
 
-    async fn move_entry(&self, _src: &Path, _dst: &Path) -> anyhow::Result<FileEntry> {
-        anyhow::bail!("Google Drive move not supported in Phase 1 (read-only)")
+    async fn move_entry(&self, src: &Path, dst: &Path) -> anyhow::Result<FileEntry> {
+        let token = self.access_token().await?;
+
+        // Resolve source file to get its ID.
+        let src_entry = self.metadata(src).await?;
+        let file_id = src_entry.id.native_id();
+
+        // Resolve destination parent.
+        let dst_parent = dst.parent().unwrap_or(Path::new("/"));
+        let dst_parent_id = if dst_parent == Path::new("") || dst_parent == Path::new("/") {
+            "root".to_string()
+        } else {
+            let parent_entry = self.metadata(dst_parent).await?;
+            parent_entry.id.native_id().to_string()
+        };
+
+        let new_name = dst.file_name().and_then(|n| n.to_str());
+
+        let file = self
+            .drive
+            .move_file(file_id, &dst_parent_id, new_name, &token)
+            .await?;
+
+        file.to_file_entry("gdrive")
+            .ok_or_else(|| anyhow::anyhow!("move returned trashed file"))
     }
 
     async fn poll_interval(&self) -> Option<Duration> {
