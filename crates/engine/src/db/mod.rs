@@ -30,7 +30,7 @@ impl StateDb {
         db.migrate()?;
 
         Ok(db)
-}
+    }
 
     /// Open an in-memory database (for testing).
     pub fn open_in_memory() -> Result<Self> {
@@ -47,7 +47,10 @@ impl StateDb {
 
     /// Run schema migrations.
     fn migrate(&self) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
 
         let current_version = Self::get_version(&conn)?;
         let target_version = SchemaVersion::current();
@@ -87,7 +90,10 @@ impl StateDb {
 
     /// Upsert a file entry into the database.
     pub fn upsert_file(&self, entry: &FileEntry) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
         conn.execute(
             "INSERT OR REPLACE INTO files (
                 id, backend_id, path, parent_id, name, is_dir, size,
@@ -113,7 +119,10 @@ impl StateDb {
 
     /// Get a file entry by ID.
     pub fn get_file(&self, id: &ItemId) -> Result<Option<FileEntry>> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
         let mut stmt = conn.prepare(
             "SELECT id, parent_id, name, is_dir, size, mime_type, mod_time, remote_hash
              FROM files WHERE id = ?1",
@@ -127,9 +136,9 @@ impl StateDb {
                 is_dir: row.get(3)?,
                 size: row.get(4)?,
                 mime_type: row.get(5)?,
-                mod_time: row.get::<_, Option<i64>>(6)?.map(|ts| {
-                    chrono::DateTime::from_timestamp(ts, 0).unwrap_or_default()
-                }),
+                mod_time: row
+                    .get::<_, Option<i64>>(6)?
+                    .map(|ts| chrono::DateTime::from_timestamp(ts, 0).unwrap_or_default()),
                 hash: row.get(7)?,
             })
         });
@@ -143,14 +152,20 @@ impl StateDb {
 
     /// Delete a file entry by ID.
     pub fn delete_file(&self, id: &ItemId) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
         conn.execute("DELETE FROM files WHERE id = ?1", [&id.0])?;
         Ok(())
     }
 
     /// Update the cache state of a file.
     pub fn update_cache_state(&self, id: &ItemId, state: CacheState) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
         let now = chrono::Utc::now().timestamp();
         conn.execute(
             "UPDATE files SET cache_state = ?1, last_access = ?2 WHERE id = ?3",
@@ -161,7 +176,10 @@ impl StateDb {
 
     /// Get the cache state of a file.
     pub fn get_cache_state(&self, id: &ItemId) -> Result<Option<CacheState>> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
         let result: Option<String> = conn
             .query_row(
                 "SELECT cache_state FROM files WHERE id = ?1",
@@ -180,7 +198,10 @@ impl StateDb {
 
     /// Store a sync cursor for a backend.
     pub fn set_cursor(&self, backend_id: &str, cursor: &Cursor) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
         conn.execute(
             "INSERT OR REPLACE INTO sync_cursors (backend_id, cursor) VALUES (?1, ?2)",
             (backend_id, &cursor.0),
@@ -190,7 +211,10 @@ impl StateDb {
 
     /// Get the sync cursor for a backend.
     pub fn get_cursor(&self, backend_id: &str) -> Result<Option<Cursor>> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
         let result = conn
             .query_row(
                 "SELECT cursor FROM sync_cursors WHERE backend_id = ?1",
@@ -212,7 +236,10 @@ impl StateDb {
         mount_path: Option<&str>,
         config: Option<&str>,
     ) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
         conn.execute(
             "INSERT OR REPLACE INTO backends (id, backend_type, display_name, mount_path, config)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -223,10 +250,12 @@ impl StateDb {
 
     /// List all registered backends.
     pub fn list_backends(&self) -> Result<Vec<BackendRecord>> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
-        let mut stmt = conn.prepare(
-            "SELECT id, backend_type, display_name, mount_path, config FROM backends",
-        )?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+        let mut stmt = conn
+            .prepare("SELECT id, backend_type, display_name, mount_path, config FROM backends")?;
 
         let records = stmt
             .query_map([], |row| {
@@ -271,7 +300,8 @@ mod tests {
         let db = StateDb::open_in_memory().unwrap();
 
         // Register backend first (foreign key constraint)
-        db.register_backend("gdrive", "gdrive", "Google Drive", None, None).unwrap();
+        db.register_backend("gdrive", "gdrive", "Google Drive", None, None)
+            .unwrap();
 
         let file_id = ItemId::new("gdrive", "file1");
         let parent_id = ItemId::new("gdrive", "root");
@@ -291,7 +321,8 @@ mod tests {
     fn test_cache_state() {
         let db = StateDb::open_in_memory().unwrap();
 
-        db.register_backend("gdrive", "gdrive", "Google Drive", None, None).unwrap();
+        db.register_backend("gdrive", "gdrive", "Google Drive", None, None)
+            .unwrap();
 
         let file_id = ItemId::new("gdrive", "file1");
         let parent_id = ItemId::new("gdrive", "root");
@@ -327,8 +358,14 @@ mod tests {
     fn test_backend_registration() {
         let db = StateDb::open_in_memory().unwrap();
 
-        db.register_backend("gdrive-personal", "gdrive", "Google Drive (Personal)", None, None)
-            .unwrap();
+        db.register_backend(
+            "gdrive-personal",
+            "gdrive",
+            "Google Drive (Personal)",
+            None,
+            None,
+        )
+        .unwrap();
 
         let backends = db.list_backends().unwrap();
         assert_eq!(backends.len(), 1);

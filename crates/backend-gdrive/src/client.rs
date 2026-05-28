@@ -59,7 +59,14 @@ pub struct DriveClient {
     http: reqwest::Client,
     rate_limiter: RateLimiter,
     base_url: String,
+    #[allow(dead_code)] // Phase 2 upload support
     upload_url: String,
+}
+
+impl Default for DriveClient {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DriveClient {
@@ -103,10 +110,17 @@ impl DriveClient {
     /// Fetch a single file by ID.
     pub async fn get_file(&self, file_id: &str, token: &str) -> anyhow::Result<DriveFile> {
         let resp = self
-            .authenticated_get(&format!("files/{file_id}"), token, &[
-                ("fields", "id,name,mimeType,parents,size,modifiedTime,md5Checksum,trashed"),
-                ("supportsAllDrives", "true"),
-            ])
+            .authenticated_get(
+                &format!("files/{file_id}"),
+                token,
+                &[
+                    (
+                        "fields",
+                        "id,name,mimeType,parents,size,modifiedTime,md5Checksum,trashed",
+                    ),
+                    ("supportsAllDrives", "true"),
+                ],
+            )
             .await?;
         let file = resp.json::<DriveFile>().await?;
         Ok(file)
@@ -122,7 +136,10 @@ impl DriveClient {
         let query = format!("'{parent_id}' in parents and trashed = false");
         let mut params = vec![
             ("q", query.as_str()),
-            ("fields", "nextPageToken,files(id,name,mimeType,parents,size,modifiedTime,md5Checksum,trashed)"),
+            (
+                "fields",
+                "nextPageToken,files(id,name,mimeType,parents,size,modifiedTime,md5Checksum,trashed)",
+            ),
             ("pageSize", "100"),
             ("supportsAllDrives", "true"),
             ("includeItemsFromAllDrives", "true"),
@@ -134,9 +151,7 @@ impl DriveClient {
             params.push(("pageToken", owned_token.as_str()));
         }
 
-        let resp = self
-            .authenticated_get("files", token, &params)
-            .await?;
+        let resp = self.authenticated_get("files", token, &params).await?;
         let list = resp.json::<FileListResponse>().await?;
         Ok(list)
     }
@@ -168,9 +183,7 @@ impl DriveClient {
     /// Fetch storage quota / about info.
     pub async fn get_about(&self, token: &str) -> anyhow::Result<AboutResponse> {
         let resp = self
-            .authenticated_get("about", token, &[
-                ("fields", "storageQuota(limit,usage)"),
-            ])
+            .authenticated_get("about", token, &[("fields", "storageQuota(limit,usage)")])
             .await?;
         let about = resp.json::<AboutResponse>().await?;
         Ok(about)
@@ -179,9 +192,11 @@ impl DriveClient {
     /// Get the initial start page token for the Changes stream.
     pub async fn get_start_page_token(&self, token: &str) -> anyhow::Result<String> {
         let resp = self
-            .authenticated_get("changes/startPageToken", token, &[
-                ("supportsAllDrives", "true"),
-            ])
+            .authenticated_get(
+                "changes/startPageToken",
+                token,
+                &[("supportsAllDrives", "true")],
+            )
             .await?;
         #[derive(serde::Deserialize)]
         struct StartPageToken {

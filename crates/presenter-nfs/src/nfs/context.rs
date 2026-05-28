@@ -63,15 +63,20 @@ impl NfsContext {
     }
 
     /// List directory contents at a VFS path.
+    #[allow(clippy::await_holding_lock)]
     pub async fn list_dir(&self, path: &str) -> anyhow::Result<Vec<DirEntry>> {
         let vfs = self.vfs.read().unwrap();
         vfs.read_dir(std::path::Path::new(path)).await
     }
 
     /// Get file metadata at a VFS path.
+    #[allow(clippy::await_holding_lock)]
     pub async fn metadata(&self, path: &str) -> anyhow::Result<cascade_engine::types::FileEntry> {
-        let vfs = self.vfs.read().unwrap();
-        let (backend, relative) = vfs.resolve(std::path::Path::new(path));
+        let (backend, relative) = {
+            let vfs = self.vfs.read().unwrap();
+            let (backend, relative) = vfs.resolve(std::path::Path::new(path));
+            (Arc::clone(backend), relative.to_path_buf())
+        };
         backend.metadata(&relative).await
     }
 }
@@ -83,14 +88,17 @@ mod tests {
     #[test]
     fn path_to_key_deterministic() {
         assert_eq!(NfsContext::path_to_key("/"), NfsContext::path_to_key("/"));
-        assert_ne!(NfsContext::path_to_key("/"), NfsContext::path_to_key("/foo"));
+        assert_ne!(
+            NfsContext::path_to_key("/"),
+            NfsContext::path_to_key("/foo")
+        );
     }
 
     #[test]
     fn register_and_lookup() {
-        let vfs = Arc::new(RwLock::new(VfsTree::new(
-            Arc::new(cascade_engine::backend::NullBackend::new("test")),
-        )));
+        let vfs = Arc::new(RwLock::new(VfsTree::new(Arc::new(
+            cascade_engine::backend::NullBackend::new("test"),
+        ))));
         let ctx = NfsContext::new(vfs);
 
         let key = ctx.register_path("/Documents");
@@ -100,9 +108,9 @@ mod tests {
 
     #[test]
     fn root_always_registered() {
-        let vfs = Arc::new(RwLock::new(VfsTree::new(
-            Arc::new(cascade_engine::backend::NullBackend::new("test")),
-        )));
+        let vfs = Arc::new(RwLock::new(VfsTree::new(Arc::new(
+            cascade_engine::backend::NullBackend::new("test"),
+        ))));
         let ctx = NfsContext::new(vfs);
         assert_eq!(ctx.lookup_path(ctx.root_key()), Some("/".to_string()));
     }

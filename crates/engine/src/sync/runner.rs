@@ -122,11 +122,7 @@ impl SyncRunner {
 
     /// Apply a batch of changes to the state database and notify the presenter.
     /// Files matching `.cascade` ignore rules are skipped.
-    async fn apply_changes(
-        &self,
-        _backend_id: &str,
-        changes: &[Change],
-    ) -> anyhow::Result<usize> {
+    async fn apply_changes(&self, _backend_id: &str, changes: &[Change]) -> anyhow::Result<usize> {
         let mut count = 0;
 
         for change in changes {
@@ -183,10 +179,10 @@ impl SyncRunner {
     async fn effective_poll_interval(&self) -> Duration {
         let mut interval = DEFAULT_POLL_INTERVAL;
         for backend in &self.backends {
-            if let Some(backend_interval) = backend.poll_interval().await {
-                if backend_interval < interval {
-                    interval = backend_interval;
-                }
+            if let Some(backend_interval) = backend.poll_interval().await
+                && backend_interval < interval
+            {
+                interval = backend_interval;
             }
         }
         interval
@@ -220,7 +216,11 @@ mod tests {
             self.deletes.lock().unwrap().push(id.0.clone());
             Ok(())
         }
-        async fn update_state(&self, _id: &ItemId, _state: crate::types::CacheState) -> anyhow::Result<()> {
+        async fn update_state(
+            &self,
+            _id: &ItemId,
+            _state: crate::types::CacheState,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
         async fn fetch_contents(&self, _id: &ItemId) -> anyhow::Result<PathBuf> {
@@ -240,7 +240,8 @@ mod tests {
     #[tokio::test]
     async fn sync_runner_initial_sync_with_null_backend() {
         let db = Arc::new(StateDb::open_in_memory().unwrap());
-        db.register_backend("test", "null", "Test", None, None).unwrap();
+        db.register_backend("test", "null", "Test", None, None)
+            .unwrap();
 
         let backend: Arc<dyn Backend> = Arc::new(NullBackend::new("test"));
         let presenter = Arc::new(MockPresenter::default());

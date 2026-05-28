@@ -19,10 +19,7 @@ pub fn parse(content: &str) -> CascadeConfig {
         }
 
         // Conditional block open: :[<expr>]
-        if let Some(expr) = trimmed
-            .strip_prefix(":[")
-            .and_then(|s| s.strip_suffix(']'))
-        {
+        if let Some(expr) = trimmed.strip_prefix(":[").and_then(|s| s.strip_suffix(']')) {
             let _ = expr.trim(); // Would push to condition_stack in full impl
             continue;
         }
@@ -59,11 +56,7 @@ pub fn parse(content: &str) -> CascadeConfig {
 }
 
 /// Parse a directive line (after the `:` prefix).
-fn parse_directive(
-    directive: &str,
-    _conditions: &[String],
-    _config: &mut CascadeConfig,
-) {
+fn parse_directive(directive: &str, _conditions: &[String], _config: &mut CascadeConfig) {
     // Phase 1 only supports ignore rules.
     // Directives like `:cache`, `:lifecycle`, `:pin`, `:unpin`, `:p2p`
     // will be implemented in Phase 2+.

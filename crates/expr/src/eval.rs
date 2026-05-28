@@ -1,8 +1,8 @@
 //! Expression evaluator — evaluates an AST against an [`EvalContext`].
 
+use crate::ExprParser;
 use crate::ast::{Expr, Operand, Operator, Value};
 use crate::context::EvalContext;
-use crate::ExprParser;
 
 use pest::Parser;
 
@@ -207,7 +207,10 @@ fn value_in(_item: &Value, _collection: &Value) -> bool {
 
 /// Build an AST from pest parse pairs.
 fn build_ast(pairs: pest::iterators::Pairs<crate::Rule>) -> anyhow::Result<Expr> {
-    let pair = pairs.into_iter().next().ok_or_else(|| anyhow::anyhow!("empty expression"))?;
+    let pair = pairs
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("empty expression"))?;
     build_from_pair(pair)
 }
 
@@ -281,7 +284,10 @@ fn build_operand(pair: pest::iterators::Pair<crate::Rule>) -> anyhow::Result<Ope
             let inner = pair.into_inner().next().unwrap();
             Ok(Operand::Literal(parse_literal(inner)?))
         }
-        _ => Err(anyhow::anyhow!("expected operand, got {:?}", pair.as_rule())),
+        _ => Err(anyhow::anyhow!(
+            "expected operand, got {:?}",
+            pair.as_rule()
+        )),
     }
 }
 
@@ -313,9 +319,7 @@ fn parse_literal(pair: pest::iterators::Pair<crate::Rule>) -> anyhow::Result<Val
             // The duration rule matches integer + suffix as one token
             parse_duration_literal(pair.as_str())
         }
-        crate::Rule::size_bytes => {
-            parse_size_literal(pair.as_str())
-        }
+        crate::Rule::size_bytes => parse_size_literal(pair.as_str()),
         crate::Rule::percentage => {
             let text = pair.as_str();
             let num: i64 = text.trim_end_matches('%').parse()?;
@@ -326,22 +330,22 @@ fn parse_literal(pair: pest::iterators::Pair<crate::Rule>) -> anyhow::Result<Val
 }
 
 fn parse_duration_literal(s: &str) -> anyhow::Result<Value> {
-    let (num_part, unit) = if s.ends_with("ms") {
-        (&s[..s.len() - 2], crate::ast::DurationUnit::Milliseconds)
-    } else if s.ends_with('s') {
-        (&s[..s.len() - 1], crate::ast::DurationUnit::Seconds)
-    } else if s.ends_with('m') {
-        (&s[..s.len() - 1], crate::ast::DurationUnit::Minutes)
-    } else if s.ends_with('h') {
-        (&s[..s.len() - 1], crate::ast::DurationUnit::Hours)
-    } else if s.ends_with('d') {
-        (&s[..s.len() - 1], crate::ast::DurationUnit::Days)
-    } else if s.ends_with('w') {
-        (&s[..s.len() - 1], crate::ast::DurationUnit::Weeks)
-    } else if s.ends_with('M') {
-        (&s[..s.len() - 1], crate::ast::DurationUnit::Months)
-    } else if s.ends_with('y') {
-        (&s[..s.len() - 1], crate::ast::DurationUnit::Years)
+    let (num_part, unit) = if let Some(stripped) = s.strip_suffix("ms") {
+        (stripped, crate::ast::DurationUnit::Milliseconds)
+    } else if let Some(stripped) = s.strip_suffix('s') {
+        (stripped, crate::ast::DurationUnit::Seconds)
+    } else if let Some(stripped) = s.strip_suffix('m') {
+        (stripped, crate::ast::DurationUnit::Minutes)
+    } else if let Some(stripped) = s.strip_suffix('h') {
+        (stripped, crate::ast::DurationUnit::Hours)
+    } else if let Some(stripped) = s.strip_suffix('d') {
+        (stripped, crate::ast::DurationUnit::Days)
+    } else if let Some(stripped) = s.strip_suffix('w') {
+        (stripped, crate::ast::DurationUnit::Weeks)
+    } else if let Some(stripped) = s.strip_suffix('M') {
+        (stripped, crate::ast::DurationUnit::Months)
+    } else if let Some(stripped) = s.strip_suffix('y') {
+        (stripped, crate::ast::DurationUnit::Years)
     } else {
         anyhow::bail!("invalid duration: {s}");
     };
@@ -349,16 +353,16 @@ fn parse_duration_literal(s: &str) -> anyhow::Result<Value> {
 }
 
 fn parse_size_literal(s: &str) -> anyhow::Result<Value> {
-    let (num_part, unit) = if s.ends_with("TB") {
-        (&s[..s.len() - 2], crate::ast::SizeUnit::Terabytes)
-    } else if s.ends_with("GB") {
-        (&s[..s.len() - 2], crate::ast::SizeUnit::Gigabytes)
-    } else if s.ends_with("MB") {
-        (&s[..s.len() - 2], crate::ast::SizeUnit::Megabytes)
-    } else if s.ends_with("KB") {
-        (&s[..s.len() - 2], crate::ast::SizeUnit::Kilobytes)
-    } else if s.ends_with('B') {
-        (&s[..s.len() - 1], crate::ast::SizeUnit::Bytes)
+    let (num_part, unit) = if let Some(stripped) = s.strip_suffix("TB") {
+        (stripped, crate::ast::SizeUnit::Terabytes)
+    } else if let Some(stripped) = s.strip_suffix("GB") {
+        (stripped, crate::ast::SizeUnit::Gigabytes)
+    } else if let Some(stripped) = s.strip_suffix("MB") {
+        (stripped, crate::ast::SizeUnit::Megabytes)
+    } else if let Some(stripped) = s.strip_suffix("KB") {
+        (stripped, crate::ast::SizeUnit::Kilobytes)
+    } else if let Some(stripped) = s.strip_suffix('B') {
+        (stripped, crate::ast::SizeUnit::Bytes)
     } else {
         anyhow::bail!("invalid size: {s}");
     };

@@ -47,8 +47,7 @@ impl ConfigResolver {
         }
 
         // Resolve from the cascade-config crate.
-        let config =
-            cascade_config::merge::resolve(&self.mount_root, dir);
+        let config = cascade_config::merge::resolve(&self.mount_root, dir);
 
         // Cache the result.
         {

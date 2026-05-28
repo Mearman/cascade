@@ -1,6 +1,5 @@
 use anyhow::Result;
 use cascade_engine::db::StateDb;
-use cascade_engine::protocol::StatusInfo;
 use std::path::PathBuf;
 
 /// Show overall mount status.
@@ -66,7 +65,7 @@ pub async fn cache_status() -> Result<()> {
         return Ok(());
     }
 
-    let db = StateDb::open(&db_path)?;
+    let _db = StateDb::open(&db_path)?;
 
     // Cache stats require scanning the files table — provide summary.
     println!("Cache Status");
@@ -96,10 +95,7 @@ pub async fn backend_list() -> Result<()> {
     } else {
         println!("Configured backends:");
         for b in &backends {
-            println!(
-                "  {} ({}) — {}",
-                b.display_name, b.backend_type, b.id
-            );
+            println!("  {} ({}) — {}", b.display_name, b.backend_type, b.id);
             if let Some(mp) = &b.mount_path {
                 println!("    Mount path: {}", mp);
             }

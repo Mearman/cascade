@@ -27,40 +27,37 @@ pub fn load_dir(dir: &std::path::Path) -> Option<CascadeConfig> {
 
     // gitignore-style (no extension)
     let gitignore_path = dir.join(".cascade");
-    if gitignore_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&gitignore_path) {
-            merge(gitignore::parse(&content));
-        }
+    if gitignore_path.exists()
+        && let Ok(content) = std::fs::read_to_string(&gitignore_path)
+    {
+        merge(gitignore::parse(&content));
     }
 
     // TOML
     let toml_path = dir.join(".cascade.toml");
-    if toml_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&toml_path) {
-            if let Ok(config) = toml::parse(&content) {
-                merge(config);
-            }
-        }
+    if toml_path.exists()
+        && let Ok(content) = std::fs::read_to_string(&toml_path)
+        && let Ok(config) = toml::parse(&content)
+    {
+        merge(config);
     }
 
     // YAML
     let yaml_path = dir.join(".cascade.yaml");
-    if yaml_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&yaml_path) {
-            if let Ok(config) = yaml::parse(&content) {
-                merge(config);
-            }
-        }
+    if yaml_path.exists()
+        && let Ok(content) = std::fs::read_to_string(&yaml_path)
+        && let Ok(config) = yaml::parse(&content)
+    {
+        merge(config);
     }
 
     // JSON
     let json_path = dir.join(".cascade.json");
-    if json_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&json_path) {
-            if let Ok(config) = json::parse(&content) {
-                merge(config);
-            }
-        }
+    if json_path.exists()
+        && let Ok(content) = std::fs::read_to_string(&json_path)
+        && let Ok(config) = json::parse(&content)
+    {
+        merge(config);
     }
 
     result

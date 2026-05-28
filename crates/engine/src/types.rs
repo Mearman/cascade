@@ -21,10 +21,7 @@ impl ItemId {
     }
 
     pub fn native_id(&self) -> &str {
-        self.0
-            .split_once(':')
-            .map(|(_, n)| n)
-            .unwrap_or(&self.0)
+        self.0.split_once(':').map(|(_, n)| n).unwrap_or(&self.0)
     }
 }
 
@@ -157,7 +154,10 @@ pub enum Provenance {
     /// File exists on the local filesystem, managed by a local backend.
     Local { disk_path: PathBuf },
     /// File exists both locally and in the cloud — synced via adopt-and-sync.
-    Synced { disk_path: PathBuf, cloud_id: FileId },
+    Synced {
+        disk_path: PathBuf,
+        cloud_id: FileId,
+    },
 }
 
 impl fmt::Display for Provenance {

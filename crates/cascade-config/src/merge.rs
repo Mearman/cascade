@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::parse::load_dir;
-use crate::types::{ResolvedConfig, CascadeConfig};
+use crate::types::{CascadeConfig, ResolvedConfig};
 
 /// Walk from mount root to target directory, layering `.cascade` configs
 /// with child-overrides-parent precedence.
@@ -166,9 +166,6 @@ mod tests {
         ];
         let resolved = resolve_from_configs(configs);
         // Second config wins
-        assert_eq!(
-            resolved.cache.unwrap().max_size,
-            Some("5GB".to_string())
-        );
+        assert_eq!(resolved.cache.unwrap().max_size, Some("5GB".to_string()));
     }
 }

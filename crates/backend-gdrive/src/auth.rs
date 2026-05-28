@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 struct TokenResponse {
     access_token: String,
     refresh_token: Option<String>,
+    #[allow(dead_code)] // Deserialisation target
     expires_in: u64,
+    #[allow(dead_code)] // Deserialisation target
     token_type: String,
 }
 
@@ -23,6 +25,7 @@ struct DeviceCodeResponse {
     device_code: String,
     user_code: String,
     verification_url: String,
+    #[allow(dead_code)] // Deserialisation target
     expires_in: u64,
     interval: Option<u64>,
 }
@@ -110,9 +113,7 @@ pub async fn poll_for_token(
                 chrono::Utc::now() + chrono::Duration::seconds(token_resp.expires_in as i64);
             return Ok(AuthTokens {
                 access_token: token_resp.access_token,
-                refresh_token: token_resp
-                    .refresh_token
-                    .unwrap_or_default(),
+                refresh_token: token_resp.refresh_token.unwrap_or_default(),
                 expires_at,
             });
         }
@@ -179,7 +180,13 @@ pub fn save_tokens(account: &str, tokens: &AuthTokens) -> anyhow::Result<()> {
 
     // Delete existing entry first (add-only will fail if it exists).
     let _ = Command::new("security")
-        .args(["delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account])
+        .args([
+            "delete-generic-password",
+            "-s",
+            KEYCHAIN_SERVICE,
+            "-a",
+            account,
+        ])
         .output();
 
     let output = Command::new("security")

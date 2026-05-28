@@ -72,9 +72,9 @@ impl GdriveBackend {
             *tokens = auth::load_tokens(&self.account)?;
         }
 
-        let tokens = tokens
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("Not authenticated. Run `cascade backend auth gdrive`"))?;
+        let tokens = tokens.as_mut().ok_or_else(|| {
+            anyhow::anyhow!("Not authenticated. Run `cascade backend auth gdrive`")
+        })?;
 
         // Refresh if expired.
         if tokens.is_expired() {
@@ -103,11 +103,15 @@ impl Backend for GdriveBackend {
         let token = self.access_token().await?;
         let about = self.drive.get_about(&token).await?;
 
-        let quota = about.storage_quota.and_then(|sq| {
+        let quota = about.storage_quota.map(|sq| {
             let total = sq.limit.as_ref().and_then(|v| v.parse::<u64>().ok());
             let used = sq.usage.as_ref().and_then(|v| v.parse::<u64>().ok());
             let available = total.zip(used).map(|(t, u)| t.saturating_sub(u));
-            Some(Quota { total, used, available })
+            Quota {
+                total,
+                used,
+                available,
+            }
         });
 
         Ok(quota)
@@ -151,10 +155,10 @@ impl Backend for GdriveBackend {
                         };
                         all_changes.push(Change::Deleted(entry));
                     }
-                } else if let Some(file) = change.file {
-                    if let Some(entry) = file.to_file_entry("gdrive") {
-                        all_changes.push(Change::Created(entry));
-                    }
+                } else if let Some(file) = change.file
+                    && let Some(entry) = file.to_file_entry("gdrive")
+                {
+                    all_changes.push(Change::Created(entry));
                 }
             }
 

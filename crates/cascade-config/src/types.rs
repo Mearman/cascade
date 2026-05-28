@@ -124,10 +124,8 @@ impl ResolvedConfig {
     pub fn is_ignored(&self, path: &str, is_dir: bool) -> bool {
         let mut ignored = false;
         for rule in &self.ignores {
-            if is_dir && !rule.dir_only || !is_dir {
-                if glob_match(&rule.pattern, path) {
-                    ignored = !rule.negated;
-                }
+            if (!is_dir || !rule.dir_only) && glob_match(&rule.pattern, path) {
+                ignored = !rule.negated;
             }
         }
         ignored
@@ -170,10 +168,8 @@ fn star_match(pattern: &str, path: &str) -> bool {
         }
         idx += first.len();
     }
-    if !last.is_empty() {
-        if !path.ends_with(last) {
-            return false;
-        }
+    if !last.is_empty() && !path.ends_with(last) {
+        return false;
     }
     // Check intermediate segments in order
     let remaining = if last.is_empty() {

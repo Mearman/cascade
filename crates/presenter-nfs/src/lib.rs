@@ -13,6 +13,7 @@ use cascade_engine::types::{CacheState, ItemId, VfsItem};
 
 /// NFS presenter using an NFSv3 server on loopback.
 pub struct NfsPresenter {
+    #[allow(dead_code)] // Used for mount/unmount commands
     mount_point: std::path::PathBuf,
     nfs_port: u16,
 }

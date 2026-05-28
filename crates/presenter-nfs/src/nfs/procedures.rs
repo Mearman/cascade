@@ -18,14 +18,8 @@ pub fn handle_nfs_call(proc: u32, args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8>
         NFS3PROC_READ => handle_read(args, ctx),
         NFS3PROC_FSSTAT => handle_fsstat(args, ctx),
         // Phase 1: all write operations return read-only error.
-        NFS3PROC_SETATTR
-        | NFS3PROC_WRITE
-        | NFS3PROC_CREATE
-        | NFS3PROC_MKDIR
-        | NFS3PROC_REMOVE
-        | NFS3PROC_RMDIR
-        | NFS3PROC_RENAME
-        | NFS3PROC_COMMIT => handle_readonly(),
+        NFS3PROC_SETATTR | NFS3PROC_WRITE | NFS3PROC_CREATE | NFS3PROC_MKDIR | NFS3PROC_REMOVE
+        | NFS3PROC_RMDIR | NFS3PROC_RENAME | NFS3PROC_COMMIT => handle_readonly(),
         _ => handle_unimplemented(),
     }
 }
@@ -41,7 +35,8 @@ fn handle_getattr(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
 
     match decode_fh(args) {
         Ok((fh, _)) => {
-            let key = fh.to_item_id()
+            let key = fh
+                .to_item_id()
                 .and_then(|id| id.parse::<u64>().ok())
                 .unwrap_or(0);
             if let Some(path) = ctx.lookup_path(key) {
@@ -74,10 +69,13 @@ fn handle_lookup(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
             match name_result {
                 Ok((name, _)) => {
                     // Resolve parent path from context.
-                    let parent_key = fh.to_item_id()
+                    let parent_key = fh
+                        .to_item_id()
                         .and_then(|id| id.parse::<u64>().ok())
                         .unwrap_or(0);
-                    let parent_path = ctx.lookup_path(parent_key).unwrap_or_else(|| "/".to_string());
+                    let parent_path = ctx
+                        .lookup_path(parent_key)
+                        .unwrap_or_else(|| "/".to_string());
                     let child_path = if parent_path == "/" {
                         format!("/{}", name)
                     } else {
@@ -121,7 +119,8 @@ fn handle_readdir(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
     let dir_result = decode_fh(args);
     match dir_result {
         Ok((fh, _rest)) => {
-            let dir_key = fh.to_item_id()
+            let dir_key = fh
+                .to_item_id()
                 .and_then(|id| id.parse::<u64>().ok())
                 .unwrap_or(0);
             let dir_path = ctx.lookup_path(dir_key).unwrap_or_else(|| "/".to_string());
@@ -154,7 +153,7 @@ fn handle_read(args: &[u8], _ctx: &Arc<NfsContext>) -> Vec<u8> {
     let file_result = decode_fh(args);
     match file_result {
         Ok((fh, rest)) => {
-            let offset = decode_u64(rest).ok().map(|(o, r)| (o, r));
+            let offset = decode_u64(rest).ok();
             let count = offset.and_then(|(_, r)| decode_u32(r).ok()).map(|(c, _)| c);
 
             let file_id = fh.to_item_id().unwrap_or("root".to_string());
@@ -182,7 +181,7 @@ fn handle_fsstat(args: &[u8], _ctx: &Arc<NfsContext>) -> Vec<u8> {
 
     match decode_fh(args) {
         Ok((_fh, _)) => {
-            let root_attr = make_attributes(&"root".to_string(), true);
+            let root_attr = make_attributes("root", true);
             encode_u32(&mut reply, NFS3_OK);
             encode_post_op_attr(&mut reply, &PostOpAttr::some(root_attr));
             encode_u64(&mut reply, 0); // total bytes
@@ -254,9 +253,9 @@ mod tests {
     use std::sync::RwLock;
 
     fn test_ctx() -> Arc<NfsContext> {
-        let vfs = Arc::new(RwLock::new(
-            VfsTree::new(Arc::new(NullBackend::new("test"))),
-        ));
+        let vfs = Arc::new(RwLock::new(VfsTree::new(Arc::new(NullBackend::new(
+            "test",
+        )))));
         let ctx = Arc::new(NfsContext::new(vfs));
         // Register root so GETATTR works.
         ctx.register_path("/");
@@ -279,7 +278,9 @@ mod tests {
     #[test]
     fn getattr_invalid_fh() {
         let ctx = test_ctx();
-        let fh = NfsFh3 { data: [0u8; NFS3_FHSIZE] };
+        let fh = NfsFh3 {
+            data: [0u8; NFS3_FHSIZE],
+        };
         let mut args = Vec::new();
         encode_fh(&mut args, &fh);
 

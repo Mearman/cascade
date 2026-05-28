@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
-use cascade_engine::db::StateDb;
 use cascade_engine::config::ConfigResolver;
+use cascade_engine::db::StateDb;
 use cascade_engine::sync::runner::SyncRunner;
 use cascade_engine::vfs::VfsTree;
 use cascade_presenter_nfs::nfs::context::NfsContext;
@@ -30,26 +30,18 @@ pub async fn start(mount_point: Option<&str>) -> Result<()> {
     let backend: Arc<dyn cascade_engine::backend::Backend> = Arc::from(backend);
 
     // Register in state DB.
-    db.register_backend(
-        backend.id(),
-        "gdrive",
-        backend.display_name(),
-        None,
-        None,
-    )?;
+    db.register_backend(backend.id(), "gdrive", backend.display_name(), None, None)?;
 
     // Build VFS tree.
     let tree = Arc::new(std::sync::RwLock::new(VfsTree::new(backend.clone())));
     tracing::info!("VFS tree initialised");
 
     // Resolve mount point.
-    let mount_path = mount_point
-        .map(resolve_mount_path)
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("/tmp"))
-                .join("Cloud")
-        });
+    let mount_path = mount_point.map(resolve_mount_path).unwrap_or_else(|| {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join("Cloud")
+    });
 
     std::fs::create_dir_all(&mount_path)?;
 
@@ -185,8 +177,7 @@ fn unmount_nfs(mount_point: &Path) -> Result<()> {
 
 /// Check if a path is already mounted.
 fn is_mounted(path: &Path) -> bool {
-    let output = std::process::Command::new("/sbin/mount")
-        .output();
+    let output = std::process::Command::new("/sbin/mount").output();
 
     let mounts = match output {
         Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),

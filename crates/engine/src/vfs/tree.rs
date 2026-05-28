@@ -29,7 +29,8 @@ impl VfsTree {
     pub fn mount(&mut self, prefix: PathBuf, backend: Arc<dyn Backend>) {
         self.children.push((prefix, backend));
         // Sort longest path first so first match wins
-        self.children.sort_by(|a, b| b.0.as_os_str().len().cmp(&a.0.as_os_str().len()));
+        self.children
+            .sort_by(|a, b| b.0.as_os_str().len().cmp(&a.0.as_os_str().len()));
     }
 
     /// Remove a child backend by prefix. Returns the backend if found.
@@ -58,23 +59,21 @@ impl VfsTree {
         let (changes, _) = backend.changes(None).await?;
         for change in changes {
             if let Change::Created(entry) = change {
-                if entry.is_dir || !entry.is_dir {
-                    entries.push(DirEntry {
-                        name: entry.name,
-                        is_dir: entry.is_dir,
-                    });
-                }
+                entries.push(DirEntry {
+                    name: entry.name,
+                    is_dir: entry.is_dir,
+                });
             }
         }
 
         // Inject child mount point directories if this path is their parent
         for (child_prefix, _) in &self.children {
-            if child_prefix.parent() == Some(path) {
-                if let Some(mount_dir_name) = child_prefix.file_name() {
-                    let mount_dir_name = mount_dir_name.to_string_lossy();
-                    if !entries.iter().any(|e| e.name == mount_dir_name) {
-                        entries.push(DirEntry::dir(mount_dir_name.to_string()));
-                    }
+            if child_prefix.parent() == Some(path)
+                && let Some(mount_dir_name) = child_prefix.file_name()
+            {
+                let mount_dir_name = mount_dir_name.to_string_lossy();
+                if !entries.iter().any(|e| e.name == mount_dir_name) {
+                    entries.push(DirEntry::dir(mount_dir_name.to_string()));
                 }
             }
         }
@@ -136,10 +135,7 @@ mod tests {
     #[test]
     fn resolve_child_path() {
         let mut tree = make_tree();
-        tree.mount(
-            PathBuf::from("Work"),
-            Arc::new(NullBackend::new("work")),
-        );
+        tree.mount(PathBuf::from("Work"), Arc::new(NullBackend::new("work")));
         let (backend, rest) = tree.resolve(Path::new("Work/Projects/code.rs"));
         assert_eq!(backend.id(), "work");
         assert_eq!(rest, Path::new("Projects/code.rs"));
@@ -148,10 +144,7 @@ mod tests {
     #[test]
     fn longest_prefix_wins() {
         let mut tree = make_tree();
-        tree.mount(
-            PathBuf::from("Work"),
-            Arc::new(NullBackend::new("work")),
-        );
+        tree.mount(PathBuf::from("Work"), Arc::new(NullBackend::new("work")));
         tree.mount(
             PathBuf::from("Work/Assets"),
             Arc::new(NullBackend::new("assets")),
@@ -171,10 +164,7 @@ mod tests {
     #[test]
     fn unmount_removes_child() {
         let mut tree = make_tree();
-        tree.mount(
-            PathBuf::from("Work"),
-            Arc::new(NullBackend::new("work")),
-        );
+        tree.mount(PathBuf::from("Work"), Arc::new(NullBackend::new("work")));
         assert!(tree.unmount(Path::new("Work")).is_some());
         assert!(tree.children().is_empty());
     }

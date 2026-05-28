@@ -110,19 +110,13 @@ pub enum CacheCommands {
 impl Cli {
     pub async fn run(self) -> Result<()> {
         match self.command {
-            Commands::Start { mount_point } => {
-                mount::start(mount_point.as_deref()).await
-            }
-            Commands::Stop => {
-                mount::stop().await
-            }
+            Commands::Start { mount_point } => mount::start(mount_point.as_deref()).await,
+            Commands::Stop => mount::stop().await,
             Commands::Restart => {
                 mount::stop().await?;
                 mount::start(None).await
             }
-            Commands::Status => {
-                status::show().await
-            }
+            Commands::Status => status::show().await,
             Commands::Pin { path } => {
                 tracing::info!("Pinning: {}", path);
                 println!("Pinned: {}", path);
@@ -137,37 +131,27 @@ impl Cli {
                 println!("No pinned paths.");
                 Ok(())
             }
-            Commands::Cache { command } => {
-                match command {
-                    CacheCommands::Status => {
-                        status::cache_status().await
-                    }
-                    CacheCommands::Evict { all } => {
-                        tracing::info!("Running eviction (all={})", all);
-                        println!("Eviction complete.");
-                        Ok(())
-                    }
-                    CacheCommands::Warm { path } => {
-                        tracing::info!("Warming cache: {}", path);
-                        println!("Cache warming: {}", path);
-                        Ok(())
-                    }
-                    CacheCommands::Clear { path } => {
-                        tracing::info!("Clearing cache: {}", path);
-                        println!("Cache cleared: {}", path);
-                        Ok(())
-                    }
+            Commands::Cache { command } => match command {
+                CacheCommands::Status => status::cache_status().await,
+                CacheCommands::Evict { all } => {
+                    tracing::info!("Running eviction (all={})", all);
+                    println!("Eviction complete.");
+                    Ok(())
                 }
-            }
-            Commands::ConfigShow { path } => {
-                config::show(&path).await
-            }
-            Commands::ConfigValidate => {
-                config::validate().await
-            }
-            Commands::BackendList => {
-                status::backend_list().await
-            }
+                CacheCommands::Warm { path } => {
+                    tracing::info!("Warming cache: {}", path);
+                    println!("Cache warming: {}", path);
+                    Ok(())
+                }
+                CacheCommands::Clear { path } => {
+                    tracing::info!("Clearing cache: {}", path);
+                    println!("Cache cleared: {}", path);
+                    Ok(())
+                }
+            },
+            Commands::ConfigShow { path } => config::show(&path).await,
+            Commands::ConfigValidate => config::validate().await,
+            Commands::BackendList => status::backend_list().await,
         }
     }
 }

@@ -123,7 +123,11 @@ impl NfsFh3 {
 
     /// Extract the ItemId string from the file handle (up to first null byte).
     pub fn to_item_id(&self) -> Option<String> {
-        let end = self.data.iter().position(|&b| b == 0).unwrap_or(NFS3_FHSIZE);
+        let end = self
+            .data
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(NFS3_FHSIZE);
         if end == 0 {
             return None;
         }
@@ -170,19 +174,10 @@ impl Default for Fattr3 {
 }
 
 /// Special device data.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Specdata3 {
     pub specdata1: u32,
     pub specdata2: u32,
-}
-
-impl Default for Specdata3 {
-    fn default() -> Self {
-        Self {
-            specdata1: 0,
-            specdata2: 0,
-        }
-    }
 }
 
 /// NFS time (seconds + nanoseconds).
@@ -254,7 +249,7 @@ pub fn encode_opaque(buf: &mut Vec<u8>, data: &[u8]) {
     buf.extend_from_slice(data);
     // Pad to 4-byte boundary.
     let pad = (4 - (data.len() % 4)) % 4;
-    buf.extend(std::iter::repeat(0u8).take(pad));
+    buf.extend(std::iter::repeat_n(0u8, pad));
 }
 
 /// Encode a variable-length string in XDR format.
@@ -266,7 +261,7 @@ pub fn encode_string(buf: &mut Vec<u8>, s: &str) {
 pub fn encode_fixed_opaque(buf: &mut Vec<u8>, data: &[u8]) {
     buf.extend_from_slice(data);
     let pad = (4 - (data.len() % 4)) % 4;
-    buf.extend(std::iter::repeat(0u8).take(pad));
+    buf.extend(std::iter::repeat_n(0u8, pad));
 }
 
 /// Encode an NFS file handle.
@@ -308,7 +303,10 @@ pub fn encode_post_op_attr(buf: &mut Vec<u8>, poa: &PostOpAttr) {
 /// Decode a uint32 from XDR data.
 pub fn decode_u32(data: &[u8]) -> io::Result<(u32, &[u8])> {
     if data.len() < 4 {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "need 4 bytes for u32"));
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "need 4 bytes for u32",
+        ));
     }
     let val = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
     Ok((val, &data[4..]))
@@ -317,7 +315,10 @@ pub fn decode_u32(data: &[u8]) -> io::Result<(u32, &[u8])> {
 /// Decode a uint64 from XDR data.
 pub fn decode_u64(data: &[u8]) -> io::Result<(u64, &[u8])> {
     if data.len() < 8 {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "need 8 bytes for u64"));
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "need 8 bytes for u64",
+        ));
     }
     let val = u64::from_be_bytes([
         data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
@@ -336,7 +337,10 @@ pub fn decode_opaque(data: &[u8]) -> io::Result<(&[u8], &[u8])> {
     let (len, rest) = decode_u32(data)?;
     let len = len as usize;
     if rest.len() < len {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "opaque data truncated"));
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "opaque data truncated",
+        ));
     }
     let (opaque_data, remainder) = rest.split_at(len);
     // Skip padding.
@@ -379,7 +383,10 @@ pub fn read_rpc_message(reader: &mut dyn Read) -> io::Result<Vec<u8>> {
     let len = u32::from_be_bytes(len_buf) as usize;
     if len > 1_048_576 {
         // Cap at 1MB to prevent OOM.
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "RPC message too large"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "RPC message too large",
+        ));
     }
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf)?;

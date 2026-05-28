@@ -99,7 +99,10 @@ async fn run_server(
 /// NFS over TCP uses a simple framing: 4-byte big-endian length prefix
 /// followed by the RPC message (which includes the RPC call header and
 /// then the NFS/Mount procedure arguments).
-async fn handle_connection(mut stream: tokio::net::TcpStream, ctx: &Arc<NfsContext>) -> anyhow::Result<()> {
+async fn handle_connection(
+    mut stream: tokio::net::TcpStream,
+    ctx: &Arc<NfsContext>,
+) -> anyhow::Result<()> {
     loop {
         // Read length-prefixed RPC message.
         let mut len_buf = [0u8; 4];
@@ -124,7 +127,9 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, ctx: &Arc<NfsConte
         let reply = dispatch_rpc(&msg_buf, ctx);
 
         // Send length-prefixed reply.
-        stream.write_all(&(reply.len() as u32).to_be_bytes()).await?;
+        stream
+            .write_all(&(reply.len() as u32).to_be_bytes())
+            .await?;
         stream.write_all(&reply).await?;
         stream.flush().await?;
     }
@@ -279,9 +284,9 @@ mod tests {
     }
 
     fn test_ctx() -> Arc<NfsContext> {
-        let vfs = Arc::new(RwLock::new(
-            VfsTree::new(Arc::new(NullBackend::new("test"))),
-        ));
+        let vfs = Arc::new(RwLock::new(VfsTree::new(Arc::new(NullBackend::new(
+            "test",
+        )))));
         Arc::new(NfsContext::new(vfs))
     }
 }
