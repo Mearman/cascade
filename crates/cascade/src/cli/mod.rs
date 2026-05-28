@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod cache;
 pub mod config;
 pub mod init;
@@ -107,6 +108,13 @@ pub enum Commands {
         /// Backend name
         name: String,
     },
+
+    /// Authenticate a backend (runs `OAuth2` device-code flow)
+    #[command(name = "backend-auth")]
+    BackendAuth {
+        /// Backend name
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -172,6 +180,7 @@ impl Cli {
                 mount_path,
             } => cache::backend_add(&backend_type, name.as_deref(), mount_path.as_deref()),
             Commands::BackendRemove { name } => cache::backend_remove(&name),
+            Commands::BackendAuth { name } => auth::authenticate(&name).await,
         }
     }
 }
