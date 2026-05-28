@@ -16,6 +16,13 @@ fn open_db() -> Result<StateDb> {
     StateDb::open(&db_path)
 }
 
+/// Resolve the config directory.
+fn config_dir() -> std::path::PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from(".cascade"))
+        .join("cascade")
+}
+
 /// Pin a path.
 pub fn pin(path: &str) -> Result<()> {
     let db = open_db()?;
@@ -112,4 +119,90 @@ pub fn evict(all: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Add a backend configuration.
+pub fn backend_add(backend_type: &str, name: Option<&str>, mount_path: Option<&str>) -> Result<()> {
+    let config_dir = config_dir();
+    std::fs::create_dir_all(&config_dir)?;
+
+    let backend_name = name.unwrap_or(backend_type);
+    let config_path = config_dir.join(format!("{backend_name}.toml"));
+
+    if config_path.exists() {
+        anyhow::bail!("Backend '{backend_name}' already exists. Remove it first.");
+    }
+
+    // Write minimal config with the backend type.
+    let mut config = toml::Table::new();
+    config.insert(
+        "type".to_string(),
+        toml::Value::String(backend_type.to_string()),
+    );
+    if let Some(mp) = mount_path {
+        config.insert(
+            "mount_path".to_string(),
+            toml::Value::String(mp.to_string()),
+        );
+    }
+
+    let config_str = toml::to_string_pretty(&config)?;
+    std::fs::write(&config_path, &config_str)?;
+
+    // Register in the state DB.
+    let db = open_db()?;
+    db.register_backend(
+        backend_name,
+        backend_type,
+        &format!("{} ({backend_name})", backend_type_display(backend_type)),
+        mount_path,
+        None,
+    )?;
+
+    println!("Added backend: {backend_name} ({backend_type})");
+    if let Some(mp) = mount_path {
+        println!("  Mount path: {mp}");
+    }
+    println!("  Config: {}", config_path.display());
+
+    // Type-specific instructions.
+    match backend_type {
+        "gdrive" => {
+            println!("\nRun `cascade backend auth {backend_name}` to authenticate.");
+        }
+        _ => {
+            println!("\nEdit {} to add credentials.", config_path.display());
+        }
+    }
+
+    Ok(())
+}
+
+/// Remove a backend configuration.
+pub fn backend_remove(name: &str) -> Result<()> {
+    let config_dir = config_dir();
+    let config_path = config_dir.join(format!("{name}.toml"));
+
+    if !config_path.exists() {
+        anyhow::bail!("Backend '{name}' not found.");
+    }
+
+    std::fs::remove_file(&config_path)?;
+
+    println!("Removed backend: {name}");
+    println!("  Config deleted: {}", config_path.display());
+    Ok(())
+}
+
+/// Display name for a backend type.
+fn backend_type_display(backend_type: &str) -> &'static str {
+    match backend_type {
+        "gdrive" => "Google Drive",
+        "s3" => "S3 Compatible",
+        "webdav" => "WebDAV",
+        "dropbox" => "Dropbox",
+        "onedrive" => "OneDrive",
+        "local" => "Local Filesystem",
+        _ => "Unknown",
+    }
 }

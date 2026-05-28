@@ -81,6 +81,28 @@ pub enum Commands {
     /// List configured backends
     #[command(name = "backend-list")]
     BackendList,
+
+    /// Add a backend
+    #[command(name = "backend-add")]
+    BackendAdd {
+        /// Backend type (gdrive, s3, webdav, dropbox, onedrive, local)
+        backend_type: String,
+
+        /// Name for this backend instance
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Mount path (relative path in VFS, e.g. Work/Projects)
+        #[arg(long)]
+        mount_path: Option<String>,
+    },
+
+    /// Remove a backend
+    #[command(name = "backend-remove")]
+    BackendRemove {
+        /// Backend name
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -136,6 +158,12 @@ impl Cli {
             Commands::ConfigShow { path } => config::show(&path).await,
             Commands::ConfigValidate => config::validate().await,
             Commands::BackendList => status::backend_list().await,
+            Commands::BackendAdd {
+                backend_type,
+                name,
+                mount_path,
+            } => cache::backend_add(&backend_type, name.as_deref(), mount_path.as_deref()),
+            Commands::BackendRemove { name } => cache::backend_remove(&name),
         }
     }
 }
