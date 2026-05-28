@@ -96,7 +96,10 @@ async fn stun_binding_request(stun_server: &str) -> Result<(SocketAddr, SocketAd
         .await
         .context("waiting for STUN binding response")?
         .context("receiving STUN binding response")?;
-    let external_address = decode_binding_response(&response[..received], &transaction_id)?;
+    let response_slice = response
+        .get(..received)
+        .ok_or_else(|| anyhow::anyhow!("STUN response length out of range"))?;
+    let external_address = decode_binding_response(response_slice, &transaction_id)?;
     let local_address = socket
         .local_addr()
         .context("reading STUN socket local address")?;
@@ -127,18 +130,37 @@ fn decode_binding_response(
         anyhow::bail!("STUN response too short");
     }
 
-    let message_type = u16::from_be_bytes([response[0], response[1]]);
+    let message_type = u16::from_be_bytes(
+        response
+            .get(0..2)
+            .ok_or_else(|| anyhow::anyhow!("STUN response too short for message type"))?
+            .try_into()?,
+    );
     if message_type != BINDING_SUCCESS_RESPONSE {
         anyhow::bail!("unexpected STUN message type {message_type:#06x}");
     }
 
-    let message_len = u16::from_be_bytes([response[2], response[3]]) as usize;
-    let magic_cookie = u32::from_be_bytes([response[4], response[5], response[6], response[7]]);
+    let message_len = usize::from(u16::from_be_bytes(
+        response
+            .get(2..4)
+            .ok_or_else(|| anyhow::anyhow!("STUN response too short for message length"))?
+            .try_into()?,
+    ));
+    let magic_cookie = u32::from_be_bytes(
+        response
+            .get(4..8)
+            .ok_or_else(|| anyhow::anyhow!("STUN response too short for magic cookie"))?
+            .try_into()?,
+    );
     if magic_cookie != STUN_MAGIC_COOKIE {
         anyhow::bail!("invalid STUN magic cookie {magic_cookie:#010x}");
     }
 
-    if &response[8..STUN_HEADER_LEN] != transaction_id {
+    if response
+        .get(8..STUN_HEADER_LEN)
+        .ok_or_else(|| anyhow::anyhow!("STUN response too short for transaction ID"))?
+        != transaction_id
+    {
         anyhow::bail!("STUN transaction ID mismatch");
     }
 
@@ -149,9 +171,12 @@ fn decode_binding_response(
     let mut offset = STUN_HEADER_LEN;
     let attributes_end = STUN_HEADER_LEN + message_len;
     while offset + STUN_ATTRIBUTE_HEADER_LEN <= attributes_end {
-        let attribute_type = u16::from_be_bytes([response[offset], response[offset + 1]]);
-        let attribute_len =
-            u16::from_be_bytes([response[offset + 2], response[offset + 3]]) as usize;
+        let attr_header: &[u8; STUN_ATTRIBUTE_HEADER_LEN] = response
+            .get(offset..offset + STUN_ATTRIBUTE_HEADER_LEN)
+            .ok_or_else(|| anyhow::anyhow!("STUN attribute header out of bounds"))?
+            .try_into()?;
+        let attribute_type = u16::from_be_bytes([attr_header[0], attr_header[1]]);
+        let attribute_len = usize::from(u16::from_be_bytes([attr_header[2], attr_header[3]]));
         let value_start = offset + STUN_ATTRIBUTE_HEADER_LEN;
         let value_end = value_start + attribute_len;
         if value_end > attributes_end {
@@ -159,7 +184,10 @@ fn decode_binding_response(
         }
 
         if attribute_type == XOR_MAPPED_ADDRESS {
-            return decode_xor_mapped_address(&response[value_start..value_end], transaction_id);
+            let value = response
+                .get(value_start..value_end)
+                .ok_or_else(|| anyhow::anyhow!("STUN XOR-MAPPED-ADDRESS value out of bounds"))?;
+            return decode_xor_mapped_address(value, transaction_id);
         }
 
         offset = value_end + padding_for(attribute_len);
@@ -176,8 +204,16 @@ fn decode_xor_mapped_address(
         anyhow::bail!("XOR-MAPPED-ADDRESS attribute too short");
     }
 
-    let family = value[1];
-    let x_port = u16::from_be_bytes([value[2], value[3]]);
+    let family = value
+        .get(1)
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("XOR-MAPPED-ADDRESS too short for family byte"))?;
+    let x_port = u16::from_be_bytes(
+        value
+            .get(2..4)
+            .ok_or_else(|| anyhow::anyhow!("XOR-MAPPED-ADDRESS too short for port"))?
+            .try_into()?,
+    );
     let port = x_port ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
 
     match family {
@@ -185,7 +221,12 @@ fn decode_xor_mapped_address(
             if value.len() != STUN_IPV4_ATTRIBUTE_VALUE_LEN {
                 anyhow::bail!("invalid IPv4 XOR-MAPPED-ADDRESS length");
             }
-            let x_addr = u32::from_be_bytes([value[4], value[5], value[6], value[7]]);
+            let x_addr = u32::from_be_bytes(
+                value
+                    .get(4..8)
+                    .ok_or_else(|| anyhow::anyhow!("XOR-MAPPED-ADDRESS too short for IPv4 address"))?
+                    .try_into()?,
+            );
             let addr = x_addr ^ STUN_MAGIC_COOKIE;
             Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::from(addr)), port))
         }
@@ -197,9 +238,16 @@ fn decode_xor_mapped_address(
             xor_key[..4].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
             xor_key[4..].copy_from_slice(transaction_id);
 
+            let ipv6_bytes: &[u8; STUN_IPV6_ADDR_LEN] = value
+                .get(4..4 + STUN_IPV6_ADDR_LEN)
+                .ok_or_else(|| anyhow::anyhow!("XOR-MAPPED-ADDRESS too short for IPv6 address"))?
+                .try_into()?;
             let mut address_bytes = [0u8; STUN_IPV6_ADDR_LEN];
-            for (index, byte) in address_bytes.iter_mut().enumerate() {
-                *byte = value[4 + index] ^ xor_key[index];
+            for (byte, (raw, key)) in address_bytes
+                .iter_mut()
+                .zip(ipv6_bytes.iter().zip(xor_key.iter()))
+            {
+                *byte = raw ^ key;
             }
             Ok(SocketAddr::new(
                 IpAddr::V6(Ipv6Addr::from(address_bytes)),
@@ -210,7 +258,7 @@ fn decode_xor_mapped_address(
     }
 }
 
-fn padding_for(attribute_len: usize) -> usize {
+const fn padding_for(attribute_len: usize) -> usize {
     (STUN_ATTRIBUTE_HEADER_LEN - (attribute_len % STUN_ATTRIBUTE_HEADER_LEN))
         % STUN_ATTRIBUTE_HEADER_LEN
 }
@@ -223,8 +271,13 @@ fn transaction_id() -> Result<[u8; STUN_TRANSACTION_ID_LEN]> {
     let pid = u128::from(std::process::id());
     let mixed = timestamp ^ (pid << 64);
     let bytes = mixed.to_be_bytes();
+    let offset = bytes.len() - STUN_TRANSACTION_ID_LEN;
     let mut transaction_id = [0u8; STUN_TRANSACTION_ID_LEN];
-    transaction_id.copy_from_slice(&bytes[bytes.len() - STUN_TRANSACTION_ID_LEN..]);
+    transaction_id.copy_from_slice(
+        bytes
+            .get(offset..)
+            .ok_or_else(|| anyhow::anyhow!("transaction ID offset out of range"))?,
+    );
     Ok(transaction_id)
 }
 

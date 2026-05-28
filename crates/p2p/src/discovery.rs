@@ -73,7 +73,7 @@ pub fn listen(timeout: Duration) -> Result<Vec<DiscoveredPeer>> {
     loop {
         match socket.recv_from(&mut buf) {
             Ok((len, src)) => {
-                if let Ok(announcement) = serde_json::from_slice::<Announcement>(&buf[..len]) {
+                if let Some(slice) = buf.get(..len) && let Ok(announcement) = serde_json::from_slice::<Announcement>(slice) {
                     let address = SocketAddr::new(src.ip(), announcement.listen_port);
                     peers.push(DiscoveredPeer {
                         device_id: announcement.device_id,

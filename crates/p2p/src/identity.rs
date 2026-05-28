@@ -7,7 +7,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use data_encoding::BASE32_NOPAD;
+use data_encoding::{BASE32_NOPAD, BASE64};
 use rcgen::KeyPair;
 use sha2::{Digest, Sha256};
 
@@ -91,7 +91,7 @@ impl DeviceIdentity {
 ///
 /// The ID is the base32 encoding of the SHA-256 of the DER-encoded
 /// certificate, matching Syncthing's convention.
-pub fn derive_device_id(cert_der: &[u8]) -> String {
+#[must_use] pub fn derive_device_id(cert_der: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(cert_der);
     let hash = hasher.finalize();
@@ -105,13 +105,19 @@ fn pem_to_der(pem: &str) -> Result<Vec<u8>> {
     let start = pem
         .find("-----BEGIN")
         .context("PEM start marker not found")?;
-    let header_end = pem[start..]
+    let after_start = pem
+        .get(start..)
+        .context("PEM start offset out of range")?;
+    let header_end = after_start
         .find('\n')
         .context("PEM header end not found")?;
     let end_marker = pem.find("-----END").context("PEM end marker not found")?;
 
-    let b64_data = pem[start + header_end + 1..end_marker].replace(['\n', '\r', ' '], "");
-    use data_encoding::BASE64;
+    let b64_start = start + header_end + 1;
+    let b64_data = pem
+        .get(b64_start..end_marker)
+        .context("PEM body out of range")?
+        .replace(['\n', '\r', ' '], "");
     BASE64
         .decode(b64_data.as_bytes())
         .map_err(|e| anyhow::anyhow!("base64 decode error: {e}"))

@@ -28,44 +28,38 @@ fn encode_u64(buf: &mut Vec<u8>, val: u64) {
     buf.extend_from_slice(&val.to_be_bytes());
 }
 
-fn encode_opaque(buf: &mut Vec<u8>, data: &[u8]) {
-    encode_u32(buf, data.len() as u32);
+fn encode_opaque(buf: &mut Vec<u8>, data: &[u8]) -> Result<()> {
+    let len = u32::try_from(data.len())
+        .map_err(|_| anyhow::anyhow!("opaque data length {} exceeds u32", data.len()))?;
+    encode_u32(buf, len);
     buf.extend_from_slice(data);
     let pad = (4 - (data.len() % 4)) % 4;
     buf.extend(std::iter::repeat_n(0u8, pad));
+    Ok(())
 }
 
-fn encode_string(buf: &mut Vec<u8>, s: &str) {
-    encode_opaque(buf, s.as_bytes());
+fn encode_string(buf: &mut Vec<u8>, s: &str) -> Result<()> {
+    encode_opaque(buf, s.as_bytes())
 }
 
 fn decode_u32(data: &[u8]) -> io::Result<(u32, &[u8])> {
-    if data.len() < 4 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "need 4 bytes for uint32",
-        ));
-    }
-    let val = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-    Ok((val, &data[4..]))
+    let (bytes, rest) = data.split_first_chunk::<4>().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::UnexpectedEof, "need 4 bytes for uint32")
+    })?;
+    Ok((u32::from_be_bytes(*bytes), rest))
 }
 
 fn decode_u64(data: &[u8]) -> io::Result<(u64, &[u8])> {
-    if data.len() < 8 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "need 8 bytes for uint64",
-        ));
-    }
-    let val = u64::from_be_bytes([
-        data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-    ]);
-    Ok((val, &data[8..]))
+    let (bytes, rest) = data.split_first_chunk::<8>().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::UnexpectedEof, "need 8 bytes for uint64")
+    })?;
+    Ok((u64::from_be_bytes(*bytes), rest))
 }
 
 fn decode_opaque(data: &[u8]) -> io::Result<(&[u8], &[u8])> {
     let (len, rest) = decode_u32(data)?;
-    let len = len as usize;
+    let len = usize::try_from(len)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     if rest.len() < len {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -74,11 +68,7 @@ fn decode_opaque(data: &[u8]) -> io::Result<(&[u8], &[u8])> {
     }
     let (opaque_data, remainder) = rest.split_at(len);
     let pad = (4 - (len % 4)) % 4;
-    let remainder = if remainder.len() >= pad {
-        &remainder[pad..]
-    } else {
-        &[]
-    };
+    let remainder = remainder.get(pad..).unwrap_or(&[]);
     Ok((opaque_data, remainder))
 }
 
@@ -149,7 +139,7 @@ pub enum BepMessage {
 }
 
 impl BepMessage {
-    fn msg_type(&self) -> u32 {
+    const fn msg_type(&self) -> u32 {
         match self {
             Self::ClusterConfig { .. } => MSG_CLUSTER_CONFIG,
             Self::Index { .. } => MSG_INDEX,
@@ -167,27 +157,30 @@ impl BepMessage {
 /// Encode a BEP message into a length-prefixed XDR frame.
 ///
 /// Wire format: `[4-byte length][4-byte msg type][XDR body...]`
-pub fn encode_message(msg: &BepMessage) -> Vec<u8> {
+pub fn encode_message(msg: &BepMessage) -> Result<Vec<u8>> {
     let mut body = Vec::new();
     encode_u32(&mut body, msg.msg_type());
 
     match msg {
         BepMessage::ClusterConfig { folders } => {
-            encode_u32(&mut body, folders.len() as u32);
+            encode_u32(
+                &mut body,
+                u32::try_from(folders.len())
+                    .map_err(|_| anyhow::anyhow!("too many folders"))?,
+            );
             for folder in folders {
-                encode_string(&mut body, &folder.id);
-                encode_string(&mut body, &folder.label);
+                encode_string(&mut body, &folder.id)?;
+                encode_string(&mut body, &folder.label)?;
             }
         }
-        BepMessage::Index { folder, files } => {
-            encode_string(&mut body, folder);
-            encode_u32(&mut body, files.len() as u32);
-            encode_file_infos(&mut body, files);
-        }
-        BepMessage::IndexUpdate { folder, files } => {
-            encode_string(&mut body, folder);
-            encode_u32(&mut body, files.len() as u32);
-            encode_file_infos(&mut body, files);
+        BepMessage::Index { folder, files } | BepMessage::IndexUpdate { folder, files } => {
+            encode_string(&mut body, folder)?;
+            encode_u32(
+                &mut body,
+                u32::try_from(files.len())
+                    .map_err(|_| anyhow::anyhow!("too many files"))?,
+            );
+            encode_file_infos(&mut body, files)?;
         }
         BepMessage::Request {
             folder,
@@ -196,39 +189,50 @@ pub fn encode_message(msg: &BepMessage) -> Vec<u8> {
             block_size,
             block_hash,
         } => {
-            encode_string(&mut body, folder);
-            encode_string(&mut body, name);
+            encode_string(&mut body, folder)?;
+            encode_string(&mut body, name)?;
             encode_u64(&mut body, *block_offset);
             encode_u32(&mut body, *block_size);
-            encode_opaque(&mut body, block_hash);
+            encode_opaque(&mut body, block_hash)?;
         }
         BepMessage::Response { data } => {
-            encode_opaque(&mut body, data);
+            encode_opaque(&mut body, data)?;
         }
         BepMessage::Ping => {}
         BepMessage::Close { reason } => {
-            encode_string(&mut body, reason);
+            encode_string(&mut body, reason)?;
         }
     }
 
+    let body_len = u32::try_from(body.len())
+        .map_err(|_| anyhow::anyhow!("frame body too large for u32 length prefix"))?;
     let mut frame = Vec::with_capacity(4 + body.len());
-    encode_u32(&mut frame, body.len() as u32);
+    encode_u32(&mut frame, body_len);
     frame.extend_from_slice(&body);
-    frame
+    Ok(frame)
 }
 
-fn encode_file_infos(buf: &mut Vec<u8>, files: &[FileInfo]) {
+fn encode_file_infos(buf: &mut Vec<u8>, files: &[FileInfo]) -> Result<()> {
     for fi in files {
-        encode_string(buf, &fi.name);
+        encode_string(buf, &fi.name)?;
         encode_u32(buf, fi.file_type);
         encode_u64(buf, fi.size);
-        encode_u64(buf, fi.modified as u64);
+        encode_u64(
+            buf,
+            u64::try_from(fi.modified)
+                .map_err(|_| anyhow::anyhow!("file modified timestamp is negative"))?,
+        );
         encode_u32(buf, fi.block_size);
-        encode_u32(buf, fi.block_hashes.len() as u32);
+        encode_u32(
+            buf,
+            u32::try_from(fi.block_hashes.len())
+                .map_err(|_| anyhow::anyhow!("too many block hashes"))?,
+        );
         for hash in &fi.block_hashes {
-            encode_opaque(buf, hash);
+            encode_opaque(buf, hash)?;
         }
     }
+    Ok(())
 }
 
 // ── Decoding ──
@@ -237,16 +241,19 @@ fn encode_file_infos(buf: &mut Vec<u8>, files: &[FileInfo]) {
 ///
 /// Expects the full frame including the 4-byte length prefix.
 pub fn decode_message(frame: &[u8]) -> Result<BepMessage> {
-    let (body_len, body) =
+    let (body_len_u32, body) =
         decode_u32(frame).map_err(|e| anyhow::anyhow!("invalid frame length: {e}"))?;
-    let body_len = body_len as usize;
+    let body_len = usize::try_from(body_len_u32)
+        .map_err(|_| anyhow::anyhow!("frame length too large for this platform"))?;
     if body.len() < body_len {
         anyhow::bail!(
             "frame body truncated: expected {body_len} bytes, got {}",
             body.len()
         );
     }
-    let body = &body[..body_len];
+    let body = body
+        .get(..body_len)
+        .ok_or_else(|| anyhow::anyhow!("frame body slice out of bounds"))?;
 
     let (msg_type, rest) =
         decode_u32(body).map_err(|e| anyhow::anyhow!("invalid message type: {e}"))?;
@@ -342,7 +349,8 @@ fn decode_file_infos(data: &[u8]) -> Result<(Vec<FileInfo>, &[u8])> {
             name,
             file_type,
             size,
-            modified: modified as i64,
+            modified: i64::try_from(modified)
+                .map_err(|_| anyhow::anyhow!("modified timestamp overflows i64"))?,
             block_size,
             block_hashes,
         });
@@ -356,7 +364,7 @@ mod tests {
     use super::*;
 
     fn round_trip(msg: BepMessage) {
-        let encoded = encode_message(&msg);
+        let encoded = encode_message(&msg).unwrap();
         let decoded = decode_message(&encoded).unwrap();
         assert_eq!(decoded, msg);
     }
@@ -484,7 +492,8 @@ mod tests {
         // Body: msg type 99 (unknown), no further data.
         let mut body = Vec::new();
         encode_u32(&mut body, 99);
-        encode_u32(&mut frame, body.len() as u32);
+        let body_len = u32::try_from(body.len()).unwrap_or(0);
+        encode_u32(&mut frame, body_len);
         frame.extend_from_slice(&body);
 
         let result = decode_message(&frame);

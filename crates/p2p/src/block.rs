@@ -9,12 +9,12 @@ use anyhow::Result;
 use sha2::{Digest, Sha256};
 
 /// SHA-256 digest — 32 bytes.
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
 pub struct BlockHash(pub [u8; 32]);
 
 impl BlockHash {
     /// Compute SHA-256 of the given data.
-    pub fn from_data(data: &[u8]) -> Self {
+    #[must_use] pub fn from_data(data: &[u8]) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(data);
         let hash = hasher.finalize().into();
@@ -22,7 +22,7 @@ impl BlockHash {
     }
 
     /// Return the raw bytes.
-    pub fn as_bytes(&self) -> &[u8; 32] {
+    #[must_use] pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 }
@@ -49,7 +49,7 @@ pub struct FileBlocks {
 
 impl FileBlocks {
     /// Number of blocks.
-    pub fn block_count(&self) -> usize {
+    #[must_use] pub const fn block_count(&self) -> usize {
         self.blocks.len()
     }
 }
@@ -68,7 +68,7 @@ const BLOCK_1MB: u32 = 1024 * 1024;
 /// - Under 250 MB → 128 KB blocks
 /// - 250 MB to 1 GB → 512 KB blocks
 /// - Over 1 GB → 1 MB blocks
-pub fn block_size_for_file(file_size: u64) -> u32 {
+#[must_use] pub const fn block_size_for_file(file_size: u64) -> u32 {
     if file_size <= SIZE_250MB {
         BLOCK_128KB
     } else if file_size <= SIZE_1GB {
@@ -110,8 +110,8 @@ pub async fn split_file(path: &Path) -> Result<FileBlocks> {
 /// `block_data` must be in block order and each slice must match the expected
 /// block size (except the last, which may be shorter). The caller is
 /// responsible for verifying block hashes before calling this.
-pub fn reassemble_blocks(block_data: &[Vec<u8>]) -> Vec<u8> {
-    let total_size: usize = block_data.iter().map(|b| b.len()).sum();
+#[must_use] pub fn reassemble_blocks(block_data: &[Vec<u8>]) -> Vec<u8> {
+    let total_size: usize = block_data.iter().map(std::vec::Vec::len).sum();
     let mut output = Vec::with_capacity(total_size);
     for block in block_data {
         output.extend_from_slice(block);

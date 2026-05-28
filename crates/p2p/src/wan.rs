@@ -53,7 +53,7 @@ pub struct PeerBook {
 
 impl PeerBook {
     /// Create an empty peer book.
-    pub fn new() -> Self {
+    #[must_use] pub fn new() -> Self {
         Self::default()
     }
 
@@ -110,28 +110,28 @@ impl PeerBook {
     }
 
     /// Get a peer by device ID.
-    pub fn get(&self, device_id: &str) -> Option<&KnownPeer> {
+    #[must_use] pub fn get(&self, device_id: &str) -> Option<&KnownPeer> {
         self.peers.get(device_id)
     }
 
     /// All known peers.
-    pub fn peers(&self) -> &HashMap<String, KnownPeer> {
+    #[must_use] pub const fn peers(&self) -> &HashMap<String, KnownPeer> {
         &self.peers
     }
 
     /// Number of known peers.
-    pub fn len(&self) -> usize {
+    #[must_use] pub fn len(&self) -> usize {
         self.peers.len()
     }
 
     /// Whether the peer book is empty.
-    pub fn is_empty(&self) -> bool {
+    #[must_use] pub fn is_empty(&self) -> bool {
         self.peers.is_empty()
     }
 
     /// Build a gossip message to send to a specific peer. Excludes
     /// the target peer itself and the sender's own device ID.
-    pub fn build_gossip(&self, exclude_device_id: &str, self_device_id: &str) -> GossipMessage {
+    #[must_use] pub fn build_gossip(&self, exclude_device_id: &str, self_device_id: &str) -> GossipMessage {
         let peers = self
             .peers
             .values()

@@ -43,7 +43,7 @@ impl RelayClient {
 impl RelayConnection {
     /// Send a BEP message through the relay.
     pub async fn send(&self, message: &[u8]) -> Result<()> {
-        let frame = encode_relay_frame(message);
+        let frame = encode_relay_frame(message)?;
         let mut socket = self.socket.lock().await;
         socket
             .send(Message::Binary(frame.into()))
@@ -79,11 +79,13 @@ fn relay_join_url(relay_url: &str, target_device_id: &str) -> String {
     )
 }
 
-fn encode_relay_frame(message: &[u8]) -> Vec<u8> {
+fn encode_relay_frame(message: &[u8]) -> Result<Vec<u8>> {
+    let len = u32::try_from(message.len())
+        .map_err(|_| anyhow::anyhow!("relay message too large for u32 length prefix"))?;
     let mut frame = Vec::with_capacity(RELAY_FRAME_LEN_SIZE + message.len());
-    frame.extend_from_slice(&(message.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&len.to_be_bytes());
     frame.extend_from_slice(message);
-    frame
+    Ok(frame)
 }
 
 fn decode_relay_frame(frame: &[u8]) -> Result<Vec<u8>> {
@@ -91,7 +93,12 @@ fn decode_relay_frame(frame: &[u8]) -> Result<Vec<u8>> {
         anyhow::bail!("relay frame too short");
     }
 
-    let message_len = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
+    let header: &[u8; RELAY_FRAME_LEN_SIZE] = frame
+        .get(..RELAY_FRAME_LEN_SIZE)
+        .ok_or_else(|| anyhow::anyhow!("relay frame header out of bounds"))?
+        .try_into()?;
+    let message_len = usize::try_from(u32::from_be_bytes(*header))
+        .map_err(|_| anyhow::anyhow!("relay message length too large for this platform"))?;
     let expected_frame_len = RELAY_FRAME_LEN_SIZE + message_len;
     if frame.len() != expected_frame_len {
         anyhow::bail!(
@@ -100,7 +107,10 @@ fn decode_relay_frame(frame: &[u8]) -> Result<Vec<u8>> {
         );
     }
 
-    Ok(frame[RELAY_FRAME_LEN_SIZE..].to_vec())
+    Ok(frame
+        .get(RELAY_FRAME_LEN_SIZE..)
+        .ok_or_else(|| anyhow::anyhow!("relay frame body out of bounds"))?
+        .to_vec())
 }
 
 #[cfg(test)]
@@ -126,7 +136,9 @@ mod tests {
                 other => panic!("unexpected relay message: {other:?}"),
             }
             websocket
-                .send(Message::Binary(encode_relay_frame(b"world").into()))
+                .send(Message::Binary(
+                    encode_relay_frame(b"world").unwrap().into(),
+                ))
                 .await
                 .unwrap();
         });

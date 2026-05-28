@@ -20,7 +20,7 @@ use crate::discovery::DiscoveredPeer;
 use crate::identity::DeviceIdentity;
 use crate::relay::{RelayClient, RelayConnection};
 
-/// Ensure a process-level CryptoProvider is installed.
+/// Ensure a process-level `CryptoProvider` is installed.
 ///
 /// rustls 0.23 requires explicit crypto provider installation.
 /// This must be called before any TLS operations. Calling it multiple
@@ -32,6 +32,7 @@ fn ensure_crypto_provider() {
 }
 
 /// Manages TLS-authenticated connections to P2P peers.
+#[derive(Debug)]
 pub struct ConnectionManager {
     /// Our device identity (certificate + key).
     identity: DeviceIdentity,
@@ -43,6 +44,7 @@ pub struct ConnectionManager {
 
 /// A TLS-authenticated connection to a peer. Wraps either a client or
 /// server TLS stream — both carry the same encrypted data.
+#[derive(Debug)]
 pub enum PeerConnection {
     /// Direct TLS connection.
     Direct(Box<TlsStream<TcpStream>>),
@@ -52,7 +54,7 @@ pub enum PeerConnection {
 
 impl ConnectionManager {
     /// Create a connection manager with our identity and trusted peers.
-    pub fn new(
+    #[must_use] pub const fn new(
         identity: DeviceIdentity,
         trusted_device_ids: Vec<String>,
         relay_urls: Vec<String>,
@@ -129,7 +131,7 @@ impl ConnectionManager {
             .await
             .with_context(|| format!("TCP connect to {address}"))?;
 
-        let connector = self.build_client_connector()?;
+        let connector = Self::build_client_connector();
         let server_name = ServerName::try_from("cascade-device")
             .map_err(|e| anyhow::anyhow!("invalid server name: {e}"))?;
 
@@ -157,7 +159,7 @@ impl ConnectionManager {
 
     /// Build a TLS client connector that accepts any self-signed cert
     /// (we verify the fingerprint ourselves after handshake).
-    fn build_client_connector(&self) -> Result<TlsConnector> {
+    fn build_client_connector() -> TlsConnector {
         ensure_crypto_provider();
         // Dangerous cert verifier — we accept any certificate and
         // verify the fingerprint post-handshake instead.
@@ -165,7 +167,7 @@ impl ConnectionManager {
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoVerifier))
             .with_no_client_auth();
-        Ok(TlsConnector::from(Arc::new(config)))
+        TlsConnector::from(Arc::new(config))
     }
 
     /// Build a TLS server acceptor using our identity certificate.
@@ -313,11 +315,7 @@ mod tests {
 
     #[test]
     fn connection_manager_builds_client_connector() {
-        let identity = DeviceIdentity::generate().unwrap();
-        let manager =
-            ConnectionManager::new(identity.clone(), vec!["SOME-PEER".to_string()], vec![]);
-        let connector = manager.build_client_connector();
-        assert!(connector.is_ok());
+        let _connector = ConnectionManager::build_client_connector();
     }
 
     #[test]

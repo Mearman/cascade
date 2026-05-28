@@ -51,6 +51,7 @@ const P2P_DIR: &str = "p2p";
 const DEFAULT_LISTEN_PORT: u16 = 22000;
 
 /// Top-level P2P engine composing all subsystems.
+#[derive(Debug)]
 pub struct P2pEngine {
     /// This device's identity.
     identity: DeviceIdentity,
@@ -86,7 +87,7 @@ impl P2pEngine {
     }
 
     /// Create with explicit identity and block store root (for testing).
-    pub fn with_identity(identity: DeviceIdentity, block_store: BlockStore) -> Self {
+    #[must_use] pub fn with_identity(identity: DeviceIdentity, block_store: BlockStore) -> Self {
         Self {
             identity,
             block_store,
@@ -97,22 +98,22 @@ impl P2pEngine {
     }
 
     /// This device's ID (base32-encoded SHA-256 of the TLS certificate).
-    pub fn device_id(&self) -> &str {
+    #[must_use] pub fn device_id(&self) -> &str {
         &self.identity.device_id
     }
 
     /// TCP port for incoming BEP connections.
-    pub fn listen_port(&self) -> u16 {
+    #[must_use] pub const fn listen_port(&self) -> u16 {
         self.listen_port
     }
 
     /// Set the BEP listen port.
-    pub fn set_listen_port(&mut self, port: u16) {
+    pub const fn set_listen_port(&mut self, port: u16) {
         self.listen_port = port;
     }
 
     /// Relay URLs used as WAN fallback transports.
-    pub fn relay_urls(&self) -> &[String] {
+    #[must_use] pub fn relay_urls(&self) -> &[String] {
         &self.relay_urls
     }
 
@@ -127,12 +128,12 @@ impl P2pEngine {
     }
 
     /// Access the block store.
-    pub fn block_store(&self) -> &BlockStore {
+    #[must_use] pub const fn block_store(&self) -> &BlockStore {
         &self.block_store
     }
 
     /// Access the device identity.
-    pub fn identity(&self) -> &DeviceIdentity {
+    #[must_use] pub const fn identity(&self) -> &DeviceIdentity {
         &self.identity
     }
 
@@ -167,12 +168,12 @@ impl P2pEngine {
     }
 
     /// Access the peer book for P2P gossip-based discovery.
-    pub fn peer_book(&self) -> &wan::PeerBook {
+    #[must_use] pub const fn peer_book(&self) -> &wan::PeerBook {
         &self.peer_book
     }
 
     /// Mutable access to the peer book.
-    pub fn peer_book_mut(&mut self) -> &mut wan::PeerBook {
+    pub const fn peer_book_mut(&mut self) -> &mut wan::PeerBook {
         &mut self.peer_book
     }
 

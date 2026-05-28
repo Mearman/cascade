@@ -68,7 +68,7 @@ impl BlockStore {
     }
 
     /// Check whether a block exists in the store.
-    pub async fn has_block(&self, hash: &BlockHash) -> bool {
+    #[must_use] pub fn has_block(&self, hash: &BlockHash) -> bool {
         self.block_path(hash).exists()
     }
 
@@ -86,12 +86,14 @@ impl BlockStore {
     /// Reassemble a file from its blocks. Reads each block from disk and
     /// concatenates them in order. Returns the reassembled bytes.
     pub async fn reassemble(&self, blocks: &FileBlocks) -> Result<Vec<u8>> {
-        let mut output = Vec::with_capacity(blocks.size as usize);
+        let capacity = usize::try_from(blocks.size)
+            .map_err(|_| anyhow::anyhow!("file size too large for allocation on this platform"))?;
+        let mut output = Vec::with_capacity(capacity);
         for hash in &blocks.blocks {
             let data = self
                 .get_block(hash)
                 .await?
-                .ok_or_else(|| anyhow::anyhow!("missing block {}", hash))?;
+                .ok_or_else(|| anyhow::anyhow!("missing block {hash}"))?;
             output.extend_from_slice(&data);
         }
         Ok(output)
@@ -109,7 +111,9 @@ impl BlockStore {
     /// Return the on-disk path for a block hash.
     fn block_path(&self, hash: &BlockHash) -> PathBuf {
         let hex = hash.to_string();
-        let prefix = &hex[..2];
+        // The hex string is always 64 ASCII characters (32 bytes × 2 hex chars).
+        // Taking the first 2 bytes is always valid.
+        let prefix = hex.get(..2).unwrap_or("xx");
         self.root.join(prefix).join(format!("{hex}.blk"))
     }
 }
@@ -196,9 +200,9 @@ mod tests {
         let data = b"check me";
         let hash = BlockHash::from_data(data);
 
-        assert!(!store.has_block(&hash).await);
+        assert!(!store.has_block(&hash));
         store.store_block(&hash, data).await.unwrap();
-        assert!(store.has_block(&hash).await);
+        assert!(store.has_block(&hash));
     }
 
     #[tokio::test]
@@ -245,9 +249,9 @@ mod tests {
         let hash = BlockHash::from_data(data);
 
         store.store_block(&hash, data).await.unwrap();
-        assert!(store.has_block(&hash).await);
+        assert!(store.has_block(&hash));
 
         store.remove_block(&hash).await.unwrap();
-        assert!(!store.has_block(&hash).await);
+        assert!(!store.has_block(&hash));
     }
 }
