@@ -101,10 +101,12 @@ async fn engine_mount_unmount_during_runtime() {
     let engine = make_engine_with_backends(vec![Arc::new(NullBackend::new("root"))]).await;
 
     // Mount a second backend.
-    engine.mount_backend(
-        PathBuf::from("Projects"),
-        Arc::new(NullBackend::new("projects")),
-    ).await;
+    engine
+        .mount_backend(
+            PathBuf::from("Projects"),
+            Arc::new(NullBackend::new("projects")),
+        )
+        .await;
 
     let tree = engine.vfs().read().unwrap();
     assert_eq!(tree.children().len(), 1);

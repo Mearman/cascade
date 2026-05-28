@@ -78,10 +78,7 @@ point = "/home/user/Cloud"
     let backend_value = config.backends.get("personal").unwrap();
     let table = backend_value.as_table().unwrap();
     assert_eq!(table.get("type").unwrap().as_str(), Some("gdrive"));
-    assert_eq!(
-        table.get("account").unwrap().as_str(),
-        Some("personal")
-    );
+    assert_eq!(table.get("account").unwrap().as_str(), Some("personal"));
 }
 
 #[test]
