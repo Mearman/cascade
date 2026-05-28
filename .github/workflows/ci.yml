@@ -72,7 +72,29 @@ jobs:
           tool: release-plz
       - name: Run release-plz
         id: release
-        run: release-plz release --git-token ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          OUTPUT=$(release-plz release --git-token ${{ secrets.GITHUB_TOKEN }} 2>&1)
+          RC=$?
+          set -e
+          echo "$OUTPUT"
+
+          # release-plz logs lines like "released cascade 0.1.0 (git-only)".
+          # Parse them to determine whether the binary crate was released
+          # and extract the version for downstream build jobs.
+          if echo "$OUTPUT" | grep -q 'released cascade ';
+          then
+            VERSION=$(echo "$OUTPUT" | grep 'released cascade ' | head -1 | grep -oP 'released cascade \K[^ ]+')
+            TAG="cascade-v${VERSION}"
+            echo "released=true" >> "$GITHUB_OUTPUT"
+            echo "version=${TAG}" >> "$GITHUB_OUTPUT"
+            echo "Detected release: ${TAG}"
+          else
+            echo "released=false" >> "$GITHUB_OUTPUT"
+            echo 'No cascade binary release detected'
+          fi
+
+          exit $RC
 
   build-macos-arm:
     name: Build macOS ARM
