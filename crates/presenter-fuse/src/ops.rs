@@ -94,7 +94,7 @@ mod linux {
             FuseFileAttr {
                 ino: INodeNo(attr.inode),
                 size: attr.size,
-                blocks: (attr.size + 511) / 512,
+                blocks: attr.size.div_ceil(512),
                 atime: UNIX_EPOCH,
                 mtime: UNIX_EPOCH,
                 ctime: UNIX_EPOCH,
@@ -159,10 +159,14 @@ mod linux {
             }
 
             if offset == 0 {
-                reply.add(ino, 1, FileType::Directory, ".");
+                if reply.add(ino, 1, FileType::Directory, ".").is_err() {
+                    return;
+                }
             }
             if offset <= 1 {
-                reply.add(ino, 2, FileType::Directory, "..");
+                if reply.add(ino, 2, FileType::Directory, "..").is_err() {
+                    return;
+                }
             }
 
             tracing::debug!(ino = ino_u64, offset, "readdir");
