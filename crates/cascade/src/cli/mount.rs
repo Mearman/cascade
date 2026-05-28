@@ -1,9 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use cascade_engine::engine::{Engine, EngineConfig};
 use cascade_presenter_nfs::nfs::server::{NfsServer, NfsServerConfig};
+
+use super::init::{BackendConfig, CascadeConfig};
 
 /// Start the Cascade daemon.
 pub async fn start(mount_point: Option<&str>) -> Result<()> {
@@ -16,21 +18,40 @@ pub async fn start(mount_point: Option<&str>) -> Result<()> {
     std::fs::create_dir_all(&config_dir)?;
     let db_path = config_dir.join("state.db");
 
-    // Create backend(s) from config.
-    // Phase 1: single Google Drive backend with defaults.
-    let gdrive_config = load_backend_config(&config_dir, "gdrive")?;
-    let backend = cascade_backend_gdrive::create_backend(&gdrive_config)?;
-    let backend: Arc<dyn cascade_engine::backend::Backend> = Arc::from(backend);
+    // Read main config.toml written by `cascade init`.
+    let main_config = load_main_config(&config_dir)?;
 
-    // Resolve mount point.
-    let mount_path = mount_point.map_or_else(
-        || {
+    // Create backends from config.
+    if main_config.backends.is_empty() {
+        anyhow::bail!(
+            "No backends configured. Run `cascade init` to set up."
+        );
+    }
+
+    let mut backends: Vec<Arc<dyn cascade_engine::backend::Backend>> = Vec::new();
+    for (name, value) in &main_config.backends {
+        let backend_cfg: BackendConfig = value
+            .clone()
+            .try_into()
+            .with_context(|| format!("invalid config for backend `{name}`"))?;
+        let per_backend_config = load_backend_config(&config_dir, name)?;
+        let backend = create_backend(name, &backend_cfg.backend_type, &per_backend_config)?;
+        backends.push(Arc::from(backend));
+    }
+
+    // Resolve mount point: CLI arg > config.toml [mount].point > ~/Cloud.
+    let mount_path = if let Some(p) = mount_point {
+        resolve_mount_path(p)
+    } else {
+        let configured = main_config.mount.point.trim().to_string();
+        if configured.is_empty() {
             dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("/tmp"))
                 .join("Cloud")
-        },
-        resolve_mount_path,
-    );
+        } else {
+            resolve_mount_path(&configured)
+        }
+    };
 
     std::fs::create_dir_all(&mount_path)?;
 
@@ -38,7 +59,7 @@ pub async fn start(mount_point: Option<&str>) -> Result<()> {
     let engine_config = EngineConfig {
         db_path,
         mount_point: mount_path.clone(),
-        backends: vec![backend],
+        backends,
         cache_dir: None,
         enable_p2p: false,
         p2p_data_dir: None,
@@ -95,10 +116,35 @@ pub fn stop() {
     println!("Cascade stopped.");
 }
 
-/// Resolve a mount point path, expanding ~ and environment variables.
-fn resolve_mount_path(path: &str) -> PathBuf {
-    let expanded = shellexpand::tilde(path).to_string();
-    PathBuf::from(expanded)
+/// Instantiate a backend by type, using its per-backend TOML config.
+fn create_backend(
+    name: &str,
+    backend_type: &str,
+    config: &toml::Value,
+) -> Result<Box<dyn cascade_engine::backend::Backend>> {
+    match backend_type {
+        "gdrive" => cascade_backend_gdrive::create_backend(config)
+            .with_context(|| format!("failed to create gdrive backend `{name}`")),
+        "s3" => cascade_backend_s3::create_backend(config)
+            .with_context(|| format!("failed to create s3 backend `{name}`")),
+        other => anyhow::bail!("unsupported backend type: {other}"),
+    }
+}
+
+/// Load the top-level `config.toml` from the config directory.
+fn load_main_config(config_dir: &Path) -> Result<CascadeConfig> {
+    let config_path = config_dir.join("config.toml");
+    if config_path.exists() {
+        let contents = std::fs::read_to_string(&config_path)
+            .with_context(|| format!("failed to read {}", config_path.display()))?;
+        let config: CascadeConfig = toml::from_str(&contents)
+            .with_context(|| format!("failed to parse {}", config_path.display()))?;
+        tracing::info!(path = ?config_path, "Loaded main config");
+        Ok(config)
+    } else {
+        tracing::warn!(path = ?config_path, "Main config not found");
+        Ok(CascadeConfig::default())
+    }
 }
 
 /// Load a backend config from the config directory.
@@ -113,6 +159,12 @@ fn load_backend_config(config_dir: &Path, name: &str) -> Result<toml::Value> {
         tracing::warn!(path = ?config_path, "Backend config not found, using defaults");
         Ok(toml::Value::Table(Default::default()))
     }
+}
+
+/// Resolve a mount point path, expanding ~ and environment variables.
+fn resolve_mount_path(path: &str) -> PathBuf {
+    let expanded = shellexpand::tilde(path).to_string();
+    PathBuf::from(expanded)
 }
 
 /// Mount NFS filesystem using the OS mount command (macOS).

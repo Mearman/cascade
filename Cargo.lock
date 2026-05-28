@@ -164,6 +164,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "cascade-backend-gdrive",
+ "cascade-backend-s3",
  "cascade-config",
  "cascade-engine",
  "cascade-expr",
