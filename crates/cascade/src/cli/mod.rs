@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod config;
+pub mod init;
 pub mod mount;
 pub mod status;
 
@@ -29,6 +30,9 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Guided initial setup
+    Init,
+
     /// Start the daemon and mount all configured backends
     Start {
         /// Mount point override
@@ -133,6 +137,7 @@ pub enum CacheCommands {
 impl Cli {
     pub async fn run(self) -> Result<()> {
         match self.command {
+            Commands::Init => init::run(),
             Commands::Start { mount_point } => mount::start(mount_point.as_deref()).await,
             Commands::Stop => mount::stop().await,
             Commands::Restart => {
