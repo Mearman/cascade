@@ -25,4 +25,7 @@ shellexpand = "3"
 dirs = "6"
 
 [dev-dependencies]
+cascade-p2p = { path = "../p2p" }
 tempfile = "3"
+proptest = "1"
+async-trait = "0.1"
