@@ -17,6 +17,9 @@ sha2 = "0.10"
 rcgen = "0.13"
 data-encoding = "2"
 rusqlite.workspace = true
+tokio-tungstenite = { version = "0.29.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+futures-util = "0.3.32"
+reqwest.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

@@ -15,14 +15,25 @@
 //!   peer communication.
 //! - **Discovery** (`discovery`): UDP multicast LAN peer discovery on port
 //!   21027.
+//! - **WAN discovery** (`wan`): HTTPS global peer discovery for devices outside
+//!   the local network.
+//! - **NAT traversal** (`nat`): STUN Binding Requests for external address
+//!   discovery and relay fallback decisions.
+//! - **Relay** (`relay`): WebSocket transport for peers behind restrictive NAT.
+//! - **Connection management** (`connection`): Direct TCP connection attempts
+//!   with relay fallback.
 //! - **Identity** (`identity`): Self-signed TLS certificate generation with
 //!   base32-encoded device ID.
 
 pub mod block;
+pub mod connection;
 pub mod discovery;
 pub mod identity;
+pub mod nat;
 pub mod protocol;
+pub mod relay;
 pub mod store;
+pub mod wan;
 
 use std::path::Path;
 
@@ -46,6 +57,8 @@ pub struct P2pEngine {
     block_store: BlockStore,
     /// TCP port for incoming BEP connections.
     listen_port: u16,
+    /// Relay servers used when direct WAN connections fail.
+    relay_urls: Vec<String>,
 }
 
 impl P2pEngine {
@@ -64,6 +77,7 @@ impl P2pEngine {
             identity,
             block_store,
             listen_port: DEFAULT_LISTEN_PORT,
+            relay_urls: Vec::new(),
         })
     }
 
@@ -73,6 +87,7 @@ impl P2pEngine {
             identity,
             block_store,
             listen_port: DEFAULT_LISTEN_PORT,
+            relay_urls: Vec::new(),
         }
     }
 
@@ -89,6 +104,21 @@ impl P2pEngine {
     /// Set the BEP listen port.
     pub fn set_listen_port(&mut self, port: u16) {
         self.listen_port = port;
+    }
+
+    /// Relay URLs used as WAN fallback transports.
+    pub fn relay_urls(&self) -> &[String] {
+        &self.relay_urls
+    }
+
+    /// Replace the ordered relay fallback URL list.
+    pub fn set_relay_urls(&mut self, relay_urls: Vec<String>) {
+        self.relay_urls = relay_urls;
+    }
+
+    /// Add a relay fallback URL.
+    pub fn add_relay_url(&mut self, relay_url: String) {
+        self.relay_urls.push(relay_url);
     }
 
     /// Access the block store.
@@ -129,6 +159,29 @@ impl P2pEngine {
     /// Blocks for the given duration, returning all discovered peers.
     pub fn discover_peers(timeout: std::time::Duration) -> Result<Vec<discovery::DiscoveredPeer>> {
         discovery::listen(timeout).context("listening for peer discovery")
+    }
+
+    /// Create a global discovery client for the given server URL.
+    pub fn global_discovery(&self, server_url: &str) -> wan::GlobalDiscovery {
+        wan::GlobalDiscovery::new(server_url)
+    }
+
+    /// Establish a peer connection, trying direct TCP before relay fallback.
+    pub async fn connect_peer(
+        &self,
+        peer: &discovery::DiscoveredPeer,
+    ) -> Result<connection::PeerConnection> {
+        connection::ConnectionManager::new(self.relay_urls.clone())
+            .connect(peer)
+            .await
+            .context("connecting to P2P peer")
+    }
+
+    /// Detect the local NAT type using a STUN server.
+    pub async fn detect_nat_type(&self, stun_server: &str) -> Result<nat::NatType> {
+        nat::NatTraversal::detect_nat_type(stun_server)
+            .await
+            .context("detecting NAT type")
     }
 }
 
