@@ -11,6 +11,7 @@ use std::io::{self, Write as IoWrite};
 use std::path::PathBuf;
 
 use anyhow::Result;
+use cascade_engine::db::StateDb;
 use serde::{Deserialize, Serialize};
 
 /// Top-level configuration persisted to `~/.config/cascade/config.toml`.
@@ -59,7 +60,7 @@ pub fn run() -> Result<()> {
     if choice_idx == 0 || choice_idx > BACKEND_TYPES.len() {
         anyhow::bail!("selection out of range");
     }
-    let &(backend_type, _backend_display_name) = BACKEND_TYPES
+    let &(backend_type, backend_display_name) = BACKEND_TYPES
         .get(choice_idx - 1)
         .ok_or_else(|| anyhow::anyhow!("selection out of range"))?;
     println!();
@@ -213,6 +214,18 @@ pub fn run() -> Result<()> {
 
     let config_str = toml::to_string_pretty(&config)?;
     std::fs::write(&config_path, &config_str)?;
+
+    // Register the backend in the state DB so `cascade status` and
+    // `cascade backend-list` can discover it.
+    let db_path = config_dir.join("state.db");
+    let db = StateDb::open(&db_path)?;
+    db.register_backend(
+        &name,
+        backend_type,
+        &format!("{backend_display_name} ({name})"),
+        None,
+        None,
+    )?;
 
     // Create the mount point directory.
     std::fs::create_dir_all(&mount_point)?;
