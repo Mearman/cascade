@@ -133,7 +133,8 @@ mod linux {
             let map = self.inode_map.lock().unwrap();
             if ino_u64 == crate::inode::ROOT_INODE {
                 let attr = FileAttr::directory(ino_u64);
-                reply.attr(&Duration::from_secs(1), attr.into());
+                let fuse_attr: FuseFileAttr = attr.into();
+                reply.attr(&Duration::from_secs(1), &fuse_attr);
                 return;
             }
             tracing::debug!(ino = ino_u64, "getattr");

@@ -87,14 +87,12 @@ impl VfsPresenter for FusePresenter {
             // Spawn the FUSE session in a background task.
             // fuser::spawn_mount2 blocks, so we run it in a dedicated thread.
             std::thread::spawn(move || {
-                let config = fuser::Config {
-                    mount_options: vec![
-                        fuser::MountOption::RO,
-                        fuser::MountOption::FSName("cascade".to_string()),
-                        fuser::MountOption::DefaultPermissions,
-                    ],
-                    ..fuser::Config::default()
-                };
+                let mut config = fuser::Config::default();
+                config.mount_options = vec![
+                    fuser::MountOption::RO,
+                    fuser::MountOption::FSName("cascade".to_string()),
+                    fuser::MountOption::DefaultPermissions,
+                ];
                 match fuser::spawn_mount2(ops, &mp, &config) {
                     Ok(_session) => {
                         tracing::info!("FUSE session ended");

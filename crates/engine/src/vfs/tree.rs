@@ -30,7 +30,7 @@ impl VfsTree {
         self.children.push((prefix, backend));
         // Sort longest path first so first match wins
         self.children
-            .sort_by(|a, b| b.0.as_os_str().len().cmp(&a.0.as_os_str().len()));
+            .sort_by_key(|b| std::cmp::Reverse(b.0.as_os_str().len()));
     }
 
     /// Remove a child backend by prefix. Returns the backend if found.
