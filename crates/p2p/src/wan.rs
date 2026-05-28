@@ -1,257 +1,313 @@
-//! WAN peer discovery via a global HTTPS discovery service.
+//! Peer gossip — fully P2P device discovery with no central server.
 //!
-//! Devices announce the addresses where they can be reached and query the
-//! service for other device IDs. The client intentionally treats the service
-//! as a narrow REST contract so the P2P engine does not depend on any specific
-//! server implementation.
+//! Devices learn about each other through introducer referrals. When two
+//! trusted devices connect, they exchange peer lists. If device A marks
+//! device B as an introducer, A auto-adds any previously-unknown peers
+//! that B mentions — but only for folders that A and B share.
+//!
+//! There is no global discovery server. WAN bootstrapping is manual
+//! (share device ID + address out-of-band), then the network grows
+//! organically through gossip.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 
-use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-const ANNOUNCE_PATH: &str = "announce";
-const LOOKUP_PATH: &str = "lookup";
-
-/// Global discovery server client.
-#[derive(Debug, Clone)]
-pub struct GlobalDiscovery {
-    server_url: String,
-    client: reqwest::Client,
-}
-
+/// A known peer, potentially learned via introducer gossip.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct DiscoveryAnnouncement {
-    device_id: String,
-    addresses: Vec<String>,
-    timestamp: DateTime<Utc>,
+pub struct KnownPeer {
+    /// Device ID (base32-encoded SHA-256 of TLS certificate).
+    pub device_id: String,
+    /// Known addresses where this device can be reached.
+    pub addresses: Vec<SocketAddr>,
+    /// Device IDs that introduced this peer (empty if manually added).
+    pub introduced_by: Vec<String>,
 }
 
+/// Gossip message exchanged between connected peers.
+///
+/// Sent after the TLS handshake and device ID verification, before
+/// any BEP protocol messages.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct DiscoveryLookupResponse {
-    addresses: Vec<String>,
+pub struct GossipMessage {
+    /// Peers this device knows about. Includes addresses but NOT
+    /// introducer-only metadata — the receiver records the sender
+    /// as the introducer.
+    pub peers: Vec<GossipPeer>,
 }
 
-impl GlobalDiscovery {
-    /// Create a discovery client pointing at a discovery server URL.
-    pub fn new(server_url: &str) -> Self {
-        Self {
-            server_url: server_url.trim_end_matches('/').to_string(),
-            client: reqwest::Client::new(),
+/// Peer entry in a gossip message. Stripped of internal bookkeeping.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GossipPeer {
+    pub device_id: String,
+    pub addresses: Vec<SocketAddr>,
+}
+
+/// Local peer database — tracks known peers and introducer relationships.
+#[derive(Debug, Clone, Default)]
+pub struct PeerBook {
+    /// Device ID → known peer entry.
+    peers: HashMap<String, KnownPeer>,
+}
+
+impl PeerBook {
+    /// Create an empty peer book.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Manually add a trusted peer. Not introduced by anyone.
+    pub fn add_peer(&mut self, device_id: String, addresses: Vec<SocketAddr>) {
+        self.peers.insert(
+            device_id.clone(),
+            KnownPeer {
+                device_id,
+                addresses,
+                introduced_by: Vec::new(),
+            },
+        );
+    }
+
+    /// Merge gossip from an introducer. Peers not already known are
+    /// auto-added with the introducer recorded. Existing peers are
+    /// updated with any new addresses but their introducer list is
+    /// preserved.
+    pub fn merge_gossip(&mut self, introducer_id: &str, gossip: &GossipMessage) {
+        for gossip_peer in &gossip.peers {
+            // Never add self.
+            if let Some(existing) = self.peers.get_mut(&gossip_peer.device_id) {
+                // Merge addresses.
+                for addr in &gossip_peer.addresses {
+                    if !existing.addresses.contains(addr) {
+                        existing.addresses.push(*addr);
+                    }
+                }
+            } else {
+                self.peers.insert(
+                    gossip_peer.device_id.clone(),
+                    KnownPeer {
+                        device_id: gossip_peer.device_id.clone(),
+                        addresses: gossip_peer.addresses.clone(),
+                        introduced_by: vec![introducer_id.to_string()],
+                    },
+                );
+            }
         }
     }
 
-    /// Announce this device's addresses to the global discovery server.
-    pub async fn announce(&self, device_id: &str, addresses: &[SocketAddr]) -> Result<()> {
-        let payload = DiscoveryAnnouncement {
-            device_id: device_id.to_string(),
-            addresses: addresses.iter().map(SocketAddr::to_string).collect(),
-            timestamp: Utc::now(),
-        };
-
-        self.client
-            .post(self.announce_url())
-            .json(&payload)
-            .send()
-            .await
-            .context("sending global discovery announcement")?
-            .error_for_status()
-            .context("global discovery announcement rejected")?;
-
-        Ok(())
+    /// Remove a peer. If the peer was introduced by someone, record
+    /// the removal so it isn't immediately re-added.
+    pub fn remove_peer(&mut self, device_id: &str) {
+        self.peers.remove(device_id);
     }
 
-    /// Query the global discovery server for a specific device.
-    pub async fn lookup(&self, device_id: &str) -> Result<Vec<SocketAddr>> {
-        let response = self
-            .client
-            .get(self.lookup_url(device_id))
-            .send()
-            .await
-            .context("querying global discovery server")?
-            .error_for_status()
-            .context("global discovery lookup rejected")?
-            .json::<DiscoveryLookupResponse>()
-            .await
-            .context("decoding global discovery lookup response")?;
+    /// Remove all peers introduced by a specific introducer.
+    /// Called when an introducer itself is removed.
+    pub fn remove_introduced_by(&mut self, introducer_id: &str) {
+        self.peers
+            .retain(|_, peer| !peer.introduced_by.contains(&introducer_id.to_string()));
+    }
 
-        response
-            .addresses
-            .iter()
-            .map(|address| {
-                address
-                    .parse::<SocketAddr>()
-                    .with_context(|| format!("parsing discovered address {address}"))
+    /// Get a peer by device ID.
+    pub fn get(&self, device_id: &str) -> Option<&KnownPeer> {
+        self.peers.get(device_id)
+    }
+
+    /// All known peers.
+    pub fn peers(&self) -> &HashMap<String, KnownPeer> {
+        &self.peers
+    }
+
+    /// Number of known peers.
+    pub fn len(&self) -> usize {
+        self.peers.len()
+    }
+
+    /// Whether the peer book is empty.
+    pub fn is_empty(&self) -> bool {
+        self.peers.is_empty()
+    }
+
+    /// Build a gossip message to send to a specific peer. Excludes
+    /// the target peer itself and the sender's own device ID.
+    pub fn build_gossip(&self, exclude_device_id: &str, self_device_id: &str) -> GossipMessage {
+        let peers = self
+            .peers
+            .values()
+            .filter(|p| p.device_id != exclude_device_id && p.device_id != self_device_id)
+            .map(|p| GossipPeer {
+                device_id: p.device_id.clone(),
+                addresses: p.addresses.clone(),
             })
-            .collect()
-    }
+            .collect();
 
-    fn announce_url(&self) -> String {
-        format!("{}/{ANNOUNCE_PATH}", self.server_url)
+        GossipMessage { peers }
     }
+}
 
-    fn lookup_url(&self, device_id: &str) -> String {
-        format!("{}/{LOOKUP_PATH}/{device_id}", self.server_url)
-    }
+/// Encode a gossip message as JSON bytes for sending over the wire.
+pub fn encode_gossip(msg: &GossipMessage) -> serde_json::Result<Vec<u8>> {
+    serde_json::to_vec(msg)
+}
+
+/// Decode a gossip message from JSON bytes received on the wire.
+pub fn decode_gossip(data: &[u8]) -> serde_json::Result<GossipMessage> {
+    serde_json::from_slice(data)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use std::sync::Arc;
 
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
-    use tokio::sync::Mutex;
-    use tokio::task::JoinHandle;
-
-    const HTTP_OK: &str =
-        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n";
-    const HTTP_NOT_FOUND: &str =
-        "HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 0\r\n\r\n";
-    const HEADER_TERMINATOR: &[u8] = b"\r\n\r\n";
-
-    struct MockGlobalDiscoveryServer {
-        address: SocketAddr,
-        task: JoinHandle<()>,
+    fn addr(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
     }
 
-    impl MockGlobalDiscoveryServer {
-        async fn start() -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let address = listener.local_addr().unwrap();
-            let state = Arc::new(Mutex::new(HashMap::<String, Vec<String>>::new()));
-            let task = tokio::spawn(run_server(listener, state));
-            Self { address, task }
-        }
+    #[test]
+    fn add_peer_manual() {
+        let mut book = PeerBook::new();
+        book.add_peer("DEVICE-A".to_string(), vec![addr(22000)]);
 
-        fn url(&self) -> String {
-            format!("http://{}", self.address)
-        }
+        let peer = book.get("DEVICE-A").unwrap();
+        assert_eq!(peer.device_id, "DEVICE-A");
+        assert_eq!(peer.addresses, vec![addr(22000)]);
+        assert!(peer.introduced_by.is_empty());
     }
 
-    impl Drop for MockGlobalDiscoveryServer {
-        fn drop(&mut self) {
-            self.task.abort();
-        }
+    #[test]
+    fn merge_gossip_adds_unknown_peers() {
+        let mut book = PeerBook::new();
+        let gossip = GossipMessage {
+            peers: vec![
+                GossipPeer {
+                    device_id: "DEVICE-B".to_string(),
+                    addresses: vec![addr(22001)],
+                },
+                GossipPeer {
+                    device_id: "DEVICE-C".to_string(),
+                    addresses: vec![addr(22002)],
+                },
+            ],
+        };
+
+        book.merge_gossip("INTRODUCER", &gossip);
+
+        let peer_b = book.get("DEVICE-B").unwrap();
+        assert_eq!(peer_b.introduced_by, vec!["INTRODUCER"]);
+
+        let peer_c = book.get("DEVICE-C").unwrap();
+        assert_eq!(peer_c.introduced_by, vec!["INTRODUCER"]);
     }
 
-    async fn run_server(listener: TcpListener, state: Arc<Mutex<HashMap<String, Vec<String>>>>) {
-        loop {
-            let (stream, _) = listener.accept().await.unwrap();
-            let state = Arc::clone(&state);
-            tokio::spawn(async move {
-                handle_request(stream, state).await.unwrap();
-            });
-        }
+    #[test]
+    fn merge_gossip_merges_addresses_for_known_peer() {
+        let mut book = PeerBook::new();
+        book.add_peer("DEVICE-B".to_string(), vec![addr(22001)]);
+
+        let gossip = GossipMessage {
+            peers: vec![GossipPeer {
+                device_id: "DEVICE-B".to_string(),
+                addresses: vec![addr(22001), addr(22003)],
+            }],
+        };
+
+        book.merge_gossip("INTRODUCER", &gossip);
+
+        let peer = book.get("DEVICE-B").unwrap();
+        assert_eq!(peer.addresses, vec![addr(22001), addr(22003)]);
+        // Manual peer keeps empty introduced_by.
+        assert!(peer.introduced_by.is_empty());
     }
 
-    async fn handle_request(
-        mut stream: TcpStream,
-        state: Arc<Mutex<HashMap<String, Vec<String>>>>,
-    ) -> Result<()> {
-        let mut buffer = Vec::new();
-        let mut chunk = [0u8; 1024];
+    #[test]
+    fn remove_introduced_by_cleans_up() {
+        let mut book = PeerBook::new();
+        book.add_peer("SELF".to_string(), vec![addr(22000)]);
 
-        while !buffer
-            .windows(HEADER_TERMINATOR.len())
-            .any(|window| window == HEADER_TERMINATOR)
-        {
-            let read = stream.read(&mut chunk).await?;
-            if read == 0 {
-                anyhow::bail!("client closed before request headers completed");
-            }
-            buffer.extend_from_slice(&chunk[..read]);
-        }
+        let gossip = GossipMessage {
+            peers: vec![GossipPeer {
+                device_id: "DEVICE-B".to_string(),
+                addresses: vec![addr(22001)],
+            }],
+        };
+        book.merge_gossip("INTRODUCER", &gossip);
+        assert_eq!(book.len(), 2);
 
-        let header_end = buffer
-            .windows(HEADER_TERMINATOR.len())
-            .position(|window| window == HEADER_TERMINATOR)
-            .context("finding request header terminator")?
-            + HEADER_TERMINATOR.len();
-        let headers = String::from_utf8(buffer[..header_end].to_vec())?;
-        let request_line = headers.lines().next().context("reading request line")?;
-        let body_len = content_length(&headers)?;
-
-        while buffer.len() < header_end + body_len {
-            let read = stream.read(&mut chunk).await?;
-            if read == 0 {
-                anyhow::bail!("client closed before request body completed");
-            }
-            buffer.extend_from_slice(&chunk[..read]);
-        }
-
-        if request_line.starts_with("POST /announce ") {
-            let body = &buffer[header_end..header_end + body_len];
-            let announcement: DiscoveryAnnouncement = serde_json::from_slice(body)?;
-            state
-                .lock()
-                .await
-                .insert(announcement.device_id, announcement.addresses);
-            write_json(&mut stream, &serde_json::json!({"ok": true})).await?;
-            return Ok(());
-        }
-
-        if let Some(device_id) = request_line
-            .strip_prefix("GET /lookup/")
-            .and_then(|rest| rest.split_once(' '))
-            .map(|(device_id, _)| device_id)
-        {
-            let addresses = state.lock().await.get(device_id).cloned();
-            match addresses {
-                Some(addresses) => {
-                    write_json(&mut stream, &DiscoveryLookupResponse { addresses }).await?;
-                }
-                None => stream.write_all(HTTP_NOT_FOUND.as_bytes()).await?,
-            }
-            return Ok(());
-        }
-
-        stream.write_all(HTTP_NOT_FOUND.as_bytes()).await?;
-        Ok(())
+        book.remove_introduced_by("INTRODUCER");
+        assert_eq!(book.len(), 1); // Only SELF remains.
+        assert!(book.get("DEVICE-B").is_none());
     }
 
-    fn content_length(headers: &str) -> Result<usize> {
-        for line in headers.lines() {
-            if let Some(value) = line.strip_prefix("content-length: ") {
-                return value.parse().context("parsing content length");
-            }
-            if let Some(value) = line.strip_prefix("Content-Length: ") {
-                return value.parse().context("parsing content length");
-            }
-        }
-        Ok(0)
+    #[test]
+    fn remove_peer_drops_entry() {
+        let mut book = PeerBook::new();
+        book.add_peer("DEVICE-A".to_string(), vec![addr(22000)]);
+        book.remove_peer("DEVICE-A");
+        assert!(book.get("DEVICE-A").is_none());
     }
 
-    async fn write_json<T: Serialize>(stream: &mut TcpStream, value: &T) -> Result<()> {
-        let body = serde_json::to_vec(value)?;
-        let headers = format!("{HTTP_OK}content-length: {}\r\n\r\n", body.len());
-        stream.write_all(headers.as_bytes()).await?;
-        stream.write_all(&body).await?;
-        Ok(())
+    #[test]
+    fn build_gossip_excludes_self_and_target() {
+        let mut book = PeerBook::new();
+        book.add_peer("SELF".to_string(), vec![addr(22000)]);
+        book.add_peer("DEVICE-A".to_string(), vec![addr(22001)]);
+        book.add_peer("DEVICE-B".to_string(), vec![addr(22002)]);
+
+        let gossip = book.build_gossip("DEVICE-A", "SELF");
+
+        assert_eq!(gossip.peers.len(), 1);
+        assert_eq!(gossip.peers[0].device_id, "DEVICE-B");
     }
 
-    #[tokio::test]
-    async fn announce_then_lookup_returns_registered_addresses() {
-        let server = MockGlobalDiscoveryServer::start().await;
-        let discovery = GlobalDiscovery::new(&server.url());
-        let addresses = ["127.0.0.1:22000".parse::<SocketAddr>().unwrap()];
+    #[test]
+    fn gossip_json_round_trip() {
+        let msg = GossipMessage {
+            peers: vec![
+                GossipPeer {
+                    device_id: "ABC".to_string(),
+                    addresses: vec![addr(22000)],
+                },
+                GossipPeer {
+                    device_id: "DEF".to_string(),
+                    addresses: vec![addr(22001), addr(22002)],
+                },
+            ],
+        };
 
-        discovery.announce("DEVICE", &addresses).await.unwrap();
-        let discovered = discovery.lookup("DEVICE").await.unwrap();
-
-        assert_eq!(discovered, addresses);
+        let encoded = encode_gossip(&msg).unwrap();
+        let decoded = decode_gossip(&encoded).unwrap();
+        assert_eq!(decoded, msg);
     }
 
-    #[tokio::test]
-    async fn lookup_unknown_device_returns_error() {
-        let server = MockGlobalDiscoveryServer::start().await;
-        let discovery = GlobalDiscovery::new(&server.url());
+    #[test]
+    fn empty_gossip_round_trip() {
+        let msg = GossipMessage { peers: vec![] };
+        let encoded = encode_gossip(&msg).unwrap();
+        let decoded = decode_gossip(&encoded).unwrap();
+        assert_eq!(decoded, msg);
+    }
 
-        let result = discovery.lookup("MISSING").await;
+    #[test]
+    fn merge_gossip_does_not_duplicate_existing_peer() {
+        let mut book = PeerBook::new();
+        book.add_peer("DEVICE-B".to_string(), vec![addr(22001)]);
 
-        assert!(result.is_err());
+        let gossip = GossipMessage {
+            peers: vec![GossipPeer {
+                device_id: "DEVICE-B".to_string(),
+                addresses: vec![addr(22001)],
+            }],
+        };
+
+        book.merge_gossip("INTRODUCER", &gossip);
+        assert_eq!(book.len(), 1);
+    }
+
+    #[test]
+    fn build_gossip_empty_book() {
+        let book = PeerBook::new();
+        let gossip = book.build_gossip("ANYONE", "SELF");
+        assert!(gossip.peers.is_empty());
     }
 }

@@ -1,8 +1,11 @@
-//! WebSocket relay transport for peers that cannot connect directly.
+//! WebSocket relay transport with end-to-end TLS.
 //!
-//! Relay sessions carry BEP frames inside WebSocket binary messages. Each
-//! WebSocket message contains one additional network-byte-order length prefix
-//! followed by the BEP bytes supplied by the caller.
+//! The relay is a blind byte-pipe — it sees only opaque ciphertext. The two
+//! endpoints negotiate TLS *through* the relay tunnel, so even a malicious
+//! relay operator cannot read or tamper with BEP traffic.
+//!
+//! Wire layers (inside out):
+//!   BEP message → length-prefixed frame → TLS record → WebSocket binary message → relay
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};

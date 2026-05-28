@@ -15,8 +15,9 @@
 //!   peer communication.
 //! - **Discovery** (`discovery`): UDP multicast LAN peer discovery on port
 //!   21027.
-//! - **WAN discovery** (`wan`): HTTPS global peer discovery for devices outside
-//!   the local network.
+//! - **WAN discovery** (`wan`): Fully P2P peer gossip with introducer referrals.
+//!   No central discovery server — devices learn about each other through
+//!   trusted peers.
 //! - **NAT traversal** (`nat`): STUN Binding Requests for external address
 //!   discovery and relay fallback decisions.
 //! - **Relay** (`relay`): WebSocket transport for peers behind restrictive NAT.
@@ -59,6 +60,8 @@ pub struct P2pEngine {
     listen_port: u16,
     /// Relay servers used when direct WAN connections fail.
     relay_urls: Vec<String>,
+    /// Peer book for gossip-based P2P discovery.
+    peer_book: wan::PeerBook,
 }
 
 impl P2pEngine {
@@ -78,6 +81,7 @@ impl P2pEngine {
             block_store,
             listen_port: DEFAULT_LISTEN_PORT,
             relay_urls: Vec::new(),
+            peer_book: wan::PeerBook::new(),
         })
     }
 
@@ -88,6 +92,7 @@ impl P2pEngine {
             block_store,
             listen_port: DEFAULT_LISTEN_PORT,
             relay_urls: Vec::new(),
+            peer_book: wan::PeerBook::new(),
         }
     }
 
@@ -161,20 +166,30 @@ impl P2pEngine {
         discovery::listen(timeout).context("listening for peer discovery")
     }
 
-    /// Create a global discovery client for the given server URL.
-    pub fn global_discovery(&self, server_url: &str) -> wan::GlobalDiscovery {
-        wan::GlobalDiscovery::new(server_url)
+    /// Access the peer book for P2P gossip-based discovery.
+    pub fn peer_book(&self) -> &wan::PeerBook {
+        &self.peer_book
     }
 
-    /// Establish a peer connection, trying direct TCP before relay fallback.
+    /// Mutable access to the peer book.
+    pub fn peer_book_mut(&mut self) -> &mut wan::PeerBook {
+        &mut self.peer_book
+    }
+
+    /// Establish a TLS-authenticated peer connection, trying direct before relay.
     pub async fn connect_peer(
         &self,
         peer: &discovery::DiscoveredPeer,
     ) -> Result<connection::PeerConnection> {
-        connection::ConnectionManager::new(self.relay_urls.clone())
-            .connect(peer)
-            .await
-            .context("connecting to P2P peer")
+        let trusted_ids: Vec<String> = self.peer_book.peers().keys().cloned().collect();
+        connection::ConnectionManager::new(
+            self.identity.clone(),
+            trusted_ids,
+            self.relay_urls.clone(),
+        )
+        .connect(peer)
+        .await
+        .context("connecting to P2P peer")
     }
 
     /// Detect the local NAT type using a STUN server.
