@@ -134,7 +134,7 @@ impl P2pBridge {
         arr.copy_from_slice(&bytes);
         let block_hash = BlockHash(arr);
 
-        Ok(self.p2p.block_store().has_block(&block_hash).await)
+        Ok(self.p2p.block_store().has_block(&block_hash))
     }
 
     /// Get this device's P2P ID.
