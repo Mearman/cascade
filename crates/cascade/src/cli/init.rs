@@ -81,11 +81,46 @@ pub fn run() -> Result<()> {
     std::fs::create_dir_all(&config_dir)?;
 
     // Step 3: Provider-specific setup.
-    let account = if backend_type == "gdrive" {
-        println!("Google Drive authentication required.");
-        println!("Run `cascade backend auth {name}` after init to complete OAuth setup.");
+    // Writes ~/.config/cascade/{name}.toml with credentials for the chosen provider.
+    if backend_type == "gdrive" {
+        // Collect OAuth2 client credentials.
+        println!("Google Drive setup:");
+        println!("  You'll need an OAuth2 client ID and secret from the Google Cloud Console.");
+        println!("  Create a project at https://console.cloud.google.com/ and enable the Drive API.");
         println!();
-        Some(name.clone())
+
+        let client_id = read_input("Client ID")?;
+        if client_id.is_empty() {
+            anyhow::bail!("client ID must not be empty");
+        }
+
+        let client_secret = read_input("Client secret")?;
+        if client_secret.is_empty() {
+            anyhow::bail!("client secret must not be empty");
+        }
+
+        println!();
+
+        // Write per-backend credentials file: ~/.config/cascade/{name}.toml
+        let mut backend_table = toml::Table::new();
+        backend_table.insert("type".to_string(), toml::Value::String("gdrive".to_string()));
+        backend_table.insert("client_id".to_string(), toml::Value::String(client_id));
+        backend_table.insert(
+            "client_secret".to_string(),
+            toml::Value::String(client_secret),
+        );
+        backend_table.insert("account".to_string(), toml::Value::String(name.clone()));
+
+        let backend_toml = toml::to_string_pretty(&backend_table)?;
+        let backend_config_path = config_dir.join(format!("{name}.toml"));
+        std::fs::write(&backend_config_path, &backend_toml)?;
+
+        println!(
+            "\u{2713} Credentials written to {}",
+            backend_config_path.display()
+        );
+        println!("Run `cascade backend auth {name}` to complete OAuth setup.");
+        println!();
     } else {
         // S3-compatible backend: collect credentials interactively.
         println!("S3 configuration:");
@@ -138,9 +173,8 @@ pub fn run() -> Result<()> {
         let backend_toml = toml::to_string_pretty(&backend_table)?;
         let backend_config_path = config_dir.join(format!("{name}.toml"));
         std::fs::write(&backend_config_path, &backend_toml)?;
-
-        None
-    };
+    }
+    let account: Option<String> = None;
 
     // Step 4: Mount point.
     let default_mount = dirs::home_dir()
