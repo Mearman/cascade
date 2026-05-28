@@ -111,7 +111,7 @@ pub enum Change {
 }
 
 /// Cache state for a file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CacheState {
     /// Metadata only — file exists in the backend but not on local disk.
@@ -212,7 +212,7 @@ impl From<FileEntry> for VfsItem {
 }
 
 /// Storage quota information.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Quota {
     pub total: Option<u64>,
     pub used: Option<u64>,

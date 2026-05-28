@@ -10,6 +10,14 @@ pub struct PinMatcher<'a> {
     rules: Vec<PinRuleRecord>,
 }
 
+impl std::fmt::Debug for PinMatcher<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PinMatcher")
+            .field("rule_count", &self.rules.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl<'a> PinMatcher<'a> {
     /// Load all pin rules from the database.
     pub fn load(db: &'a StateDb) -> Result<Self> {
@@ -61,7 +69,8 @@ fn glob_match_exact(pattern: &str, path: &str) -> bool {
     if pattern.contains("**") {
         let parts: Vec<&str> = pattern.split("**").collect();
         if parts.len() == 2 {
-            let (prefix, suffix) = (parts[0], parts[1]);
+            let prefix = parts.first().copied().unwrap_or("");
+            let suffix = parts.get(1).copied().unwrap_or("");
             let prefix_ok = prefix.is_empty() || path.starts_with(prefix);
             if !prefix_ok {
                 return false;
@@ -82,12 +91,16 @@ fn glob_match_exact(pattern: &str, path: &str) -> bool {
             // The ** matches everything between prefix and the last segment(s).
             if suffix.contains('/') {
                 // Multi-segment suffix: find the rightmost occurrence.
-                if let Some(pos) = after_prefix.rfind(suffix.trim_start_matches('*')) {
-                    return after_prefix[pos..].ends_with(suffix.trim_start_matches('*'))
-                        || star_match_path(
-                            suffix,
-                            &after_prefix[after_prefix.len() - suffix.len()..],
-                        );
+                let trimmed_suffix = suffix.trim_start_matches('*');
+                if let Some(pos) = after_prefix.rfind(trimmed_suffix) {
+                    let from_pos = after_prefix.get(pos..).unwrap_or("");
+                    if from_pos.ends_with(trimmed_suffix) {
+                        return true;
+                    }
+                    let tail_len = suffix.len().min(after_prefix.len());
+                    let tail_start = after_prefix.len() - tail_len;
+                    let tail = after_prefix.get(tail_start..).unwrap_or("");
+                    return star_match_path(suffix, tail);
                 }
                 return false;
             }
@@ -111,8 +124,8 @@ fn star_match_path(pattern: &str, path: &str) -> bool {
     if segments.len() == 1 {
         return pattern == path;
     }
-    let first = segments[0];
-    let last = segments[segments.len() - 1];
+    let first = segments.first().copied().unwrap_or("");
+    let last = segments.last().copied().unwrap_or("");
     if !first.is_empty() && !path.starts_with(first) {
         return false;
     }
@@ -123,18 +136,20 @@ fn star_match_path(pattern: &str, path: &str) -> bool {
     let end = if last.is_empty() {
         path.len()
     } else {
-        path.len() - last.len()
+        path.len().saturating_sub(last.len())
     };
     if start > end {
         return false;
     }
-    let remaining = &path[start..end];
+    let remaining = path.get(start..end).unwrap_or("");
     let mut search_from = 0;
-    for seg in &segments[1..segments.len() - 1] {
+    let middle = segments.get(1..segments.len().saturating_sub(1)).unwrap_or(&[]);
+    for seg in middle {
         if seg.is_empty() {
             continue;
         }
-        if let Some(pos) = remaining[search_from..].find(seg) {
+        let rest = remaining.get(search_from..).unwrap_or("");
+        if let Some(pos) = rest.find(seg) {
             search_from += pos + seg.len();
         } else {
             return false;

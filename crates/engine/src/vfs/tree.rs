@@ -16,6 +16,15 @@ pub struct VfsTree {
     children: Vec<(PathBuf, Arc<dyn Backend>)>,
 }
 
+impl std::fmt::Debug for VfsTree {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VfsTree")
+            .field("root_id", &self.root.id())
+            .field("child_count", &self.children.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl VfsTree {
     pub fn new(root: Arc<dyn Backend>) -> Self {
         Self {

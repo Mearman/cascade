@@ -1,7 +1,7 @@
 pub mod schema;
 
 use crate::db::schema::SchemaVersion;
-use crate::types::{FileEntry, ItemId, CacheState, Cursor};
+use crate::types::{CacheState, Cursor, FileEntry, ItemId};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
@@ -12,6 +12,12 @@ use std::sync::Mutex;
 /// pin rules, lifecycle policies, config cache, sync cursors, and P2P state.
 pub struct StateDb {
     conn: Mutex<Connection>,
+}
+
+impl std::fmt::Debug for StateDb {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StateDb").finish_non_exhaustive()
+    }
 }
 
 impl StateDb {
@@ -53,7 +59,7 @@ impl StateDb {
             .lock()
             .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
 
-        let current_version = Self::get_version(&conn)?;
+        let current_version = Self::get_version(&conn);
         let target_version = SchemaVersion::current();
 
         if current_version < target_version {
@@ -64,7 +70,7 @@ impl StateDb {
         Ok(())
     }
 
-    fn get_version(conn: &Connection) -> Result<SchemaVersion> {
+    fn get_version(conn: &Connection) -> SchemaVersion {
         let version: i32 = conn
             .query_row(
                 "SELECT value FROM schema_meta WHERE key = 'version'",
@@ -72,7 +78,7 @@ impl StateDb {
                 |row| row.get(0),
             )
             .unwrap_or(0);
-        Ok(SchemaVersion(version))
+        SchemaVersion(version)
     }
 
     fn set_version(conn: &Connection, version: SchemaVersion) -> Result<()> {
@@ -476,9 +482,11 @@ impl StateDb {
             [&file_id.0],
         )?;
         for (index, hash) in block_hashes.iter().enumerate() {
+            let block_index = i64::try_from(index)
+                .map_err(|e| anyhow::anyhow!("block index overflow: {e}"))?;
             conn.execute(
                 "INSERT INTO p2p_block_index (file_id, block_index, block_hash) VALUES (?1, ?2, ?3)",
-                (&file_id.0, index as i64, hash.as_slice()),
+                (&file_id.0, block_index, hash.as_slice()),
             )?;
         }
         Ok(())
@@ -496,8 +504,7 @@ impl StateDb {
         let hashes = stmt
             .query_map([&file_id.0], |row| {
                 let hash_blob: Vec<u8> = row.get(0)?;
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&hash_blob[..32]);
+                let arr: [u8; 32] = hash_blob.try_into().unwrap_or([0u8; 32]);
                 Ok(arr)
             })?
             .collect::<Result<Vec<_>, _>>()?;

@@ -18,6 +18,14 @@ pub struct ConfigResolver {
     cache: RwLock<Vec<(PathBuf, ResolvedConfig)>>,
 }
 
+impl std::fmt::Debug for ConfigResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConfigResolver")
+            .field("mount_root", &self.mount_root)
+            .finish_non_exhaustive()
+    }
+}
+
 impl ConfigResolver {
     #[must_use] pub const fn new(mount_root: PathBuf) -> Self {
         Self {
@@ -44,23 +52,21 @@ impl ConfigResolver {
         is_dir: bool,
         ctx: Option<&EvalContext>,
     ) -> bool {
-        let parent = file_path.parent().unwrap_or(Path::new("/"));
+        let parent = file_path.parent().unwrap_or_else(|| Path::new("/"));
         let config = self.resolve_for_dir(parent);
 
         // If no context, use the standard is_ignored (which ignores conditions).
         let Some(ctx) = ctx else {
             let name = file_path
                 .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
             return config.is_ignored(&name, is_dir);
         };
 
         // With context: evaluate each rule's conditions.
         let name = file_path
             .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
 
         let mut ignored = false;
         for rule in &config.ignores {
@@ -87,7 +93,7 @@ impl ConfigResolver {
     fn resolve_for_dir(&self, dir: &Path) -> ResolvedConfig {
         // Check cache first.
         {
-            let cache = self.cache.read().unwrap();
+            let cache = self.cache.read().unwrap_or_else(|e| e.into_inner());
             if let Some((_, config)) = cache.iter().find(|(p, _)| p == dir) {
                 return config.clone();
             }
@@ -98,7 +104,7 @@ impl ConfigResolver {
 
         // Cache the result.
         {
-            let mut cache = self.cache.write().unwrap();
+            let mut cache = self.cache.write().unwrap_or_else(|e| e.into_inner());
             cache.push((dir.to_path_buf(), config.clone()));
         }
 
@@ -108,7 +114,7 @@ impl ConfigResolver {
     /// Invalidate cached configs for a directory and its children.
     /// Call this when `.cascade` files are created or modified.
     pub fn invalidate(&self, dir: &Path) {
-        let mut cache = self.cache.write().unwrap();
+        let mut cache = self.cache.write().unwrap_or_else(|e| e.into_inner());
         cache.retain(|(p, _)| !p.starts_with(dir));
     }
 }
@@ -118,7 +124,8 @@ fn glob_match(pattern: &str, path: &str) -> bool {
     if pattern.contains("**") {
         let parts: Vec<&str> = pattern.split("**").collect();
         if parts.len() == 2 {
-            let (prefix, suffix) = (parts[0], parts[1]);
+            let prefix = parts.first().copied().unwrap_or("");
+            let suffix = parts.get(1).copied().unwrap_or("");
             let prefix_ok = prefix.is_empty() || path.starts_with(prefix);
             let suffix_ok = suffix.is_empty() || path.ends_with(suffix);
             return prefix_ok && suffix_ok;
@@ -135,11 +142,12 @@ fn star_match(pattern: &str, path: &str) -> bool {
     if segments.len() == 1 {
         return pattern == path;
     }
-    let first = segments[0];
-    let last = segments[segments.len() - 1];
+    let first = segments.first().copied().unwrap_or("");
+    let last = segments.last().copied().unwrap_or("");
     let mut idx = 0;
     if !first.is_empty() {
-        if !path[idx..].starts_with(first) {
+        let rest = path.get(idx..).unwrap_or("");
+        if !rest.starts_with(first) {
             return false;
         }
         idx += first.len();
@@ -147,17 +155,20 @@ fn star_match(pattern: &str, path: &str) -> bool {
     if !last.is_empty() && !path.ends_with(last) {
         return false;
     }
-    let remaining = if last.is_empty() {
-        &path[idx..]
+    let end = if last.is_empty() {
+        path.len()
     } else {
-        &path[idx..path.len() - last.len()]
+        path.len().saturating_sub(last.len())
     };
+    let remaining = path.get(idx..end).unwrap_or("");
     let mut search_from = 0;
-    for seg in &segments[1..segments.len() - 1] {
+    let middle = segments.get(1..segments.len().saturating_sub(1)).unwrap_or(&[]);
+    for seg in middle {
         if seg.is_empty() {
             continue;
         }
-        if let Some(pos) = remaining[search_from..].find(seg) {
+        let rest = remaining.get(search_from..).unwrap_or("");
+        if let Some(pos) = rest.find(seg) {
             search_from += pos + seg.len();
         } else {
             return false;
@@ -178,7 +189,7 @@ mod tests {
         let _ = resolver.is_ignored(path, false);
         let _ = resolver.is_ignored(path, false);
 
-        let cache = resolver.cache.read().unwrap();
+        let cache = resolver.cache.read().unwrap_or_else(|e| e.into_inner());
         assert_eq!(cache.len(), 1);
     }
 
@@ -190,7 +201,7 @@ mod tests {
 
         resolver.invalidate(Path::new("/tmp/test-mount/Documents"));
 
-        let cache = resolver.cache.read().unwrap();
+        let cache = resolver.cache.read().unwrap_or_else(|e| e.into_inner());
         assert!(cache.is_empty());
     }
 }

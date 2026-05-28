@@ -1,4 +1,4 @@
-use crate::types::{VfsItem, ItemId, CacheState};
+use crate::types::{CacheState, ItemId, VfsItem};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::path::Path;

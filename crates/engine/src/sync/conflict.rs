@@ -56,13 +56,14 @@ pub enum ConflictCheck {
     let suffix = format!(" ({device_name} {date}).conflict");
 
     // Split name and extension.
-    if let Some(dot_pos) = original_name.rfind('.') {
-        let stem = &original_name[..dot_pos];
-        let ext = &original_name[dot_pos..];
-        format!("{stem}{suffix}{ext}")
-    } else {
-        format!("{original_name}{suffix}")
-    }
+    original_name.rfind('.').map_or_else(
+        || format!("{original_name}{suffix}"),
+        |dot_pos| {
+            let stem = original_name.get(..dot_pos).unwrap_or(original_name);
+            let ext = original_name.get(dot_pos..).unwrap_or("");
+            format!("{stem}{suffix}{ext}")
+        },
+    )
 }
 
 #[cfg(test)]

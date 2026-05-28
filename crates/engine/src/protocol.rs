@@ -58,7 +58,7 @@ pub struct BackendStatus {
 }
 
 /// Cache usage statistics.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
 pub struct CacheStats {
     pub total_files: u64,
     pub online_files: u64,
@@ -70,7 +70,9 @@ pub struct CacheStats {
 /// Encode a message with a 4-byte big-endian length prefix.
 pub fn encode_message(msg: &impl Serialize) -> anyhow::Result<Vec<u8>> {
     let json = serde_json::to_vec(msg)?;
-    let len = (json.len() as u32).to_be_bytes();
+    let len = u32::try_from(json.len())
+        .map_err(|e| anyhow::anyhow!("message too large to encode: {e}"))?
+        .to_be_bytes();
     let mut out = Vec::with_capacity(4 + json.len());
     out.extend_from_slice(&len);
     out.extend_from_slice(&json);
@@ -82,15 +84,24 @@ pub fn encode_message(msg: &impl Serialize) -> anyhow::Result<Vec<u8>> {
 pub fn decode_message<T: for<'de> Deserialize<'de>>(
     buf: &[u8],
 ) -> anyhow::Result<Option<(usize, T)>> {
-    if buf.len() < 4 {
+    let Some(header) = buf.get(..4) else {
+        return Ok(None);
+    };
+    let b0 = header.first().copied().unwrap_or(0);
+    let b1 = header.get(1).copied().unwrap_or(0);
+    let b2 = header.get(2).copied().unwrap_or(0);
+    let b3 = header.get(3).copied().unwrap_or(0);
+    let len = usize::try_from(u32::from_be_bytes([b0, b1, b2, b3]))
+        .unwrap_or(usize::MAX);
+    let end = 4 + len;
+    if buf.len() < end {
         return Ok(None);
     }
-    let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-    if buf.len() < 4 + len {
-        return Ok(None);
-    }
-    let value: T = serde_json::from_slice(&buf[4..4 + len])?;
-    Ok(Some((4 + len, value)))
+    let body = buf
+        .get(4..end)
+        .ok_or_else(|| anyhow::anyhow!("buffer slice out of range"))?;
+    let value: T = serde_json::from_slice(body)?;
+    Ok(Some((end, value)))
 }
 
 #[cfg(test)]

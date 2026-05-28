@@ -23,6 +23,14 @@ pub struct P2pBridge {
     db: Arc<StateDb>,
 }
 
+impl std::fmt::Debug for P2pBridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("P2pBridge")
+            .field("device_id", &self.p2p.device_id())
+            .finish_non_exhaustive()
+    }
+}
+
 impl P2pBridge {
     /// Create a new P2P bridge.
     pub const fn new(p2p: P2pEngine, db: Arc<StateDb>) -> Self {
@@ -122,7 +130,13 @@ impl P2pBridge {
         // Parse the hex hash into a BlockHash.
         let bytes: Vec<u8> = (0..hash.len())
             .step_by(2)
-            .map(|i| u8::from_str_radix(&hash[i..i + 2], 16))
+            .map(|i| {
+                let end = i + 2;
+                let chunk = hash
+                    .get(i..end)
+                    .ok_or_else(|| anyhow::anyhow!("hash string index out of range at {i}"))?;
+                u8::from_str_radix(chunk, 16).map_err(anyhow::Error::from)
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         if bytes.len() != 32 {

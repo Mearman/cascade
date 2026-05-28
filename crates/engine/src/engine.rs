@@ -8,6 +8,7 @@
 //! - P2P bridge (optional, LAN block sharing)
 //! - Config resolver (.cascade file filtering)
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -40,6 +41,19 @@ pub struct EngineConfig {
     pub p2p_data_dir: Option<PathBuf>,
 }
 
+impl fmt::Debug for EngineConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EngineConfig")
+            .field("db_path", &self.db_path)
+            .field("mount_point", &self.mount_point)
+            .field("backends", &format!("[{} backend(s)]", self.backends.len()))
+            .field("cache_dir", &self.cache_dir)
+            .field("enable_p2p", &self.enable_p2p)
+            .field("p2p_data_dir", &self.p2p_data_dir)
+            .finish()
+    }
+}
+
 /// Unified Cascade engine that owns and coordinates all components.
 pub struct Engine {
     db: Arc<StateDb>,
@@ -49,6 +63,14 @@ pub struct Engine {
     p2p: Option<P2pBridge>,
     cancel: watch::Sender<bool>,
     cancel_rx: watch::Receiver<bool>,
+}
+
+impl fmt::Debug for Engine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Engine")
+            .field("p2p_enabled", &self.p2p.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Engine {
@@ -67,11 +89,15 @@ impl Engine {
         info!(path = %config.db_path.display(), "state database opened");
 
         // Register all backends in the DB and build the VFS tree.
-        let root = backends[0].clone();
+        // Safety: we checked `backends.is_empty()` above, so first() is always Some here.
+        let root = backends
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("backend list is empty"))?
+            .clone();
         db.register_backend(root.id(), "unknown", root.display_name(), None, None)?;
 
         let mut vfs_tree = VfsTree::new(root);
-        for backend in &backends[1..] {
+        for backend in backends.get(1..).unwrap_or(&[]) {
             db.register_backend(backend.id(), "unknown", backend.display_name(), None, None)?;
             // Use the backend ID as the mount prefix for non-root backends.
             vfs_tree.mount(PathBuf::from(backend.id()), (*backend).clone());
@@ -91,7 +117,7 @@ impl Engine {
                 config
                     .db_path
                     .parent()
-                    .unwrap_or(Path::new("."))
+                    .unwrap_or_else(|| Path::new("."))
                     .join("p2p")
             });
             let p2p_engine = cascade_p2p::P2pEngine::new(&p2p_dir).await?;
@@ -115,28 +141,33 @@ impl Engine {
     }
 
     /// Mount a backend at a VFS prefix.
-    pub async fn mount_backend(&self, prefix: PathBuf, backend: Arc<dyn Backend>) {
-        let mut tree = self.vfs.write().unwrap();
+    pub fn mount_backend(&self, prefix: PathBuf, backend: Arc<dyn Backend>) {
+        let mut tree = self
+            .vfs
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         tree.mount(prefix, backend);
     }
 
     /// Unmount a backend from a VFS prefix.
-    pub async fn unmount_backend(&self, prefix: &Path) -> Result<()> {
-        let mut tree = self.vfs.write().unwrap();
+    pub fn unmount_backend(&self, prefix: &Path) {
+        let mut tree = self
+            .vfs
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         tree.unmount(prefix);
-        Ok(())
     }
 
     /// Start the engine — spawns the sync runner and cache manager as
     /// background tasks. Returns a handle for monitoring.
-    pub async fn start(&self) -> Result<EngineHandle> {
+    pub fn start(&self) -> Result<EngineHandle> {
         // Build presenter wrapper that forwards to the VFS.
         // The SyncRunner needs a presenter — we use a no-op here because
         // the actual presenter (NFS, FUSE, etc.) is managed externally.
         let presenter = Arc::new(NullPresenter);
 
         // Collect all backends from the VFS tree.
-        let tree = self.vfs.read().unwrap();
+        let tree = self.vfs.read().unwrap_or_else(|e| e.into_inner());
         let mut backends = vec![tree.root().clone()];
         for (_, backend) in tree.children() {
             backends.push(backend.clone());
@@ -170,11 +201,10 @@ impl Engine {
     }
 
     /// Graceful shutdown — signals all components to stop.
-    pub async fn shutdown(&self) -> Result<()> {
+    pub fn shutdown(&self) {
         info!("engine shutting down");
         let _ = self.cancel.send(true);
         info!("engine shutdown complete");
-        Ok(())
     }
 
     /// Pin a path pattern. All files matching the glob will be kept offline.
@@ -239,6 +269,7 @@ impl Engine {
 }
 
 /// Handle returned by [`Engine::start()`] for monitoring background tasks.
+#[derive(Debug)]
 pub struct EngineHandle {
     /// Join handle for the sync runner background task.
     pub sync_handle: tokio::task::JoinHandle<()>,
@@ -262,7 +293,7 @@ pub struct EngineStatus {
 }
 
 /// Cache statistics snapshot within engine status.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct CacheStatsSnapshot {
     /// Files in Online state (metadata only).
     pub online_count: usize,
@@ -350,14 +381,13 @@ mod tests {
         let engine = make_test_engine().await;
 
         engine
-            .mount_backend(PathBuf::from("Work"), Arc::new(NullBackend::new("work")))
-            .await;
+            .mount_backend(PathBuf::from("Work"), Arc::new(NullBackend::new("work")));
 
         let tree = engine.vfs().read().unwrap();
         assert_eq!(tree.children().len(), 1);
         drop(tree);
 
-        engine.unmount_backend(Path::new("Work")).await.unwrap();
+        engine.unmount_backend(Path::new("Work"));
 
         let tree = engine.vfs().read().unwrap();
         assert!(tree.children().is_empty());
@@ -393,7 +423,7 @@ mod tests {
     #[tokio::test]
     async fn engine_shutdown_signals_cancel() {
         let engine = make_test_engine().await;
-        engine.shutdown().await.unwrap();
+        engine.shutdown();
 
         let status = engine.status();
         assert!(!status.running);
@@ -402,12 +432,12 @@ mod tests {
     #[tokio::test]
     async fn engine_start_and_shutdown() {
         let engine = make_test_engine().await;
-        let handle = engine.start().await.unwrap();
+        let handle = engine.start().unwrap();
 
         // Give the tasks a moment to start.
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
-        engine.shutdown().await.unwrap();
+        engine.shutdown();
 
         // Abort tasks (they should have already stopped via cancel).
         handle.sync_handle.abort();

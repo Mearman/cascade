@@ -61,6 +61,7 @@ pub trait Backend: Send + Sync {
 }
 
 /// A null backend used for P2P-only folders with no cloud storage.
+#[derive(Debug)]
 pub struct NullBackend {
     id: String,
 }

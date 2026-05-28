@@ -18,7 +18,7 @@ use tokio::sync::watch;
 use tracing::info;
 
 /// Configuration for the cache manager.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct CacheManagerConfig {
     /// Maximum total cache size in bytes. None = unlimited.
     pub max_size: Option<u64>,
@@ -45,6 +45,15 @@ pub struct CacheManager {
     p2p: Option<Arc<P2pBridge>>,
 }
 
+impl std::fmt::Debug for CacheManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CacheManager")
+            .field("config", &self.config)
+            .field("p2p_enabled", &self.p2p.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 impl CacheManager {
     /// Create a new cache manager.
     pub const fn new(db: Arc<StateDb>, config: CacheManagerConfig) -> Self {
@@ -64,18 +73,16 @@ impl CacheManager {
     /// Try to fetch file contents from P2P peers before falling back to
     /// cloud. Returns the file data if P2P has it, None otherwise.
     pub async fn fetch_from_p2p(&self, file: &crate::types::FileEntry) -> Result<Option<Vec<u8>>> {
-        let bridge = match &self.p2p {
-            Some(b) => b,
-            None => return Ok(None),
+        let Some(bridge) = &self.p2p else {
+            return Ok(None);
         };
         bridge.try_fetch_from_peers(file).await
     }
 
     /// Index downloaded file data into the P2P block store for sharing.
     pub async fn index_for_p2p(&self, file_id: &crate::types::ItemId, data: &[u8]) -> Result<()> {
-        let bridge = match &self.p2p {
-            Some(b) => b,
-            None => return Ok(()),
+        let Some(bridge) = &self.p2p else {
+            return Ok(());
         };
         bridge.index_file_by_id(file_id, data).await?;
         Ok(())
@@ -130,7 +137,7 @@ impl CacheManager {
 
         // 2. Evict LRU files if cache exceeds max_size.
         if let Some(max_size) = self.config.max_size {
-            let current_size = self.db.cache_size()? as u64;
+            let current_size = u64::try_from(self.db.cache_size()?).unwrap_or(0);
             if current_size > max_size {
                 // Evict in LRU order until under limit.
                 let candidates = self.db.eviction_candidates(100)?;
@@ -168,7 +175,7 @@ impl CacheManager {
             online_count: online.len(),
             cached_count: cached.len(),
             pinned_count: pinned.len(),
-            total_bytes: total_size as u64,
+            total_bytes: u64::try_from(total_size).unwrap_or(0),
             max_bytes: self.config.max_size,
         })
     }
@@ -195,7 +202,7 @@ impl CacheManager {
 }
 
 /// Cache statistics.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct CacheStats {
     pub online_count: usize,
     pub cached_count: usize,
@@ -205,7 +212,7 @@ pub struct CacheStats {
 }
 
 /// Report from an eviction sweep.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct EvictionReport {
     /// Files evicted due to lifecycle policies.
     pub lifecycle_evicted: usize,

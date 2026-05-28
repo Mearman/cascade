@@ -31,6 +31,15 @@ pub struct SyncRunner {
     cancel_rx: watch::Receiver<bool>,
 }
 
+impl std::fmt::Debug for SyncRunner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SyncRunner")
+            .field("backend_count", &self.backends.len())
+            .field("p2p_enabled", &self.p2p.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 impl SyncRunner {
     /// Create a new sync runner.
     pub fn new(
@@ -215,10 +224,7 @@ impl SyncRunner {
     /// Check if a file entry matches any pin rule.
     fn is_pinned_entry(&self, entry: &crate::types::FileEntry) -> bool {
         let path = std::path::Path::new(&entry.name);
-        match PinMatcher::load(&self.db) {
-            Ok(matcher) => matcher.is_pinned(path),
-            Err(_) => false,
-        }
+        PinMatcher::load(&self.db).is_ok_and(|matcher| matcher.is_pinned(path))
     }
 
     /// Check if a file entry should be ignored based on `.cascade` config.

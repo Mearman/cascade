@@ -11,6 +11,14 @@ pub struct LifecycleEvaluator<'a> {
     policies: Vec<LifecyclePolicyRecord>,
 }
 
+impl std::fmt::Debug for LifecycleEvaluator<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LifecycleEvaluator")
+            .field("policy_count", &self.policies.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl<'a> LifecycleEvaluator<'a> {
     /// Load all lifecycle policies from the database.
     pub fn load(db: &'a StateDb) -> Result<Self> {
@@ -45,7 +53,7 @@ impl<'a> LifecycleEvaluator<'a> {
             }
 
             if let (Some(max_size), Some(file_size)) = (policy.max_file_size, file.size)
-                && file_size > max_size as u64
+                && u64::try_from(max_size).is_ok_and(|m| file_size > m)
             {
                 return EvictionDecision::Evict {
                     reason: EvictionReason::MaxSize {
@@ -90,7 +98,7 @@ impl<'a> LifecycleEvaluator<'a> {
 }
 
 /// Decision about whether a file should be evicted.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvictionDecision {
     /// File should be evicted.
     Evict { reason: EvictionReason },
@@ -99,7 +107,7 @@ pub enum EvictionDecision {
 }
 
 /// Reason for eviction.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvictionReason {
     /// File exceeds the maximum age defined by a lifecycle policy.
     MaxAge { max_age_secs: i64, policy_id: i64 },
@@ -116,7 +124,8 @@ fn path_matches_policy(pattern: &str, path: &str) -> bool {
     if pattern.contains("**") {
         let parts: Vec<&str> = pattern.split("**").collect();
         if parts.len() == 2 {
-            let (prefix, suffix) = (parts[0], parts[1]);
+            let prefix = parts.first().copied().unwrap_or("");
+            let suffix = parts.get(1).copied().unwrap_or("");
             let prefix_ok = prefix.is_empty() || path.starts_with(prefix);
             let suffix_ok = suffix.is_empty() || path.ends_with(suffix);
             return prefix_ok && suffix_ok;
@@ -133,8 +142,8 @@ fn simple_star_match(pattern: &str, path: &str) -> bool {
     if segments.len() == 1 {
         return pattern == path;
     }
-    let first = segments[0];
-    let last = segments[segments.len() - 1];
+    let first = segments.first().copied().unwrap_or("");
+    let last = segments.last().copied().unwrap_or("");
     if !first.is_empty() && !path.starts_with(first) {
         return false;
     }
