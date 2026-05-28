@@ -11,7 +11,7 @@ use crate::inode::InodeMap;
 use std::sync::{Arc, RwLock};
 
 /// Internal file attribute representation, independent of platform-specific FUSE types.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct FileAttr {
     pub inode: u64,
     pub size: u64,
@@ -69,6 +69,12 @@ pub struct FuseOps {
     pub vfs: Arc<RwLock<VfsTree>>,
 }
 
+impl std::fmt::Debug for FuseOps {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FuseOps").finish_non_exhaustive()
+    }
+}
+
 impl FuseOps {
     /// Create a new `FuseOps` with the given root `ItemId` (no VFS tree).
     #[must_use] pub fn new(root_id: ItemId) -> Self {
@@ -97,7 +103,7 @@ impl FuseOps {
         let rt = tokio::runtime::Handle::current();
         rt.block_on(async {
             let (backend, relative) = {
-                let vfs = self.vfs.read().unwrap();
+                let vfs = self.vfs.read().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let (backend, relative) = vfs.resolve(path);
                 (Arc::clone(backend), relative)
             };
@@ -114,7 +120,7 @@ impl FuseOps {
     ) -> anyhow::Result<Vec<cascade_engine::types::DirEntry>> {
         let rt = tokio::runtime::Handle::current();
         rt.block_on(async {
-            let vfs = self.vfs.read().unwrap();
+            let vfs = self.vfs.read().unwrap_or_else(std::sync::PoisonError::into_inner);
             let result = vfs.read_dir(path).await;
             drop(vfs);
             result
@@ -127,7 +133,7 @@ impl FuseOps {
         let rt = tokio::runtime::Handle::current();
         rt.block_on(async {
             let (backend, relative) = {
-                let vfs = self.vfs.read().unwrap();
+                let vfs = self.vfs.read().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let (backend, relative) = vfs.resolve(path);
                 (Arc::clone(backend), relative)
             };
@@ -135,13 +141,13 @@ impl FuseOps {
             let mut buf = Vec::new();
             backend.download(&entry, &mut buf).await?;
 
-            let off = offset as usize;
+            let off = usize::try_from(offset).unwrap_or(usize::MAX);
             if off >= buf.len() {
                 return Ok(Vec::new());
             }
-            let remaining = &buf[off..];
-            let end = (size as usize).min(remaining.len());
-            Ok(remaining[..end].to_vec())
+            let remaining = buf.get(off..).unwrap_or_default();
+            let end = usize::try_from(size).unwrap_or(usize::MAX).min(remaining.len());
+            Ok(remaining.get(..end).unwrap_or_default().to_vec())
         })
     }
 }

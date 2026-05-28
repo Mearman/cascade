@@ -17,11 +17,13 @@ use cascade_engine::types::{CacheState, ItemId, VfsItem};
 use cascade_engine::vfs::VfsTree;
 
 use crate::inode::InodeMap;
+use tokio::io::AsyncWriteExt;
 
 /// Directory used for cached file contents.
 const CACHE_DIR_NAME: &str = "cascade/cache";
 
 /// FUSE presenter wrapping an inode map and VFS tree reference.
+#[derive(Debug)]
 pub struct FusePresenter {
     /// The root `ItemId` for the VFS tree.
     #[allow(dead_code)] // Used on Linux in start()
@@ -91,7 +93,7 @@ fn safe_filename(id: &str) -> String {
 impl VfsPresenter for FusePresenter {
     async fn upsert_item(&self, item: VfsItem) -> anyhow::Result<()> {
         tracing::debug!(id = %item.id, name = %item.name, "upsert_item");
-        let mut map = self.inode_map.lock().unwrap();
+        let mut map = self.inode_map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         map.allocate(item.id);
         Ok(())
     }
@@ -100,7 +102,7 @@ impl VfsPresenter for FusePresenter {
         tracing::debug!(id = %id, "delete_item");
         // Remove from inode map.
         {
-            let mut map = self.inode_map.lock().unwrap();
+            let mut map = self.inode_map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             map.remove(id);
         }
         // Remove any cached file on disk.
@@ -130,7 +132,7 @@ impl VfsPresenter for FusePresenter {
         // Resolve the item through the VFS to get metadata and a backend.
         let (entry, backend): (cascade_engine::types::FileEntry, Arc<dyn Backend>) = {
             let (backend, relative) = {
-                let vfs = self.vfs.read().unwrap();
+                let vfs = self.vfs.read().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let (backend, relative) = vfs.resolve(Path::new(&id.0));
                 (Arc::clone(backend), relative)
             };
@@ -146,7 +148,6 @@ impl VfsPresenter for FusePresenter {
         let mut writer = WriterAdapter { inner: file };
         backend.download(&entry, &mut writer).await?;
         let mut file = writer.inner;
-        use tokio::io::AsyncWriteExt;
         file.flush().await?;
 
         tokio::fs::rename(&temp_path, &cache_path).await?;

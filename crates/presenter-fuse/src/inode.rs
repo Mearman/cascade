@@ -10,6 +10,7 @@ use cascade_engine::types::ItemId;
 pub const ROOT_INODE: u64 = 1;
 
 /// Bidirectional map between VFS `ItemId` and FUSE inode numbers.
+#[derive(Debug)]
 pub struct InodeMap {
     /// `ItemId` → inode number.
     id_to_inode: HashMap<ItemId, u64>,
