@@ -145,3 +145,60 @@ mod tests {
         assert_eq!(map.get_id(inode), Some(&child));
     }
 }
+
+/// Property-based tests for InodeMap.
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn allocate_n_inodes_all_unique(ids in prop::collection::vec("[a-z]{1,10}", 1..50)) {
+            let root = ItemId::new("test", "root");
+            let mut map = InodeMap::new(root.clone());
+
+            // Deduplicate to ensure we test distinct IDs.
+            let mut seen = std::collections::HashSet::new();
+            let mut inodes = Vec::new();
+            for id_str in &ids {
+                if !seen.insert(id_str.clone()) {
+                    continue;
+                }
+                let id = ItemId::new("test", id_str);
+                let inode = map.allocate(id);
+                inodes.push(inode);
+            }
+
+            // All inodes should be unique.
+            let mut sorted = inodes.clone();
+            sorted.sort();
+            sorted.dedup();
+            prop_assert_eq!(sorted.len(), inodes.len());
+        }
+
+        #[test]
+        fn allocate_lookup_roundtrip(ids in prop::collection::vec("[a-z]{1,10}", 1..50)) {
+            let root = ItemId::new("test", "root");
+            let mut map = InodeMap::new(root);
+
+            for id_str in &ids {
+                let id = ItemId::new("test", id_str);
+                let inode = map.allocate(id.clone());
+                prop_assert_eq!(map.get_inode(&id), Some(inode));
+                prop_assert_eq!(map.get_id(inode), Some(&id));
+            }
+        }
+
+        #[test]
+        fn allocate_idempotent_prop(id_str in "[a-z]{1,10}") {
+            let root = ItemId::new("test", "root");
+            let mut map = InodeMap::new(root);
+            let id = ItemId::new("test", &id_str);
+
+            let first = map.allocate(id.clone());
+            let second = map.allocate(id.clone());
+            prop_assert_eq!(first, second);
+        }
+    }
+}

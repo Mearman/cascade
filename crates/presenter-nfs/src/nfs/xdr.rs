@@ -481,3 +481,178 @@ mod tests {
         assert_eq!(&read, msg);
     }
 }
+
+/// Property-based tests for XDR encode/decode.
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Strategy for generating arbitrary Fattr3 values.
+    fn arb_fattr3() -> impl Strategy<Value = Fattr3> {
+        (
+            prop::num::u32::ANY,
+            prop::num::u32::ANY,
+            prop::num::u32::ANY,
+            prop::num::u32::ANY,
+            prop::num::u32::ANY,
+            prop::num::u64::ANY,
+            prop::num::u64::ANY,
+        )
+            .prop_flat_map(|(ftype, mode, nlink, uid, gid, size, used)| {
+                (
+                    Just(ftype),
+                    Just(mode),
+                    Just(nlink),
+                    Just(uid),
+                    Just(gid),
+                    Just(size),
+                    Just(used),
+                    (
+                        prop::num::u32::ANY,
+                        prop::num::u32::ANY,
+                        prop::num::u64::ANY,
+                        prop::num::u64::ANY,
+                        (
+                            prop::num::u32::ANY,
+                            prop::num::u32::ANY,
+                            prop::num::u32::ANY,
+                            prop::num::u32::ANY,
+                            prop::num::u32::ANY,
+                            prop::num::u32::ANY,
+                        ),
+                    ),
+                )
+            })
+            .prop_map(
+                |(ftype, mode, nlink, uid, gid, size, used, (sd1, sd2, fsid, fileid, (at_s, at_ns, mt_s, mt_ns, ct_s, ct_ns)))| {
+                    Fattr3 {
+                        ftype,
+                        mode,
+                        nlink,
+                        uid,
+                        gid,
+                        size,
+                        used,
+                        rdev: Specdata3 {
+                            specdata1: sd1,
+                            specdata2: sd2,
+                        },
+                        fsid,
+                        fileid,
+                        atime: NfsTime {
+                            seconds: at_s,
+                            nseconds: at_ns,
+                        },
+                        mtime: NfsTime {
+                            seconds: mt_s,
+                            nseconds: mt_ns,
+                        },
+                        ctime: NfsTime {
+                            seconds: ct_s,
+                            nseconds: ct_ns,
+                        },
+                    }
+                },
+            )
+    }
+
+    /// Decode a Fattr3 from XDR bytes.
+    fn decode_fattr3(data: &[u8]) -> Option<Fattr3> {
+        let (ftype, r) = decode_u32(data).ok()?;
+        let (mode, r) = decode_u32(r).ok()?;
+        let (nlink, r) = decode_u32(r).ok()?;
+        let (uid, r) = decode_u32(r).ok()?;
+        let (gid, r) = decode_u32(r).ok()?;
+        let (size, r) = decode_u64(r).ok()?;
+        let (used, r) = decode_u64(r).ok()?;
+        let (sd1, r) = decode_u32(r).ok()?;
+        let (sd2, r) = decode_u32(r).ok()?;
+        let (fsid, r) = decode_u64(r).ok()?;
+        let (fileid, r) = decode_u64(r).ok()?;
+        let (at_s, r) = decode_u32(r).ok()?;
+        let (at_ns, r) = decode_u32(r).ok()?;
+        let (mt_s, r) = decode_u32(r).ok()?;
+        let (mt_ns, r) = decode_u32(r).ok()?;
+        let (ct_s, r) = decode_u32(r).ok()?;
+        let (ct_ns, _) = decode_u32(r).ok()?;
+        Some(Fattr3 {
+            ftype,
+            mode,
+            nlink,
+            uid,
+            gid,
+            size,
+            used,
+            rdev: Specdata3 {
+                specdata1: sd1,
+                specdata2: sd2,
+            },
+            fsid,
+            fileid,
+            atime: NfsTime {
+                seconds: at_s,
+                nseconds: at_ns,
+            },
+            mtime: NfsTime {
+                seconds: mt_s,
+                nseconds: mt_ns,
+            },
+            ctime: NfsTime {
+                seconds: ct_s,
+                nseconds: ct_ns,
+            },
+        })
+    }
+
+    proptest! {
+        #[test]
+        fn fattr3_round_trip(attr in arb_fattr3()) {
+            let mut buf = Vec::new();
+            encode_fattr3(&mut buf, &attr);
+            let decoded = decode_fattr3(&buf);
+            prop_assert!(decoded.is_some());
+            let decoded = decoded.unwrap();
+            prop_assert_eq!(decoded.ftype, attr.ftype);
+            prop_assert_eq!(decoded.mode, attr.mode);
+            prop_assert_eq!(decoded.nlink, attr.nlink);
+            prop_assert_eq!(decoded.uid, attr.uid);
+            prop_assert_eq!(decoded.gid, attr.gid);
+            prop_assert_eq!(decoded.size, attr.size);
+            prop_assert_eq!(decoded.used, attr.used);
+            prop_assert_eq!(decoded.rdev.specdata1, attr.rdev.specdata1);
+            prop_assert_eq!(decoded.rdev.specdata2, attr.rdev.specdata2);
+            prop_assert_eq!(decoded.fsid, attr.fsid);
+            prop_assert_eq!(decoded.fileid, attr.fileid);
+            prop_assert_eq!(decoded.atime.seconds, attr.atime.seconds);
+            prop_assert_eq!(decoded.atime.nseconds, attr.atime.nseconds);
+            prop_assert_eq!(decoded.mtime.seconds, attr.mtime.seconds);
+            prop_assert_eq!(decoded.mtime.nseconds, attr.mtime.nseconds);
+            prop_assert_eq!(decoded.ctime.seconds, attr.ctime.seconds);
+            prop_assert_eq!(decoded.ctime.nseconds, attr.ctime.nseconds);
+        }
+
+        #[test]
+        fn file_handle_round_trip_prop(id in "[a-zA-Z0-9_:/]{1,32}") {
+            // Use ASCII-only to ensure strings fit in the 64-byte NFS file handle.
+            let fh = NfsFh3::from_item_id(&id);
+            let decoded = fh.to_item_id();
+            prop_assert_eq!(decoded, Some(id.clone()));
+            // Also verify XDR round-trip.
+            let mut buf = Vec::new();
+            encode_fh(&mut buf, &fh);
+            let (decoded_fh, rest) = decode_fh(&buf).unwrap();
+            prop_assert!(rest.is_empty());
+            prop_assert_eq!(decoded_fh.to_item_id(), Some(id));
+        }
+
+        #[test]
+        fn opaque_round_trip(data in prop::collection::vec(prop::num::u8::ANY, 0..1024)) {
+            let mut buf = Vec::new();
+            encode_opaque(&mut buf, &data);
+            let (decoded, rest) = decode_opaque(&buf).unwrap();
+            prop_assert_eq!(decoded.to_vec(), data);
+            prop_assert!(rest.is_empty());
+        }
+    }
+}

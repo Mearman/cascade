@@ -18,3 +18,4 @@ fuser = "0.17"
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tempfile = "3"
+proptest = "1"

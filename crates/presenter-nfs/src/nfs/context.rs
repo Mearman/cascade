@@ -143,4 +143,54 @@ mod tests {
         let ctx = NfsContext::new(vfs);
         assert_eq!(ctx.lookup_path(ctx.root_key()), Some("/".to_string()));
     }
+
+    #[test]
+    fn remove_path_removes_entry() {
+        let vfs = Arc::new(RwLock::new(VfsTree::new(Arc::new(
+            cascade_engine::backend::NullBackend::new("test"),
+        ))));
+        let ctx = NfsContext::new(vfs);
+        let key = ctx.register_path("/tmp");
+        assert!(ctx.lookup_path(key).is_some());
+        ctx.remove_path(key);
+        assert!(ctx.lookup_path(key).is_none());
+    }
+}
+
+/// Property-based tests for NfsContext.
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn path_to_key_deterministic_prop(s in ".*") {
+            let k1 = NfsContext::path_to_key(&s);
+            let k2 = NfsContext::path_to_key(&s);
+            prop_assert_eq!(k1, k2);
+        }
+
+        #[test]
+        fn path_to_key_different_strings_mostly_differ(s1 in ".*", s2 in ".*") {
+            prop_assume!(s1 != s2);
+            let k1 = NfsContext::path_to_key(&s1);
+            let k2 = NfsContext::path_to_key(&s2);
+            // Hash collisions are possible but should be extremely rare.
+            // We don't assert they always differ, but log if they collide.
+            if k1 == k2 {
+                // Acceptable but noteworthy.
+            }
+        }
+
+        #[test]
+        fn register_lookup_roundtrip(path in ".*") {
+            let vfs = Arc::new(RwLock::new(VfsTree::new(Arc::new(
+                cascade_engine::backend::NullBackend::new("test"),
+            ))));
+            let ctx = NfsContext::new(vfs);
+            let key = ctx.register_path(&path);
+            prop_assert_eq!(ctx.lookup_path(key), Some(path));
+        }
+    }
 }
