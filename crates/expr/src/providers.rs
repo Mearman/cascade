@@ -149,6 +149,9 @@ impl DiskProvider {
             let c_path = std::ffi::CString::new(path).unwrap_or_default();
             let result = unsafe { libc::statfs(c_path.as_ptr(), &raw mut stat) };
             if result == 0 {
+                #[cfg(target_os = "linux")]
+                let block_size = stat.f_bsize as u64;
+                #[cfg(not(target_os = "linux"))]
                 let block_size = u64::from(stat.f_bsize);
                 DiskContext {
                     total_bytes: stat.f_blocks * block_size,
