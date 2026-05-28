@@ -8,6 +8,26 @@ set -euo pipefail
 export PATH="$HOME/.rustup/toolchains/1.89.0-aarch64-apple-darwin/bin:$PATH"
 export RUSTUP_TOOLCHAIN=1.89.0-aarch64-apple-darwin
 
+# Reject merge commits being pushed to main.
+while read -r local_ref local_sha remote_ref remote_sha; do
+    if [[ "$remote_ref" == refs/heads/main || "$remote_ref" == refs/heads/origin-main ]]; then
+        range="${remote_sha}..${local_sha}"
+        # Handle new branch (no common ancestor yet): check all commits.
+        if git merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; then
+            range="$remote_sha..$local_sha"
+        else
+            range="$local_sha"
+        fi
+        merges=$(git rev-list --merges "$range" 2>/dev/null || true)
+        if [[ -n "$merges" ]]; then
+            echo "error: merge commits are forbidden on ${remote_ref#refs/heads/}. Use rebase instead."
+            echo "offending commits:"
+            git log --oneline --merges "$range"
+            exit 1
+        fi
+    fi
+done
+
 echo "Checking formatting..."
 if ! cargo fmt --check 2>&1; then
     echo ""
