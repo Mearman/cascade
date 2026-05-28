@@ -445,6 +445,90 @@ impl StateDb {
         Ok(size)
     }
 
+    // ── Dirty file operations ──
+
+    /// Mark a file as dirty (locally modified, pending upload).
+    pub fn mark_dirty(&self, id: &ItemId) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        conn.execute("UPDATE files SET dirty = TRUE WHERE id = ?1", [&id.0])?;
+        Ok(())
+    }
+
+    /// Clear the dirty flag for a file (upload succeeded).
+    pub fn clear_dirty(&self, id: &ItemId) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        conn.execute("UPDATE files SET dirty = FALSE WHERE id = ?1", [&id.0])?;
+        Ok(())
+    }
+
+    /// Set the local (on-disk) path and VFS path for a file.
+    /// Used by the cache layer when a file is materialised to disk.
+    pub fn set_file_paths(&self, id: &ItemId, path: &str, local_path: &str) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        conn.execute(
+            "UPDATE files SET path = ?1, local_path = ?2 WHERE id = ?3",
+            (path, local_path, &id.0),
+        )?;
+        Ok(())
+    }
+
+    /// Check whether a file is marked dirty.
+    pub fn is_dirty(&self, id: &ItemId) -> Result<Option<bool>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let result = conn
+            .query_row("SELECT dirty FROM files WHERE id = ?1", [&id.0], |row| {
+                row.get::<_, bool>(0)
+            })
+            .ok();
+        Ok(result)
+    }
+
+    /// List all files with `dirty = TRUE`, ordered by path for deterministic processing.
+    pub fn list_dirty_files(&self) -> Result<Vec<DirtyFileRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, backend_id, path, parent_id, name, is_dir, size,
+                    mime_type, mod_time, remote_hash, local_path
+             FROM files WHERE dirty = TRUE
+             ORDER BY path ASC",
+        )?;
+        let records = stmt
+            .query_map([], |row| {
+                Ok(DirtyFileRecord {
+                    id: ItemId(row.get(0)?),
+                    backend_id: row.get(1)?,
+                    path: row.get(2)?,
+                    parent_id: ItemId(row.get(3)?),
+                    name: row.get(4)?,
+                    is_dir: row.get(5)?,
+                    size: row.get(6)?,
+                    mime_type: row.get(7)?,
+                    mod_time: row
+                        .get::<_, Option<i64>>(8)?
+                        .map(|ts| chrono::DateTime::from_timestamp(ts, 0).unwrap_or_default()),
+                    remote_hash: row.get(9)?,
+                    local_path: row.get(10)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(records)
+    }
+
     /// Find eviction candidates: cached (not pinned) files ordered by `last_access` ascending (LRU).
     pub fn eviction_candidates(&self, limit: usize) -> Result<Vec<FileEntry>> {
         let conn = self
@@ -593,6 +677,22 @@ pub struct LifecyclePolicyRecord {
     pub conditions: Option<String>,
 }
 
+/// A dirty file record — a locally modified file pending upload.
+#[derive(Debug, Clone)]
+pub struct DirtyFileRecord {
+    pub id: ItemId,
+    pub backend_id: String,
+    pub path: String,
+    pub parent_id: ItemId,
+    pub name: String,
+    pub is_dir: bool,
+    pub size: Option<u64>,
+    pub mime_type: Option<String>,
+    pub mod_time: Option<chrono::DateTime<chrono::Utc>>,
+    pub remote_hash: Option<String>,
+    pub local_path: Option<String>,
+}
+
 /// A P2P peer row from the database.
 #[derive(Debug, Clone)]
 pub struct PeerRecord {
@@ -690,5 +790,42 @@ mod tests {
         let backends = db.list_backends().unwrap();
         assert_eq!(backends.len(), 1);
         assert_eq!(backends[0].backend_type, "gdrive");
+    }
+
+    #[test]
+    fn test_mark_dirty_and_clear() {
+        let db = StateDb::open_in_memory().unwrap();
+        db.register_backend("gdrive", "gdrive", "Google Drive", None, None)
+            .unwrap();
+
+        let file_id = ItemId::new("gdrive", "file1");
+        let parent_id = ItemId::new("gdrive", "root");
+        let entry = FileEntry::file(file_id.clone(), parent_id, "test.txt".into());
+        db.upsert_file(&entry).unwrap();
+
+        // Initially not dirty.
+        assert_eq!(db.is_dirty(&file_id).unwrap(), Some(false));
+        assert!(db.list_dirty_files().unwrap().is_empty());
+
+        // Mark dirty.
+        db.mark_dirty(&file_id).unwrap();
+        assert_eq!(db.is_dirty(&file_id).unwrap(), Some(true));
+
+        let dirty = db.list_dirty_files().unwrap();
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0].id, file_id);
+        assert_eq!(dirty[0].name, "test.txt");
+
+        // Clear dirty.
+        db.clear_dirty(&file_id).unwrap();
+        assert_eq!(db.is_dirty(&file_id).unwrap(), Some(false));
+        assert!(db.list_dirty_files().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_is_dirty_returns_none_for_missing_file() {
+        let db = StateDb::open_in_memory().unwrap();
+        let file_id = ItemId::new("gdrive", "nonexistent");
+        assert_eq!(db.is_dirty(&file_id).unwrap(), None);
     }
 }
