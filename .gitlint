@@ -1,0 +1,21 @@
+[general]
+ignore-merge-commits=true
+
+# Title rules
+[title-max-length]
+line-length=72
+
+[title-min-length]
+min-length=10
+
+[title-match-regex]
+regex=^(feat|fix|docs|style|refactor|perf|test|chore|build|ci|revert)(\(.+\))?!?: .+
+
+[title-trailing-punctuation]
+
+# Body rules
+[body-max-line-length]
+line-length=80
+
+[body-min-length]
+min-length=10

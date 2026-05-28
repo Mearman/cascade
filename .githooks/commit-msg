@@ -1,0 +1,7 @@
+#!/bin/bash
+# Commit-msg hook: enforce conventional commit format via gitlint.
+# Uses .gitlint in the repo root for configuration.
+
+set -euo pipefail
+
+gitlint --msg-filename "$1" --config "$(git rev-parse --show-toplevel)/.gitlint"
