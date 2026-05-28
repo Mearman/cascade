@@ -223,7 +223,7 @@ mod linux {
                         FileAttr::file(inode, entry.size.unwrap_or(0))
                     };
                     let fuse_attr: FuseFileAttr = attr.into();
-                    reply.attr(&Duration::from_secs(1), &fuse_attr);
+                    reply.entry(&Duration::from_secs(1), &fuse_attr, 0);
                 }
                 Err(_) => {
                     reply.error(Errno::ENOENT);
@@ -321,9 +321,12 @@ mod linux {
                 } else {
                     FileType::RegularFile
                 };
-                if !reply.add(ino_u64 + entry_offset, entry_offset, kind, &entry.name) {
-                    return;
-                }
+                let _ = reply.add(
+                    INodeNo(ino_u64 + entry_offset),
+                    entry_offset,
+                    kind,
+                    &entry.name,
+                );
             }
 
             reply.ok();
