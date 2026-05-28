@@ -57,6 +57,16 @@ impl NfsContext {
         self.fh_map.read().unwrap().get(&fh_key).cloned()
     }
 
+    /// Remove a file handle key from the map.
+    pub fn remove_path(&self, fh_key: u64) {
+        self.fh_map.write().unwrap().remove(&fh_key);
+    }
+
+    /// Access the underlying VFS tree (for download operations).
+    pub fn vfs(&self) -> &Arc<RwLock<VfsTree>> {
+        &self.vfs
+    }
+
     /// Get the root file handle key.
     pub fn root_key(&self) -> u64 {
         self.root_fh_key
@@ -78,6 +88,25 @@ impl NfsContext {
             (Arc::clone(backend), relative.to_path_buf())
         };
         backend.metadata(&relative).await
+    }
+
+    /// Synchronous wrapper around `list_dir` for use in NFS procedure
+    /// handlers which must return `Vec<u8>` synchronously.
+    ///
+    /// Uses `tokio::runtime::Handle::block_on` to run the async VFS query
+    /// on the current tokio runtime.
+    pub fn list_dir_sync(&self, path: &str) -> anyhow::Result<Vec<DirEntry>> {
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(self.list_dir(path))
+    }
+
+    /// Synchronous wrapper for fetching file metadata.
+    pub fn metadata_sync(
+        &self,
+        path: &str,
+    ) -> anyhow::Result<cascade_engine::types::FileEntry> {
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(self.metadata(path))
     }
 }
 
