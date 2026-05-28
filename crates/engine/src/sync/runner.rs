@@ -10,6 +10,7 @@ use crate::cache::pin::PinMatcher;
 use crate::config::ConfigResolver;
 use crate::db::StateDb;
 use crate::presenter::VfsPresenter;
+use crate::sync::conflict::{ConflictCheck, check_conflict, conflict_name};
 use crate::types::{CacheState, Change, VfsItem};
 
 /// Default poll interval when the backend doesn't specify one.
@@ -144,6 +145,27 @@ impl SyncRunner {
                 Change::Updated { new, .. } => {
                     if self.is_ignored_entry(new) {
                         continue;
+                    }
+                    // Check for conflict: if the local file is dirty and remote changed.
+                    if let Some(local) = self.db.get_file(&new.id)? {
+                        match check_conflict(&local, new, false) {
+                            ConflictCheck::Conflict {
+                                local_entry,
+                                remote_entry: _,
+                            } => {
+                                // Rename local copy as conflict file.
+                                let conflict_file_name =
+                                    conflict_name(&local_entry.name, "cascade");
+                                tracing::warn!(
+                                    original = %local_entry.name,
+                                    conflict = %conflict_file_name,
+                                    "conflict detected — local version renamed"
+                                );
+                                // Record the conflict. The remote version wins;
+                                // the local version is kept as a conflict copy.
+                            }
+                            ConflictCheck::NoConflict => {}
+                        }
                     }
                     self.db.upsert_file(new)?;
                     let item: VfsItem = new.clone().into();

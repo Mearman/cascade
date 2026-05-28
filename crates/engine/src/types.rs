@@ -47,7 +47,7 @@ impl fmt::Display for FileId {
 pub struct Cursor(pub String);
 
 /// A file or directory in the VFS.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileEntry {
     pub id: ItemId,
     pub parent_id: ItemId,
@@ -91,6 +91,12 @@ impl FileEntry {
     /// Set the file size.
     pub fn with_size(mut self, size: Option<u64>) -> Self {
         self.size = size;
+        self
+    }
+
+    /// Set the file hash.
+    pub fn with_hash(mut self, hash: Option<String>) -> Self {
+        self.hash = hash;
         self
     }
 }
