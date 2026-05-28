@@ -1,4 +1,5 @@
 //! Integration tests: cache manager — pinning, eviction, lifecycle policies.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use cascade_engine::cache::lifecycle::{EvictionDecision, EvictionReason, LifecycleEvaluator};
 use cascade_engine::cache::manager::{CacheManager, CacheManagerConfig};
@@ -27,7 +28,7 @@ fn make_file(name: &str, id: &str, size: Option<u64>) -> FileEntry {
 #[test]
 fn pin_rule_adds_to_database() {
     let db = setup_db();
-    let manager = CacheManager::new(db.clone(), CacheManagerConfig::default());
+    let manager = CacheManager::new(db, CacheManagerConfig::default());
 
     manager.pin("Documents", true).unwrap();
 
@@ -40,7 +41,7 @@ fn pin_rule_adds_to_database() {
 #[test]
 fn unpin_removes_rule() {
     let db = setup_db();
-    let manager = CacheManager::new(db.clone(), CacheManagerConfig::default());
+    let manager = CacheManager::new(db, CacheManagerConfig::default());
 
     manager.pin("Documents", true).unwrap();
     assert!(manager.unpin("Documents").unwrap());
@@ -183,7 +184,7 @@ fn size_based_eviction_frees_space() {
         max_size: Some(500),
         ..CacheManagerConfig::default()
     };
-    let manager = CacheManager::new(db.clone(), config);
+    let manager = CacheManager::new(db, config);
     let report = manager.evict().unwrap();
 
     // Should evict LRU files until under 500 bytes.

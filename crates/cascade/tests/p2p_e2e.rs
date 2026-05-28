@@ -3,6 +3,7 @@
 //! Exercises the full path: create two P2P engines, index a file on one,
 //! share block data between their block stores (simulating P2P transfer),
 //! and verify the second engine can reassemble the data.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use cascade_engine::db::StateDb;
 use cascade_engine::p2p_bridge::P2pBridge;
@@ -156,12 +157,13 @@ async fn e2e_multiple_files_independent_blocks() {
 }
 
 /// Build test data spanning several blocks (~384 KB).
+#[allow(clippy::cast_possible_truncation)] // i % 251 always fits in u8
 fn build_test_data() -> Vec<u8> {
     // Three full blocks + a partial.
     let size = BLOCK_128KB * 3 + 7890;
     let mut data = Vec::with_capacity(size);
     for i in 0..size {
-        data.push((i % 251) as u8); // PRIME_MOD to get varied byte values.
+        data.push((i % 251) as u8);
     }
     data
 }

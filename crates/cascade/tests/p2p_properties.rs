@@ -1,4 +1,5 @@
 //! Property-based tests for P2P block operations, protocol messages, and gossip.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use cascade_p2p::block::{BlockHash, reassemble_blocks, split_data};
 use cascade_p2p::protocol::{BepMessage, FileInfo, Folder, decode_message, encode_message};
@@ -25,7 +26,7 @@ fn block_reassembly_lossless() {
         let file_blocks = split_data(&data);
         let block_data: Vec<Vec<u8>> = data
             .chunks(file_blocks.block_size as usize)
-            .map(|c| c.to_vec())
+            .map(<[u8]>::to_vec)
             .collect();
         let reassembled = reassemble_blocks(&block_data);
         assert_eq!(reassembled, data);

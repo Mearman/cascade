@@ -3,6 +3,7 @@
 //! Tests the full config pipeline: write temp files in multiple formats,
 //! resolve via directory walk, and verify ignore rules are accumulated
 //! and applied correctly.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use cascade_config::merge;
 use cascade_config::parse;
@@ -60,10 +61,7 @@ fn yaml_format_parses_ignores() {
     let dir = TempDir::new().unwrap();
     fs::write(
         dir.path().join(".cascade.yaml"),
-        r#"ignore:
-  - pattern: '*.o'
-  - pattern: '*.d'
-"#,
+        "ignore:\n  - pattern: '*.o'\n  - pattern: '*.d'\n",
     )
     .unwrap();
 

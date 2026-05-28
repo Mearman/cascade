@@ -1,4 +1,5 @@
 //! Integration tests for the .cascade config parser.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use cascade_config::parse;
 use std::path::PathBuf;
@@ -62,7 +63,6 @@ fn test_merge_order_deterministic() {
     let pattern_count = config.ignore.len();
     assert!(
         pattern_count >= 4,
-        "should have patterns from all formats, got {}",
-        pattern_count
+        "should have patterns from all formats, got {pattern_count}"
     );
 }

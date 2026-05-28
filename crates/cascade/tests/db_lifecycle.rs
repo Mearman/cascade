@@ -1,5 +1,6 @@
 //! Integration tests: state DB file lifecycle — register backend, insert,
 //! query, update cache state, delete, sync cursor round-trip.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use cascade_engine::db::StateDb;
 use cascade_engine::types::{CacheState, FileEntry, ItemId};

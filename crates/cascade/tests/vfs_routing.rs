@@ -1,4 +1,5 @@
 //! Integration tests: VFS tree mount/unmount routing with nested backends.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use cascade_engine::backend::NullBackend;
 use cascade_engine::vfs::VfsTree;

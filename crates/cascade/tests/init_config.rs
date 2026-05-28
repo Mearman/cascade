@@ -1,9 +1,10 @@
 //! Integration tests for cascade init config file handling.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use serde::{Deserialize, Serialize};
 
 /// Configuration structures duplicated from init.rs for test isolation.
-/// These mirror the CascadeConfig, MountConfig, and BackendConfig types.
+/// These mirror the `CascadeConfig`, `MountConfig`, and `BackendConfig` types.
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct CascadeConfig {
@@ -13,17 +14,9 @@ struct CascadeConfig {
     mount: MountConfig,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 struct MountConfig {
     point: String,
-}
-
-impl Default for MountConfig {
-    fn default() -> Self {
-        Self {
-            point: String::new(),
-        }
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

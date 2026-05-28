@@ -1,4 +1,5 @@
 //! Integration tests for the unified Engine lifecycle.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

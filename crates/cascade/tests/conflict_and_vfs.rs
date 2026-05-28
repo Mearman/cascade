@@ -1,4 +1,5 @@
 //! Integration tests: conflict detection, multi-backend VFS, write operations.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use cascade_engine::backend::NullBackend;
 use cascade_engine::sync::conflict::{ConflictCheck, check_conflict, conflict_name};
@@ -85,7 +86,7 @@ fn multiple_backends_route_correctly() {
 fn unmount_restores_parent_routing() {
     let personal = Arc::new(NullBackend::new("personal"));
     let work = Arc::new(NullBackend::new("work"));
-    let mut tree = VfsTree::new(personal.clone());
+    let mut tree = VfsTree::new(personal);
     tree.mount(std::path::PathBuf::from("Work"), work);
 
     // Verify work routing.

@@ -1,5 +1,6 @@
 //! P2P integration tests — bridge lifecycle, cross-engine block sharing,
 //! and sync-runner integration.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use cascade_engine::backend::NullBackend;
 use cascade_engine::cache::manager::{CacheManager, CacheManagerConfig};
@@ -13,7 +14,7 @@ use std::sync::Arc;
 /// 128 KB block size — matches the P2P engine's default for files under 250 MB.
 const BLOCK_128KB: usize = 128 * 1024;
 
-/// Verify that a P2pBridge can be created, index a file, and then
+/// Verify that a `P2pBridge` can be created, index a file, and then
 /// look up the blocks.
 #[tokio::test]
 async fn bridge_index_and_lookup() {
@@ -34,7 +35,7 @@ async fn bridge_index_and_lookup() {
     }
 }
 
-/// Two P2pEngine instances sharing a block store directory: index on one,
+/// Two `P2pEngine` instances sharing a block store directory: index on one,
 /// read from the other. This simulates P2P block sharing without real
 /// networking — the block store is content-addressed so both engines
 /// can read the same blocks from disk.
@@ -78,7 +79,7 @@ async fn cross_engine_block_sharing_via_shared_store() {
     assert_eq!(fetched, data);
 }
 
-/// Sync runner with P2P bridge: create a NullBackend with files, verify
+/// Sync runner with P2P bridge: create a `NullBackend` with files, verify
 /// the sync runner processes them and the P2P bridge is accessible.
 #[tokio::test]
 async fn sync_runner_with_p2p_bridge() {
@@ -107,7 +108,7 @@ async fn sync_runner_with_p2p_bridge() {
     assert!(result.is_ok());
 }
 
-/// Cache manager with P2P: verify fetch_from_p2p and index_for_p2p work
+/// Cache manager with P2P: verify `fetch_from_p2p` and `index_for_p2p` work
 /// through the cache manager's API.
 #[tokio::test]
 async fn cache_manager_with_p2p() {
@@ -136,11 +137,11 @@ async fn cache_manager_with_p2p() {
     assert_eq!(fetched, data);
 }
 
-/// Cache manager without P2P returns None from fetch_from_p2p.
+/// Cache manager without P2P returns `None` from `fetch_from_p2p`.
 #[tokio::test]
 async fn cache_manager_without_p2p_returns_none() {
     let db = Arc::new(StateDb::open_in_memory().unwrap());
-    let cache = CacheManager::new(db.clone(), CacheManagerConfig::default());
+    let cache = CacheManager::new(db, CacheManagerConfig::default());
 
     let file = FileEntry::file(
         ItemId::new("gdrive", "file1"),

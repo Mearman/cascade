@@ -1,5 +1,6 @@
 //! Integration tests: expression evaluation with platform context providers
 //! and conditional rule evaluation in config resolver.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use cascade_engine::config::ConfigResolver;
 use cascade_expr::context::*;

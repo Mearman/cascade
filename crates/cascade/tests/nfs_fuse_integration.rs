@@ -1,8 +1,9 @@
 //! Integration tests for NFS and FUSE presenters with the engine's VFS tree.
 //!
-//! Exercises the full VfsPresenter trait cycle (upsert → fetch → delete)
-//! with NullBackend and verifies the presenters integrate correctly with
-//! the engine's VfsTree.
+//! Exercises the full `VfsPresenter` trait cycle (upsert → fetch → delete)
+//! with `NullBackend` and verifies the presenters integrate correctly with
+//! the engine's `VfsTree`.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use std::sync::{Arc, RwLock};
 
@@ -90,6 +91,7 @@ async fn nfs_multiple_upserts() {
 // --- FUSE presenter integration ---
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // guard is explicitly dropped before the await
 async fn fuse_upsert_delete_cycle() {
     let vfs = make_vfs();
     let root = ItemId::new("test-backend", "root");
@@ -152,7 +154,7 @@ async fn fuse_multiple_upserts_allocate_unique_inodes() {
 
     // All inodes should be unique.
     let mut sorted = inodes.clone();
-    sorted.sort();
+    sorted.sort_unstable();
     sorted.dedup();
     assert_eq!(sorted.len(), inodes.len());
 
