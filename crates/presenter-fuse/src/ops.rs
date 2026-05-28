@@ -159,12 +159,12 @@ mod linux {
             }
 
             if offset == 0 {
-                if reply.add(ino, 1, FileType::Directory, ".").is_err() {
+                if !reply.add(ino, 1, FileType::Directory, ".") {
                     return;
                 }
             }
             if offset <= 1 {
-                if reply.add(ino, 2, FileType::Directory, "..").is_err() {
+                if !reply.add(ino, 2, FileType::Directory, "..") {
                     return;
                 }
             }
