@@ -159,14 +159,8 @@ impl Cli {
             Commands::Cache { command } => match command {
                 CacheCommands::Status => cache::cache_status(),
                 CacheCommands::Evict { all } => cache::evict(all),
-                CacheCommands::Warm { path } => {
-                    println!("Cache warming: {path}");
-                    Ok(())
-                }
-                CacheCommands::Clear { path } => {
-                    println!("Cache cleared: {path}");
-                    Ok(())
-                }
+                CacheCommands::Warm { path } => cache::warm(&path),
+                CacheCommands::Clear { path } => cache::clear(&path),
             },
             Commands::ConfigShow { path } => config::show(&path),
             Commands::ConfigValidate => config::validate(),

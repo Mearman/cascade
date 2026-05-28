@@ -66,6 +66,58 @@ pub fn pin_list() -> Result<()> {
     Ok(())
 }
 
+/// Pre-warm a path by pinning it so files are downloaded on the next sync.
+pub fn warm(path: &str) -> Result<()> {
+    let db = open_db()?;
+    let db = Arc::new(db);
+    let manager = CacheManager::new(db, CacheManagerConfig::default());
+
+    manager.pin(path, true)?;
+    println!("Warmed: {path}");
+    println!("Files will be downloaded on next sync.");
+    Ok(())
+}
+
+/// Clear a path from the local cache, reverting matching files to online-only.
+///
+/// There is no per-path eviction method on `CacheManager`, so this function
+/// works directly at the `StateDb` level: it unpins the path (if pinned), then
+/// transitions every cached file whose path matches `path` as a prefix to the
+/// `Online` state. The background worker will then skip those files until they
+/// are accessed or re-pinned.
+pub fn clear(path: &str) -> Result<()> {
+    use cascade_engine::types::CacheState;
+
+    let db = open_db()?;
+    let db = Arc::new(db);
+    let manager = CacheManager::new(Arc::clone(&db), CacheManagerConfig::default());
+
+    // Remove the pin rule if one exists — ignore "not pinned" case.
+    let _ = manager.unpin(path)?;
+
+    // Normalise the prefix for matching: "foo/bar" should match "foo/bar" and
+    // "foo/bar/baz" but not "foo/barbaz".
+    let prefix_slash = format!("{}/", path.trim_end_matches('/'));
+
+    let cached = db.list_files_by_cache_state(CacheState::Cached)?;
+    let pinned = db.list_files_by_cache_state(CacheState::Pinned)?;
+
+    let mut cleared: usize = 0;
+    for file in cached.iter().chain(pinned.iter()) {
+        if file.name == path || file.name.starts_with(&prefix_slash) {
+            db.update_cache_state(&file.id, CacheState::Online)?;
+            cleared += 1;
+        }
+    }
+
+    if cleared == 0 {
+        println!("Cleared: {path} (no locally cached files matched)");
+    } else {
+        println!("Cleared: {path} ({cleared} file(s) reverted to online-only)");
+    }
+    Ok(())
+}
+
 /// Show cache status.
 #[allow(clippy::cast_precision_loss)]
 pub fn cache_status() -> Result<()> {

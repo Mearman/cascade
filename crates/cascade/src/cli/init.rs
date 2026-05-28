@@ -86,7 +86,9 @@ pub fn run() -> Result<()> {
         // Collect OAuth2 client credentials.
         println!("Google Drive setup:");
         println!("  You'll need an OAuth2 client ID and secret from the Google Cloud Console.");
-        println!("  Create a project at https://console.cloud.google.com/ and enable the Drive API.");
+        println!(
+            "  Create a project at https://console.cloud.google.com/ and enable the Drive API."
+        );
         println!();
 
         let client_id = read_input("Client ID")?;
@@ -103,7 +105,10 @@ pub fn run() -> Result<()> {
 
         // Write per-backend credentials file: ~/.config/cascade/{name}.toml
         let mut backend_table = toml::Table::new();
-        backend_table.insert("type".to_string(), toml::Value::String("gdrive".to_string()));
+        backend_table.insert(
+            "type".to_string(),
+            toml::Value::String("gdrive".to_string()),
+        );
         backend_table.insert("client_id".to_string(), toml::Value::String(client_id));
         backend_table.insert(
             "client_secret".to_string(),
