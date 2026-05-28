@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
+use cascade_engine::cache::manager::{CacheManager, CacheManagerConfig};
 use cascade_engine::config::ConfigResolver;
 use cascade_engine::db::StateDb;
 use cascade_engine::sync::runner::SyncRunner;
@@ -69,6 +70,13 @@ pub async fn start(mount_point: Option<&str>) -> Result<()> {
         }
     });
 
+    // Start the cache manager background worker.
+    let cache_manager = Arc::new(CacheManager::new(db.clone(), CacheManagerConfig::default()));
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let cache_handle = tokio::spawn(async move {
+        cache_manager.run(cancel_rx).await;
+    });
+
     // Mount NFS via OS mount command.
     mount_nfs(&mount_path, nfs_port)?;
 
@@ -87,7 +95,9 @@ pub async fn start(mount_point: Option<&str>) -> Result<()> {
     // Clean up.
     unmount_nfs(&mount_path)?;
     server.stop().await?;
+    let _ = cancel_tx.send(true);
     sync_handle.abort();
+    cache_handle.abort();
 
     tracing::info!("Cascade stopped.");
     Ok(())

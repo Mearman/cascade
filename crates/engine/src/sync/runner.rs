@@ -6,10 +6,11 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 use crate::backend::Backend;
+use crate::cache::pin::PinMatcher;
 use crate::config::ConfigResolver;
 use crate::db::StateDb;
 use crate::presenter::VfsPresenter;
-use crate::types::{Change, VfsItem};
+use crate::types::{CacheState, Change, VfsItem};
 
 /// Default poll interval when the backend doesn't specify one.
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(60);
@@ -132,6 +133,10 @@ impl SyncRunner {
                         continue;
                     }
                     self.db.upsert_file(entry)?;
+                    // Auto-pin if the file matches any pin rule.
+                    if self.is_pinned_entry(entry) {
+                        self.db.update_cache_state(&entry.id, CacheState::Pinned)?;
+                    }
                     let item: VfsItem = entry.clone().into();
                     self.presenter.upsert_item(item).await?;
                     count += 1;
@@ -163,6 +168,15 @@ impl SyncRunner {
         }
 
         Ok(count)
+    }
+
+    /// Check if a file entry matches any pin rule.
+    fn is_pinned_entry(&self, entry: &crate::types::FileEntry) -> bool {
+        let path = std::path::Path::new(&entry.name);
+        match PinMatcher::load(&self.db) {
+            Ok(matcher) => matcher.is_pinned(path),
+            Err(_) => false,
+        }
     }
 
     /// Check if a file entry should be ignored based on `.cascade` config.
