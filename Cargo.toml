@@ -8,6 +8,7 @@ members = [
     "crates/presenter-nfs",
     "crates/backend-local",
     "crates/presenter-fuse",
+    "crates/presenter-fileprovider",
     "crates/cascade",
     "crates/p2p",
 ]

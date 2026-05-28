@@ -1,0 +1,17 @@
+[package]
+name = "cascade-presenter-fileprovider"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cascade-engine = { path = "../engine" }
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "net"] }
+anyhow.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
