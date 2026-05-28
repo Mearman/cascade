@@ -19,6 +19,8 @@ futures-core.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
+wiremock = "0.6.5"
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

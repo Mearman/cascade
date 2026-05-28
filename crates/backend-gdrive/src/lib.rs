@@ -27,6 +27,11 @@ use client::DriveClient;
 /// - `client_id` — Google OAuth2 client ID
 /// - `client_secret` — Google OAuth2 client secret
 /// - `account` — account identifier for Keychain storage (defaults to "default")
+///
+/// Optional keys used in integration tests:
+/// - `base_url` — override the Drive API base URL (e.g. a local mock server)
+/// - `upload_url` — override the Drive upload API URL
+/// - `access_token` — pre-populate an access token, bypassing Keychain lookup
 pub fn create_backend(config: &toml::Value) -> anyhow::Result<Box<dyn Backend>> {
     let client_id = config
         .get("client_id")
@@ -44,14 +49,35 @@ pub fn create_backend(config: &toml::Value) -> anyhow::Result<Box<dyn Backend>> 
         .unwrap_or("default")
         .to_string();
 
+    let drive = match (
+        config.get("base_url").and_then(|v| v.as_str()),
+        config.get("upload_url").and_then(|v| v.as_str()),
+    ) {
+        (Some(base), Some(upload)) => DriveClient::with_urls(base.to_string(), upload.to_string()),
+        (Some(base), None) => DriveClient::with_urls(
+            base.to_string(),
+            "https://www.googleapis.com/upload/drive/v3".to_string(),
+        ),
+        _ => DriveClient::new(),
+    };
+
+    let initial_tokens = config
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .map(|token| auth::AuthTokens {
+            access_token: token.to_string(),
+            refresh_token: String::new(),
+            expires_at: chrono::Utc::now() + chrono::Duration::hours(24),
+        });
+
     Ok(Box::new(GdriveBackend {
-        drive: DriveClient::new(),
+        drive,
         oauth: auth::OAuthConfig {
             client_id,
             client_secret,
         },
         account,
-        tokens: Arc::new(RwLock::new(None)),
+        tokens: Arc::new(RwLock::new(initial_tokens)),
     }))
 }
 
