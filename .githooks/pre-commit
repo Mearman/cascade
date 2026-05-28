@@ -1,8 +1,16 @@
 #!/bin/bash
-# Pre-commit hook: auto-fix formatting.
-# Runs cargo fmt and stages the changes so the commit proceeds cleanly.
+# Pre-commit hook: reject merge commits on main, auto-fix formatting.
 
 set -euo pipefail
+
+# Reject merge commits on main branch.
+branch=$(git symbolic-ref --short HEAD 2>/dev/null || true)
+if [[ "$branch" == "main" || "$branch" == "origin-main" ]]; then
+    if test -f "$(git rev-parse --git-dir)/MERGE_HEAD"; then
+        echo "error: merge commits are forbidden on $branch. Use rebase instead."
+        exit 1
+    fi
+fi
 
 # Use the mise-managed toolchain directly.
 export PATH="$HOME/.rustup/toolchains/1.89.0-aarch64-apple-darwin/bin:$PATH"
