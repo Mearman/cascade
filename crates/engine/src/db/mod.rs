@@ -255,6 +255,16 @@ impl StateDb {
         Ok(())
     }
 
+    /// Remove a registered backend by ID. Returns `true` if a row was deleted.
+    pub fn remove_backend(&self, id: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let rows = conn.execute("DELETE FROM backends WHERE id = ?1", [id])?;
+        Ok(rows > 0)
+    }
+
     /// List all registered backends.
     pub fn list_backends(&self) -> Result<Vec<BackendRecord>> {
         let conn = self

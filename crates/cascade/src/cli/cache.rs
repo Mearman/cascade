@@ -6,6 +6,8 @@ use cascade_engine::cache::manager::CacheManagerConfig;
 use cascade_engine::db::StateDb;
 use std::sync::Arc;
 
+use super::init::{BackendConfig, CascadeConfig};
+
 /// Open the state database from the default path.
 fn open_db() -> Result<StateDb> {
     let db_path = config_dir().join("state.db");
@@ -248,6 +250,24 @@ pub fn backend_add(backend_type: &str, name: Option<&str>, mount_path: Option<&s
         None,
     )?;
 
+    // Update config.toml so `cascade start` can discover this backend.
+    let main_config_path = config_dir.join("config.toml");
+    let mut main_config: CascadeConfig = if main_config_path.exists() {
+        let raw = std::fs::read_to_string(&main_config_path)?;
+        toml::from_str(&raw)?
+    } else {
+        CascadeConfig::default()
+    };
+    let backend_entry = BackendConfig {
+        backend_type: backend_type.to_string(),
+        account: None,
+    };
+    main_config
+        .backends
+        .insert(backend_name.to_string(), toml::Value::try_from(&backend_entry)?);
+    let main_config_str = toml::to_string_pretty(&main_config)?;
+    std::fs::write(&main_config_path, &main_config_str)?;
+
     println!("Added backend: {backend_name} ({backend_type})");
     if let Some(mp) = mount_path {
         println!("  Mount path: {mp}");
@@ -287,6 +307,20 @@ pub fn backend_remove(name: &str) -> Result<()> {
     }
 
     std::fs::remove_file(&config_path)?;
+
+    // Remove from config.toml so `cascade start` no longer tries to load it.
+    let main_config_path = config_dir.join("config.toml");
+    if main_config_path.exists() {
+        let raw = std::fs::read_to_string(&main_config_path)?;
+        let mut main_config: CascadeConfig = toml::from_str(&raw)?;
+        main_config.backends.remove(name);
+        let main_config_str = toml::to_string_pretty(&main_config)?;
+        std::fs::write(&main_config_path, &main_config_str)?;
+    }
+
+    // Remove from the state DB.
+    let db = open_db()?;
+    db.remove_backend(name)?;
 
     println!("Removed backend: {name}");
     println!("  Config deleted: {}", config_path.display());
