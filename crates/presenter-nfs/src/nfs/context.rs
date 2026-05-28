@@ -22,7 +22,18 @@ pub struct NfsContext {
     root_fh_key: u64,
 }
 
+impl std::fmt::Debug for NfsContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NfsContext")
+            .field("root_fh_key", &self.root_fh_key)
+            .finish_non_exhaustive()
+    }
+}
+
 impl NfsContext {
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
     pub fn new(vfs: Arc<RwLock<VfsTree>>) -> Self {
         let root_fh_key = Self::path_to_key("/");
         let mut fh_map = HashMap::new();
@@ -36,7 +47,8 @@ impl NfsContext {
     }
 
     /// Convert a VFS path to a file handle key.
-    #[must_use] pub fn path_to_key(path: &str) -> u64 {
+    #[must_use]
+    pub fn path_to_key(path: &str) -> u64 {
         let mut hash: u64 = 5381;
         for byte in path.bytes() {
             hash = hash.wrapping_mul(33).wrapping_add(u64::from(byte));
@@ -47,45 +59,77 @@ impl NfsContext {
     /// Register a path and get its file handle key.
     pub fn register_path(&self, path: &str) -> u64 {
         let key = Self::path_to_key(path);
-        let mut map = self.fh_map.write().unwrap();
+        let mut map = self
+            .fh_map
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.entry(key).or_insert_with(|| path.to_string());
         key
     }
 
     /// Look up the VFS path for a file handle key.
     pub fn lookup_path(&self, fh_key: u64) -> Option<String> {
-        self.fh_map.read().unwrap().get(&fh_key).cloned()
+        self.fh_map
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&fh_key)
+            .cloned()
     }
 
     /// Remove a file handle key from the map.
     pub fn remove_path(&self, fh_key: u64) {
-        self.fh_map.write().unwrap().remove(&fh_key);
+        self.fh_map
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&fh_key);
     }
 
     /// Access the underlying VFS tree (for download operations).
+    #[must_use]
     pub const fn vfs(&self) -> &Arc<RwLock<VfsTree>> {
         &self.vfs
     }
 
     /// Get the root file handle key.
+    #[must_use]
     pub const fn root_key(&self) -> u64 {
         self.root_fh_key
     }
 
     /// List directory contents at a VFS path.
-    #[allow(clippy::await_holding_lock)]
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the VFS tree cannot read the directory.
+    ///
+    /// Note: the `RwLockReadGuard` is intentionally held across the `.await`
+    /// here because `VfsTree::read_dir` needs `&self` for the duration of the
+    /// call. The future is therefore not `Send`. All callers invoke this via
+    /// `block_on` from a sync context, so `Send` is not required.
+    #[allow(clippy::await_holding_lock, clippy::future_not_send)]
     pub async fn list_dir(&self, path: &str) -> anyhow::Result<Vec<DirEntry>> {
-        let vfs = self.vfs.read().unwrap();
+        let vfs = self
+            .vfs
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         vfs.read_dir(std::path::Path::new(path)).await
     }
 
     /// Get file metadata at a VFS path.
-    #[allow(clippy::await_holding_lock)]
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend cannot fetch metadata.
     pub async fn metadata(&self, path: &str) -> anyhow::Result<cascade_engine::types::FileEntry> {
         let (backend, relative) = {
-            let vfs = self.vfs.read().unwrap();
+            let vfs = self
+                .vfs
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let (backend, relative) = vfs.resolve(std::path::Path::new(path));
-            (Arc::clone(backend), relative)
+            let result = (Arc::clone(backend), relative);
+            drop(vfs);
+            result
         };
         backend.metadata(&relative).await
     }
@@ -95,12 +139,20 @@ impl NfsContext {
     ///
     /// Uses `tokio::runtime::Handle::block_on` to run the async VFS query
     /// on the current tokio runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the VFS tree cannot read the directory.
     pub fn list_dir_sync(&self, path: &str) -> anyhow::Result<Vec<DirEntry>> {
         let rt = tokio::runtime::Handle::current();
         rt.block_on(self.list_dir(path))
     }
 
     /// Synchronous wrapper for fetching file metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend cannot fetch metadata.
     pub fn metadata_sync(&self, path: &str) -> anyhow::Result<cascade_engine::types::FileEntry> {
         let rt = tokio::runtime::Handle::current();
         rt.block_on(self.metadata(path))
@@ -129,7 +181,7 @@ mod tests {
 
         let key = ctx.register_path("/Documents");
         assert_eq!(ctx.lookup_path(key), Some("/Documents".to_string()));
-        assert_eq!(ctx.lookup_path(99999), None);
+        assert_eq!(ctx.lookup_path(99_999), None);
     }
 
     #[test]

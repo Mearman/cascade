@@ -4,19 +4,22 @@
 //! The mount protocol runs on a separate TCP port from NFS.
 
 use super::context::NfsContext;
-use super::xdr::{MOUNTPROC_NULL, MOUNTPROC_MNT, MOUNTPROC_DUMP, MOUNTPROC_UMNT, MOUNTPROC_UMNTALL, MOUNTPROC_EXPORT, decode_string, NfsFh3, encode_u32, MNTPROC_OK, encode_fh, MNT3ERR_ACCES, encode_bool, encode_string};
+use super::xdr::{
+    decode_string, encode_bool, encode_fh, encode_string, encode_u32, NfsFh3,
+    MOUNTPROC_MNT, MOUNTPROC_DUMP, MOUNTPROC_UMNT, MOUNTPROC_EXPORT,
+    MNTPROC_OK, MNT3ERR_ACCES,
+};
 use std::sync::Arc;
 
 /// Handle a mount protocol request.
 /// Returns XDR-encoded reply.
 pub fn handle_mount_call(proc: u32, args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
     match proc {
-        MOUNTPROC_NULL => vec![],
         MOUNTPROC_MNT => handle_mount(args, ctx),
         MOUNTPROC_DUMP => handle_dump(),
         MOUNTPROC_UMNT => handle_umnt(args),
-        MOUNTPROC_UMNTALL => vec![],
         MOUNTPROC_EXPORT => handle_export(),
+        // NULL, UMNTALL, and all unknown procedures return empty response.
         _ => vec![],
     }
 }

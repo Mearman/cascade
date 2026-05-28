@@ -11,7 +11,11 @@ use tokio::net::TcpListener;
 use super::context::NfsContext;
 use super::mount;
 use super::procedures;
-use super::xdr::{decode_u32, RPC_REPLY_DENIED, RPC_MSG_CALL, NFS_PROGRAM, NFS_V3, MOUNT_PROGRAM, MOUNT_V3, encode_u32, RPC_MSG_REPLY, RPC_REPLY_ACCEPTED, RPC_AUTH_NONE, RPC_ACCEPT_SUCCESS};
+use super::xdr::{
+    decode_u32, encode_u32, NFS_PROGRAM, NFS_V3, MOUNT_PROGRAM, MOUNT_V3,
+    RPC_AUTH_NONE, RPC_ACCEPT_SUCCESS, RPC_MSG_CALL, RPC_MSG_REPLY,
+    RPC_REPLY_ACCEPTED, RPC_REPLY_DENIED,
+};
 use std::sync::Arc;
 
 /// NFS server configuration.
@@ -25,8 +29,9 @@ pub struct NfsServerConfig {
 
 impl Default for NfsServerConfig {
     fn default() -> Self {
+        use std::net::{IpAddr, Ipv4Addr};
         Self {
-            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             export_path: "/".to_string(),
         }
     }
@@ -39,8 +44,20 @@ pub struct NfsServer {
     shutdown: tokio::sync::oneshot::Sender<()>,
 }
 
+impl std::fmt::Debug for NfsServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NfsServer")
+            .field("local_addr", &self.local_addr)
+            .finish_non_exhaustive()
+    }
+}
+
 impl NfsServer {
     /// Start the NFS server. Returns a handle with the bound address.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the TCP listener cannot bind.
     pub async fn start(config: NfsServerConfig, ctx: Arc<NfsContext>) -> anyhow::Result<Self> {
         let listener = TcpListener::bind(config.bind_addr).await?;
         let local_addr = listener.local_addr()?;
@@ -62,7 +79,12 @@ impl NfsServer {
     }
 
     /// Stop the NFS server.
-    pub async fn stop(self) -> anyhow::Result<()> {
+    ///
+    /// # Errors
+    ///
+    /// This function currently always succeeds but returns `Result` for API
+    /// consistency with other presenter stop methods.
+    pub fn stop(self) -> anyhow::Result<()> {
         let _ = self.shutdown.send(());
         tracing::info!("NFS server stopped");
         Ok(())
@@ -115,7 +137,8 @@ async fn handle_connection(
             Err(e) => return Err(e.into()),
         }
 
-        let len = u32::from_be_bytes(len_buf) as usize;
+        let len = usize::try_from(u32::from_be_bytes(len_buf))
+            .unwrap_or(usize::MAX);
         if len > 1_048_576 {
             anyhow::bail!("RPC message too large: {len} bytes");
         }
@@ -127,9 +150,9 @@ async fn handle_connection(
         let reply = dispatch_rpc(&msg_buf, ctx);
 
         // Send length-prefixed reply.
-        stream
-            .write_all(&(reply.len() as u32).to_be_bytes())
-            .await?;
+        let reply_len = u32::try_from(reply.len())
+            .unwrap_or(u32::MAX);
+        stream.write_all(&reply_len.to_be_bytes()).await?;
         stream.write_all(&reply).await?;
         stream.flush().await?;
     }
@@ -141,52 +164,45 @@ async fn handle_connection(
 fn dispatch_rpc(msg: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
     // Parse RPC call header:
     //   xid (u32) + call body (msg_type=0 + rpc_version + program + version + procedure + auth)
-    let (xid, rest) = match decode_u32(msg) {
-        Ok(r) => r,
-        Err(_) => return make_rpc_error(0, RPC_REPLY_DENIED),
+    let Ok((xid, rest)) = decode_u32(msg) else {
+        return make_rpc_error(0, RPC_REPLY_DENIED);
     };
 
     // msg_type must be CALL (0).
-    let (msg_type, rest) = match decode_u32(rest) {
-        Ok(r) => r,
-        Err(_) => return make_rpc_error(xid, RPC_REPLY_DENIED),
+    let Ok((msg_type, rest)) = decode_u32(rest) else {
+        return make_rpc_error(xid, RPC_REPLY_DENIED);
     };
     if msg_type != RPC_MSG_CALL {
         return make_rpc_error(xid, RPC_REPLY_DENIED);
     }
 
     // RPC version must be 2.
-    let (rpc_version, rest) = match decode_u32(rest) {
-        Ok(r) => r,
-        Err(_) => return make_rpc_error(xid, RPC_REPLY_DENIED),
+    let Ok((rpc_version, rest)) = decode_u32(rest) else {
+        return make_rpc_error(xid, RPC_REPLY_DENIED);
     };
     if rpc_version != 2 {
         return make_rpc_error(xid, RPC_REPLY_DENIED);
     }
 
     // Program and version.
-    let (program, rest) = match decode_u32(rest) {
-        Ok(r) => r,
-        Err(_) => return make_rpc_error(xid, RPC_REPLY_DENIED),
+    let Ok((program, rest)) = decode_u32(rest) else {
+        return make_rpc_error(xid, RPC_REPLY_DENIED);
     };
-    let (version, rest) = match decode_u32(rest) {
-        Ok(r) => r,
-        Err(_) => return make_rpc_error(xid, RPC_REPLY_DENIED),
+    let Ok((version, rest)) = decode_u32(rest) else {
+        return make_rpc_error(xid, RPC_REPLY_DENIED);
     };
 
     // Procedure.
-    let (procedure, rest) = match decode_u32(rest) {
-        Ok(r) => r,
-        Err(_) => return make_rpc_error(xid, RPC_REPLY_DENIED),
+    let Ok((procedure, rest)) = decode_u32(rest) else {
+        return make_rpc_error(xid, RPC_REPLY_DENIED);
     };
 
     // Skip auth (opaque_auth: flavor + body).
-    let (_auth_rest, args_offset) = match skip_auth(rest) {
-        Some(r) => r,
-        None => return make_rpc_error(xid, RPC_REPLY_DENIED),
+    let Some((_, args_offset)) = skip_auth(rest) else {
+        return make_rpc_error(xid, RPC_REPLY_DENIED);
     };
 
-    let args = &msg[args_offset..];
+    let args = msg.get(args_offset..).unwrap_or(&[]);
 
     // Dispatch based on program.
     let result = match program {
@@ -226,25 +242,31 @@ fn make_rpc_error(xid: u32, reject_stat: u32) -> Vec<u8> {
 fn skip_auth(data: &[u8]) -> Option<(&[u8], usize)> {
     let (_flavor, rest) = decode_u32(data).ok()?;
     let (body_len, rest) = decode_u32(rest).ok()?;
-    let body_len = body_len as usize;
+    let body_len = usize::try_from(body_len).ok()?;
     if rest.len() < body_len {
         return None;
     }
-    let _after_auth = &rest[body_len..];
     // Pad to 4-byte boundary.
     let pad = (4 - (body_len % 4)) % 4;
     let padded = body_len + pad;
-    let after_auth_rest = &rest[padded.min(rest.len())..];
+    let after_auth_rest = rest.get(padded.min(rest.len())..).unwrap_or(&[]);
     let offset = data.len() - after_auth_rest.len();
     Some((after_auth_rest, offset))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        dispatch_rpc, NfsServer, NfsServerConfig,
+        decode_u32, encode_u32,
+        NFS_PROGRAM, NFS_V3,
+        RPC_AUTH_NONE, RPC_ACCEPT_SUCCESS, RPC_MSG_CALL, RPC_MSG_REPLY,
+    };
+    use super::super::context::NfsContext;
+    use super::super::xdr::NFS3PROC_NULL;
     use cascade_engine::backend::NullBackend;
     use cascade_engine::vfs::VfsTree;
-    use std::sync::RwLock;
+    use std::sync::{Arc, RwLock};
 
     #[test]
     fn dispatch_null_procedure() {
@@ -280,7 +302,7 @@ mod tests {
         let ctx = test_ctx();
         let server = NfsServer::start(config, ctx).await.unwrap();
         assert!(server.local_addr.port() > 0);
-        server.stop().await.unwrap();
+        server.stop().unwrap();
     }
 
     fn test_ctx() -> Arc<NfsContext> {

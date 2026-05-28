@@ -13,11 +13,13 @@ use cascade_engine::presenter::VfsPresenter;
 use cascade_engine::types::{CacheState, ItemId, VfsItem};
 use nfs::context::NfsContext;
 use nfs::xdr::NfsFh3;
+use tokio::io::AsyncWriteExt;
 
 /// Directory used for cached file contents.
 const CACHE_DIR_NAME: &str = "cascade/cache";
 
 /// NFS presenter using an `NFSv3` server on loopback.
+#[derive(Debug)]
 pub struct NfsPresenter {
     #[allow(dead_code)] // Used for mount/unmount commands
     mount_point: PathBuf,
@@ -30,6 +32,7 @@ pub struct NfsPresenter {
 
 impl NfsPresenter {
     /// Create a new NFS presenter backed by the given VFS tree.
+    #[must_use]
     pub fn with_vfs(
         mount_point: impl Into<PathBuf>,
         vfs: Arc<RwLock<cascade_engine::vfs::VfsTree>>,
@@ -45,7 +48,8 @@ impl NfsPresenter {
     }
 
     /// Create with default mount point.
-    #[must_use] pub fn default_mount() -> Self {
+    #[must_use]
+    pub fn default_mount() -> Self {
         Self {
             mount_point: PathBuf::from("/mnt/cascade"),
             nfs_port: 0,
@@ -58,13 +62,15 @@ impl NfsPresenter {
         }
     }
 
-    #[must_use] pub const fn with_port(mut self, port: u16) -> Self {
+    #[must_use]
+    pub const fn with_port(mut self, port: u16) -> Self {
         self.nfs_port = port;
         self
     }
 
     /// Get a reference to the NFS context (for testing).
-    #[must_use] pub const fn context(&self) -> &Arc<NfsContext> {
+    #[must_use]
+    pub const fn context(&self) -> &Arc<NfsContext> {
         &self.context
     }
 
@@ -137,9 +143,15 @@ impl VfsPresenter for NfsPresenter {
             Arc<dyn cascade_engine::backend::Backend>,
         ) = {
             let (backend, relative) = {
-                let vfs = self.context.vfs().read().unwrap();
+                let vfs = self
+                    .context
+                    .vfs()
+                    .read()
+                    .map_err(|e| anyhow::anyhow!("vfs RwLock poisoned: {e}"))?;
                 let (backend, relative) = vfs.resolve(std::path::Path::new(&id.0));
-                (Arc::clone(backend), relative)
+                let result = (Arc::clone(backend), relative);
+                drop(vfs);
+                result
             };
             // Lock is dropped here, before the await.
             let entry = backend.metadata(&relative).await?;
@@ -150,7 +162,6 @@ impl VfsPresenter for NfsPresenter {
         tokio::fs::create_dir_all(&self.cache_dir).await?;
         let temp_path = cache_path.with_extension("tmp");
         let mut file = tokio::fs::File::create(&temp_path).await?;
-        use tokio::io::AsyncWriteExt;
         // Wrap in a compat writer for the Backend trait.
         let mut writer = WriterAdapter { inner: file };
         backend.download(&entry, &mut writer).await?;
@@ -192,6 +203,7 @@ impl VfsPresenter for NfsPresenter {
 
 /// Adapter from `tokio::fs::File` (`AsyncWrite`) to the
 /// `dyn AsyncWrite + Unpin + Send` that the Backend trait expects.
+#[derive(Debug)]
 struct WriterAdapter {
     inner: tokio::fs::File,
 }

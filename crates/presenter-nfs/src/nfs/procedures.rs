@@ -4,7 +4,14 @@
 //! Write procedures return `NFS3ERR_ROFS`.
 
 use super::context::NfsContext;
-use super::xdr::{NFS3PROC_NULL, NFS3PROC_GETATTR, NFS3PROC_LOOKUP, NFS3PROC_READDIR, NFS3PROC_READ, NFS3PROC_FSSTAT, NFS3PROC_SETATTR, NFS3PROC_WRITE, NFS3PROC_CREATE, NFS3PROC_MKDIR, NFS3PROC_REMOVE, NFS3PROC_RMDIR, NFS3PROC_RENAME, NFS3PROC_COMMIT, decode_fh, encode_u32, NFS3_OK, encode_post_op_attr, PostOpAttr, NFS3ERR_STALE, NFS3ERR_INVAL, decode_string, NfsFh3, encode_fh, decode_u64, NFS3ERR_IO, encode_u64, encode_bool, encode_string, decode_u32, NFS3ERR_ROFS, Fattr3, NF3DIR, NF3REG, Specdata3, NfsTime};
+use super::xdr::{
+    decode_fh, decode_string, decode_u32, decode_u64, encode_bool, encode_fh, encode_post_op_attr,
+    encode_string, encode_u32, encode_u64, Fattr3, NfsFh3, NfsTime, PostOpAttr, Specdata3,
+    NF3DIR, NF3REG, NFS3ERR_INVAL, NFS3ERR_IO, NFS3ERR_ROFS, NFS3ERR_STALE, NFS3_OK,
+    NFS3PROC_COMMIT, NFS3PROC_CREATE, NFS3PROC_FSSTAT, NFS3PROC_GETATTR, NFS3PROC_LOOKUP,
+    NFS3PROC_MKDIR, NFS3PROC_NULL, NFS3PROC_READ, NFS3PROC_READDIR, NFS3PROC_REMOVE,
+    NFS3PROC_RENAME, NFS3PROC_RMDIR, NFS3PROC_SETATTR, NFS3PROC_WRITE,
+};
 use std::sync::Arc;
 
 /// Handle an NFS procedure call with VFS context.
@@ -59,10 +66,8 @@ fn handle_lookup(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
     let mut reply = Vec::new();
 
     // Args: dir_fh + name
-    let dir_fh = decode_fh(args);
-    if let Ok((fh, rest)) = dir_fh {
-        let name_result = decode_string(rest);
-        if let Ok((name, _)) = name_result {
+    if let Ok((fh, rest)) = decode_fh(args) {
+        if let Ok((name, _)) = decode_string(rest) {
             // Resolve parent path from context.
             let parent_key = fh
                 .to_item_id()
@@ -107,8 +112,7 @@ fn handle_readdir(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
     let mut reply = Vec::new();
 
     // Args: dir_fh + cookie + cookieverf + dircount + maxcount
-    let dir_result = decode_fh(args);
-    if let Ok((fh, rest)) = dir_result {
+    if let Ok((fh, rest)) = decode_fh(args) {
         let dir_key = fh
             .to_item_id()
             .and_then(|id| id.parse::<u64>().ok())
@@ -118,7 +122,7 @@ fn handle_readdir(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
 
         // Decode cookie (skip entries before this offset) and
         // cookieverf + counts.
-        let cookie = decode_u64(rest).ok().map_or(0, |(c, _)| c);
+        let cookie = decode_u64(rest).map_or(0, |(c, _)| c);
         // cookieverf is the next 8 bytes — we ignore it for now.
 
         // Fetch directory listing from the VFS tree synchronously.
@@ -141,7 +145,7 @@ fn handle_readdir(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
         // into the entry list. Skip entries with cookie <= the
         // requested cookie (client is resuming a previous listing).
         for (i, entry) in entries.iter().enumerate() {
-            let entry_cookie = (i as u64) + 3; // cookies start at 3 (. and .. take 1,2)
+            let entry_cookie = u64::try_from(i).unwrap_or(u64::MAX) + 3; // cookies start at 3 (. and .. take 1,2)
             if entry_cookie <= cookie {
                 continue;
             }
@@ -177,8 +181,7 @@ fn handle_read(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
     let mut reply: Vec<u8> = Vec::new();
 
     // Args: file_fh + offset + count
-    let file_result = decode_fh(args);
-    if let Ok((fh, rest)) = file_result {
+    if let Ok((fh, rest)) = decode_fh(args) {
         let offset = decode_u64(rest).ok();
         let count = offset.and_then(|(_, r)| decode_u32(r).ok()).map(|(c, _)| c);
 
@@ -209,7 +212,8 @@ fn handle_read(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
         let is_eof = data.is_empty();
         encode_u32(&mut reply, NFS3_OK);
         encode_post_op_attr(&mut reply, &PostOpAttr::some(file_attr));
-        encode_u32(&mut reply, data.len() as u32); // count of bytes returned
+        let data_len = u32::try_from(data.len()).unwrap_or(u32::MAX);
+        encode_u32(&mut reply, data_len); // count of bytes returned
         encode_bool(&mut reply, is_eof); // EOF if no data
         reply.extend_from_slice(&data);
     } else {
@@ -230,23 +234,36 @@ fn fetch_file_data_sync(
     let rt = tokio::runtime::Handle::current();
     rt.block_on(async {
         let (backend, relative) = {
-            let vfs = ctx.vfs().read().unwrap();
+            let vfs = ctx
+                .vfs()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let (backend, relative) = vfs.resolve(std::path::Path::new(path));
-            (Arc::clone(backend), relative)
+            let result = (Arc::clone(backend), relative);
+            drop(vfs);
+            result
         };
         let entry = backend.metadata(&relative).await?;
         let mut buf = Vec::new();
         backend.download(&entry, &mut buf).await?;
 
         // Apply offset and count bounds.
-        let off = offset.unwrap_or(0) as usize;
+        let off = usize::try_from(offset.unwrap_or(0))
+            .unwrap_or(usize::MAX);
         if off >= buf.len() {
             return Ok(Vec::new());
         }
-        let remaining = &buf[off..];
-        let max = max_count.map_or(remaining.len(), |c| c as usize);
+        let remaining = buf
+            .get(off..)
+            .ok_or_else(|| anyhow::anyhow!("offset {off} out of bounds"))?;
+        let max = max_count.map_or(remaining.len(), |c| {
+            usize::try_from(c).unwrap_or(usize::MAX)
+        });
         let end = max.min(remaining.len());
-        Ok(remaining[..end].to_vec())
+        Ok(remaining
+            .get(..end)
+            .ok_or_else(|| anyhow::anyhow!("slice end {end} out of bounds"))?
+            .to_vec())
     })
 }
 
@@ -351,7 +368,7 @@ mod tests {
     fn getattr_invalid_fh() {
         let ctx = test_ctx();
         let fh = NfsFh3 {
-            data: [0u8; NFS3_FHSIZE],
+            data: [0u8; super::super::xdr::NFS3_FHSIZE],
         };
         let mut args = Vec::new();
         encode_fh(&mut args, &fh);

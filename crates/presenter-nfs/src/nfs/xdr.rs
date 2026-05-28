@@ -1,8 +1,8 @@
 //! XDR codec for NFS data structures (RFC 1813).
 //!
 //! Encodes and decodes `NFSv3` wire format:
-//! - Primitive types: uint32, uint64, int32, bool, opaque<>, string<>
-//! - NFS-specific types: file handles (`nfs_fh3`), file attributes (fattr3)
+//! - Primitive types: uint32, uint64, int32, bool, `opaque<>`, `string<>`
+//! - NFS-specific types: file handles (`nfs_fh3`), file attributes (`fattr3`)
 //! - Fixed and variable-length arrays
 
 use std::io::{self, Read, Write};
@@ -85,12 +85,12 @@ pub const MNT3ERR_ACCES: u32 = 13;
 pub const MNT3ERR_NOTDIR: u32 = 20;
 
 /// NFS RPC program number.
-pub const NFS_PROGRAM: u32 = 100003;
+pub const NFS_PROGRAM: u32 = 100_003;
 /// NFS RPC program version.
 pub const NFS_V3: u32 = 3;
 
 /// Mount RPC program number.
-pub const MOUNT_PROGRAM: u32 = 100005;
+pub const MOUNT_PROGRAM: u32 = 100_005;
 /// Mount RPC program version.
 pub const MOUNT_V3: u32 = 3;
 
@@ -106,23 +106,28 @@ pub const RPC_AUTH_NONE: u32 = 0;
 // ── XDR types ──
 
 /// NFS file handle — fixed 64-byte opaque.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct NfsFh3 {
     pub data: [u8; NFS3_FHSIZE],
 }
 
 impl NfsFh3 {
     /// Create a file handle from an `ItemId` string, padding with zeros.
-    #[must_use] pub fn from_item_id(id: &str) -> Self {
+    #[must_use]
+    pub fn from_item_id(id: &str) -> Self {
         let mut data = [0u8; NFS3_FHSIZE];
         let bytes = id.as_bytes();
         let len = bytes.len().min(NFS3_FHSIZE);
+        // SAFETY: `len <= NFS3_FHSIZE` by construction (`.min(NFS3_FHSIZE)`),
+        // so both slices are within their respective lengths.
+        #[allow(clippy::indexing_slicing)]
         data[..len].copy_from_slice(&bytes[..len]);
         Self { data }
     }
 
     /// Extract the `ItemId` string from the file handle (up to first null byte).
-    #[must_use] pub fn to_item_id(&self) -> Option<String> {
+    #[must_use]
+    pub fn to_item_id(&self) -> Option<String> {
         let end = self
             .data
             .iter()
@@ -131,12 +136,15 @@ impl NfsFh3 {
         if end == 0 {
             return None;
         }
+        // SAFETY: `end <= NFS3_FHSIZE` because `.position()` returns an
+        // index within the array, and the fallback is exactly `NFS3_FHSIZE`.
+        #[allow(clippy::indexing_slicing)]
         String::from_utf8(self.data[..end].to_vec()).ok()
     }
 }
 
 /// File attributes (fattr3).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct Fattr3 {
     pub ftype: u32,
     pub mode: u32,
@@ -174,51 +182,58 @@ impl Default for Fattr3 {
 }
 
 /// Special device data.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct Specdata3 {
     pub specdata1: u32,
     pub specdata2: u32,
 }
 
 /// NFS time (seconds + nanoseconds).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct NfsTime {
     pub seconds: u32,
     pub nseconds: u32,
 }
 
 impl NfsTime {
-    #[must_use] pub const fn epoch() -> Self {
+    #[must_use]
+    pub const fn epoch() -> Self {
         Self {
             seconds: 0,
             nseconds: 0,
         }
     }
 
-    #[must_use] pub const fn from_epoch(secs: i64) -> Self {
+    /// # Panics
+    ///
+    /// Does not panic; saturates negative timestamps to 0.
+    #[must_use]
+    pub fn from_epoch(secs: i64) -> Self {
         Self {
-            seconds: secs as u32,
+            seconds: u32::try_from(secs).unwrap_or(0),
             nseconds: 0,
         }
     }
 }
 
 /// Post-operation attributes — either present or not.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct PostOpAttr {
     pub attributes_follow: bool,
     pub attributes: Option<Fattr3>,
 }
 
 impl PostOpAttr {
-    #[must_use] pub const fn some(attr: Fattr3) -> Self {
+    #[must_use]
+    pub const fn some(attr: Fattr3) -> Self {
         Self {
             attributes_follow: true,
             attributes: Some(attr),
         }
     }
 
-    #[must_use] pub const fn none() -> Self {
+    #[must_use]
+    pub const fn none() -> Self {
         Self {
             attributes_follow: false,
             attributes: None,
@@ -245,7 +260,8 @@ pub fn encode_bool(buf: &mut Vec<u8>, val: bool) {
 
 /// Encode a variable-length opaque in XDR format (length + padded data).
 pub fn encode_opaque(buf: &mut Vec<u8>, data: &[u8]) {
-    encode_u32(buf, data.len() as u32);
+    let len = u32::try_from(data.len()).unwrap_or(u32::MAX);
+    encode_u32(buf, len);
     buf.extend_from_slice(data);
     // Pad to 4-byte boundary.
     let pad = (4 - (data.len() % 4)) % 4;
@@ -301,6 +317,10 @@ pub fn encode_post_op_attr(buf: &mut Vec<u8>, poa: &PostOpAttr) {
 // ── XDR decoding ──
 
 /// Decode a uint32 from XDR data.
+///
+/// # Errors
+///
+/// Returns an error if the slice has fewer than 4 bytes.
 pub fn decode_u32(data: &[u8]) -> io::Result<(u32, &[u8])> {
     if data.len() < 4 {
         return Err(io::Error::new(
@@ -308,11 +328,19 @@ pub fn decode_u32(data: &[u8]) -> io::Result<(u32, &[u8])> {
             "need 4 bytes for u32",
         ));
     }
-    let val = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-    Ok((val, &data[4..]))
+    let (word, rest) = data.split_at(4);
+    let val = u32::from_be_bytes(
+        word.try_into()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+    );
+    Ok((val, rest))
 }
 
 /// Decode a uint64 from XDR data.
+///
+/// # Errors
+///
+/// Returns an error if the slice has fewer than 8 bytes.
 pub fn decode_u64(data: &[u8]) -> io::Result<(u64, &[u8])> {
     if data.len() < 8 {
         return Err(io::Error::new(
@@ -320,22 +348,32 @@ pub fn decode_u64(data: &[u8]) -> io::Result<(u64, &[u8])> {
             "need 8 bytes for u64",
         ));
     }
-    let val = u64::from_be_bytes([
-        data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
-    ]);
-    Ok((val, &data[8..]))
+    let (word, rest) = data.split_at(8);
+    let val = u64::from_be_bytes(
+        word.try_into()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+    );
+    Ok((val, rest))
 }
 
 /// Decode a bool from XDR data.
+///
+/// # Errors
+///
+/// Returns an error if the slice has fewer than 4 bytes.
 pub fn decode_bool(data: &[u8]) -> io::Result<(bool, &[u8])> {
     let (val, rest) = decode_u32(data)?;
     Ok((val != 0, rest))
 }
 
 /// Decode a variable-length opaque from XDR data.
+///
+/// # Errors
+///
+/// Returns an error if the slice is too short to contain the declared length.
 pub fn decode_opaque(data: &[u8]) -> io::Result<(&[u8], &[u8])> {
     let (len, rest) = decode_u32(data)?;
-    let len = len as usize;
+    let len = usize::try_from(len).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     if rest.len() < len {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
@@ -345,6 +383,8 @@ pub fn decode_opaque(data: &[u8]) -> io::Result<(&[u8], &[u8])> {
     let (opaque_data, remainder) = rest.split_at(len);
     // Skip padding.
     let pad = (4 - (len % 4)) % 4;
+    // SAFETY: the guard `remainder.len() >= pad` ensures the slice is in bounds.
+    #[allow(clippy::indexing_slicing)]
     let remainder = if remainder.len() >= pad {
         &remainder[pad..]
     } else {
@@ -354,6 +394,10 @@ pub fn decode_opaque(data: &[u8]) -> io::Result<(&[u8], &[u8])> {
 }
 
 /// Decode a variable-length string from XDR data.
+///
+/// # Errors
+///
+/// Returns an error if the slice is malformed or the bytes are not valid UTF-8.
 pub fn decode_string(data: &[u8]) -> io::Result<(String, &[u8])> {
     let (bytes, rest) = decode_opaque(data)?;
     let s = String::from_utf8(bytes.to_vec())
@@ -362,6 +406,10 @@ pub fn decode_string(data: &[u8]) -> io::Result<(String, &[u8])> {
 }
 
 /// Decode an NFS file handle from XDR data.
+///
+/// # Errors
+///
+/// Returns an error if the slice has fewer than `NFS3_FHSIZE` bytes.
 pub fn decode_fh(data: &[u8]) -> io::Result<(NfsFh3, &[u8])> {
     if data.len() < NFS3_FHSIZE {
         return Err(io::Error::new(
@@ -369,14 +417,19 @@ pub fn decode_fh(data: &[u8]) -> io::Result<(NfsFh3, &[u8])> {
             "file handle truncated",
         ));
     }
+    let (fh_bytes, rest) = data.split_at(NFS3_FHSIZE);
     let mut fh = NfsFh3 {
         data: [0u8; NFS3_FHSIZE],
     };
-    fh.data.copy_from_slice(&data[..NFS3_FHSIZE]);
-    Ok((fh, &data[NFS3_FHSIZE..]))
+    fh.data.copy_from_slice(fh_bytes);
+    Ok((fh, rest))
 }
 
 /// Read a complete RPC message (length-prefixed) from a reader.
+///
+/// # Errors
+///
+/// Returns an error if reading fails or the declared message length exceeds 1 MiB.
 pub fn read_rpc_message(reader: &mut dyn Read) -> io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf)?;
@@ -394,8 +447,14 @@ pub fn read_rpc_message(reader: &mut dyn Read) -> io::Result<Vec<u8>> {
 }
 
 /// Write a complete RPC message (length-prefixed) to a writer.
+///
+/// # Errors
+///
+/// Returns an error if writing fails.
 pub fn write_rpc_message(writer: &mut dyn Write, msg: &[u8]) -> io::Result<()> {
-    writer.write_all(&(msg.len() as u32).to_be_bytes())?;
+    let len = u32::try_from(msg.len())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    writer.write_all(&len.to_be_bytes())?;
     writer.write_all(msg)?;
     writer.flush()?;
     Ok(())
@@ -408,18 +467,18 @@ mod tests {
     #[test]
     fn encode_decode_u32() {
         let mut buf = Vec::new();
-        encode_u32(&mut buf, 0xDEADBEEF);
+        encode_u32(&mut buf, 0xDEAD_BEEF);
         let (val, rest) = decode_u32(&buf).unwrap();
-        assert_eq!(val, 0xDEADBEEF);
+        assert_eq!(val, 0xDEAD_BEEF);
         assert!(rest.is_empty());
     }
 
     #[test]
     fn encode_decode_u64() {
         let mut buf = Vec::new();
-        encode_u64(&mut buf, 0x0102030405060708);
+        encode_u64(&mut buf, 0x0102_0304_0506_0708);
         let (val, rest) = decode_u64(&buf).unwrap();
-        assert_eq!(val, 0x0102030405060708);
+        assert_eq!(val, 0x0102_0304_0506_0708);
         assert!(rest.is_empty());
     }
 
