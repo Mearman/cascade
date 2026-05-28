@@ -142,23 +142,28 @@ fn load_main_config(config_dir: &Path) -> Result<CascadeConfig> {
         tracing::info!(path = ?config_path, "Loaded main config");
         Ok(config)
     } else {
-        tracing::warn!(path = ?config_path, "Main config not found");
-        Ok(CascadeConfig::default())
+        anyhow::bail!(
+            "Config file not found at {}. Run `cascade init` to create it.",
+            config_path.display()
+        );
     }
 }
 
 /// Load a backend config from the config directory.
 fn load_backend_config(config_dir: &Path, name: &str) -> Result<toml::Value> {
     let config_path = config_dir.join(format!("{name}.toml"));
-    if config_path.exists() {
-        let contents = std::fs::read_to_string(&config_path)?;
-        let value: toml::Value = toml::from_str(&contents)?;
-        tracing::info!(path = ?config_path, "Loaded backend config");
-        Ok(value)
-    } else {
-        tracing::warn!(path = ?config_path, "Backend config not found, using defaults");
-        Ok(toml::Value::Table(Default::default()))
+    if !config_path.exists() {
+        anyhow::bail!(
+            "Backend config not found: {}. Re-run `cascade init` or create it manually.",
+            config_path.display()
+        );
     }
+    let contents = std::fs::read_to_string(&config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    let value: toml::Value = toml::from_str(&contents)
+        .with_context(|| format!("failed to parse {}", config_path.display()))?;
+    tracing::info!(path = ?config_path, "Loaded backend config");
+    Ok(value)
 }
 
 /// Resolve a mount point path, expanding ~ and environment variables.

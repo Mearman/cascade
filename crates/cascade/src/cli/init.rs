@@ -38,7 +38,7 @@ pub struct BackendConfig {
 }
 
 /// Supported backend types for the init wizard.
-const BACKEND_TYPES: &[(&str, &str)] = &[("gdrive", "Google Drive"), ("local", "Local filesystem")];
+const BACKEND_TYPES: &[(&str, &str)] = &[("gdrive", "Google Drive"), ("s3", "S3-compatible")];
 
 /// Run the interactive init wizard.
 pub fn run() -> Result<()> {
