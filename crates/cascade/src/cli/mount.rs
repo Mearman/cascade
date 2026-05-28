@@ -2,39 +2,25 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
-use cascade_engine::cache::manager::{CacheManager, CacheManagerConfig};
-use cascade_engine::config::ConfigResolver;
-use cascade_engine::db::StateDb;
-use cascade_engine::sync::runner::SyncRunner;
-use cascade_engine::vfs::VfsTree;
+use cascade_engine::engine::{Engine, EngineConfig};
 use cascade_presenter_nfs::nfs::server::{NfsServer, NfsServerConfig};
 
 /// Start the Cascade daemon.
 pub async fn start(mount_point: Option<&str>) -> Result<()> {
     tracing::info!("Starting Cascade daemon");
 
-    // Resolve config directory and open state database.
+    // Resolve config directory and database path.
     let config_dir = dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from(".cascade"))
         .join("cascade");
     std::fs::create_dir_all(&config_dir)?;
     let db_path = config_dir.join("state.db");
 
-    let db = Arc::new(StateDb::open(&db_path)?);
-    tracing::info!(path = ?db_path, "State database opened");
-
     // Create backend(s) from config.
     // Phase 1: single Google Drive backend with defaults.
     let gdrive_config = load_backend_config(&config_dir, "gdrive")?;
     let backend = cascade_backend_gdrive::create_backend(&gdrive_config)?;
     let backend: Arc<dyn cascade_engine::backend::Backend> = Arc::from(backend);
-
-    // Register in state DB.
-    db.register_backend(backend.id(), "gdrive", backend.display_name(), None, None)?;
-
-    // Build VFS tree.
-    let tree = Arc::new(std::sync::RwLock::new(VfsTree::new(backend.clone())));
-    tracing::info!("VFS tree initialised");
 
     // Resolve mount point.
     let mount_path = mount_point.map(resolve_mount_path).unwrap_or_else(|| {
@@ -45,10 +31,22 @@ pub async fn start(mount_point: Option<&str>) -> Result<()> {
 
     std::fs::create_dir_all(&mount_path)?;
 
-    // Create presenter (which creates the NFS context internally).
+    // Create and start the engine.
+    let engine_config = EngineConfig {
+        db_path,
+        mount_point: mount_path.clone(),
+        backends: vec![backend],
+        cache_dir: None,
+        enable_p2p: false,
+        p2p_data_dir: None,
+    };
+    let engine = Engine::new(engine_config).await?;
+    let handle = engine.start().await?;
+
+    // Create presenter using engine's VFS.
     let presenter = Arc::new(cascade_presenter_nfs::NfsPresenter::with_vfs(
         &mount_path,
-        tree.clone(),
+        engine.vfs().clone(),
     ));
 
     // Start NFS server on loopback, sharing the presenter's context.
@@ -60,24 +58,6 @@ pub async fn start(mount_point: Option<&str>) -> Result<()> {
     let server = NfsServer::start(server_config, nfs_ctx).await?;
     let nfs_port = server.local_addr.port();
     tracing::info!(port = nfs_port, "NFS server started");
-
-    // Create config resolver for .cascade file filtering.
-    let config = Arc::new(ConfigResolver::new(mount_path.clone()));
-
-    // Start the sync runner (spawns a background task).
-    let sync_runner = SyncRunner::new(db.clone(), vec![backend], presenter.clone(), config);
-    let sync_handle = tokio::spawn(async move {
-        if let Err(e) = sync_runner.run().await {
-            tracing::error!(error = %e, "sync runner exited with error");
-        }
-    });
-
-    // Start the cache manager background worker.
-    let cache_manager = Arc::new(CacheManager::new(db.clone(), CacheManagerConfig::default()));
-    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-    let cache_handle = tokio::spawn(async move {
-        cache_manager.run(cancel_rx).await;
-    });
 
     // Mount NFS via OS mount command.
     mount_nfs(&mount_path, nfs_port)?;
@@ -97,9 +77,9 @@ pub async fn start(mount_point: Option<&str>) -> Result<()> {
     // Clean up.
     unmount_nfs(&mount_path)?;
     server.stop().await?;
-    let _ = cancel_tx.send(true);
-    sync_handle.abort();
-    cache_handle.abort();
+    engine.shutdown().await?;
+    handle.sync_handle.abort();
+    handle.cache_handle.abort();
 
     tracing::info!("Cascade stopped.");
     Ok(())
