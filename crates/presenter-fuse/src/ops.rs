@@ -153,8 +153,9 @@ mod linux {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use fuser::{
-        Errno, FileAttr as FuseFileAttr, FileHandle, FileType, Filesystem, INodeNo, KernelConfig,
-        LockOwner, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyWrite, Request,
+        Errno, FileAttr as FuseFileAttr, FileHandle, FileType, Filesystem, Generation, INodeNo,
+        KernelConfig, LockOwner, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyWrite,
+        Request,
     };
 
     use super::*;
@@ -225,7 +226,7 @@ mod linux {
                         FileAttr::file(inode, entry.size.unwrap_or(0))
                     };
                     let fuse_attr: FuseFileAttr = attr.into();
-                    reply.entry(&Duration::from_secs(1), &fuse_attr, 0);
+                    reply.entry(&Duration::from_secs(1), &fuse_attr, Generation(0));
                 }
                 Err(_) => {
                     reply.error(Errno::ENOENT);

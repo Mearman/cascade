@@ -46,9 +46,10 @@ pub async fn start(mount_point: Option<&str>) -> Result<()> {
     std::fs::create_dir_all(&mount_path)?;
 
     // Create presenter (which creates the NFS context internally).
-    let presenter = Arc::new(
-        cascade_presenter_nfs::NfsPresenter::with_vfs(&mount_path, tree.clone()),
-    );
+    let presenter = Arc::new(cascade_presenter_nfs::NfsPresenter::with_vfs(
+        &mount_path,
+        tree.clone(),
+    ));
 
     // Start NFS server on loopback, sharing the presenter's context.
     let server_config = NfsServerConfig {
