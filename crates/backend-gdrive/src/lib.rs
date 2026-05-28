@@ -341,6 +341,7 @@ impl Backend for GdriveBackend {
     }
 
     async fn poll_interval(&self) -> Option<Duration> {
+        #[allow(unknown_lints, clippy::duration_suboptimal_units)]
         Some(Duration::from_secs(60))
     }
 }

@@ -694,6 +694,7 @@ impl Backend for S3Backend {
 
     async fn poll_interval(&self) -> Option<Duration> {
         // S3 doesn't push changes, so use a fixed 60-second poll.
+        #[allow(unknown_lints, clippy::duration_suboptimal_units)]
         Some(Duration::from_secs(60))
     }
 }
