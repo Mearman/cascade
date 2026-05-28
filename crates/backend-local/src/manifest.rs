@@ -200,7 +200,7 @@ pub async fn walk_tree(root: &Path) -> anyhow::Result<Vec<FileState>> {
             .modified()?
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
-        let mtime_secs = modified.as_secs() as i64;
+        let mtime_secs = i64::try_from(modified.as_secs()).unwrap_or(i64::MAX);
         let mtime_nanos = modified.subsec_nanos();
         let size = metadata.len();
 

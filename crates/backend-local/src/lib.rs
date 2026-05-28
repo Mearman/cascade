@@ -29,6 +29,7 @@ pub enum LocalMode {
 }
 
 /// Configuration for creating a local backend.
+#[derive(Debug)]
 pub struct LocalConfig {
     /// Unique backend identifier (e.g. "local-photos").
     pub id: String,
@@ -77,16 +78,18 @@ pub fn create_backend(config: &toml::Value) -> anyhow::Result<Box<dyn Backend>> 
     let display_name = config
         .get("display_name")
         .and_then(|v| v.as_str())
-        .map(String::from)
-        .unwrap_or_else(|| {
-            format!(
-                "Local Files ({})",
-                root_path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("unknown")
-            )
-        });
+        .map_or_else(
+            || {
+                format!(
+                    "Local Files ({})",
+                    root_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("unknown")
+                )
+            },
+            String::from,
+        );
 
     let manifest_path = root_path.join(".cascade-cache").join("manifest.jsonl");
 
@@ -101,6 +104,7 @@ pub fn create_backend(config: &toml::Value) -> anyhow::Result<Box<dyn Backend>> 
 }
 
 /// Local filesystem backend.
+#[derive(Debug)]
 pub struct LocalBackend {
     id: String,
     display_name: String,
@@ -139,7 +143,7 @@ impl LocalBackend {
     /// Convert a `FileState` into a `FileEntry`.
     fn state_to_entry(&self, state: &FileState, is_dir: bool) -> FileEntry {
         let path = Path::new(&state.path);
-        let parent_relative = path.parent().unwrap_or(Path::new(""));
+        let parent_relative = path.parent().unwrap_or_else(|| Path::new(""));
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -172,7 +176,7 @@ impl LocalBackend {
     /// Build a `FileEntry` for a directory at the given relative path.
     fn dir_entry(&self, relative_path: &str) -> FileEntry {
         let path = Path::new(relative_path);
-        let parent_relative = path.parent().unwrap_or(Path::new(""));
+        let parent_relative = path.parent().unwrap_or_else(|| Path::new(""));
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -294,7 +298,7 @@ impl Backend for LocalBackend {
             .modified()?
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
-        let mtime_secs = modified.as_secs() as i64;
+        let mtime_secs = i64::try_from(modified.as_secs()).unwrap_or(i64::MAX);
         let mtime_nanos = modified.subsec_nanos();
         let size = metadata.len();
         let hash = manifest::hash_file(&abs).await?;
@@ -369,7 +373,7 @@ impl Backend for LocalBackend {
 
         let state = FileState {
             path: relative.to_string(),
-            mtime_secs: modified.as_secs() as i64,
+            mtime_secs: i64::try_from(modified.as_secs()).unwrap_or(i64::MAX),
             mtime_nanos: modified.subsec_nanos(),
             size: metadata.len(),
             hash,
@@ -459,7 +463,7 @@ impl Backend for LocalBackend {
 
         let new_state = FileState {
             path: dst_relative.clone(),
-            mtime_secs: modified.as_secs() as i64,
+            mtime_secs: i64::try_from(modified.as_secs()).unwrap_or(i64::MAX),
             mtime_nanos: modified.subsec_nanos(),
             size: metadata.len(),
             hash,
