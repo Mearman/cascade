@@ -277,6 +277,7 @@ fn resolve_mount_path(path: &str) -> PathBuf {
 }
 
 /// Mount NFS filesystem using the OS mount command (macOS).
+#[cfg(target_os = "macos")]
 fn mount_nfs(mount_point: &Path, port: u16) -> Result<()> {
     // Create the mount point directory.
     if !mount_point.exists() {
@@ -309,6 +310,7 @@ fn mount_nfs(mount_point: &Path, port: u16) -> Result<()> {
 }
 
 /// Unmount the NFS filesystem.
+#[cfg(target_os = "macos")]
 fn unmount_nfs(mount_point: &Path) -> Result<()> {
     if !is_mounted(mount_point) {
         tracing::debug!(path = %mount_point.display(), "not mounted, skipping unmount");
@@ -331,6 +333,7 @@ fn unmount_nfs(mount_point: &Path) -> Result<()> {
 }
 
 /// Check if a path is already mounted.
+#[cfg(target_os = "macos")]
 fn is_mounted(path: &Path) -> bool {
     let output = std::process::Command::new("/sbin/mount").output();
 
@@ -339,4 +342,19 @@ fn is_mounted(path: &Path) -> bool {
         Err(_) => return false,
     };
     mounts.contains(&*path.to_string_lossy())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn mount_nfs(_mount_point: &Path, _port: u16) -> Result<()> {
+    anyhow::bail!("NFS mounting is not supported on this platform yet");
+}
+
+#[cfg(not(target_os = "macos"))]
+fn unmount_nfs(_mount_point: &Path) -> Result<()> {
+    Ok(()) // no-op: nothing was mounted
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_mounted(_path: &Path) -> bool {
+    false
 }
