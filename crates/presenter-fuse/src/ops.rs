@@ -4,8 +4,11 @@
 //! On other platforms, provides compile-time stubs.
 
 use cascade_engine::types::{ItemId, VfsItem};
+use cascade_engine::vfs::VfsTree;
 
 use crate::inode::InodeMap;
+
+use std::sync::{Arc, RwLock};
 
 /// Internal file attribute representation, independent of platform-specific FUSE types.
 #[derive(Debug, Clone)]
@@ -60,14 +63,86 @@ pub fn vfs_item_to_attr(item: &VfsItem, inode: u64) -> FileAttr {
 pub struct FuseOps {
     /// Inode ↔ ItemId mapping.
     pub inode_map: std::sync::Mutex<InodeMap>,
+    /// VFS tree for resolving paths to backends.
+    pub vfs: Arc<RwLock<VfsTree>>,
 }
 
 impl FuseOps {
-    /// Create a new FuseOps with the given root ItemId.
+    /// Create a new FuseOps with the given root ItemId (no VFS tree).
     pub fn new(root_id: ItemId) -> Self {
         Self {
             inode_map: std::sync::Mutex::new(InodeMap::new(root_id)),
+            vfs: Arc::new(RwLock::new(VfsTree::new(Arc::new(
+                cascade_engine::backend::NullBackend::new("null"),
+            )))),
         }
+    }
+
+    /// Create a new FuseOps with the given root ItemId and VFS tree.
+    pub fn new_with_vfs(root_id: ItemId, vfs: Arc<RwLock<VfsTree>>) -> Self {
+        Self {
+            inode_map: std::sync::Mutex::new(InodeMap::new(root_id)),
+            vfs,
+        }
+    }
+
+    /// Synchronously resolve a path through the VFS tree and get metadata.
+    #[allow(dead_code)] // Used in #[cfg(target_os = "linux")] Filesystem impl
+    fn metadata_sync(
+        &self,
+        path: &std::path::Path,
+    ) -> anyhow::Result<cascade_engine::types::FileEntry> {
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(async {
+            let (backend, relative) = {
+                let vfs = self.vfs.read().unwrap();
+                let (backend, relative) = vfs.resolve(path);
+                (Arc::clone(backend), relative.to_path_buf())
+            };
+            backend.metadata(&relative).await
+        })
+    }
+
+    /// Synchronously list a directory through the VFS tree.
+    #[allow(dead_code)] // Used in #[cfg(target_os = "linux")] Filesystem impl
+    fn readdir_sync(
+        &self,
+        path: &std::path::Path,
+    ) -> anyhow::Result<Vec<cascade_engine::types::DirEntry>> {
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(async {
+            let vfs = self.vfs.read().unwrap();
+            vfs.read_dir(path).await
+        })
+    }
+
+    /// Synchronously read file data from the backend.
+    #[allow(dead_code)] // Used in #[cfg(target_os = "linux")] Filesystem impl
+    fn read_sync(
+        &self,
+        path: &std::path::Path,
+        offset: u64,
+        size: u32,
+    ) -> anyhow::Result<Vec<u8>> {
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(async {
+            let (backend, relative) = {
+                let vfs = self.vfs.read().unwrap();
+                let (backend, relative) = vfs.resolve(path);
+                (Arc::clone(backend), relative.to_path_buf())
+            };
+            let entry = backend.metadata(&relative).await?;
+            let mut buf = Vec::new();
+            backend.download(&entry, &mut buf).await?;
+
+            let off = offset as usize;
+            if off >= buf.len() {
+                return Ok(Vec::new());
+            }
+            let remaining = &buf[off..];
+            let end = (size as usize).min(remaining.len());
+            Ok(remaining[..end].to_vec())
+        })
     }
 }
 
@@ -123,23 +198,79 @@ mod linux {
 
         fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
             let name_str = name.to_string_lossy();
-            tracing::debug!(parent = u64::from(parent), name = %name_str, "lookup");
-            drop(self.inode_map.lock().unwrap());
-            reply.error(Errno::ENOENT);
+            let parent_u64 = u64::from(parent);
+            tracing::debug!(parent = parent_u64, name = %name_str, "lookup");
+
+            // Resolve parent ItemId from inode.
+            let parent_id = {
+                let map = self.inode_map.lock().unwrap();
+                map.get_id(parent_u64).cloned()
+            };
+
+            let Some(parent_id) = parent_id else {
+                reply.error(Errno::ENOENT);
+                return;
+            };
+
+            // Build child path and try to resolve it.
+            let child_path = format!("{}/{}", parent_id.0, name_str);
+            match self.metadata_sync(std::path::Path::new(&child_path)) {
+                Ok(entry) => {
+                    let mut map = self.inode_map.lock().unwrap();
+                    let child_id = entry.id.clone();
+                    let inode = map.allocate(child_id.clone());
+                    let attr = if entry.is_dir {
+                        FileAttr::directory(inode)
+                    } else {
+                        FileAttr::file(inode, entry.size.unwrap_or(0))
+                    };
+                    let fuse_attr: FuseFileAttr = attr.into();
+                    reply.attr(&Duration::from_secs(1), &fuse_attr);
+                }
+                Err(_) => {
+                    reply.error(Errno::ENOENT);
+                }
+            }
         }
 
-        fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        fn getattr(
+            &self,
+            _req: &Request,
+            ino: INodeNo,
+            _fh: Option<FileHandle>,
+            reply: ReplyAttr,
+        ) {
             let ino_u64 = u64::from(ino);
             let map = self.inode_map.lock().unwrap();
+
             if ino_u64 == crate::inode::ROOT_INODE {
                 let attr = FileAttr::directory(ino_u64);
                 let fuse_attr: FuseFileAttr = attr.into();
                 reply.attr(&Duration::from_secs(1), &fuse_attr);
                 return;
             }
-            tracing::debug!(ino = ino_u64, "getattr");
-            drop(map);
-            reply.error(Errno::ENOENT);
+
+            if let Some(id) = map.get_id(ino_u64) {
+                let id_str = id.0.clone();
+                drop(map);
+                match self.metadata_sync(std::path::Path::new(&id_str)) {
+                    Ok(entry) => {
+                        let attr = if entry.is_dir {
+                            FileAttr::directory(ino_u64)
+                        } else {
+                            FileAttr::file(ino_u64, entry.size.unwrap_or(0))
+                        };
+                        let fuse_attr: FuseFileAttr = attr.into();
+                        reply.attr(&Duration::from_secs(1), &fuse_attr);
+                    }
+                    Err(_) => {
+                        reply.error(Errno::ENOENT);
+                    }
+                }
+            } else {
+                drop(map);
+                reply.error(Errno::ENOENT);
+            }
         }
 
         fn readdir(
@@ -152,7 +283,10 @@ mod linux {
         ) {
             let ino_u64 = u64::from(ino);
             let map = self.inode_map.lock().unwrap();
+
             if ino_u64 != crate::inode::ROOT_INODE {
+                // Only root is a directory for now.
+                // TODO: support nested directories.
                 drop(map);
                 reply.error(Errno::ENOTDIR);
                 return;
@@ -165,8 +299,41 @@ mod linux {
                 let _ = reply.add(ino, 2, FileType::Directory, "..");
             }
 
-            tracing::debug!(ino = ino_u64, offset, "readdir");
+            // List children from the VFS tree.
+            let id_str = match map.get_id(ino_u64) {
+                Some(id) => id.0.clone(),
+                None => {
+                    drop(map);
+                    reply.error(Errno::ENOENT);
+                    return;
+                }
+            };
             drop(map);
+
+            let entries = match self.readdir_sync(std::path::Path::new(&id_str)) {
+                Ok(entries) => entries,
+                Err(_) => {
+                    reply.ok();
+                    return;
+                }
+            };
+
+            let mut entry_offset = 3u64; // . and .. take 1 and 2
+            for entry in &entries {
+                entry_offset += 1;
+                if entry_offset <= offset {
+                    continue;
+                }
+                let kind = if entry.is_dir {
+                    FileType::Directory
+                } else {
+                    FileType::RegularFile
+                };
+                if !reply.add(ino_u64 + entry_offset, entry_offset, kind, &entry.name) {
+                    return;
+                }
+            }
+
             reply.ok();
         }
 
@@ -181,8 +348,21 @@ mod linux {
             _lock_owner: Option<LockOwner>,
             reply: ReplyData,
         ) {
-            tracing::debug!(ino = u64::from(ino), offset, size, "read");
-            reply.error(Errno::ENOENT);
+            let ino_u64 = u64::from(ino);
+            tracing::debug!(ino = ino_u64, offset, size, "read");
+
+            let path = {
+                let map = self.inode_map.lock().unwrap();
+                map.get_id(ino_u64).map(|id| id.0.clone())
+            };
+
+            match path {
+                Some(path) => match self.read_sync(std::path::Path::new(&path), offset, size) {
+                    Ok(data) => reply.data(&data),
+                    Err(_) => reply.error(Errno::EIO),
+                },
+                None => reply.error(Errno::ENOENT),
+            }
         }
 
         fn write(
@@ -198,6 +378,7 @@ mod linux {
             reply: ReplyWrite,
         ) {
             tracing::debug!(ino = u64::from(ino), offset, len = data.len(), "write");
+            // Phase 1: read-only filesystem.
             reply.error(Errno::EROFS);
         }
 
@@ -211,7 +392,11 @@ mod linux {
             _flags: i32,
             reply: fuser::ReplyCreate,
         ) {
-            tracing::debug!(parent = u64::from(parent), name = %name.to_string_lossy(), "create");
+            tracing::debug!(
+                parent = u64::from(parent),
+                name = %name.to_string_lossy(),
+                "create"
+            );
             reply.error(Errno::EROFS);
         }
 
@@ -224,17 +409,41 @@ mod linux {
             _umask: u32,
             reply: ReplyEntry,
         ) {
-            tracing::debug!(parent = u64::from(parent), name = %name.to_string_lossy(), "mkdir");
+            tracing::debug!(
+                parent = u64::from(parent),
+                name = %name.to_string_lossy(),
+                "mkdir"
+            );
             reply.error(Errno::EROFS);
         }
 
-        fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: fuser::ReplyEmpty) {
-            tracing::debug!(parent = u64::from(parent), name = %name.to_string_lossy(), "unlink");
+        fn unlink(
+            &self,
+            _req: &Request,
+            parent: INodeNo,
+            name: &OsStr,
+            reply: fuser::ReplyEmpty,
+        ) {
+            tracing::debug!(
+                parent = u64::from(parent),
+                name = %name.to_string_lossy(),
+                "unlink"
+            );
             reply.error(Errno::EROFS);
         }
 
-        fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: fuser::ReplyEmpty) {
-            tracing::debug!(parent = u64::from(parent), name = %name.to_string_lossy(), "rmdir");
+        fn rmdir(
+            &self,
+            _req: &Request,
+            parent: INodeNo,
+            name: &OsStr,
+            reply: fuser::ReplyEmpty,
+        ) {
+            tracing::debug!(
+                parent = u64::from(parent),
+                name = %name.to_string_lossy(),
+                "rmdir"
+            );
             reply.error(Errno::EROFS);
         }
 
@@ -339,5 +548,16 @@ mod tests {
         let attr = vfs_item_to_attr(&item, 3);
         assert!(attr.is_dir);
         assert_eq!(attr.size, 0);
+    }
+
+    #[test]
+    fn fuse_ops_new_with_vfs() {
+        let root = ItemId::new("gdrive", "root");
+        let vfs = Arc::new(RwLock::new(VfsTree::new(Arc::new(
+            cascade_engine::backend::NullBackend::new("test"),
+        ))));
+        let ops = FuseOps::new_with_vfs(root.clone(), vfs);
+        let map = ops.inode_map.lock().unwrap();
+        assert_eq!(map.get_inode(&root), Some(crate::inode::ROOT_INODE));
     }
 }
