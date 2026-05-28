@@ -102,7 +102,7 @@ impl StateDb {
             (
                 &entry.id.0,
                 entry.id.backend_id(),
-                "", // path — would need to be set by caller
+                &entry.name, // path derived from file name
                 &entry.parent_id.0,
                 &entry.name,
                 entry.is_dir,
@@ -271,6 +271,194 @@ impl StateDb {
 
         Ok(records)
     }
+
+    // ── Pin rule operations ──
+
+    /// Add a pin rule.
+    pub fn add_pin_rule(
+        &self,
+        path_glob: &str,
+        recursive: bool,
+        conditions: Option<&str>,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO pin_rules (path_glob, recursive, conditions) VALUES (?1, ?2, ?3)",
+            (path_glob, recursive, conditions),
+        )?;
+        Ok(())
+    }
+
+    /// Remove a pin rule by path glob.
+    pub fn remove_pin_rule(&self, path_glob: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+        let rows = conn.execute("DELETE FROM pin_rules WHERE path_glob = ?1", [path_glob])?;
+        Ok(rows > 0)
+    }
+
+    /// List all pin rules.
+    pub fn list_pin_rules(&self) -> Result<Vec<PinRuleRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+        let mut stmt =
+            conn.prepare("SELECT id, path_glob, recursive, conditions FROM pin_rules")?;
+        let rules = stmt
+            .query_map([], |row| {
+                Ok(PinRuleRecord {
+                    id: row.get(0)?,
+                    path_glob: row.get(1)?,
+                    recursive: row.get(2)?,
+                    conditions: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rules)
+    }
+
+    // ── Lifecycle policy operations ──
+
+    /// Add a lifecycle policy.
+    pub fn add_lifecycle_policy(
+        &self,
+        path_glob: &str,
+        max_age: Option<i64>,
+        max_file_size: Option<i64>,
+        priority: i32,
+        conditions: Option<&str>,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+        conn.execute(
+            "INSERT INTO lifecycle_policies (path_glob, max_age, max_file_size, priority, conditions)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            (path_glob, max_age, max_file_size, priority, conditions),
+        )?;
+        Ok(())
+    }
+
+    /// List all lifecycle policies ordered by priority descending.
+    pub fn list_lifecycle_policies(&self) -> Result<Vec<LifecyclePolicyRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, path_glob, max_age, max_file_size, priority, conditions
+             FROM lifecycle_policies ORDER BY priority DESC",
+        )?;
+        let policies = stmt
+            .query_map([], |row| {
+                Ok(LifecyclePolicyRecord {
+                    id: row.get(0)?,
+                    path_glob: row.get(1)?,
+                    max_age: row.get(2)?,
+                    max_file_size: row.get(3)?,
+                    priority: row.get(4)?,
+                    conditions: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(policies)
+    }
+
+    /// Remove a lifecycle policy by ID.
+    pub fn remove_lifecycle_policy(&self, id: i64) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+        let rows = conn.execute("DELETE FROM lifecycle_policies WHERE id = ?1", [id])?;
+        Ok(rows > 0)
+    }
+
+    // ── Cache queries ──
+
+    /// List all files in a given cache state.
+    pub fn list_files_by_cache_state(&self, state: CacheState) -> Result<Vec<FileEntry>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, parent_id, name, is_dir, size, mime_type, mod_time, remote_hash
+             FROM files WHERE cache_state = ?1",
+        )?;
+        let entries = stmt
+            .query_map([state.as_str()], |row| {
+                Ok(FileEntry {
+                    id: ItemId(row.get(0)?),
+                    parent_id: ItemId(row.get(1)?),
+                    name: row.get(2)?,
+                    is_dir: row.get(3)?,
+                    size: row.get(4)?,
+                    mime_type: row.get(5)?,
+                    mod_time: row
+                        .get::<_, Option<i64>>(6)?
+                        .map(|ts| chrono::DateTime::from_timestamp(ts, 0).unwrap_or_default()),
+                    hash: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(entries)
+    }
+
+    /// Get total cache size (sum of sizes of cached/pinned files).
+    pub fn cache_size(&self) -> Result<i64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+        let size: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(size), 0) FROM files WHERE cache_state IN ('cached', 'pinned')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        Ok(size)
+    }
+
+    /// Find eviction candidates: cached (not pinned) files ordered by last_access ascending (LRU).
+    pub fn eviction_candidates(&self, limit: usize) -> Result<Vec<FileEntry>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, parent_id, name, is_dir, size, mime_type, mod_time, remote_hash
+             FROM files
+             WHERE cache_state = 'cached' AND dirty = FALSE
+             ORDER BY last_access ASC
+             LIMIT ?1",
+        )?;
+        let entries = stmt
+            .query_map([limit], |row| {
+                Ok(FileEntry {
+                    id: ItemId(row.get(0)?),
+                    parent_id: ItemId(row.get(1)?),
+                    name: row.get(2)?,
+                    is_dir: row.get(3)?,
+                    size: row.get(4)?,
+                    mime_type: row.get(5)?,
+                    mod_time: row
+                        .get::<_, Option<i64>>(6)?
+                        .map(|ts| chrono::DateTime::from_timestamp(ts, 0).unwrap_or_default()),
+                    hash: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(entries)
+    }
 }
 
 /// A registered backend row from the database.
@@ -281,6 +469,26 @@ pub struct BackendRecord {
     pub display_name: String,
     pub mount_path: Option<String>,
     pub config: Option<String>,
+}
+
+/// A pin rule row from the database.
+#[derive(Debug, Clone)]
+pub struct PinRuleRecord {
+    pub id: i64,
+    pub path_glob: String,
+    pub recursive: bool,
+    pub conditions: Option<String>,
+}
+
+/// A lifecycle policy row from the database.
+#[derive(Debug, Clone)]
+pub struct LifecyclePolicyRecord {
+    pub id: i64,
+    pub path_glob: String,
+    pub max_age: Option<i64>,
+    pub max_file_size: Option<i64>,
+    pub priority: i32,
+    pub conditions: Option<String>,
 }
 
 #[cfg(test)]

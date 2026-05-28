@@ -52,29 +52,6 @@ pub async fn show() -> Result<()> {
     Ok(())
 }
 
-/// Show cache status.
-pub async fn cache_status() -> Result<()> {
-    let config_dir = dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from(".cascade"))
-        .join("cascade");
-    let db_path = config_dir.join("state.db");
-
-    if !db_path.exists() {
-        println!("Cache Status");
-        println!("  No cache data available (not running).");
-        return Ok(());
-    }
-
-    let _db = StateDb::open(&db_path)?;
-
-    // Cache stats require scanning the files table — provide summary.
-    println!("Cache Status");
-    println!("  Use `cascade status` for backend info.");
-    println!("  File-level cache stats coming in Phase 2.");
-
-    Ok(())
-}
-
 /// List configured backends.
 pub async fn backend_list() -> Result<()> {
     let config_dir = dirs::config_dir()

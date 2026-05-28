@@ -87,6 +87,12 @@ impl FileEntry {
             hash: None,
         }
     }
+
+    /// Set the file size.
+    pub fn with_size(mut self, size: Option<u64>) -> Self {
+        self.size = size;
+        self
+    }
 }
 
 /// A change event from a backend.

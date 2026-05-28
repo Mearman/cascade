@@ -1,3 +1,4 @@
+pub mod cache;
 pub mod config;
 pub mod mount;
 pub mod status;
@@ -117,34 +118,17 @@ impl Cli {
                 mount::start(None).await
             }
             Commands::Status => status::show().await,
-            Commands::Pin { path } => {
-                tracing::info!("Pinning: {}", path);
-                println!("Pinned: {}", path);
-                Ok(())
-            }
-            Commands::Unpin { path } => {
-                tracing::info!("Unpinning: {}", path);
-                println!("Unpinned: {}", path);
-                Ok(())
-            }
-            Commands::PinList => {
-                println!("No pinned paths.");
-                Ok(())
-            }
+            Commands::Pin { path } => cache::pin(&path),
+            Commands::Unpin { path } => cache::unpin(&path),
+            Commands::PinList => cache::pin_list(),
             Commands::Cache { command } => match command {
-                CacheCommands::Status => status::cache_status().await,
-                CacheCommands::Evict { all } => {
-                    tracing::info!("Running eviction (all={})", all);
-                    println!("Eviction complete.");
-                    Ok(())
-                }
+                CacheCommands::Status => cache::cache_status(),
+                CacheCommands::Evict { all } => cache::evict(all),
                 CacheCommands::Warm { path } => {
-                    tracing::info!("Warming cache: {}", path);
                     println!("Cache warming: {}", path);
                     Ok(())
                 }
                 CacheCommands::Clear { path } => {
-                    tracing::info!("Clearing cache: {}", path);
                     println!("Cache cleared: {}", path);
                     Ok(())
                 }
