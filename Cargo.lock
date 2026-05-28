@@ -173,6 +173,7 @@ dependencies = [
  "clap",
  "dirs",
  "proptest",
+ "reqwest",
  "serde",
  "serde_json",
  "shellexpand",
