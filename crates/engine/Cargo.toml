@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 cascade-config = { path = "../cascade-config" }
+cascade-expr = { path = "../expr" }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
