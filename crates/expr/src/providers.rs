@@ -14,10 +14,14 @@
 //! assert!(cascade_expr::eval::evaluate(&expr, &ctx));
 //! ```
 
-use crate::context::{EvalContext, FileContext, PeerContext, DeviceContext, DiskContext, NetworkContext, NetworkType, PowerContext, PowerSource, TimeContext};
+use crate::context::{
+    DeviceContext, DiskContext, EvalContext, FileContext, FileFlags, NetworkContext, NetworkType,
+    PeerContext, PowerContext, PowerSource, TimeContext,
+};
 
 /// Collect a full `EvalContext` with all providers using default values.
-#[must_use] pub fn collect_default() -> EvalContext {
+#[must_use]
+pub fn collect_default() -> EvalContext {
     EvalContext {
         file: FileContext::default_for_eval(),
         device: DeviceProvider::collect(),
@@ -30,7 +34,8 @@ use crate::context::{EvalContext, FileContext, PeerContext, DeviceContext, DiskC
 }
 
 /// Build an `EvalContext` for a specific file, filling system context from providers.
-#[must_use] pub fn for_file(file: &FileContext) -> EvalContext {
+#[must_use]
+pub fn for_file(file: &FileContext) -> EvalContext {
     EvalContext {
         file: file.clone(),
         device: DeviceProvider::collect(),
@@ -46,7 +51,8 @@ use crate::context::{EvalContext, FileContext, PeerContext, DeviceContext, DiskC
 
 impl FileContext {
     /// Create a `FileContext` suitable for expression evaluation from a file entry.
-    #[must_use] pub fn from_entry(
+    #[must_use]
+    pub fn from_entry(
         name: &str,
         size: u64,
         mime_type: Option<&str>,
@@ -55,8 +61,9 @@ impl FileContext {
     ) -> Self {
         let ext = name
             .rfind('.')
-            .map(|i| name[i + 1..].to_string())
-            .unwrap_or_default();
+            .and_then(|i| name.get(i + 1..))
+            .unwrap_or("")
+            .to_string();
         let mime = mime_type.unwrap_or("").to_string();
         Self {
             size,
@@ -65,11 +72,7 @@ impl FileContext {
             name: name.to_string(),
             modified: chrono::Utc::now(),
             owner: String::new(),
-            shared: false,
-            starred: false,
-            dirty: false,
-            cached,
-            pinned,
+            flags: FileFlags::default().with_cached(cached).with_pinned(pinned),
         }
     }
 
@@ -82,11 +85,7 @@ impl FileContext {
             name: String::new(),
             modified: chrono::Utc::now(),
             owner: String::new(),
-            shared: false,
-            starred: false,
-            dirty: false,
-            cached: false,
-            pinned: false,
+            flags: FileFlags::default(),
         }
     }
 }
@@ -94,10 +93,12 @@ impl FileContext {
 // ── Device provider ──
 
 /// Collects device identity and capabilities.
+#[derive(Debug, Clone, Copy)]
 pub struct DeviceProvider;
 
 impl DeviceProvider {
-    #[must_use] pub fn collect() -> DeviceContext {
+    #[must_use]
+    pub fn collect() -> DeviceContext {
         DeviceContext {
             id: device_id(),
             name: hostname(),
@@ -112,33 +113,36 @@ fn hostname() -> String {
     std::process::Command::new("hostname")
         .output()
         .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok()).map_or_else(|| "unknown".to_string(), |s| s.trim().to_string())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map_or_else(|| "unknown".to_string(), |s| s.trim().to_string())
 }
 
 fn device_id() -> String {
     // Derive a stable device ID from hostname.
     // Production would use a TLS certificate fingerprint (Phase 7).
     use std::hash::{Hash, Hasher};
-    let name = hostname();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    name.hash(&mut hasher);
+    hostname().hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 
 // ── Disk provider ──
 
 /// Collects disk usage statistics.
+#[derive(Debug, Clone, Copy)]
 pub struct DiskProvider;
 
 impl DiskProvider {
     /// Collect disk stats for the root filesystem.
-    #[must_use] pub fn collect_root() -> DiskContext {
+    #[must_use]
+    pub fn collect_root() -> DiskContext {
         Self::collect_for_path("/")
     }
 
     /// Collect disk stats for the filesystem containing the given path.
     #[allow(unsafe_code)]
-    #[must_use] pub fn collect_for_path(path: &str) -> DiskContext {
+    #[must_use]
+    pub fn collect_for_path(path: &str) -> DiskContext {
         #[cfg(unix)]
         {
             let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
@@ -171,10 +175,12 @@ impl DiskProvider {
 // ── Network provider ──
 
 /// Collects network interface information.
+#[derive(Debug, Clone, Copy)]
 pub struct NetworkProvider;
 
 impl NetworkProvider {
-    #[must_use] pub fn collect() -> NetworkContext {
+    #[must_use]
+    pub fn collect() -> NetworkContext {
         // Determine the default route's interface type.
         let if_type = detect_network_type();
         let metered = detect_metered();
@@ -231,10 +237,12 @@ const fn detect_metered() -> bool {
 // ── Power provider ──
 
 /// Collects power source information.
+#[derive(Debug, Clone, Copy)]
 pub struct PowerProvider;
 
 impl PowerProvider {
-    #[must_use] pub fn collect() -> PowerContext {
+    #[must_use]
+    pub fn collect() -> PowerContext {
         #[cfg(target_os = "macos")]
         {
             let output = std::process::Command::new("pmset")
@@ -257,7 +265,7 @@ impl PowerProvider {
                     .split(';')
                     .next()
                     .and_then(|s| s.trim().strip_suffix('%'))
-                    .and_then(|s| s.parse::<f64>().ok());
+                    .and_then(|s| s.trim().parse::<u8>().ok());
 
                 PowerContext {
                     source,
@@ -283,10 +291,12 @@ impl PowerProvider {
 // ── Time provider ──
 
 /// Collects current time.
+#[derive(Debug, Clone, Copy)]
 pub struct TimeProvider;
 
 impl TimeProvider {
-    #[must_use] pub fn collect() -> TimeContext {
+    #[must_use]
+    pub fn collect() -> TimeContext {
         TimeContext {
             now: chrono::Utc::now(),
         }
@@ -345,8 +355,8 @@ mod tests {
         assert_eq!(fc.size, 1024);
         assert_eq!(fc.ext, "pdf");
         assert_eq!(fc.mime, "application/pdf");
-        assert!(!fc.cached);
-        assert!(fc.pinned);
+        assert!(!fc.flags.cached());
+        assert!(fc.flags.pinned());
     }
 
     #[test]

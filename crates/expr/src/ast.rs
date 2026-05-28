@@ -73,7 +73,8 @@ pub enum SizeUnit {
 
 impl Value {
     /// Convert to seconds (for duration values).
-    #[must_use] pub fn to_seconds(&self) -> Option<i64> {
+    #[must_use]
+    pub fn to_seconds(&self) -> Option<i64> {
         match self {
             Self::Duration(v, unit) => Some(match unit {
                 DurationUnit::Milliseconds => v / 1000,
@@ -90,7 +91,8 @@ impl Value {
     }
 
     /// Convert to bytes (for size values).
-    #[must_use] pub fn to_bytes(&self) -> Option<i64> {
+    #[must_use]
+    pub fn to_bytes(&self) -> Option<i64> {
         match self {
             Self::Size(v, unit) => Some(match unit {
                 SizeUnit::Bytes => *v,

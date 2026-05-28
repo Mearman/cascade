@@ -7,13 +7,18 @@ use crate::context::EvalContext;
 use pest::Parser;
 
 /// Parse an expression string into an AST.
+///
+/// # Errors
+///
+/// Returns an error if the input is not a valid expression.
 pub fn parse_expr(input: &str) -> anyhow::Result<Expr> {
     let pairs = ExprParser::parse(crate::Rule::expression, input)?;
     build_ast(pairs)
 }
 
 /// Evaluate an expression against a context.
-#[must_use] pub fn evaluate(expr: &Expr, ctx: &EvalContext) -> bool {
+#[must_use]
+pub fn evaluate(expr: &Expr, ctx: &EvalContext) -> bool {
     match expr {
         Expr::Or(exprs) => exprs.iter().any(|e| evaluate(e, ctx)),
         Expr::And(exprs) => exprs.iter().all(|e| evaluate(e, ctx)),
@@ -25,10 +30,10 @@ pub fn parse_expr(input: &str) -> anyhow::Result<Expr> {
         } => {
             let lv = resolve_operand(left, ctx);
             let rv = resolve_operand(right, ctx);
-            compare(&lv, operator, &rv)
+            compare(&lv, *operator, &rv)
         }
         Expr::Literal(Value::Boolean(b)) => *b,
-        _ => false,
+        Expr::Literal(_) => false,
     }
 }
 
@@ -44,16 +49,18 @@ fn resolve_operand(operand: &Operand, ctx: &EvalContext) -> Value {
 fn resolve_identifier(id: &str, ctx: &EvalContext) -> Value {
     match id {
         // File context
-        "FILE.size" => Value::Integer(ctx.file.size as i64),
+        "FILE.size" => Value::Integer(
+            i64::try_from(ctx.file.size).unwrap_or(i64::MAX),
+        ),
         "FILE.mime" => Value::String(ctx.file.mime.clone()),
         "FILE.ext" => Value::String(ctx.file.ext.clone()),
         "FILE.name" => Value::String(ctx.file.name.clone()),
         "FILE.year" => Value::Integer(i64::from(ctx.file.year())),
-        "FILE.shared" => Value::Boolean(ctx.file.shared),
-        "FILE.starred" => Value::Boolean(ctx.file.starred),
-        "FILE.dirty" => Value::Boolean(ctx.file.dirty),
-        "FILE.cached" => Value::Boolean(ctx.file.cached),
-        "FILE.pinned" => Value::Boolean(ctx.file.pinned),
+        "FILE.shared" => Value::Boolean(ctx.file.shared()),
+        "FILE.starred" => Value::Boolean(ctx.file.starred()),
+        "FILE.dirty" => Value::Boolean(ctx.file.dirty()),
+        "FILE.cached" => Value::Boolean(ctx.file.cached()),
+        "FILE.pinned" => Value::Boolean(ctx.file.pinned()),
 
         // Device context
         "DEVICE.id" => Value::String(ctx.device.id.clone()),
@@ -62,17 +69,25 @@ fn resolve_identifier(id: &str, ctx: &EvalContext) -> Value {
         "DEVICE.os" => Value::String(ctx.device.os.clone()),
 
         // Disk context
-        "DISK.free" => Value::Integer(ctx.disk.free_bytes as i64),
-        "DISK.used" => Value::Integer(ctx.disk.used_bytes() as i64),
+        "DISK.free" => Value::Integer(
+            i64::try_from(ctx.disk.free_bytes).unwrap_or(i64::MAX),
+        ),
+        "DISK.used" => Value::Integer(
+            i64::try_from(ctx.disk.used_bytes()).unwrap_or(i64::MAX),
+        ),
 
         // Network context
         "NETWORK.type" => Value::String(ctx.network.if_type.to_string()),
         "NETWORK.metered" => Value::Boolean(ctx.network.metered),
-        "NETWORK.bandwidth" => Value::Integer(ctx.network.bandwidth_bps.unwrap_or(0) as i64),
+        "NETWORK.bandwidth" => Value::Integer(
+            i64::try_from(ctx.network.bandwidth_bps.unwrap_or(0)).unwrap_or(i64::MAX),
+        ),
 
         // Power context
         "POWER.source" => Value::String(ctx.power.source.to_string()),
-        "POWER.battery" => Value::Integer(ctx.power.battery_pct.map_or(0, |p| p as i64)),
+        "POWER.battery" => Value::Integer(
+            ctx.power.battery_pct.map_or(0i64, i64::from),
+        ),
 
         // Time context
         "TIME.hour" => Value::Integer(i64::from(ctx.time.hour())),
@@ -82,16 +97,19 @@ fn resolve_identifier(id: &str, ctx: &EvalContext) -> Value {
         }
 
         // Peer context
-        "PEER.online" => Value::Integer(ctx.peer.online_count as i64),
-        "PEER.has_file" => Value::Integer(ctx.peer.peers_with_file as i64),
-        "PEER.count" => Value::Integer(ctx.peer.online_count as i64),
+        "PEER.online" | "PEER.count" => Value::Integer(
+            i64::try_from(ctx.peer.online_count).unwrap_or(i64::MAX),
+        ),
+        "PEER.has_file" => Value::Integer(
+            i64::try_from(ctx.peer.peers_with_file).unwrap_or(i64::MAX),
+        ),
 
         _ => Value::Integer(0),
     }
 }
 
 /// Compare two values with the given operator.
-fn compare(left: &Value, op: &Operator, right: &Value) -> bool {
+fn compare(left: &Value, op: Operator, right: &Value) -> bool {
     match op {
         Operator::Eq => value_eq(left, right),
         Operator::Ne => !value_eq(left, right),
@@ -107,10 +125,11 @@ fn compare(left: &Value, op: &Operator, right: &Value) -> bool {
 
 fn value_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
-        (Value::Integer(x), Value::Integer(y)) => x == y,
+        (Value::Integer(x), Value::Integer(y)) | (Value::Percentage(x), Value::Percentage(y)) => {
+            x == y
+        }
         (Value::Boolean(x), Value::Boolean(y)) => x == y,
         (Value::String(x), Value::String(y)) => x == y,
-        (Value::Percentage(x), Value::Percentage(y)) => x == y,
         // Cross-type: compare size/duration by converting to common unit
         (Value::Size(_, _), _) | (_, Value::Size(_, _)) => {
             a.to_bytes() == b.to_bytes() && a.to_bytes().is_some()
@@ -164,13 +183,13 @@ fn string_matches(haystack: &Value, pattern: &Value) -> bool {
             // Simple glob matching
             if p.contains('*') {
                 let parts: Vec<&str> = p.split('*').collect();
-                let mut idx = 0;
+                let mut idx = 0usize;
                 for (i, part) in parts.iter().enumerate() {
                     if part.is_empty() {
                         continue;
                     }
                     if i == 0 {
-                        if !s[idx..].starts_with(part) {
+                        if !s.get(idx..).is_some_and(|rest| rest.starts_with(part)) {
                             return false;
                         }
                         idx += part.len();
@@ -178,7 +197,7 @@ fn string_matches(haystack: &Value, pattern: &Value) -> bool {
                         if !s.ends_with(part) {
                             return false;
                         }
-                    } else if let Some(pos) = s[idx..].find(part) {
+                    } else if let Some(pos) = s.get(idx..).and_then(|rest| rest.find(part)) {
                         idx += pos + part.len();
                     } else {
                         return false;
@@ -228,7 +247,10 @@ fn build_from_pair(pair: pest::iterators::Pair<crate::Rule>) -> anyhow::Result<E
                 }
             }
             if exprs.len() == 1 {
-                Ok(exprs.into_iter().next().unwrap())
+                exprs
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("internal: expected one expr"))
             } else {
                 Ok(Expr::Or(exprs))
             }
@@ -243,25 +265,32 @@ fn build_from_pair(pair: pest::iterators::Pair<crate::Rule>) -> anyhow::Result<E
                 }
             }
             if exprs.len() == 1 {
-                Ok(exprs.into_iter().next().unwrap())
+                exprs
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("internal: expected one expr"))
             } else {
                 Ok(Expr::And(exprs))
             }
         }
         crate::Rule::primary => {
-            let inner = pair.into_inner().next().unwrap();
-            if inner.as_rule() == crate::Rule::expression {
-                // Parenthesised expression
-                build_from_pair(inner)
-            } else {
-                build_from_pair(inner)
-            }
+            let inner = pair
+                .into_inner()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("primary rule has no inner pair"))?;
+            build_from_pair(inner)
         }
         crate::Rule::comparison => {
             let mut inner = pair.into_inner();
-            let left = inner.next().unwrap();
-            let op = inner.next().unwrap();
-            let right = inner.next().unwrap();
+            let left = inner
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("comparison missing left operand"))?;
+            let op = inner
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("comparison missing operator"))?;
+            let right = inner
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("comparison missing right operand"))?;
 
             Ok(Expr::Comparison {
                 left: build_operand(left)?,
@@ -276,12 +305,18 @@ fn build_from_pair(pair: pest::iterators::Pair<crate::Rule>) -> anyhow::Result<E
 fn build_operand(pair: pest::iterators::Pair<crate::Rule>) -> anyhow::Result<Operand> {
     match pair.as_rule() {
         crate::Rule::operand => {
-            let inner = pair.into_inner().next().unwrap();
+            let inner = pair
+                .into_inner()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("operand has no inner pair"))?;
             build_operand(inner)
         }
         crate::Rule::identifier => Ok(Operand::Identifier(pair.as_str().to_string())),
         crate::Rule::literal => {
-            let inner = pair.into_inner().next().unwrap();
+            let inner = pair
+                .into_inner()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("literal has no inner pair"))?;
             Ok(Operand::Literal(parse_literal(inner)?))
         }
         _ => Err(anyhow::anyhow!(
@@ -293,7 +328,6 @@ fn build_operand(pair: pest::iterators::Pair<crate::Rule>) -> anyhow::Result<Ope
 
 fn parse_operator(s: &str) -> Operator {
     match s {
-        "==" => Operator::Eq,
         "!=" => Operator::Ne,
         "<" => Operator::Lt,
         "<=" => Operator::Le,
@@ -312,8 +346,12 @@ fn parse_literal(pair: pest::iterators::Pair<crate::Rule>) -> anyhow::Result<Val
         crate::Rule::boolean => Ok(Value::Boolean(pair.as_str() == "true")),
         crate::Rule::string => {
             let s = pair.as_str();
-            // Strip surrounding quotes
-            Ok(Value::String(s[1..s.len() - 1].to_string()))
+            // Strip surrounding quotes — the grammar guarantees these are ASCII
+            // quote characters at byte boundaries.
+            let inner = s
+                .get(1..s.len().saturating_sub(1))
+                .ok_or_else(|| anyhow::anyhow!("malformed string literal: {s}"))?;
+            Ok(Value::String(inner.to_string()))
         }
         crate::Rule::duration => {
             // The duration rule matches integer + suffix as one token
@@ -372,7 +410,7 @@ fn parse_size_literal(s: &str) -> anyhow::Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::*;
+    use crate::context::{EvalContext, FileFlags, NetworkType};
 
     #[test]
     fn parse_simple_comparison() {
@@ -462,8 +500,7 @@ mod tests {
     #[test]
     fn evaluate_or_expression() {
         let mut ctx = EvalContext::default();
-        ctx.file.cached = false;
-        ctx.file.pinned = true;
+        ctx.file.flags = FileFlags::default().with_pinned(true);
         let expr = parse_expr("FILE.cached == true || FILE.pinned == true").unwrap();
         assert!(evaluate(&expr, &ctx));
     }

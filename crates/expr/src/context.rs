@@ -14,6 +14,98 @@ pub struct EvalContext {
     pub peer: PeerContext,
 }
 
+/// Boolean flags for a file entry, packed into a single byte.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FileFlags(u8);
+
+impl FileFlags {
+    const SHARED: u8 = 1 << 0;
+    const STARRED: u8 = 1 << 1;
+    const DIRTY: u8 = 1 << 2;
+    const CACHED: u8 = 1 << 3;
+    const PINNED: u8 = 1 << 4;
+
+    /// Set the `cached` flag to the given value.
+    #[must_use]
+    pub const fn with_cached(self, value: bool) -> Self {
+        if value {
+            Self(self.0 | Self::CACHED)
+        } else {
+            Self(self.0 & !Self::CACHED)
+        }
+    }
+
+    /// Set the `pinned` flag to the given value.
+    #[must_use]
+    pub const fn with_pinned(self, value: bool) -> Self {
+        if value {
+            Self(self.0 | Self::PINNED)
+        } else {
+            Self(self.0 & !Self::PINNED)
+        }
+    }
+
+    /// Set the `shared` flag to the given value.
+    #[must_use]
+    pub const fn with_shared(self, value: bool) -> Self {
+        if value {
+            Self(self.0 | Self::SHARED)
+        } else {
+            Self(self.0 & !Self::SHARED)
+        }
+    }
+
+    /// Set the `starred` flag to the given value.
+    #[must_use]
+    pub const fn with_starred(self, value: bool) -> Self {
+        if value {
+            Self(self.0 | Self::STARRED)
+        } else {
+            Self(self.0 & !Self::STARRED)
+        }
+    }
+
+    /// Set the `dirty` flag to the given value.
+    #[must_use]
+    pub const fn with_dirty(self, value: bool) -> Self {
+        if value {
+            Self(self.0 | Self::DIRTY)
+        } else {
+            Self(self.0 & !Self::DIRTY)
+        }
+    }
+
+    /// Returns whether the `shared` flag is set.
+    #[must_use]
+    pub const fn shared(self) -> bool {
+        self.0 & Self::SHARED != 0
+    }
+
+    /// Returns whether the `starred` flag is set.
+    #[must_use]
+    pub const fn starred(self) -> bool {
+        self.0 & Self::STARRED != 0
+    }
+
+    /// Returns whether the `dirty` flag is set.
+    #[must_use]
+    pub const fn dirty(self) -> bool {
+        self.0 & Self::DIRTY != 0
+    }
+
+    /// Returns whether the `cached` flag is set.
+    #[must_use]
+    pub const fn cached(self) -> bool {
+        self.0 & Self::CACHED != 0
+    }
+
+    /// Returns whether the `pinned` flag is set.
+    #[must_use]
+    pub const fn pinned(self) -> bool {
+        self.0 & Self::PINNED != 0
+    }
+}
+
 /// File-level context.
 #[derive(Debug, Clone)]
 pub struct FileContext {
@@ -23,19 +115,47 @@ pub struct FileContext {
     pub name: String,
     pub modified: DateTime<Utc>,
     pub owner: String,
-    pub shared: bool,
-    pub starred: bool,
-    pub dirty: bool,
-    pub cached: bool,
-    pub pinned: bool,
+    pub flags: FileFlags,
 }
 
 impl FileContext {
-    #[must_use] pub fn age(&self) -> chrono::Duration {
+    /// Returns whether this file is shared.
+    #[must_use]
+    pub const fn shared(&self) -> bool {
+        self.flags.shared()
+    }
+
+    /// Returns whether this file is starred.
+    #[must_use]
+    pub const fn starred(&self) -> bool {
+        self.flags.starred()
+    }
+
+    /// Returns whether this file is dirty (locally modified).
+    #[must_use]
+    pub const fn dirty(&self) -> bool {
+        self.flags.dirty()
+    }
+
+    /// Returns whether this file is cached locally.
+    #[must_use]
+    pub const fn cached(&self) -> bool {
+        self.flags.cached()
+    }
+
+    /// Returns whether this file is pinned.
+    #[must_use]
+    pub const fn pinned(&self) -> bool {
+        self.flags.pinned()
+    }
+
+    #[must_use]
+    pub fn age(&self) -> chrono::Duration {
         Utc::now() - self.modified
     }
 
-    #[must_use] pub fn year(&self) -> i32 {
+    #[must_use]
+    pub fn year(&self) -> i32 {
         self.modified.year()
     }
 }
@@ -51,20 +171,21 @@ pub struct DeviceContext {
 }
 
 /// Disk context.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct DiskContext {
     pub total_bytes: u64,
     pub free_bytes: u64,
 }
 
 impl DiskContext {
-    #[must_use] pub const fn used_bytes(&self) -> u64 {
+    #[must_use]
+    pub const fn used_bytes(&self) -> u64 {
         self.total_bytes - self.free_bytes
     }
 }
 
 /// Network context.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct NetworkContext {
     pub if_type: NetworkType,
     pub metered: bool,
@@ -92,10 +213,11 @@ impl std::fmt::Display for NetworkType {
 }
 
 /// Power context.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct PowerContext {
     pub source: PowerSource,
-    pub battery_pct: Option<f64>,
+    /// Battery percentage 0–100, or `None` if no battery is present.
+    pub battery_pct: Option<u8>,
 }
 
 /// Power source.
@@ -117,24 +239,26 @@ impl std::fmt::Display for PowerSource {
 }
 
 /// Time context.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct TimeContext {
     pub now: DateTime<Utc>,
 }
 
 impl TimeContext {
-    #[must_use] pub fn hour(&self) -> u32 {
+    #[must_use]
+    pub fn hour(&self) -> u32 {
         self.now.hour()
     }
 
-    #[must_use] pub fn is_weekday(&self) -> bool {
+    #[must_use]
+    pub fn is_weekday(&self) -> bool {
         use chrono::Datelike;
         self.now.weekday().number_from_monday() <= 5
     }
 }
 
 /// Peer context (P2P).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct PeerContext {
     pub online_count: usize,
     pub peers_with_file: usize,
@@ -150,11 +274,7 @@ impl Default for EvalContext {
                 name: String::new(),
                 modified: Utc::now(),
                 owner: String::new(),
-                shared: false,
-                starred: false,
-                dirty: false,
-                cached: false,
-                pinned: false,
+                flags: FileFlags::default(),
             },
             device: DeviceContext {
                 id: String::new(),
