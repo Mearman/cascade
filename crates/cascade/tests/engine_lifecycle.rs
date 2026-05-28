@@ -104,14 +104,14 @@ async fn engine_mount_unmount_during_runtime() {
     engine.mount_backend(
         PathBuf::from("Projects"),
         Arc::new(NullBackend::new("projects")),
-    );
+    ).await;
 
     let tree = engine.vfs().read().unwrap();
     assert_eq!(tree.children().len(), 1);
     drop(tree);
 
     // Unmount it.
-    engine.unmount_backend(Path::new("Projects")).unwrap();
+    engine.unmount_backend(Path::new("Projects")).await.unwrap();
 
     let tree = engine.vfs().read().unwrap();
     assert!(tree.children().is_empty());

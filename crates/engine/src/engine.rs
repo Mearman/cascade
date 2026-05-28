@@ -9,10 +9,10 @@
 //! - Config resolver (.cascade file filtering)
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
-use tokio::sync::{RwLock, watch};
+use tokio::sync::watch;
 use tracing::info;
 
 use crate::backend::Backend;
@@ -72,13 +72,7 @@ impl Engine {
 
         let mut vfs_tree = VfsTree::new(root);
         for backend in &backends[1..] {
-            db.register_backend(
-                backend.id(),
-                "unknown",
-                backend.display_name(),
-                None,
-                None,
-            )?;
+            db.register_backend(backend.id(), "unknown", backend.display_name(), None, None)?;
             // Use the backend ID as the mount prefix for non-root backends.
             vfs_tree.mount(PathBuf::from(backend.id()), (*backend).clone());
         }
@@ -93,9 +87,13 @@ impl Engine {
 
         // P2P bridge (optional).
         let p2p = if config.enable_p2p {
-            let p2p_dir = config
-                .p2p_data_dir
-                .unwrap_or_else(|| config.db_path.parent().unwrap_or(Path::new(".")).join("p2p"));
+            let p2p_dir = config.p2p_data_dir.unwrap_or_else(|| {
+                config
+                    .db_path
+                    .parent()
+                    .unwrap_or(Path::new("."))
+                    .join("p2p")
+            });
             let p2p_engine = cascade_p2p::P2pEngine::new(&p2p_dir).await?;
             info!(device_id = %p2p_engine.device_id(), "P2P engine initialised");
             Some(P2pBridge::new(p2p_engine, db.clone()))
@@ -118,13 +116,13 @@ impl Engine {
 
     /// Mount a backend at a VFS prefix.
     pub async fn mount_backend(&self, prefix: PathBuf, backend: Arc<dyn Backend>) {
-        let mut tree = self.vfs.write().await;
+        let mut tree = self.vfs.write().unwrap();
         tree.mount(prefix, backend);
     }
 
     /// Unmount a backend from a VFS prefix.
     pub async fn unmount_backend(&self, prefix: &Path) -> Result<()> {
-        let mut tree = self.vfs.write().await;
+        let mut tree = self.vfs.write().unwrap();
         tree.unmount(prefix);
         Ok(())
     }
@@ -138,7 +136,7 @@ impl Engine {
         let presenter = Arc::new(NullPresenter);
 
         // Collect all backends from the VFS tree.
-        let tree = self.vfs.read().await;
+        let tree = self.vfs.read().unwrap();
         let mut backends = vec![tree.root().clone()];
         for (_, backend) in tree.children() {
             backends.push(backend.clone());
@@ -146,12 +144,8 @@ impl Engine {
         drop(tree);
 
         // Build and spawn the sync runner.
-        let sync_runner = SyncRunner::new(
-            self.db.clone(),
-            backends,
-            presenter,
-            self.config.clone(),
-        );
+        let sync_runner =
+            SyncRunner::new(self.db.clone(), backends, presenter, self.config.clone());
         let sync_handle = tokio::spawn(async move {
             if let Err(e) = sync_runner.run().await {
                 tracing::error!(error = %e, "sync runner exited with error");
@@ -356,19 +350,16 @@ mod tests {
         let engine = make_test_engine().await;
 
         engine
-            .mount_backend(
-                PathBuf::from("Work"),
-                Arc::new(NullBackend::new("work")),
-            )
+            .mount_backend(PathBuf::from("Work"), Arc::new(NullBackend::new("work")))
             .await;
 
-        let tree = engine.vfs().read().await;
+        let tree = engine.vfs().read().unwrap();
         assert_eq!(tree.children().len(), 1);
         drop(tree);
 
         engine.unmount_backend(Path::new("Work")).await.unwrap();
 
-        let tree = engine.vfs().read().await;
+        let tree = engine.vfs().read().unwrap();
         assert!(tree.children().is_empty());
     }
 
@@ -456,7 +447,7 @@ mod tests {
         .await
         .unwrap();
 
-        let tree = engine.vfs().read().await;
+        let tree = engine.vfs().read().unwrap();
         assert_eq!(tree.children().len(), 1);
         drop(tree);
 
