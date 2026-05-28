@@ -115,7 +115,47 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     /// Guided initial setup
-    Init,
+    Init {
+        /// Backend type (gdrive, s3)
+        #[arg(long)]
+        backend_type: Option<String>,
+
+        /// Name for this backend instance
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Mount point path
+        #[arg(long)]
+        mount_point: Option<String>,
+
+        /// S3 endpoint URL (for --backend-type s3)
+        #[arg(long)]
+        endpoint: Option<String>,
+
+        /// S3 bucket name (for --backend-type s3)
+        #[arg(long)]
+        bucket: Option<String>,
+
+        /// S3 region (for --backend-type s3)
+        #[arg(long)]
+        region: Option<String>,
+
+        /// S3 access key ID (for --backend-type s3)
+        #[arg(long)]
+        access_key_id: Option<String>,
+
+        /// S3 secret access key (for --backend-type s3)
+        #[arg(long)]
+        secret_access_key: Option<String>,
+
+        /// Google Drive `OAuth2` client ID (for --backend-type gdrive)
+        #[arg(long)]
+        client_id: Option<String>,
+
+        /// Google Drive `OAuth2` client secret (for --backend-type gdrive)
+        #[arg(long)]
+        client_secret: Option<String>,
+    },
 
     /// Start the daemon and mount all configured backends
     Start {
@@ -228,7 +268,32 @@ pub enum CacheCommands {
 impl Cli {
     pub async fn run(self, ctx: &CliContext) -> Result<()> {
         match self.command {
-            Commands::Init => init::run(ctx),
+            Commands::Init {
+                backend_type,
+                name,
+                mount_point,
+                endpoint,
+                bucket,
+                region,
+                access_key_id,
+                secret_access_key,
+                client_id,
+                client_secret,
+            } => init::run(
+                ctx,
+                init::InitFlags {
+                    backend_type,
+                    name,
+                    mount_point,
+                    endpoint,
+                    bucket,
+                    region,
+                    access_key_id,
+                    secret_access_key,
+                    client_id,
+                    client_secret,
+                },
+            ),
             Commands::Start { mount_point } => mount::start(ctx, mount_point.as_deref()).await,
             Commands::Stop => mount::stop(ctx),
             Commands::Restart => {
