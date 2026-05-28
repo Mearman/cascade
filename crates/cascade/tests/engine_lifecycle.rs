@@ -42,7 +42,6 @@ async fn full_engine_lifecycle() {
 
     // Shut down.
     engine.shutdown();
-    handle.sync_handle.abort();
     handle.cache_handle.abort();
 
     let status = engine.status();
@@ -74,7 +73,6 @@ async fn engine_start_stop_idempotent() {
     let handle = engine.start().unwrap();
     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     engine.shutdown();
-    handle.sync_handle.abort();
     handle.cache_handle.abort();
 }
 

@@ -21,6 +21,7 @@ use crate::cache::manager::{CacheManager, CacheManagerConfig};
 use crate::config::ConfigResolver;
 use crate::db::{PinRuleRecord, StateDb};
 use crate::p2p_bridge::P2pBridge;
+use crate::presenter::VfsPresenter;
 use crate::sync::runner::SyncRunner;
 use crate::vfs::VfsTree;
 
@@ -158,14 +159,12 @@ impl Engine {
         tree.unmount(prefix);
     }
 
-    /// Start the engine — spawns the sync runner and cache manager as
-    /// background tasks. Returns a handle for monitoring.
-    pub fn start(&self) -> Result<EngineHandle> {
-        // Build presenter wrapper that forwards to the VFS.
-        // The SyncRunner needs a presenter — we use a no-op here because
-        // the actual presenter (NFS, FUSE, etc.) is managed externally.
-        let presenter = Arc::new(NullPresenter);
-
+    /// Create a sync runner for polling all registered backends.
+    ///
+    /// The caller provides the presenter (typically the platform presenter —
+    /// NFS, FUSE, etc.) and is responsible for spawning the runner as a
+    /// background task.
+    pub fn create_sync_runner(&self, presenter: Arc<dyn VfsPresenter>) -> SyncRunner {
         // Collect all backends from the VFS tree.
         let tree = self
             .vfs
@@ -177,15 +176,14 @@ impl Engine {
         }
         drop(tree);
 
-        // Build and spawn the sync runner.
-        let sync_runner =
-            SyncRunner::new(self.db.clone(), backends, presenter, self.config.clone());
-        let sync_handle = tokio::spawn(async move {
-            if let Err(e) = sync_runner.run().await {
-                tracing::error!(error = %e, "sync runner exited with error");
-            }
-        });
+        SyncRunner::new(self.db.clone(), backends, presenter, self.config.clone())
+    }
 
+    /// Start the engine's background tasks (cache manager).
+    ///
+    /// The sync runner is not started here — use [`Engine::create_sync_runner`]
+    /// to build one with the real presenter, then spawn it yourself.
+    pub fn start(&self) -> Result<EngineHandle> {
         // Start cache manager background worker.
         let cancel_rx = self.cancel.subscribe();
         let cache_db = self.db.clone();
@@ -197,10 +195,7 @@ impl Engine {
 
         info!("engine started");
 
-        Ok(EngineHandle {
-            sync_handle,
-            cache_handle,
-        })
+        Ok(EngineHandle { cache_handle })
     }
 
     /// Graceful shutdown — signals all components to stop.
@@ -277,8 +272,6 @@ impl Engine {
 /// Handle returned by [`Engine::start()`] for monitoring background tasks.
 #[derive(Debug)]
 pub struct EngineHandle {
-    /// Join handle for the sync runner background task.
-    pub sync_handle: tokio::task::JoinHandle<()>,
     /// Join handle for the cache manager background task.
     pub cache_handle: tokio::task::JoinHandle<()>,
 }
@@ -309,46 +302,6 @@ pub struct CacheStatsSnapshot {
     pub pinned_count: usize,
     /// Total bytes used by cached and pinned files.
     pub total_bytes: u64,
-}
-
-/// Null presenter used by the engine for sync runner wiring.
-/// The actual platform presenter (NFS, FUSE, File Provider) is managed
-/// separately by the CLI layer.
-struct NullPresenter;
-
-#[async_trait::async_trait]
-impl crate::presenter::VfsPresenter for NullPresenter {
-    async fn upsert_item(&self, _item: crate::types::VfsItem) -> Result<()> {
-        Ok(())
-    }
-
-    async fn delete_item(&self, _id: &crate::types::ItemId) -> Result<()> {
-        Ok(())
-    }
-
-    async fn update_state(
-        &self,
-        _id: &crate::types::ItemId,
-        _state: crate::types::CacheState,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    async fn fetch_contents(&self, _id: &crate::types::ItemId) -> Result<PathBuf> {
-        anyhow::bail!("NullPresenter does not serve content")
-    }
-
-    async fn evict_item(&self, _id: &crate::types::ItemId) -> Result<()> {
-        Ok(())
-    }
-
-    async fn start(&self, _mount_point: &Path) -> Result<()> {
-        Ok(())
-    }
-
-    async fn stop(&self) -> Result<()> {
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -439,13 +392,10 @@ mod tests {
         let engine = make_test_engine().await;
         let handle = engine.start().unwrap();
 
-        // Give the tasks a moment to start.
+        // Give the task a moment to start.
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         engine.shutdown();
-
-        // Abort tasks (they should have already stopped via cancel).
-        handle.sync_handle.abort();
         handle.cache_handle.abort();
     }
 

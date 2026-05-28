@@ -2,3 +2,5 @@
 
 pub mod conflict;
 pub mod runner;
+
+pub use runner::SyncRunner;
