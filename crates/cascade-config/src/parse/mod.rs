@@ -15,7 +15,7 @@ pub trait ConfigLoader {
 
 /// Parse all `.cascade*` files in a directory, merging in deterministic order:
 /// gitignore-style → TOML → YAML → JSON.
-pub fn load_dir(dir: &std::path::Path) -> Option<CascadeConfig> {
+#[must_use] pub fn load_dir(dir: &std::path::Path) -> Option<CascadeConfig> {
     let mut result: Option<CascadeConfig> = None;
     let mut merge = |config: CascadeConfig| {
         if let Some(existing) = result.as_mut() {

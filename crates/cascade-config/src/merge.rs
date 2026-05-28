@@ -7,7 +7,7 @@ use crate::types::{CascadeConfig, ResolvedConfig};
 
 /// Walk from mount root to target directory, layering `.cascade` configs
 /// with child-overrides-parent precedence.
-pub fn resolve(mount_root: &Path, target_dir: &Path) -> ResolvedConfig {
+#[must_use] pub fn resolve(mount_root: &Path, target_dir: &Path) -> ResolvedConfig {
     let mut builder = ResolvedConfigBuilder::new();
 
     for dir in ancestors_between(mount_root, target_dir) {
@@ -20,7 +20,7 @@ pub fn resolve(mount_root: &Path, target_dir: &Path) -> ResolvedConfig {
 }
 
 /// Resolve config from an explicit list of configs (for testing).
-pub fn resolve_from_configs(configs: Vec<CascadeConfig>) -> ResolvedConfig {
+#[must_use] pub fn resolve_from_configs(configs: Vec<CascadeConfig>) -> ResolvedConfig {
     let mut builder = ResolvedConfigBuilder::new();
     for config in configs {
         builder.apply(config);

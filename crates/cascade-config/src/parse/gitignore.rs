@@ -7,7 +7,7 @@
 use crate::types::{CascadeConfig, IgnoreRule};
 
 /// Parse a gitignore-style `.cascade` file.
-pub fn parse(content: &str) -> CascadeConfig {
+#[must_use] pub fn parse(content: &str) -> CascadeConfig {
     let mut config = CascadeConfig::empty();
     let condition_stack: Vec<String> = Vec::new();
 
@@ -36,11 +36,7 @@ pub fn parse(content: &str) -> CascadeConfig {
         }
 
         // Ignore pattern (gitignore syntax)
-        let (negated, pattern) = if let Some(p) = trimmed.strip_prefix('!') {
-            (true, p)
-        } else {
-            (false, trimmed)
-        };
+        let (negated, pattern) = trimmed.strip_prefix('!').map_or((false, trimmed), |p| (true, p));
 
         let dir_only = pattern.ends_with('/');
 
@@ -56,7 +52,7 @@ pub fn parse(content: &str) -> CascadeConfig {
 }
 
 /// Parse a directive line (after the `:` prefix).
-fn parse_directive(directive: &str, _conditions: &[String], _config: &mut CascadeConfig) {
+const fn parse_directive(directive: &str, _conditions: &[String], _config: &mut CascadeConfig) {
     // Phase 1 only supports ignore rules.
     // Directives like `:cache`, `:lifecycle`, `:pin`, `:unpin`, `:p2p`
     // will be implemented in Phase 2+.

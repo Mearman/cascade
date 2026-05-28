@@ -30,12 +30,12 @@ pub struct CascadeConfig {
 
 impl CascadeConfig {
     /// An empty config with no rules.
-    pub fn empty() -> Self {
+    #[must_use] pub fn empty() -> Self {
         Self::default()
     }
 
     /// Merge another config into this one. Rules accumulate, scalars override.
-    pub fn merge(&mut self, other: CascadeConfig) {
+    pub fn merge(&mut self, other: Self) {
         self.ignore.extend(other.ignore);
         self.lifecycle.extend(other.lifecycle);
         self.pin.extend(other.pin);
@@ -121,7 +121,7 @@ pub struct ResolvedConfig {
 
 impl ResolvedConfig {
     /// Check if a given path should be ignored.
-    pub fn is_ignored(&self, path: &str, is_dir: bool) -> bool {
+    #[must_use] pub fn is_ignored(&self, path: &str, is_dir: bool) -> bool {
         let mut ignored = false;
         for rule in &self.ignores {
             if (!is_dir || !rule.dir_only) && glob_match(&rule.pattern, path) {
@@ -138,10 +138,9 @@ impl ResolvedConfig {
 fn glob_match(pattern: &str, path: &str) -> bool {
     if pattern.contains("**") {
         let parts: Vec<&str> = pattern.split("**").collect();
-        if parts.len() == 2 {
-            let (prefix, suffix) = (parts[0], parts[1]);
-            let prefix_ok = prefix.is_empty() || path.starts_with(prefix);
-            let suffix_ok = suffix.is_empty() || path.ends_with(suffix);
+        if let [prefix, suffix] = parts.as_slice() {
+            let prefix_ok = prefix.is_empty() || path.starts_with(*prefix);
+            let suffix_ok = suffix.is_empty() || path.ends_with(*suffix);
             return prefix_ok && suffix_ok;
         }
     }
@@ -159,31 +158,37 @@ fn star_match(pattern: &str, path: &str) -> bool {
         return pattern == path;
     }
     // Must match start and end
-    let first = segments[0];
-    let last = segments[segments.len() - 1];
-    let mut idx = 0;
-    if !first.is_empty() {
-        if !path[idx..].starts_with(first) {
-            return false;
-        }
-        idx += first.len();
-    }
-    if !last.is_empty() && !path.ends_with(last) {
-        return false;
-    }
-    // Check intermediate segments in order
-    let remaining = if last.is_empty() {
-        &path[idx..]
+    let first = segments.first().copied().unwrap_or("");
+    let last = segments.last().copied().unwrap_or("");
+
+    // Strip the fixed prefix from the front of path
+    let after_prefix = if first.is_empty() {
+        path
+    } else if let Some(rest) = path.strip_prefix(first) {
+        rest
     } else {
-        &path[idx..path.len() - last.len()]
+        return false;
     };
-    let mut search_from = 0;
-    for seg in &segments[1..segments.len() - 1] {
+
+    // Strip the fixed suffix from the end of the remaining path
+    let middle = if last.is_empty() {
+        after_prefix
+    } else if let Some(rest) = after_prefix.strip_suffix(last) {
+        rest
+    } else {
+        return false;
+    };
+
+    // Check intermediate segments appear in order within `middle`
+    let inner_segments = segments.get(1..segments.len() - 1).unwrap_or(&[]);
+    let mut remaining = middle;
+    for seg in inner_segments {
         if seg.is_empty() {
             continue;
         }
-        if let Some(pos) = remaining[search_from..].find(seg) {
-            search_from += pos + seg.len();
+        // Split on the first occurrence of `seg`; advance past it.
+        if let Some((_before, after)) = remaining.split_once(seg) {
+            remaining = after;
         } else {
             return false;
         }
