@@ -192,7 +192,7 @@ fn handle_read(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
     let file_result = decode_fh(args);
     match file_result {
         Ok((fh, rest)) => {
-            let offset = decode_u64(rest).ok().map(|(o, r)| (o, r));
+            let offset = decode_u64(rest).ok();
             let count = offset.and_then(|(_, r)| decode_u32(r).ok()).map(|(c, _)| c);
 
             let file_key = fh

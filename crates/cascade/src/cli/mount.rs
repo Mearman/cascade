@@ -7,7 +7,6 @@ use cascade_engine::config::ConfigResolver;
 use cascade_engine::db::StateDb;
 use cascade_engine::sync::runner::SyncRunner;
 use cascade_engine::vfs::VfsTree;
-use cascade_presenter_nfs::nfs::context::NfsContext;
 use cascade_presenter_nfs::nfs::server::{NfsServer, NfsServerConfig};
 
 /// Start the Cascade daemon.
@@ -46,18 +45,20 @@ pub async fn start(mount_point: Option<&str>) -> Result<()> {
 
     std::fs::create_dir_all(&mount_path)?;
 
-    // Start NFS server on loopback.
+    // Create presenter (which creates the NFS context internally).
+    let presenter = Arc::new(
+        cascade_presenter_nfs::NfsPresenter::with_vfs(&mount_path, tree.clone()),
+    );
+
+    // Start NFS server on loopback, sharing the presenter's context.
     let server_config = NfsServerConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         export_path: "/".to_string(),
     };
-    let nfs_ctx = Arc::new(NfsContext::new(tree.clone()));
-    let server = NfsServer::start(server_config, nfs_ctx.clone()).await?;
+    let nfs_ctx = presenter.context().clone();
+    let server = NfsServer::start(server_config, nfs_ctx).await?;
     let nfs_port = server.local_addr.port();
     tracing::info!(port = nfs_port, "NFS server started");
-
-    // Create presenter.
-    let presenter = Arc::new(cascade_presenter_nfs::NfsPresenter::new(&mount_path));
 
     // Create config resolver for .cascade file filtering.
     let config = Arc::new(ConfigResolver::new(mount_path.clone()));

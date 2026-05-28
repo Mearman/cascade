@@ -105,6 +105,7 @@ impl FuseOps {
 
     /// Synchronously list a directory through the VFS tree.
     #[allow(dead_code)] // Used in #[cfg(target_os = "linux")] Filesystem impl
+    #[allow(clippy::await_holding_lock)]
     fn readdir_sync(
         &self,
         path: &std::path::Path,
@@ -112,7 +113,9 @@ impl FuseOps {
         let rt = tokio::runtime::Handle::current();
         rt.block_on(async {
             let vfs = self.vfs.read().unwrap();
-            vfs.read_dir(path).await
+            let result = vfs.read_dir(path).await;
+            drop(vfs);
+            result
         })
     }
 
