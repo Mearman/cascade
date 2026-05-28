@@ -16,7 +16,15 @@ fi
 export PATH="$HOME/.rustup/toolchains/1.89.0-aarch64-apple-darwin/bin:$PATH"
 export RUSTUP_TOOLCHAIN=1.89.0-aarch64-apple-darwin
 
+# Snapshot staged Rust files before formatting.
+staged_rs=()
+while IFS= read -r f; do
+    [[ -n "$f" ]] && staged_rs+=("$f")
+done < <(git diff --cached --name-only -- '*.rs')
+
 cargo fmt
 
-# Stage any formatting changes so they're included in this commit.
-git diff --name-only --diff-filter=M -- '*.rs' | xargs -r git add
+# Re-stage any of those files that cargo fmt reformatted.
+for f in "${staged_rs[@]+"${staged_rs[@]}"}"; do
+    git diff --quiet -- "$f" || git add -- "$f"
+done
