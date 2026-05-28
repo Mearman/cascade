@@ -3,6 +3,7 @@ pub mod schema;
 use crate::db::schema::SchemaVersion;
 use crate::types::*;
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 use std::path::Path;
 use std::sync::Mutex;
@@ -459,6 +460,90 @@ impl StateDb {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(entries)
     }
+
+    // ── P2P operations ──
+
+    /// Store block index for a file. Each block hash is recorded with its
+    /// ordinal position so blocks can be looked up in order.
+    pub fn index_p2p_blocks(&self, file_id: &ItemId, block_hashes: &[[u8; 32]]) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+        // Remove any previous index for this file.
+        conn.execute(
+            "DELETE FROM p2p_block_index WHERE file_id = ?1",
+            [&file_id.0],
+        )?;
+        for (index, hash) in block_hashes.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO p2p_block_index (file_id, block_index, block_hash) VALUES (?1, ?2, ?3)",
+                (&file_id.0, index as i64, hash.as_slice()),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Get block hashes for a file, in ordinal order.
+    pub fn get_p2p_blocks(&self, file_id: &ItemId) -> Result<Vec<[u8; 32]>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT block_hash FROM p2p_block_index WHERE file_id = ?1 ORDER BY block_index ASC",
+        )?;
+        let hashes = stmt
+            .query_map([&file_id.0], |row| {
+                let hash_blob: Vec<u8> = row.get(0)?;
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&hash_blob[..32]);
+                Ok(arr)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(hashes)
+    }
+
+    /// Store or update a known peer.
+    pub fn upsert_peer(
+        &self,
+        device_id: &str,
+        address: &str,
+        last_seen: DateTime<Utc>,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO p2p_peers (device_id, addresses, last_seen, online) VALUES (?1, ?2, ?3, TRUE)",
+            (device_id, address, last_seen.timestamp()),
+        )?;
+        Ok(())
+    }
+
+    /// List all known peers.
+    pub fn list_peers(&self) -> Result<Vec<PeerRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {}", e))?;
+        let mut stmt =
+            conn.prepare("SELECT device_id, name, addresses, last_seen, online FROM p2p_peers")?;
+        let peers = stmt
+            .query_map([], |row| {
+                let last_seen_ts: Option<i64> = row.get(3)?;
+                Ok(PeerRecord {
+                    device_id: row.get(0)?,
+                    name: row.get(1)?,
+                    addresses: row.get(2)?,
+                    last_seen: last_seen_ts.and_then(|ts| DateTime::from_timestamp(ts, 0)),
+                    online: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(peers)
+    }
 }
 
 /// A registered backend row from the database.
@@ -489,6 +574,16 @@ pub struct LifecyclePolicyRecord {
     pub max_file_size: Option<i64>,
     pub priority: i32,
     pub conditions: Option<String>,
+}
+
+/// A P2P peer row from the database.
+#[derive(Debug, Clone)]
+pub struct PeerRecord {
+    pub device_id: String,
+    pub name: Option<String>,
+    pub addresses: Option<String>,
+    pub last_seen: Option<DateTime<Utc>>,
+    pub online: bool,
 }
 
 #[cfg(test)]
