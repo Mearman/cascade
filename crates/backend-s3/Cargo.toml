@@ -13,10 +13,10 @@ toml = { workspace = true }
 reqwest = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
-hmac = "0.12"
-sha2 = "0.10"
-hex = "0.4"
-url = "2"
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

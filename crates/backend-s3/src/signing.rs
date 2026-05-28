@@ -69,7 +69,7 @@ pub(crate) fn uri_encode(value: &str, encode_slash: bool) -> String {
             other => {
                 encoded.push('%');
                 // Two hex digits; write! into String never fails.
-                write!(encoded, "{other:02X}").unwrap_or(());
+                let _ = write!(encoded, "{other:02X}");
             }
         }
     }

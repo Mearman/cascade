@@ -16,6 +16,15 @@ use chrono::{DateTime, Utc};
 use signing::{SigningParams, sha256_hex, sign, uri_encode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+// ── Constants ────────────────────────────────────────────────────────────────
+
+/// Maximum bytes buffered for a single `PutObject` upload.
+///
+/// S3 `PutObject` requires `Content-Length` upfront, so we must buffer the
+/// entire payload in memory. Objects larger than 5 GB require multipart upload,
+/// which is not yet implemented.
+const MAX_UPLOAD_BYTES: usize = 5 * 1024 * 1024 * 1024;
+
 // ── Config ───────────────────────────────────────────────────────────────────
 
 /// Configuration for an S3-compatible backend.
@@ -372,6 +381,62 @@ fn parse_list_response(
     Ok((entries, next_token))
 }
 
+/// Parse the XML body of a flat (no-delimiter) `ListObjectsV2` response into
+/// file entries.
+///
+/// Unlike [`parse_list_response`], this does not apply a depth filter — it
+/// returns all objects regardless of how many path components they contain.
+/// Used by [`S3Backend::list_all_objects`] for recursive change detection.
+///
+/// Returns `(entries, next_continuation_token)`.
+fn parse_flat_list_response(
+    xml: &str,
+    backend_id: &str,
+    prefix: &str,
+    parent_id: &ItemId,
+) -> anyhow::Result<(Vec<FileEntry>, Option<String>)> {
+    let mut entries = Vec::new();
+
+    for_each_xml_block(xml, "Contents", |block| {
+        let key = xml_text(block, "Key")
+            .ok_or_else(|| anyhow::anyhow!("ListObjectsV2 <Contents> missing <Key>"))?;
+
+        // Skip "directory" marker objects (keys ending in `/`).
+        if !key.ends_with('/') {
+            let size: u64 = xml_text(block, "Size")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+
+            let last_modified = xml_text(block, "LastModified")
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&Utc));
+
+            // Strip the prefix to get the path relative to the listing root.
+            let relative = key.strip_prefix(prefix).unwrap_or(key);
+
+            // The file name is the last path component.
+            let name = relative
+                .rsplit('/')
+                .next()
+                .filter(|n| !n.is_empty())
+                .unwrap_or(relative);
+
+            if !name.is_empty() {
+                let id = ItemId::new(backend_id, key);
+                let mut entry = FileEntry::file(id, parent_id.clone(), name.to_string())
+                    .with_size(Some(size));
+                entry.mod_time = last_modified;
+                entries.push(entry);
+            }
+        }
+        Ok(())
+    })?;
+
+    let next_token = xml_text(xml, "NextContinuationToken").map(String::from);
+
+    Ok((entries, next_token))
+}
+
 /// Parse a `HeadObject` response into a `FileEntry`.
 fn parse_head_response(
     headers: &reqwest::header::HeaderMap,
@@ -499,6 +564,13 @@ impl Backend for S3Backend {
 
         let mut data = Vec::new();
         reader.read_to_end(&mut data).await?;
+
+        // S3 PutObject requires Content-Length upfront. We buffer the full file.
+        // For objects > 5 GB, multipart upload (not yet implemented) is required.
+        if data.len() > MAX_UPLOAD_BYTES {
+            anyhow::bail!("upload exceeds 5 GB limit; multipart upload is not yet implemented");
+        }
+
         let content_length = data.len().to_string();
 
         let resp = self
@@ -575,7 +647,7 @@ impl Backend for S3Backend {
         let dst_key = self.key_for_path(dst);
         let dst_url = self.object_url(&dst_key);
 
-        let copy_source = format!("{}/{}", self.config.bucket, src_key);
+        let copy_source = format!("{}/{}", self.config.bucket, uri_encode(&src_key, false));
 
         let resp = self
             .signed_request(
@@ -605,13 +677,21 @@ impl Backend for S3Backend {
         let parent_key = self.key_for_path(parent_path);
         let parent_id = ItemId::new(&self.backend_id, &parent_key);
 
+        // Fetch real metadata for the destination object via HEAD.
+        let head_resp = self
+            .signed_request("HEAD", &dst_url, "", &[], &[])
+            .await?;
+        let head_resp = Self::check_response(head_resp).await?;
+        let dst_entry =
+            parse_head_response(head_resp.headers(), &dst_key, &name, &parent_id, &self.backend_id);
+
         tracing::debug!(
             src = %src.display(),
             dst = %dst.display(),
             "moved in S3"
         );
 
-        Ok(self.object_entry(&dst_key, &name, 0, Some(Utc::now()), &parent_id))
+        Ok(dst_entry)
     }
 
     async fn poll_interval(&self) -> Option<Duration> {
@@ -654,7 +734,7 @@ impl S3Backend {
             let xml = resp.text().await?;
 
             let (page_entries, next_token) =
-                parse_list_response(&xml, &self.backend_id, &prefix_with_slash, parent_id)?;
+                parse_flat_list_response(&xml, &self.backend_id, &prefix_with_slash, parent_id)?;
             entries.extend(page_entries);
 
             match next_token {
@@ -670,6 +750,17 @@ impl S3Backend {
     ///
     /// This is a public-facing method exposed through `Backend::changes` and
     /// used internally. It returns both file entries and directory entries.
+    ///
+    /// # Known limitation — continuation token double-encoding
+    ///
+    /// `list_url` URI-encodes query parameters when building the URL. The query
+    /// string is then extracted via `split_once('?')` and passed to
+    /// `signed_request` → `sign` → `build_canonical_query_string`, which
+    /// URI-encodes the values a second time. For most tokens this is harmless,
+    /// but tokens containing `+`, `=`, or other reserved characters will be
+    /// double-encoded, producing an invalid `SigV4` signature. The proper fix is
+    /// to separate raw parameter construction from URL construction so that the
+    /// canonical query string is built from unencoded key/value pairs.
     pub async fn list(&self, path: &Path) -> anyhow::Result<Vec<FileEntry>> {
         let list_prefix = self.list_prefix_for_path(path);
         let parent_key = self.key_for_path(path);
