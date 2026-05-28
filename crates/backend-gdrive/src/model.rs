@@ -29,8 +29,7 @@ impl DriveFile {
         let parent_id = self
             .parents
             .first()
-            .map(|p| ItemId::new(backend_id, p))
-            .unwrap_or(ItemId::new(backend_id, "root"));
+            .map_or_else(|| ItemId::new(backend_id, "root"), |p| ItemId::new(backend_id, p));
 
         let mod_time = self
             .modified_time

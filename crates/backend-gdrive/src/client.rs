@@ -7,6 +7,7 @@ use super::model::{AboutResponse, ChangesResponse, DriveFile, FileListResponse};
 
 /// Token-bucket rate limiter for Google Drive API.
 /// Allows ~10,000 requests per 100 seconds per user.
+#[derive(Debug)]
 pub struct RateLimiter {
     tokens: AtomicU32,
     max_tokens: u32,
@@ -60,6 +61,15 @@ pub struct DriveClient {
     rate_limiter: RateLimiter,
     base_url: String,
     upload_url: String,
+}
+
+impl std::fmt::Debug for DriveClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DriveClient")
+            .field("base_url", &self.base_url)
+            .field("upload_url", &self.upload_url)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for DriveClient {
@@ -199,6 +209,12 @@ impl DriveClient {
 
     /// Get the initial start page token for the Changes stream.
     pub async fn get_start_page_token(&self, token: &str) -> anyhow::Result<String> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct StartPageToken {
+            start_page_token: String,
+        }
+
         let resp = self
             .authenticated_get(
                 "changes/startPageToken",
@@ -206,11 +222,6 @@ impl DriveClient {
                 &[("supportsAllDrives", "true")],
             )
             .await?;
-        #[derive(serde::Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct StartPageToken {
-            start_page_token: String,
-        }
         let spt = resp.json::<StartPageToken>().await?;
         Ok(spt.start_page_token)
     }
@@ -379,10 +390,11 @@ impl DriveClient {
     ) -> anyhow::Result<DriveFile> {
         self.rate_limiter.acquire().await;
         let url = format!("{}/files/{file_id}?supportsAllDrives=true", self.base_url);
-        let mut body = serde_json::json!({});
+        let mut body = serde_json::Map::new();
         if let Some(name) = new_name {
-            body["name"] = serde_json::Value::String(name.to_string());
+            body.insert("name".to_string(), serde_json::Value::String(name.to_string()));
         }
+        let body = serde_json::Value::Object(body);
         // The addParents/removeParents params handle parent change.
         let resp = self
             .http

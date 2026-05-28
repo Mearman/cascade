@@ -82,6 +82,7 @@ pub fn create_backend(config: &toml::Value) -> anyhow::Result<Box<dyn Backend>> 
 }
 
 /// Google Drive backend implementation.
+#[derive(Debug)]
 pub struct GdriveBackend {
     drive: DriveClient,
     oauth: auth::OAuthConfig,
@@ -224,7 +225,7 @@ impl Backend for GdriveBackend {
 
             match found {
                 Some(f) => {
-                    current_id = f.id.clone();
+                    f.id.clone_into(&mut current_id);
                 }
                 None => anyhow::bail!("Path not found: {path_str}"),
             }
@@ -289,7 +290,7 @@ impl Backend for GdriveBackend {
             .unwrap_or("New Folder");
 
         // Resolve parent directory.
-        let parent = path.parent().unwrap_or(Path::new("/"));
+        let parent = path.parent().unwrap_or_else(|| Path::new("/"));
         let parent_id = if parent == Path::new("") || parent == Path::new("/") {
             "root".to_string()
         } else {
@@ -320,7 +321,7 @@ impl Backend for GdriveBackend {
         let file_id = src_entry.id.native_id();
 
         // Resolve destination parent.
-        let dst_parent = dst.parent().unwrap_or(Path::new("/"));
+        let dst_parent = dst.parent().unwrap_or_else(|| Path::new("/"));
         let dst_parent_id = if dst_parent == Path::new("") || dst_parent == Path::new("/") {
             "root".to_string()
         } else {

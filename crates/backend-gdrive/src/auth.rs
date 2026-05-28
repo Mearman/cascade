@@ -46,6 +46,7 @@ impl AuthTokens {
 }
 
 /// `OAuth2` configuration for Google Drive.
+#[derive(Debug)]
 pub struct OAuthConfig {
     pub client_id: String,
     pub client_secret: String,
@@ -90,6 +91,11 @@ pub async fn poll_for_token(
     device_code: &str,
     interval_secs: u64,
 ) -> anyhow::Result<AuthTokens> {
+    #[derive(Deserialize)]
+    struct ErrorBody {
+        error: String,
+    }
+
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
 
@@ -109,8 +115,8 @@ pub async fn poll_for_token(
 
         if status.is_success() {
             let token_resp: TokenResponse = serde_json::from_str(&body)?;
-            let expires_at =
-                chrono::Utc::now() + chrono::Duration::seconds(token_resp.expires_in as i64);
+            let secs = i64::try_from(token_resp.expires_in).unwrap_or(i64::MAX);
+            let expires_at = chrono::Utc::now() + chrono::Duration::seconds(secs);
             return Ok(AuthTokens {
                 access_token: token_resp.access_token,
                 refresh_token: token_resp.refresh_token.unwrap_or_default(),
@@ -119,19 +125,13 @@ pub async fn poll_for_token(
         }
 
         // Check for pending vs error.
-        #[derive(Deserialize)]
-        struct ErrorBody {
-            error: String,
-        }
-        let err: ErrorBody = serde_json::from_str(&body).unwrap_or(ErrorBody {
-            error: "unknown".to_string(),
-        });
+        let err: ErrorBody = serde_json::from_str(&body)
+            .unwrap_or_else(|_| ErrorBody { error: "unknown".to_string() });
 
         match err.error.as_str() {
-            "authorization_pending" => continue,
+            "authorization_pending" => {}
             "slow_down" => {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                continue;
             }
             "expired_token" => anyhow::bail!("Device code expired. Please try again."),
             other => anyhow::bail!("OAuth2 error: {other}"),
@@ -163,7 +163,8 @@ pub async fn refresh_access_token(
     }
 
     let token_resp: TokenResponse = resp.json().await?;
-    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(token_resp.expires_in as i64);
+    let secs = i64::try_from(token_resp.expires_in).unwrap_or(i64::MAX);
+    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(secs);
 
     Ok(AuthTokens {
         access_token: token_resp.access_token,
