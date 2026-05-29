@@ -8,7 +8,7 @@ $(BINARY):
 release: $(BINARY)
 
 start: $(BINARY)
-	$(BINARY) start
+	exec $(BINARY) start
 
 stop: $(BINARY)
 	$(BINARY) stop
@@ -17,7 +17,7 @@ build:
 	cargo build
 
 dev:
-	RUST_LOG="$${RUST_LOG:-debug}" cargo watch -x "run -- start"
+	exec env RUST_LOG="$${RUST_LOG:-debug}" cargo watch -x "run -- start"
 
 debug:
-	RUST_LOG="$${RUST_LOG:-debug}" $(BINARY) start
+	exec env RUST_LOG="$${RUST_LOG:-debug}" $(BINARY) start
