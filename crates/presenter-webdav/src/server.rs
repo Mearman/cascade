@@ -202,7 +202,10 @@ async fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> R
         };
 
         if cached.is_empty() && t.is_dir {
-            expand_directory(state, &t.id).await;
+            // Try DB first, fall back to API.
+            if hydrate_children_from_db(state, &target_id) == 0 {
+                expand_directory(state, &t.id).await;
+            }
             let items = read_items(&state.items);
             items
                 .values()
@@ -225,7 +228,10 @@ async fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> R
         };
 
         if cached.is_empty() {
-            expand_root(state, backend_prefix).await;
+            // Try DB first, fall back to API.
+            if hydrate_children_from_db(state, &root_id) == 0 {
+                expand_root(state, backend_prefix).await;
+            }
             let items = read_items(&state.items);
             items
                 .values()
@@ -712,6 +718,30 @@ pub fn item_path(item: &VfsItem) -> String {
     } else {
         format!("/{}", item.name)
     }
+}
+
+/// Try to populate children from the state database.
+/// Returns the number of items loaded (zero if no DB or no results).
+fn hydrate_children_from_db(state: &AppState, parent_id: &str) -> usize {
+    let Some(db) = &state.db else {
+        return 0;
+    };
+    let Ok(entries) = db.list_children(parent_id) else {
+        return 0;
+    };
+    if entries.is_empty() {
+        return 0;
+    }
+    let count = entries.len();
+    let mut items = state
+        .items
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for entry in entries {
+        let key = entry.id.0.clone();
+        items.insert(key, VfsItem::from(entry));
+    }
+    count
 }
 
 /// Resolve the full path for an item by walking its parent chain.
