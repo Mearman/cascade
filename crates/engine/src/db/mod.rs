@@ -458,6 +458,35 @@ impl StateDb {
         Ok(entries)
     }
 
+    /// List all file entries whose parent matches the given `ItemId` string.
+    pub fn list_children(&self, parent_id: &str) -> Result<Vec<FileEntry>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, parent_id, name, is_dir, size, mime_type, mod_time, remote_hash
+             FROM files WHERE parent_id = ?1",
+        )?;
+        let entries = stmt
+            .query_map([&parent_id], |row| {
+                Ok(FileEntry {
+                    id: ItemId(row.get(0)?),
+                    parent_id: ItemId(row.get(1)?),
+                    name: row.get(2)?,
+                    is_dir: row.get(3)?,
+                    size: row.get(4)?,
+                    mime_type: row.get(5)?,
+                    mod_time: row
+                        .get::<_, Option<i64>>(6)?
+                        .map(|ts| chrono::DateTime::from_timestamp(ts, 0).unwrap_or_default()),
+                    hash: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(entries)
+    }
+
     /// Get total cache size (sum of sizes of cached/pinned files).
     pub fn cache_size(&self) -> Result<i64> {
         let conn = self
