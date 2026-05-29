@@ -1,4 +1,4 @@
-.PHONY: start stop build dev release
+.PHONY: start stop build dev debug release
 
 BINARY := ./target/release/cascade
 
@@ -18,3 +18,6 @@ build:
 
 dev:
 	RUST_LOG="$${RUST_LOG:-debug}" cargo watch -x "run -- start"
+
+debug:
+	RUST_LOG="$${RUST_LOG:-debug}" $(BINARY) start
