@@ -1,4 +1,4 @@
-.PHONY: start build dev release
+.PHONY: start stop build dev release
 
 BINARY := ./target/release/cascade
 
@@ -9,6 +9,9 @@ release: $(BINARY)
 
 start: $(BINARY)
 	$(BINARY) start
+
+stop: $(BINARY)
+	$(BINARY) stop
 
 build:
 	cargo build
