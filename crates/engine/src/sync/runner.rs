@@ -537,6 +537,14 @@ mod tests {
             ))
         }
 
+        async fn update(
+            &self,
+            _file_id: &crate::types::FileId,
+            _reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+        ) -> anyhow::Result<crate::types::FileEntry> {
+            anyhow::bail!("not implemented")
+        }
+
         async fn create_dir(
             &self,
             _path: &std::path::Path,

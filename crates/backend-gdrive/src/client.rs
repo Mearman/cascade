@@ -177,6 +177,34 @@ impl DriveClient {
         Ok(list)
     }
 
+    /// Search for a file by name within a specific parent directory.
+    /// Returns at most one match (the first found).
+    pub async fn find_file_in_parent(
+        &self,
+        name: &str,
+        parent_id: &str,
+        token: &str,
+    ) -> anyhow::Result<Option<DriveFile>> {
+        self.rate_limiter.acquire().await;
+        let query = format!(
+            "'{parent_id}' in parents and name = '{}' and trashed = false",
+            name.replace('\\', "\\\\").replace('"', "\\\"")
+        );
+        let params = [
+            ("q", query.as_str()),
+            (
+                "fields",
+                "files(id,name,mimeType,parents,size,modifiedTime,md5Checksum,trashed)",
+            ),
+            ("pageSize", "1"),
+            ("supportsAllDrives", "true"),
+            ("includeItemsFromAllDrives", "true"),
+        ];
+        let resp = self.authenticated_get("files", token, &params).await?;
+        let list = resp.json::<FileListResponse>().await?;
+        Ok(list.files.into_iter().next())
+    }
+
     /// Download file content.
     pub async fn download_content(
         &self,

@@ -38,12 +38,20 @@ pub trait Backend: Send + Sync {
         writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
     ) -> anyhow::Result<()>;
 
-    /// Upload file content, replacing the existing file or creating a new one.
+    /// Upload a new file. Does not check for existing files — the caller
+    /// should use `update()` when overwriting.
     async fn upload(
         &self,
         path: &Path,
         reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
         parent_id: &FileId,
+    ) -> anyhow::Result<FileEntry>;
+
+    /// Overwrite the content of an existing file.
+    async fn update(
+        &self,
+        file_id: &FileId,
+        reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
     ) -> anyhow::Result<FileEntry>;
 
     /// Create a directory.
@@ -116,6 +124,14 @@ impl Backend for NullBackend {
         _parent_id: &FileId,
     ) -> anyhow::Result<FileEntry> {
         anyhow::bail!("null backend cannot upload")
+    }
+
+    async fn update(
+        &self,
+        _file_id: &FileId,
+        _reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+    ) -> anyhow::Result<FileEntry> {
+        anyhow::bail!("null backend cannot update")
     }
 
     async fn create_dir(&self, _path: &Path) -> anyhow::Result<FileEntry> {

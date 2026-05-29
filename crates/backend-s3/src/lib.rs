@@ -596,6 +596,44 @@ impl Backend for S3Backend {
         Ok(self.object_entry(&key, &name, size, Some(Utc::now()), &parent_id))
     }
 
+    async fn update(
+        &self,
+        file_id: &FileId,
+        reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+    ) -> anyhow::Result<FileEntry> {
+        let key = file_id.native_id();
+        let url = self.object_url(&key);
+
+        let mut data = Vec::new();
+        reader.read_to_end(&mut data).await?;
+
+        if data.len() > MAX_UPLOAD_BYTES {
+            anyhow::bail!("upload exceeds 5 GB limit; multipart upload is not yet implemented");
+        }
+
+        let content_length = data.len().to_string();
+
+        let resp = self
+            .signed_request(
+                "PUT",
+                &url,
+                &[],
+                &data,
+                &[("content-length", &content_length)],
+            )
+            .await?;
+        Self::check_response(resp).await?;
+
+        let size = u64::try_from(data.len()).unwrap_or(u64::MAX);
+        let parent_key = key
+            .rfind('/')
+            .map_or(String::new(), |i| key[..i].to_string());
+        let parent_id = ItemId::new(&self.backend_id, &parent_key);
+        let name = key.rsplit('/').next().unwrap_or(&key).to_string();
+
+        Ok(self.object_entry(&key, &name, size, Some(Utc::now()), &parent_id))
+    }
+
     async fn create_dir(&self, path: &Path) -> anyhow::Result<FileEntry> {
         // S3 has no real directories; we PUT a zero-byte object with a trailing slash.
         let key = format!("{}/", self.key_for_path(path));

@@ -419,7 +419,6 @@ async fn handle_put(state: &AppState, path: &str, req: Request) -> Response {
     let parent_id = if relative.is_empty() {
         cascade_engine::types::FileId(format!("{backend_id}:root"))
     } else {
-        // Walk up the path to find the parent directory in items.
         let parent_segments: Vec<&str> = if relative.len() > 1 {
             relative
                 .get(..relative.len().saturating_sub(1))
@@ -433,7 +432,9 @@ async fn handle_put(state: &AppState, path: &str, req: Request) -> Response {
             format!("/{backend_id}/{}", parent_segments.join("/"))
         };
         let parent_normalised = normalise_path(&parent_normalised);
-        let found_parent = {
+
+        // Try in-memory store first.
+        let found_in_items = {
             let Ok(items) = state.items.read() else {
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             };
@@ -443,17 +444,59 @@ async fn handle_put(state: &AppState, path: &str, req: Request) -> Response {
                     let ip = resolve_full_path(item, &items);
                     ip == parent_normalised
                 })
-                .cloned()
+                .map(|p| cascade_engine::types::FileId(p.id.0.clone()))
         };
-        match found_parent {
-            Some(p) => cascade_engine::types::FileId(p.id.0),
-            None => cascade_engine::types::FileId(format!("{backend_id}:root")),
+
+        if let Some(id) = found_in_items {
+            tracing::debug!(parent = %id.0, "parent found in items");
+            id
+        } else {
+            // Fall back to backend metadata to resolve the parent.
+            let parent_path_str = parent_segments.join("/");
+            let parent_path = Path::new(&parent_path_str);
+            tracing::info!(path = %parent_normalised, "resolving parent via backend metadata");
+            if let Ok(parent_entry) = backend.metadata(parent_path).await {
+                tracing::debug!(parent = %parent_entry.id.0, "parent found via backend");
+                cascade_engine::types::FileId(parent_entry.id.0)
+            } else {
+                tracing::warn!(
+                    path = %parent_normalised,
+                    "parent not found via items or backend, uploading to root"
+                );
+                cascade_engine::types::FileId(format!("{backend_id}:root"))
+            }
         }
     };
 
     let mut cursor = std::io::Cursor::new(bytes.clone());
-    match backend.upload(relative_path, &mut cursor, &parent_id).await {
+
+    // Check if a file with the same name already exists in the parent directory.
+    let existing_file_id = {
+        let Ok(items) = state.items.read() else {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
+        let file_normalised = normalise_path(&format!("/{path}"));
+        items
+            .values()
+            .find(|item| {
+                let ip = resolve_full_path(item, &items);
+                ip == file_normalised
+            })
+            .map(|item| cascade_engine::types::FileId(item.id.0.clone()))
+    };
+
+    let result = if let Some(file_id) = existing_file_id {
+        backend.update(&file_id, &mut cursor).await
+    } else {
+        backend.upload(relative_path, &mut cursor, &parent_id).await
+    };
+
+    match result {
         Ok(entry) => {
+            // Persist to state DB.
+            if let Some(db) = &state.db {
+                let _ = db.upsert_file(&entry);
+            }
             // Store the returned entry in the items map.
             let key = entry.id.0.clone();
             let vfs_item = VfsItem::from(entry);
@@ -526,6 +569,10 @@ async fn handle_delete(state: &AppState, path: &str) -> Response {
 
     match backend.delete(&file_entry).await {
         Ok(()) => {
+            // Remove from state DB.
+            if let Some(db) = &state.db {
+                let _ = db.delete_file(&ItemId(item_id.clone()));
+            }
             // Remove from cache and in-memory store.
             let cache_path = state.cache_dir.join(safe_filename(&item_id));
             let _ = tokio::fs::remove_file(&cache_path).await;
@@ -584,6 +631,10 @@ async fn handle_mkcol(state: &AppState, path: &str) -> Response {
 
     match backend.create_dir(relative_path).await {
         Ok(entry) => {
+            // Persist to state DB.
+            if let Some(db) = &state.db {
+                let _ = db.upsert_file(&entry);
+            }
             let mut items = state
                 .items
                 .write()
@@ -659,6 +710,11 @@ async fn handle_move(state: &AppState, src_path: &str, headers: &HeaderMap) -> R
 
     match backend.move_entry(&src_relative, &dest_relative).await {
         Ok(entry) => {
+            // Persist to state DB: delete old, insert new.
+            if let Some(db) = &state.db {
+                let _ = db.delete_file(&ItemId(src_key.clone()));
+                let _ = db.upsert_file(&entry);
+            }
             let mut items = state
                 .items
                 .write()
@@ -801,7 +857,8 @@ pub fn build_propfind_response(
 
     for child in children {
         let child_path = resolve_full_path(child, items);
-        let child_href = xml_escape(&format!("{child_path}/"));
+        let href_suffix = if child.is_dir { "/" } else { "" };
+        let child_href = xml_escape(&format!("{child_path}{href_suffix}"));
         responses.push_str(&build_response_element_escaped(&child_href, child));
     }
 

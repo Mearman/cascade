@@ -388,6 +388,56 @@ impl Backend for LocalBackend {
         Ok(self.state_to_entry(&state, false))
     }
 
+    async fn update(
+        &self,
+        file_id: &FileId,
+        reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+    ) -> anyhow::Result<FileEntry> {
+        let relative = file_id.native_id();
+        let full_path = self.root.join(&relative);
+
+        let mut data = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(reader, &mut data).await?;
+
+        if let Some(parent) = full_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(&full_path, &data).await?;
+
+        let size = u64::try_from(data.len()).unwrap_or(u64::MAX);
+        let metadata = tokio::fs::metadata(&full_path).await?;
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|d| {
+                chrono::DateTime::from_timestamp(i64::try_from(d.as_secs()).unwrap_or(0), 0)
+            });
+
+        let name = full_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        let parent_relative = Path::new(&relative)
+            .parent()
+            .and_then(|p| p.to_str())
+            .unwrap_or("")
+            .to_string();
+        let parent_id = ItemId::new(&self.id, &parent_relative);
+
+        Ok(FileEntry {
+            id: ItemId::new(&self.id, &relative),
+            parent_id,
+            name,
+            is_dir: false,
+            size: Some(size),
+            mod_time: modified,
+            mime_type: None,
+            hash: None,
+        })
+    }
+
     async fn create_dir(&self, path: &Path) -> anyhow::Result<FileEntry> {
         if self.mode == LocalMode::UploadOnly {
             anyhow::bail!("local backend is in upload-only mode");

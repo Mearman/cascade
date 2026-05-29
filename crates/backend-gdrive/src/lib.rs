@@ -308,13 +308,32 @@ impl Backend for GdriveBackend {
             .and_then(|n| n.to_str())
             .unwrap_or("untitled");
 
+        let native_parent = parent_id.native_id();
+
         let file = self
             .drive
-            .upload_file(file_name, parent_id.native_id(), &data, &token)
+            .upload_file(file_name, native_parent, &data, &token)
             .await?;
 
         file.to_file_entry(&self.instance_id)
             .ok_or_else(|| anyhow::anyhow!("upload returned trashed file"))
+    }
+
+    async fn update(
+        &self,
+        file_id: &cascade_engine::types::FileId,
+        reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+    ) -> anyhow::Result<FileEntry> {
+        let token = self.access_token().await?;
+
+        let mut data = Vec::<u8>::new();
+        tokio::io::AsyncReadExt::read_to_end(reader, &mut data).await?;
+
+        let native_id = file_id.native_id();
+        let file = self.drive.update_file(&native_id, &data, &token).await?;
+
+        file.to_file_entry(&self.instance_id)
+            .ok_or_else(|| anyhow::anyhow!("update returned trashed file"))
     }
 
     async fn create_dir(&self, path: &Path) -> anyhow::Result<FileEntry> {
