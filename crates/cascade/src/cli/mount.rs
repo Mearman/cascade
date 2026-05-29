@@ -83,7 +83,12 @@ pub async fn start(ctx: &CliContext, mount_point: Option<&str>) -> Result<()> {
         }
     };
 
-    std::fs::create_dir_all(&mount_path)?;
+    // Clean up any stale mount left behind by a previous run that
+    // exited without unmounting (e.g. kill -9, tmux kill, panic).
+    #[cfg(target_os = "macos")]
+    evict_stale_mount(&mount_path);
+
+    ensure_directory(&mount_path, "mount point")?;
 
     // On macOS: FSKit first (native, kext-free, POSIX), then WebDAV (no
     // root needed), then NFSv4/v3 fallback.  NFS already has the v4 → v3 →
@@ -574,15 +579,72 @@ fn write_pid_file(path: &Path) -> Result<()> {
 // macOS mount helpers
 // ---------------------------------------------------------------------------
 
+/// Remove stale `WebDAV` or NFS mounts on the given path left behind by a
+/// previous Cascade run that exited without clean shutdown.
+///
+/// Detects mounts whose remote endpoint is `http://127.0.0.1:` (`WebDAV`) or
+/// `127.0.0.1:/` (NFS) — Cascade-only patterns — so it never touches mounts
+/// belonging to other programs.
+#[cfg(target_os = "macos")]
+fn evict_stale_mount(mount_point: &Path) {
+    let path_str = mount_point.to_string_lossy();
+
+    let output = match std::process::Command::new("/sbin/mount").output() {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
+        Err(_) => return,
+    };
+
+    // Collect lines that mention our mount point *and* look like a Cascade
+    // WebDAV or NFS mount (localhost endpoint).
+    let stale: Vec<&str> = output
+        .lines()
+        .filter(|line| line.contains(&*path_str))
+        .filter(|line| {
+            line.contains("http://127.0.0.1:")
+                || line.contains("http://localhost:")
+                || line.contains("127.0.0.1:/")
+        })
+        .collect();
+
+    if stale.is_empty() {
+        return;
+    }
+
+    for entry in &stale {
+        tracing::warn!(path = %path_str, entry, "evicting stale mount");
+    }
+
+    // `umount` handles stacked mounts (multiple mounts on the same path)
+    // but only removes one per invocation. Call it in a loop until clean.
+    loop {
+        let result = std::process::Command::new("/sbin/umount")
+            .arg(mount_point)
+            .output();
+
+        match result {
+            Ok(o) if o.status.success() => {
+                tracing::info!(path = %path_str, "stale mount evicted");
+            }
+            Ok(_) => break, // no more mounts to remove
+            Err(e) => {
+                tracing::warn!(
+                    path = %path_str,
+                    error = %e,
+                    "failed to run umount; startup may fail"
+                );
+                break;
+            }
+        }
+    }
+}
+
 /// Mount `WebDAV` filesystem using the OS mount command (macOS).
 /// Uses `/sbin/mount_webdav` which does not require root.
 #[cfg(target_os = "macos")]
 fn mount_webdav(mount_point: &Path, port: u16) -> Result<()> {
-    if !mount_point.exists() {
-        std::fs::create_dir_all(mount_point)?;
-    }
+    ensure_directory(mount_point, "WebDAV mount point")?;
 
-    let url = format!("http://127.0.0.1:{port}/");
+    let url = format!("http://localhost:{port}/");
     tracing::info!(url = %url, mount = %mount_point.display(), "mounting WebDAV");
 
     let output = std::process::Command::new("/sbin/mount_webdav")
@@ -607,7 +669,7 @@ fn mount_webdav(mount_point: &Path, port: u16) -> Result<()> {
 #[cfg(test)]
 #[cfg(target_os = "macos")]
 fn webdav_mount_command(mount_point: &Path, port: u16) -> std::process::Command {
-    let url = format!("http://127.0.0.1:{port}/");
+    let url = format!("http://localhost:{port}/");
     let mut cmd = std::process::Command::new("/sbin/mount_webdav");
     cmd.arg(&url).arg(mount_point);
     cmd
@@ -643,9 +705,7 @@ fn unmount_path(mount_point: &Path) -> Result<()> {
 /// then fall back to v3 with osascript escalation.
 #[cfg(target_os = "macos")]
 fn mount_nfs(mount_point: &Path, port: u16) -> Result<()> {
-    if !mount_point.exists() {
-        std::fs::create_dir_all(mount_point)?;
-    }
+    ensure_directory(mount_point, "NFS mount point")?;
 
     let nfs_spec = "127.0.0.1:/".to_string();
     tracing::info!(spec = %nfs_spec, port, mount = %mount_point.display(), "mounting NFS");
@@ -793,6 +853,73 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ensure_directory_creates_missing_directory() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("Cloud");
+
+        ensure_directory(&path, "mount point").unwrap();
+
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn ensure_directory_rejects_existing_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("Cloud");
+        std::fs::write(&path, "not a directory").unwrap();
+
+        let error = ensure_directory(&path, "mount point").unwrap_err();
+        let message = format!("{error:#}");
+
+        assert!(message.contains("mount point"));
+        assert!(message.contains("exists but is not a directory"));
+    }
+
+    #[test]
+    fn read_text_file_includes_path_in_error() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("missing.pid");
+
+        let error = read_text_file(&path, "PID file").unwrap_err();
+        let message = format!("{error:#}");
+
+        assert!(message.contains("PID file"));
+        assert!(message.contains("missing.pid"));
+    }
+
+    #[test]
+    fn write_pid_file_includes_path_in_error() {
+        let dir = TempDir::new().unwrap();
+        // Create a directory where the file should go — write will fail.
+        let path = dir.path().join("subdir");
+        std::fs::create_dir_all(&path).unwrap();
+        let file_path = path.join("pid");
+        // Make the directory read-only so writing fails.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
+
+        let result = write_pid_file(&file_path);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let error = result.unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("PID file"));
+            assert!(message.contains("pid"));
+            // Restore permissions so TempDir can clean up.
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = result;
+        }
+    }
+
     // --- Stop ---
 
     #[test]
@@ -876,7 +1003,7 @@ mod tests {
             .map(std::ffi::OsStr::to_string_lossy)
             .map(std::borrow::Cow::into_owned)
             .collect();
-        assert_eq!(args[0], "http://127.0.0.1:52431/");
+        assert_eq!(args[0], "http://localhost:52431/");
         assert_eq!(args[1], mount_point.to_str().unwrap());
     }
 
