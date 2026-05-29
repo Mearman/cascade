@@ -47,12 +47,11 @@ impl PresenterResources {
 pub async fn start(ctx: &CliContext, mount_point: Option<&str>) -> Result<()> {
     tracing::info!("Starting Cascade daemon");
 
-    std::fs::create_dir_all(&ctx.config_dir)?;
+    ensure_directory(&ctx.config_dir, "config directory")?;
 
     // Bail early if the daemon is already running.
     if ctx.pid_path.exists() {
-        let raw = std::fs::read_to_string(&ctx.pid_path)
-            .with_context(|| format!("failed to read {}", ctx.pid_path.display()))?;
+        let raw = read_text_file(&ctx.pid_path, "PID file")?;
         if let Ok(pid) = raw.trim().parse::<u32>() {
             if is_process_alive(pid) {
                 anyhow::bail!("Cascade is already running (PID {pid}). Run `cascade stop` first.");
@@ -185,9 +184,9 @@ async fn try_fskit(
     // FSKit presenter.start() triggers the mount internally via the Swift
     // extension; no separate OS mount command is needed.
 
-    if let Err(e) = std::fs::write(&ctx.pid_path, std::process::id().to_string()) {
+    if let Err(e) = write_pid_file(&ctx.pid_path) {
         resources.shutdown();
-        return Err(e).context("failed to write PID file");
+        return Err(e);
     }
 
     println!("Cascade started (FSKit).");
@@ -289,9 +288,9 @@ async fn try_webdav(
         return Err(e);
     }
 
-    if let Err(e) = std::fs::write(&ctx.pid_path, std::process::id().to_string()) {
+    if let Err(e) = write_pid_file(&ctx.pid_path) {
         resources.shutdown();
-        return Err(e).context("failed to write PID file");
+        return Err(e);
     }
 
     println!("Cascade started (WebDAV).");
@@ -378,9 +377,9 @@ async fn try_nfs(
         return Err(e);
     }
 
-    if let Err(e) = std::fs::write(&ctx.pid_path, std::process::id().to_string()) {
+    if let Err(e) = write_pid_file(&ctx.pid_path) {
         resources.shutdown();
-        return Err(e).context("failed to write PID file");
+        return Err(e);
     }
 
     println!("Cascade started (NFS).");
@@ -418,8 +417,7 @@ pub fn stop(ctx: &CliContext) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let raw = std::fs::read_to_string(&ctx.pid_path)
-        .with_context(|| format!("failed to read {}", ctx.pid_path.display()))?;
+    let raw = read_text_file(&ctx.pid_path, "PID file")?;
     let pid_u32: u32 = raw.trim().parse().with_context(|| {
         format!(
             "invalid PID in {}: {:?}",
@@ -548,6 +546,28 @@ fn load_backend_config(config_dir: &Path, name: &str) -> Result<toml::Value> {
 fn resolve_mount_path(path: &str) -> PathBuf {
     let expanded = shellexpand::tilde(path).to_string();
     PathBuf::from(expanded)
+}
+
+/// Ensure a path exists as a directory, with a message that names the path.
+fn ensure_directory(path: &Path, label: &str) -> Result<()> {
+    if path.exists() && !path.is_dir() {
+        anyhow::bail!("{label} {} exists but is not a directory", path.display());
+    }
+
+    std::fs::create_dir_all(path)
+        .with_context(|| format!("failed to create {label} at {}", path.display()))
+}
+
+/// Read a text file with the file path included in the error message.
+fn read_text_file(path: &Path, label: &str) -> Result<String> {
+    std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {label} at {}", path.display()))
+}
+
+/// Write the current process ID to the PID file with a path-aware error.
+fn write_pid_file(path: &Path) -> Result<()> {
+    std::fs::write(path, std::process::id().to_string())
+        .with_context(|| format!("failed to write PID file at {}", path.display()))
 }
 
 // ---------------------------------------------------------------------------
