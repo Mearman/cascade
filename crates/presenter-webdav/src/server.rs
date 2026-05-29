@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::fmt::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use axum::Router;
@@ -128,15 +128,17 @@ async fn webdav_handler(State(state): State<AppState>, req: Request) -> Response
         Method::GET => handle_get(&state, &path).await,
         Method::PUT => handle_put(&state, &path, req).await,
         Method::DELETE => handle_delete(&state, &path).await,
-        m if m == Method::from_bytes(b"MKCOL").unwrap_or_default() => handle_mkcol(&state, &path),
+        m if m == Method::from_bytes(b"MKCOL").unwrap_or_default() => {
+            handle_mkcol(&state, &path).await
+        }
         m if m == Method::from_bytes(b"PROPFIND").unwrap_or_default() => {
             handle_propfind(&state, &path, req.headers()).await
         }
         m if m == Method::from_bytes(b"MOVE").unwrap_or_default() => {
-            handle_move(&state, &path, req.headers())
+            handle_move(&state, &path, req.headers()).await
         }
         m if m == Method::from_bytes(b"COPY").unwrap_or_default() => {
-            handle_copy(&state, &path, req.headers())
+            async move { handle_copy(&state, &path, req.headers()) }.await
         }
         Method::OPTIONS => handle_options(),
         _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
@@ -242,11 +244,10 @@ async fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> R
             let hydrated = hydrate_children_from_db(state, &root_id);
             let effective_root = if hydrated == 0 {
                 state.db.as_ref().and_then(|db| {
-                    resolve_root_id_from_db(db, backend_prefix)
-                        .and_then(|real_root| {
-                            let n = hydrate_children_from_db(state, &real_root);
-                            (n > 0).then_some(real_root)
-                        })
+                    resolve_root_id_from_db(db, backend_prefix).and_then(|real_root| {
+                        let n = hydrate_children_from_db(state, &real_root);
+                        (n > 0).then_some(real_root)
+                    })
                 })
             } else {
                 Some(root_id.clone())
@@ -302,7 +303,7 @@ async fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> R
 async fn handle_get(state: &AppState, path: &str) -> Response {
     let normalised = normalise_path(path);
 
-    let item_id = {
+    let (item_id, backend_id) = {
         let items = match state.items.read() {
             Ok(guard) => guard,
             Err(e) => {
@@ -310,103 +311,138 @@ async fn handle_get(state: &AppState, path: &str) -> Response {
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         };
-        items
-            .values()
-            .find(|item| {
-                resolve_full_path(item, &items) == normalised
-                    || resolve_full_path(item, &items) == path
-            })
-            .map(|item| item.id.0.clone())
+        let found = items.values().find(|item| {
+            let ip = resolve_full_path(item, &items);
+            ip == normalised || ip == path
+        });
+        match found {
+            Some(item) => (item.id.0.clone(), item.id.backend_id().to_string()),
+            None => return StatusCode::NOT_FOUND.into_response(),
+        }
     };
 
-    let Some(item_id) = item_id else {
+    // Try local cache first.
+    let cache_path = state.cache_dir.join(safe_filename(&item_id));
+    if let Ok(data) = tokio::fs::read(&cache_path).await {
+        let mut response = Response::new(Body::from(data));
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        );
+        return response;
+    }
+
+    // Fall back to backend download.
+    let backend = {
+        let backends = state.backends.read().await;
+        backends.iter().find(|b| b.id() == backend_id).cloned()
+    };
+    let Some(backend) = backend else {
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    let cache_path = state.cache_dir.join(safe_filename(&item_id));
-    tokio::fs::read(&cache_path).await.map_or_else(
-        |_| StatusCode::NOT_FOUND.into_response(),
-        |data| {
-            let mut response = Response::new(Body::from(data));
-            response.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("application/octet-stream"),
-            );
-            response
-        },
-    )
+    // Find the FileEntry for this item.
+    let file_entry = {
+        let Ok(items) = state.items.read() else {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
+        items
+            .get(&item_id)
+            .map(cascade_engine::types::FileEntry::from)
+    };
+    let Some(file_entry) = file_entry else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    // Download to a cache file, then serve it.
+    let _ = tokio::fs::create_dir_all(&state.cache_dir).await;
+    let download_cache = state.cache_dir.join(safe_filename(&item_id));
+    let mut file = match tokio::fs::File::create(&download_cache).await {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to create cache file");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    match backend.download(&file_entry, &mut file).await {
+        Ok(()) => {
+            drop(file);
+            tokio::fs::read(&download_cache).await.map_or_else(
+                |_| StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                |data| {
+                    let mut response = Response::new(Body::from(data));
+                    response.headers_mut().insert(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/octet-stream"),
+                    );
+                    response
+                },
+            )
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "backend download failed");
+            let _ = tokio::fs::remove_file(&download_cache).await;
+            StatusCode::NOT_FOUND.into_response()
+        }
+    }
 }
 
 /// Handle `PUT` — store file contents to the cache.
 async fn handle_put(state: &AppState, path: &str, req: Request) -> Response {
     let normalised = normalise_path(path);
 
-    // Find or create an item entry.
-    let item_id = {
-        let items = match state.items.read() {
-            Ok(guard) => guard,
-            Err(e) => {
-                tracing::error!(error = %e, "failed to read items lock");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-        };
-        items
-            .values()
-            .find(|item| {
-                resolve_full_path(item, &items) == normalised
-                    || resolve_full_path(item, &items) == path
-            })
-            .map(|item| item.id.0.clone())
+    // Parse backend prefix and relative path.
+    let parts: Vec<&str> = normalised.trim_start_matches('/').split('/').collect();
+    let Some((&backend_id, relative)) = parts.split_first() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let relative_path = relative.join("/");
+    let relative_path = Path::new(&relative_path);
+
+    // Find the backend.
+    let backend = {
+        let backends = state.backends.read().await;
+        backends.iter().find(|b| b.id() == backend_id).cloned()
+    };
+    let Some(backend) = backend else {
+        return StatusCode::NOT_FOUND.into_response();
     };
 
-    // If item doesn't exist, register a placeholder in the items map.
-    let id_key = item_id.unwrap_or_else(|| {
-        let native_id = normalised.trim_start_matches('/').replace('/', ":");
-        let parts: Vec<&str> = normalised.trim_start_matches('/').split('/').collect();
-        let name = parts.last().copied().unwrap_or("").to_string();
-        let parent_id_str = if parts.len() > 1 {
-            let end = parts.len() - 1;
-            parts.get(..end).map_or_else(String::new, |p| p.join(":"))
-        } else {
-            String::new()
-        };
-        let placeholder = VfsItem {
-            id: cascade_engine::types::ItemId(native_id.clone()),
-            parent_id: cascade_engine::types::ItemId(parent_id_str),
-            name,
-            is_dir: false,
-            size: None,
-            mod_time: None,
-            cache_state: cascade_engine::types::CacheState::Cached,
-            mime_type: None,
-        };
-        if let Ok(mut items) = state.items.write() {
-            items.insert(placeholder.id.0.clone(), placeholder);
-        }
-        native_id
-    });
+    // Read the request body.
+    let body_bytes = axum::body::to_bytes(req.into_body(), 100 * 1024 * 1024).await;
+    let Ok(bytes) = body_bytes else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
 
-    let cache_path = state.cache_dir.join(safe_filename(&id_key));
-    if let Some(parent) = cache_path.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
-    }
-
-    let body_bytes = axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024).await;
-    match body_bytes {
-        Ok(bytes) => {
-            if let Err(e) = tokio::fs::write(&cache_path, &bytes).await {
-                tracing::error!(error = %e, "failed to write cache file");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    // Upload via the backend.
+    let parent_id_str = format!("{backend_id}:root");
+    let file_id = cascade_engine::types::FileId(parent_id_str);
+    let mut cursor = std::io::Cursor::new(bytes.clone());
+    match backend.upload(relative_path, &mut cursor, &file_id).await {
+        Ok(entry) => {
+            // Store the returned entry in the items map.
+            let key = entry.id.0.clone();
+            let vfs_item = VfsItem::from(entry);
+            // Also cache locally for fast reads.
+            let cache_path = state.cache_dir.join(safe_filename(&key));
+            if let Some(parent) = cache_path.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
             }
-            // Update the item size.
-            if let Ok(mut items) = state.items.write()
-                && let Some(item) = items.get_mut(&id_key)
+            let _ = tokio::fs::write(&cache_path, &bytes).await;
+            // Now acquire the lock and insert (no await between lock and unlock).
             {
-                item.size = Some(u64::try_from(bytes.len()).unwrap_or(0));
+                let mut items = state
+                    .items
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                items.insert(key, vfs_item);
             }
             StatusCode::CREATED.into_response()
         }
-        Err(_) => StatusCode::BAD_REQUEST.into_response(),
+        Err(e) => {
+            tracing::warn!(error = %e, "backend upload failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 
@@ -414,7 +450,7 @@ async fn handle_put(state: &AppState, path: &str, req: Request) -> Response {
 async fn handle_delete(state: &AppState, path: &str) -> Response {
     let normalised = normalise_path(path);
 
-    let item_id = {
+    let (item_id, backend_id) = {
         let items = match state.items.read() {
             Ok(guard) => guard,
             Err(e) => {
@@ -422,42 +458,59 @@ async fn handle_delete(state: &AppState, path: &str) -> Response {
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         };
-        items
-            .values()
-            .find(|item| {
-                resolve_full_path(item, &items) == normalised
-                    || resolve_full_path(item, &items) == path
-            })
-            .map(|item| item.id.0.clone())
+        let found = items.values().find(|item| {
+            let ip = resolve_full_path(item, &items);
+            ip == normalised || ip == path
+        });
+        match found {
+            Some(item) => (item.id.0.clone(), item.id.backend_id().to_string()),
+            None => return StatusCode::NOT_FOUND.into_response(),
+        }
     };
 
-    let Some(item_id) = item_id else {
+    // Find the backend.
+    let backend = {
+        let backends = state.backends.read().await;
+        backends.iter().find(|b| b.id() == backend_id).cloned()
+    };
+    let Some(backend) = backend else {
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    // Remove from cache.
-    let cache_path = state.cache_dir.join(safe_filename(&item_id));
-    if cache_path.exists() {
-        let _ = tokio::fs::remove_file(&cache_path).await;
-    }
-
-    // Remove from in-memory store.
-    {
-        let mut items = match state.items.write() {
-            Ok(guard) => guard,
-            Err(e) => {
-                tracing::error!(error = %e, "failed to write items lock");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
+    // Build a FileEntry for the backend.
+    let file_entry = {
+        let Ok(items) = state.items.read() else {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         };
-        items.remove(&item_id);
-    }
+        items
+            .get(&item_id)
+            .map(cascade_engine::types::FileEntry::from)
+    };
+    let Some(file_entry) = file_entry else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
 
-    StatusCode::NO_CONTENT.into_response()
+    match backend.delete(&file_entry).await {
+        Ok(()) => {
+            // Remove from cache and in-memory store.
+            let cache_path = state.cache_dir.join(safe_filename(&item_id));
+            let _ = tokio::fs::remove_file(&cache_path).await;
+            let mut items = state
+                .items
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            items.remove(&item_id);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "backend delete failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 /// Handle `MKCOL` — create a directory.
-fn handle_mkcol(state: &AppState, path: &str) -> Response {
+async fn handle_mkcol(state: &AppState, path: &str) -> Response {
     let normalised = normalise_path(path);
 
     // Check if it already exists.
@@ -478,44 +531,41 @@ fn handle_mkcol(state: &AppState, path: &str) -> Response {
         }
     }
 
-    // Create a directory entry in the item store.
+    // Parse backend prefix and relative path.
     let parts: Vec<&str> = normalised.trim_start_matches('/').split('/').collect();
-    let name = parts.last().copied().unwrap_or("").to_string();
-    let parent_id = if parts.len() > 1 {
-        let end = parts.len() - 1;
-        parts.get(..end).map_or_else(String::new, |p| p.join(":"))
-    } else {
-        String::new()
+    let Some((&backend_id, relative)) = parts.split_first() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let relative_path = relative.join("/");
+    let relative_path = Path::new(&relative_path);
+
+    // Find the backend.
+    let backend = {
+        let backends = state.backends.read().await;
+        backends.iter().find(|b| b.id() == backend_id).cloned()
+    };
+    let Some(backend) = backend else {
+        return StatusCode::NOT_FOUND.into_response();
     };
 
-    let id_str = normalised.trim_start_matches('/').replace('/', ":");
-    let item = VfsItem {
-        id: cascade_engine::types::ItemId::new("webdav", &id_str),
-        parent_id: cascade_engine::types::ItemId::new("webdav", &parent_id),
-        name,
-        is_dir: true,
-        size: None,
-        mod_time: None,
-        cache_state: cascade_engine::types::CacheState::Online,
-        mime_type: None,
-    };
-
-    {
-        let mut items = match state.items.write() {
-            Ok(guard) => guard,
-            Err(e) => {
-                tracing::error!(error = %e, "failed to write items lock");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-        };
-        items.insert(item.id.0.clone(), item);
+    match backend.create_dir(relative_path).await {
+        Ok(entry) => {
+            let mut items = state
+                .items
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            items.insert(entry.id.0.clone(), VfsItem::from(entry));
+            StatusCode::CREATED.into_response()
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "backend create_dir failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
-
-    StatusCode::CREATED.into_response()
 }
 
 /// Handle `MOVE` — rename or move a resource.
-fn handle_move(state: &AppState, src_path: &str, headers: &HeaderMap) -> Response {
+async fn handle_move(state: &AppState, src_path: &str, headers: &HeaderMap) -> Response {
     let dest = headers
         .get("Destination")
         .and_then(|v| v.to_str().ok())
@@ -524,36 +574,70 @@ fn handle_move(state: &AppState, src_path: &str, headers: &HeaderMap) -> Respons
     let src_normalised = normalise_path(src_path);
     let dest_normalised = normalise_path(dest);
 
-    let mut items = match state.items.write() {
-        Ok(guard) => guard,
-        Err(e) => {
-            tracing::error!(error = %e, "failed to write items lock");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    // Resolve source item.
+    let (src_key, backend_id) = {
+        let items = match state.items.read() {
+            Ok(guard) => guard,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to read items lock");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+        let found = items.iter().find(|(_, item)| {
+            let ip = resolve_full_path(item, &items);
+            ip == src_normalised || ip == src_path
+        });
+        match found {
+            Some((k, item)) => (k.clone(), item.id.backend_id().to_string()),
+            None => return StatusCode::NOT_FOUND.into_response(),
         }
     };
 
-    // Find the source item by matching its path.
-    let src_key = items
-        .iter()
-        .find(|(_, item)| {
-            let ip = resolve_full_path(item, &items);
-            ip == src_normalised || ip == src_path
-        })
-        .map(|(k, _)| k.clone());
+    // Parse relative paths.
+    let src_parts: Vec<&str> = src_normalised.trim_start_matches('/').split('/').collect();
+    let dest_parts: Vec<&str> = dest_normalised.trim_start_matches('/').split('/').collect();
+    if src_parts.len() < 2 || dest_parts.len() < 2 {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let Some(src_relative) = src_parts
+        .get(1..)
+        .map(|p| p.join("/"))
+        .map(|s| Path::new(&s).to_path_buf())
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(dest_relative) = dest_parts
+        .get(1..)
+        .map(|p| p.join("/"))
+        .map(|s| Path::new(&s).to_path_buf())
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
 
-    let Some(src_key) = src_key else {
+    // Find the backend.
+    let backend = {
+        let backends = state.backends.read().await;
+        backends.iter().find(|b| b.id() == backend_id).cloned()
+    };
+    let Some(backend) = backend else {
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    // Update the item with a new name.
-    let dest_parts: Vec<&str> = dest_normalised.trim_start_matches('/').split('/').collect();
-    let new_name = dest_parts.last().copied().unwrap_or("").to_string();
-
-    if let Some(item) = items.get_mut(&src_key) {
-        item.name = new_name;
+    match backend.move_entry(&src_relative, &dest_relative).await {
+        Ok(entry) => {
+            let mut items = state
+                .items
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            items.remove(&src_key);
+            items.insert(entry.id.0.clone(), VfsItem::from(entry));
+            StatusCode::CREATED.into_response()
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "backend move_entry failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
-
-    StatusCode::CREATED.into_response()
 }
 
 /// Handle `COPY` — copy a resource.
@@ -818,9 +902,7 @@ fn resolve_root_id_from_db(db: &cascade_engine::db::StateDb, prefix: &str) -> Op
     // prefix with no real native ID, or it's not in the ids set).
     let mut root_candidates: std::collections::HashSet<&String> = std::collections::HashSet::new();
     for entry in &all {
-        if entry.id.0.starts_with(&prefix_colon)
-            && ids.contains(&entry.parent_id.0)
-        {
+        if entry.id.0.starts_with(&prefix_colon) && ids.contains(&entry.parent_id.0) {
             root_candidates.insert(&entry.parent_id.0);
         }
     }
