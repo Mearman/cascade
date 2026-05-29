@@ -225,7 +225,10 @@ mod linux {
 
             // Resolve parent ItemId from inode.
             let parent_id = {
-                let map = self.inode_map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let map = self
+                    .inode_map
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 map.get_id(parent_u64).cloned()
             };
 
@@ -238,7 +241,10 @@ mod linux {
             let child_path = format!("{}/{}", parent_id.0, name_str);
             match self.metadata_sync(std::path::Path::new(&child_path)) {
                 Ok(entry) => {
-                    let mut map = self.inode_map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let mut map = self
+                        .inode_map
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     let child_id = entry.id.clone();
                     let inode = map.allocate(child_id);
                     let attr = if entry.is_dir {
@@ -257,7 +263,10 @@ mod linux {
 
         fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
             let ino_u64 = u64::from(ino);
-            let map = self.inode_map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let map = self
+                .inode_map
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
 
             if ino_u64 == crate::inode::ROOT_INODE {
                 let attr = FileAttr::directory(ino_u64);
@@ -299,7 +308,10 @@ mod linux {
             mut reply: ReplyDirectory,
         ) {
             let ino_u64 = u64::from(ino);
-            let map = self.inode_map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let map = self
+                .inode_map
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
 
             if ino_u64 != crate::inode::ROOT_INODE {
                 // Only root is a directory for now.
@@ -367,7 +379,10 @@ mod linux {
             tracing::debug!(ino = ino_u64, offset, size, "read");
 
             let path = {
-                let map = self.inode_map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let map = self
+                    .inode_map
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 map.get_id(ino_u64).map(|id| id.0.clone())
             };
 
