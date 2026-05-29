@@ -259,12 +259,12 @@ fn mount_nfs(mount_point: &Path, port: u16) -> Result<()> {
         std::fs::create_dir_all(mount_point)?;
     }
 
-    let nfs_spec = format!("127.0.0.1:{port}:/");
-    tracing::info!(spec = %nfs_spec, mount = %mount_point.display(), "mounting NFS");
+    let nfs_spec = "127.0.0.1:/".to_string();
+    tracing::info!(spec = %nfs_spec, port, mount = %mount_point.display(), "mounting NFS");
 
     let output = std::process::Command::new("/sbin/mount_nfs")
         .arg("-o")
-        .arg("rw,resvport")
+        .arg(format!("rw,resvport,port={port}"))
         .arg(&nfs_spec)
         .arg(mount_point)
         .output()?;
@@ -275,11 +275,43 @@ fn mount_nfs(mount_point: &Path, port: u16) -> Result<()> {
             tracing::warn!(path = %mount_point.display(), "already mounted");
             return Ok(());
         }
+
+        // Retry with administrator privileges on permission errors.
+        if is_permission_error(&stderr) {
+            tracing::info!(path = %mount_point.display(), "retrying mount with administrator privileges");
+            let escalated = osascript_mount_command(mount_point, port).output()?;
+            if escalated.status.success() {
+                tracing::info!(path = %mount_point.display(), "NFS mounted (via administrator privileges)");
+                return Ok(());
+            }
+            let esc_stderr = String::from_utf8_lossy(&escalated.stderr);
+            anyhow::bail!("mount_nfs failed even with administrator privileges: {esc_stderr}");
+        }
+
         anyhow::bail!("mount_nfs failed: {stderr}");
     }
 
     tracing::info!(path = %mount_point.display(), "NFS mounted");
     Ok(())
+}
+
+/// Check if a `mount_nfs` stderr indicates a permission error.
+#[cfg(target_os = "macos")]
+fn is_permission_error(stderr: &str) -> bool {
+    stderr.contains("Operation not permitted")
+}
+
+/// Build an osascript command that mounts NFS with administrator privileges.
+#[cfg(target_os = "macos")]
+fn osascript_mount_command(mount_point: &Path, port: u16) -> std::process::Command {
+    let mount_cmd = format!(
+        "/sbin/mount_nfs -o rw,resvport,port={port} 127.0.0.1:/ {mp}",
+        mp = mount_point.display()
+    );
+    let script = format!("do shell script \"{mount_cmd}\" with administrator privileges");
+    let mut cmd = std::process::Command::new("osascript");
+    cmd.arg("-e").arg(&script);
+    cmd
 }
 
 /// Unmount the NFS filesystem.
@@ -342,7 +374,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn make_ctx(dir: &TempDir) -> CliContext {
-        let config_dir = dir.path().to_path_buf();
+        let config_dir: PathBuf = dir.path().to_path_buf();
         CliContext {
             db_path: config_dir.join("state.db"),
             pid_path: config_dir.join("cascade.pid"),
@@ -371,5 +403,49 @@ mod tests {
 
         // The stale PID file should have been removed.
         assert!(!ctx.pid_path.exists());
+    }
+
+    // --- Permission escalation ---
+
+    #[test]
+    fn is_permission_error_detects_operation_not_permitted() {
+        assert!(is_permission_error(
+            "mount_nfs: can't mount / from 127.0.0.1 onto /tmp/cloud: Operation not permitted"
+        ));
+    }
+
+    #[test]
+    fn is_permission_error_rejects_other_errors() {
+        assert!(!is_permission_error("mount_nfs: No such file or directory"));
+    }
+
+    #[test]
+    fn osascript_mount_command_constructs_correctly() {
+        let dir = TempDir::new().unwrap();
+        let mount_point = dir.path().join("Cloud");
+        let cmd = osascript_mount_command(&mount_point, 12345);
+
+        assert_eq!(cmd.get_program(), "osascript");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(std::ffi::OsStr::to_string_lossy)
+            .map(std::borrow::Cow::into_owned)
+            .collect();
+        assert_eq!(args[0], "-e");
+        assert!(args[1].contains("with administrator privileges"));
+        assert!(args[1].contains("port=12345"));
+        assert!(args[1].contains(mount_point.to_str().unwrap()));
+    }
+
+    #[test]
+    fn mount_nfs_on_unreachable_port_errors_without_privilege_escalation() {
+        // When mount_nfs fails with a non-permission error (e.g. connection
+        // refused), it should not try osascript escalation.
+        //
+        // We can't easily control mount_nfs output, but we CAN test the
+        // decision function directly — which is the real logic under test.
+        assert!(!is_permission_error("Connection refused"));
+        assert!(!is_permission_error("No such file or directory"));
+        assert!(is_permission_error("Operation not permitted"));
     }
 }
