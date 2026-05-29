@@ -65,69 +65,62 @@ pub async fn start(ctx: &CliContext, mount_point: Option<&str>) -> Result<()> {
 
     std::fs::create_dir_all(&mount_path)?;
 
-    // Create and start the engine.
-    let engine_config = EngineConfig {
-        db_path: ctx.db_path.clone(),
-        mount_point: mount_path.clone(),
-        backends,
-        cache_dir: None,
-        enable_p2p: false,
-        p2p_data_dir: None,
-    };
-    let engine = Engine::new(engine_config).await?;
-
-    // On macOS, prefer WebDAV mounting which works without root.
-    // NFS is the fallback for Linux and older macOS where WebDAV fails.
-    let mount_strategy = select_mount_strategy();
-    tracing::info!(strategy = %mount_strategy, "selected mount strategy");
-
-    #[cfg(target_os = "macos")]
-    match mount_strategy {
-        MountStrategy::WebDav => run_with_webdav(ctx, mount_path, engine).await,
-        MountStrategy::Nfs => run_with_nfs(ctx, mount_path, engine).await,
-    }
-    #[cfg(not(target_os = "macos"))]
-    match mount_strategy {
-        MountStrategy::Nfs => run_with_nfs(ctx, mount_path, engine).await,
-        MountStrategy::WebDav => {
-            anyhow::bail!("WebDAV mounting is not supported on this platform")
-        }
-    }
-}
-
-/// Mount strategy — `WebDAV` preferred on macOS, NFS elsewhere.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MountStrategy {
-    WebDav,
-    #[allow(dead_code)] // Used on non-macOS platforms
-    Nfs,
-}
-
-impl std::fmt::Display for MountStrategy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::WebDav => write!(f, "webdav"),
-            Self::Nfs => write!(f, "nfs"),
-        }
-    }
-}
-
-/// Select the best mount strategy for the current platform.
-const fn select_mount_strategy() -> MountStrategy {
+    // On macOS: WebDAV first (no root needed), then NFSv4, then NFSv3 with
+    // osascript escalation. NFS already has the v4 → v3 → escalation chain
+    // inside mount_nfs().
     #[cfg(target_os = "macos")]
     {
-        MountStrategy::WebDav
+        tracing::info!(strategy = "webdav", "attempting WebDAV mount");
+        let engine_config = EngineConfig {
+            db_path: ctx.db_path.clone(),
+            mount_point: mount_path.clone(),
+            backends,
+            cache_dir: None,
+            enable_p2p: false,
+            p2p_data_dir: None,
+        };
+        let engine = Engine::new(engine_config).await?;
+        match run_with_webdav(ctx, &mount_path, engine).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                tracing::warn!(error = %e, "WebDAV mount failed, falling back to NFS");
+                drop(e);
+                // Re-create backends for the NFS path. Arc clones are cheap,
+                // but backends was moved into the first engine — we must
+                // rebuild from config.
+                let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
+                let engine_config = EngineConfig {
+                    db_path: ctx.db_path.clone(),
+                    mount_point: mount_path.clone(),
+                    backends,
+                    cache_dir: None,
+                    enable_p2p: false,
+                    p2p_data_dir: None,
+                };
+                let engine = Engine::new(engine_config).await?;
+                run_with_nfs(ctx, &mount_path, engine).await
+            }
+        }
     }
     #[cfg(not(target_os = "macos"))]
     {
-        MountStrategy::Nfs
+        let engine_config = EngineConfig {
+            db_path: ctx.db_path.clone(),
+            mount_point: mount_path.clone(),
+            backends,
+            cache_dir: None,
+            enable_p2p: false,
+            p2p_data_dir: None,
+        };
+        let engine = Engine::new(engine_config).await?;
+        run_with_nfs(ctx, &mount_path, engine).await
     }
 }
 
 /// Run the daemon using `WebDAV` presenter.
 #[cfg(target_os = "macos")]
-async fn run_with_webdav(ctx: &CliContext, mount_path: PathBuf, engine: Engine) -> Result<()> {
-    let presenter = Arc::new(WebDavPresenter::new(&mount_path));
+async fn run_with_webdav(ctx: &CliContext, mount_path: &Path, engine: Engine) -> Result<()> {
+    let presenter = Arc::new(WebDavPresenter::new(mount_path));
     let items = presenter.items().clone();
 
     let sync_runner = engine.create_sync_runner(presenter.clone());
@@ -140,7 +133,7 @@ async fn run_with_webdav(ctx: &CliContext, mount_path: PathBuf, engine: Engine) 
     let handle = engine.start()?;
 
     // Start the WebDAV presenter's HTTP server.
-    presenter.start(&mount_path).await?;
+    presenter.start(mount_path).await?;
     let webdav_port = {
         let guard = presenter.server.lock().await;
         guard
@@ -149,7 +142,7 @@ async fn run_with_webdav(ctx: &CliContext, mount_path: PathBuf, engine: Engine) 
             .context("WebDAV server not started")?
     };
 
-    mount_webdav(&mount_path, webdav_port)?;
+    mount_webdav(mount_path, webdav_port)?;
 
     std::fs::write(&ctx.pid_path, std::process::id().to_string())?;
 
@@ -164,7 +157,7 @@ async fn run_with_webdav(ctx: &CliContext, mount_path: PathBuf, engine: Engine) 
 
     tracing::info!("Shutting down...");
 
-    unmount_path(&mount_path)?;
+    unmount_path(mount_path)?;
     presenter.stop().await?;
     drop(items);
     sync_handle.abort();
@@ -178,9 +171,9 @@ async fn run_with_webdav(ctx: &CliContext, mount_path: PathBuf, engine: Engine) 
 }
 
 /// Run the daemon using NFS presenter.
-async fn run_with_nfs(ctx: &CliContext, mount_path: PathBuf, engine: Engine) -> Result<()> {
+async fn run_with_nfs(ctx: &CliContext, mount_path: &Path, engine: Engine) -> Result<()> {
     let presenter = Arc::new(cascade_presenter_nfs::NfsPresenter::with_vfs(
-        &mount_path,
+        mount_path,
         engine.vfs().clone(),
     ));
 
@@ -203,7 +196,7 @@ async fn run_with_nfs(ctx: &CliContext, mount_path: PathBuf, engine: Engine) -> 
     let nfs_port = server.local_addr.port();
     tracing::info!(port = nfs_port, "NFS server started");
 
-    mount_nfs(&mount_path, nfs_port)?;
+    mount_nfs(mount_path, nfs_port)?;
 
     std::fs::write(&ctx.pid_path, std::process::id().to_string())?;
 
@@ -218,7 +211,7 @@ async fn run_with_nfs(ctx: &CliContext, mount_path: PathBuf, engine: Engine) -> 
 
     tracing::info!("Shutting down...");
 
-    unmount_path(&mount_path)?;
+    unmount_path(mount_path)?;
     server.stop()?;
     sync_handle.abort();
     engine.shutdown();
@@ -304,6 +297,25 @@ fn create_backend(
             .with_context(|| format!("failed to create s3 backend `{name}`")),
         other => anyhow::bail!("unsupported backend type: {other}"),
     }
+}
+
+/// Rebuild backends from the main config — used when falling back between
+/// presenters and the first engine consumed the original backend instances.
+fn rebuild_backends(
+    main_config: &CascadeConfig,
+    config_dir: &Path,
+) -> Result<Vec<Arc<dyn cascade_engine::backend::Backend>>> {
+    let mut backends: Vec<Arc<dyn cascade_engine::backend::Backend>> = Vec::new();
+    for (name, value) in &main_config.backends {
+        let backend_cfg: BackendConfig = value
+            .clone()
+            .try_into()
+            .with_context(|| format!("invalid config for backend `{name}`"))?;
+        let per_backend_config = load_backend_config(config_dir, name)?;
+        let backend = create_backend(name, &backend_cfg.backend_type, &per_backend_config)?;
+        backends.push(Arc::from(backend));
+    }
+    Ok(backends)
 }
 
 /// Load the top-level `config.toml` from the config directory.
@@ -642,20 +654,5 @@ mod tests {
             .collect();
         assert_eq!(args[0], "http://127.0.0.1:52431/");
         assert_eq!(args[1], mount_point.to_str().unwrap());
-    }
-
-    #[test]
-    fn mount_strategy_selects_correctly() {
-        let strategy = select_mount_strategy();
-        #[cfg(target_os = "macos")]
-        assert_eq!(strategy, MountStrategy::WebDav);
-        #[cfg(not(target_os = "macos"))]
-        assert_eq!(strategy, MountStrategy::Nfs);
-    }
-
-    #[test]
-    fn mount_strategy_display() {
-        assert_eq!(MountStrategy::WebDav.to_string(), "webdav");
-        assert_eq!(MountStrategy::Nfs.to_string(), "nfs");
     }
 }
