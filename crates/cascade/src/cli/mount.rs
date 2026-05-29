@@ -702,7 +702,7 @@ fn osascript_mount_command(mount_point: &Path, port: u16) -> std::process::Comma
 
 /// Unmount the NFS filesystem (kept for compatibility with non-macOS code paths).
 #[cfg(not(target_os = "macos"))]
-#[allow(clippy::unnecessary_wraps)]
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
 fn unmount_path(_mount_point: &Path) -> Result<()> {
     Ok(())
 }
