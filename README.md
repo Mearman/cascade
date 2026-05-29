@@ -8,10 +8,10 @@ Rust (edition 2024) · Swift (macOS File Provider extension) · SQLite state · 
 
 ### Prerequisites
 
-- Rust 1.85+ (edition 2024)
-- macOS: Xcode Command Line Tools (for Swift File Provider extension)
-- Linux: `libfuse3-dev` (for FUSE)
-- Windows: WinFSP installed
+- Rust toolchain pinned in [`rust-toolchain.toml`](rust-toolchain.toml) (currently 1.96.0, edition 2024). `rustup` installs it automatically on first build.
+- macOS: Xcode Command Line Tools (for Swift File Provider and FSKit extensions). FSKit requires macOS 15.4+ (Sequoia).
+- Linux: `libfuse3-dev` (for FUSE).
+- Windows: not yet supported (WinFSP/ProjFS presenter is planned, not implemented).
 
 ### Build
 
@@ -22,8 +22,20 @@ cargo build --release
 cargo build --release --features presenter-nfs
 cargo build --release --features presenter-fileprovider  # macOS only
 
-# Including Swift extension (macOS)
+# Including Swift extensions (macOS)
 cargo build --release && cd swift/CascadeFileProvider && xcodebuild
+cargo build --release && cd swift/CascadeFSKit && xcodebuild
+```
+
+The `Makefile` wraps the common workflows:
+
+```bash
+make release   # cargo build --release
+make build     # cargo build (debug)
+make start     # build then run the daemon
+make stop      # stop a running daemon
+make dev       # cargo watch with debug logging
+make debug     # run the release binary with RUST_LOG=debug
 ```
 
 ### Run
@@ -53,8 +65,9 @@ The design is documented in full at [`docs/design.md`](docs/design.md). This sec
 ```
 ┌──────────────────────────────────────────────────────────┐
 │  Platform Layer (per-OS)                                 │
-│  macOS: File Provider (Swift) · Linux: FUSE · Windows:   │
-│  WinFSP/ProjFS · Fallback: NFS server (all platforms)    │
+│  macOS: File Provider · FSKit (15.4+) · Linux: FUSE      │
+│  Windows: WinFSP/ProjFS (planned)                        │
+│  Universal fallback: NFS server · WebDAV server          │
 └────────────────────┬─────────────────────────────────────┘
                      │ VfsPresenter trait
 ┌────────────────────▼─────────────────────────────────────┐
@@ -64,32 +77,31 @@ The design is documented in full at [`docs/design.md`](docs/design.md). This sec
 └──────────────────────────────────────────────────────────┘
 ```
 
-Communication between the platform layer and the engine uses a Unix domain socket with a length-prefixed JSON protocol, shared by the CLI, the macOS File Provider extension, and any future GUI.
+Communication between the platform layer and the engine uses a Unix domain socket with a length-prefixed JSON protocol, shared by the CLI, the macOS File Provider and FSKit extensions, and any future GUI.
 
 ### Workspace structure
 
 ```
 crates/
   engine/                 VFS tree, backend trait, cache manager, sync, state DB
-  cascade/                .cascade parsing (4 formats), merge, directory walk
+  cascade-config/         .cascade parsing (4 formats), merge, directory walk
   expr/                   Conditional expression parser (PEG via pest) and evaluator
   p2p/                    BEP protocol, peer discovery, block store
   backend-gdrive/         Google Drive (Drive API v3, OAuth2 device code)
   backend-s3/             S3-compatible
-  backend-webdav/         Generic WebDAV
-  backend-dropbox/        Dropbox Files API
-  backend-onedrive/       OneDrive Graph API
   backend-local/          Local filesystem (adopt-and-sync)
-  presenter-nfs/          NFSv3 server + FUSE presenter (Linux)
-  presenter-fileprovider/  macOS File Provider bridge (Rust side)
-  presenter-winfsp/       Windows WinFSP / ProjFS presenter
-  cascade/                Binary crate (CLI entry point)
+  presenter-nfs/          NFSv3 server
+  presenter-fuse/         Linux FUSE presenter
+  presenter-webdav/       WebDAV server presenter (cross-platform)
+  presenter-fileprovider/ macOS File Provider bridge (Rust side)
+  presenter-fskit/        macOS FSKit bridge (Rust side, macOS 15.4+)
+  cascade/                Binary crate (CLI entry point and daemon)
 swift/
-  CascadeFileProvider/    macOS File Provider extension (~1,000 lines Swift)
-tests/
-  integration/            Backend, config, VFS, lifecycle integration tests
-  fixtures/               Sample .cascade files and mock backend responses
+  CascadeFileProvider/    macOS File Provider extension
+  CascadeFSKit/           macOS FSKit extension (15.4+)
 ```
+
+Integration tests live inside each crate's `tests/` directory rather than at workspace root.
 
 ### Key abstractions
 
@@ -112,6 +124,7 @@ SQLite at `~/.config/cascade/state.db`. Tables: `files`, `backends`, `pin_rules`
 - **Platform context** is injected via traits (`PlatformContext`), not pulled from global APIs. Each OS provides its own implementation behind the same contract.
 - **Backend crates** are self-contained: each exposes exactly one `create_backend` function and implements the `Backend` trait.
 - **Config merge semantics** differ by concern: ignore rules and pins accumulate, lifecycle policies are child-first first-match-wins, cache settings are nearest-wins, device config is root-only.
+- **Strict workspace lints** in `Cargo.toml`: pedantic, nursery, and cargo Clippy groups are denied, plus `unwrap_used`, `expect_used`, `indexing_slicing`, `string_slice`, and `unsafe_code`. New code must satisfy these without `#[allow]` escapes.
 
 ## Gotchas and quirks
 
