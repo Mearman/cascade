@@ -318,17 +318,19 @@ fn is_mounted(path: &Path) -> bool {
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(clippy::missing_const_for_fn, clippy::unused_self)]
 fn mount_nfs(_mount_point: &Path, _port: u16) -> Result<()> {
     anyhow::bail!("NFS mounting is not supported on this platform yet");
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)]
 fn unmount_nfs(_mount_point: &Path) -> Result<()> {
     Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
-#[allow(dead_code)]
+#[allow(clippy::missing_const_for_fn, dead_code)]
 fn is_mounted(_path: &Path) -> bool {
     false
 }
