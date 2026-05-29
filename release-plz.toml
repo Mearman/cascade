@@ -49,3 +49,38 @@ version_group = "workspace"
 name = "cascade-p2p"
 release = false
 version_group = "workspace"
+
+[[package]]
+name = "cascade-presenter-webdav"
+release = false
+version_group = "workspace"
+
+[[package]]
+name = "cascade-presenter-fskit"
+release = false
+version_group = "workspace"
+
+[[package]]
+name = "cascade-backend-s3"
+release = false
+version_group = "workspace"
+
+[[package]]
+name = "cascade-presenter-fileprovider"
+release = false
+version_group = "workspace"
+
+[[package]]
+name = "cascade-backend-dropbox"
+release = false
+version_group = "workspace"
+
+[[package]]
+name = "cascade-backend-webdav"
+release = false
+version_group = "workspace"
+
+[[package]]
+name = "cascade-backend-onedrive"
+release = false
+version_group = "workspace"

@@ -132,8 +132,29 @@ jobs:
         uses: taiki-e/install-action@13608cbb45b01feb47ef444ab1a42dc41ad56f1a # v2
         with:
           tool: release-plz
-      - name: Run release-plz
+      - name: Bump versions
+        run: |
+          release-plz update 2>&1
+      - name: Commit and push version bump
+        id: bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo 'No version bump to commit'
+            echo "bumped=false" >> "$GITHUB_OUTPUT"
+          else
+            VERSION=$(grep '^version =' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+            git commit -m "chore: release v${VERSION}"
+            git push
+            echo "bumped=true" >> "$GITHUB_OUTPUT"
+            echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+            echo "Bumped to v${VERSION}"
+          fi
+      - name: Create releases
         id: release
+        if: steps.bump.outputs.bumped == 'true'
         run: |
           set +e
           OUTPUT=$(release-plz release --git-token ${{ secrets.GITHUB_TOKEN }} 2>&1)
@@ -141,9 +162,7 @@ jobs:
           set -e
           echo "$OUTPUT"
 
-          # release-plz logs lines like "released cascade 0.1.0 (git-only)".
-          # Parse them to determine whether the binary crate was released
-          # and extract the version for downstream build jobs.
+          # release-plz logs lines like "released cascade 0.2.0 (git-only)".
           if echo "$OUTPUT" | grep -q 'released cascade ';
           then
             VERSION=$(echo "$OUTPUT" | grep 'released cascade ' | head -1 | grep -oP 'released cascade \K[^ ]+')
