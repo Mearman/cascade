@@ -1,4 +1,4 @@
-//! `NFSv3` server — TCP listener on loopback with RPC dispatch.
+//! ``NFSv3`` server — TCP listener on loopback with RPC dispatch.
 //!
 //! Listens for NFS and Mount protocol RPC messages, dispatches to the
 //! appropriate handler, and returns XDR-encoded replies.
@@ -11,6 +11,9 @@ use tokio::net::TcpListener;
 use super::context::NfsContext;
 use super::mount;
 use super::procedures;
+use super::v4::compound;
+use super::v4::state::StateManager;
+use super::v4::xdr as v4_xdr;
 use super::xdr::{
     MOUNT_PROGRAM, MOUNT_V3, NFS_PROGRAM, NFS_V3, RPC_ACCEPT_SUCCESS, RPC_AUTH_NONE, RPC_MSG_CALL,
     RPC_MSG_REPLY, RPC_REPLY_ACCEPTED, RPC_REPLY_DENIED, decode_u32, encode_u32,
@@ -41,6 +44,9 @@ pub struct NfsServer {
     /// The actual address the server bound to (useful when port is 0).
     pub local_addr: SocketAddr,
     shutdown: tokio::sync::oneshot::Sender<()>,
+    /// `NFSv4` state manager (kept alive for the server's lifetime).
+    #[allow(dead_code)] // Held for lifetime, not directly accessed
+    state_mgr: Arc<StateManager>,
 }
 
 impl std::fmt::Debug for NfsServer {
@@ -63,17 +69,21 @@ impl NfsServer {
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
+        let state_mgr = Arc::new(StateManager::new());
+        let state_mgr_clone = Arc::clone(&state_mgr);
+
         tokio::spawn(async move {
-            if let Err(e) = run_server(listener, shutdown_rx, ctx).await {
+            if let Err(e) = run_server(listener, shutdown_rx, ctx, state_mgr_clone).await {
                 tracing::error!(error = %e, "NFS server error");
             }
         });
 
-        tracing::info!(addr = %local_addr, "NFS server started");
+        tracing::info!(addr = %local_addr, "NFS server started (v3 + v4)");
 
         Ok(Self {
             local_addr,
             shutdown: shutdown_tx,
+            state_mgr,
         })
     }
 
@@ -95,15 +105,17 @@ async fn run_server(
     listener: TcpListener,
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
     ctx: Arc<NfsContext>,
+    state_mgr: Arc<StateManager>,
 ) -> anyhow::Result<()> {
     loop {
         tokio::select! {
             result = listener.accept() => {
                 let (stream, addr) = result?;
                 let ctx = ctx.clone();
+                let state_mgr = state_mgr.clone();
                 tracing::debug!(peer = %addr, "NFS connection accepted");
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, &ctx).await {
+                    if let Err(e) = handle_connection(stream, &ctx, &state_mgr).await {
                         tracing::warn!(peer = %addr, error = %e, "connection error");
                     }
                 });
@@ -123,6 +135,7 @@ async fn run_server(
 async fn handle_connection(
     mut stream: tokio::net::TcpStream,
     ctx: &Arc<NfsContext>,
+    state_mgr: &Arc<StateManager>,
 ) -> anyhow::Result<()> {
     loop {
         // Read length-prefixed RPC message.
@@ -145,7 +158,7 @@ async fn handle_connection(
         stream.read_exact(&mut msg_buf).await?;
 
         // Parse and dispatch.
-        let reply = dispatch_rpc(&msg_buf, ctx);
+        let reply = dispatch_rpc(&msg_buf, ctx, state_mgr);
 
         // Send length-prefixed reply.
         let reply_len = u32::try_from(reply.len()).unwrap_or(u32::MAX);
@@ -155,10 +168,10 @@ async fn handle_connection(
     }
 }
 
-/// Dispatch an RPC call to the correct handler (NFS or Mount).
+/// Dispatch an RPC call to the correct handler (`NFSv3`, `NFSv4`, or Mount).
 /// The input is the RPC call body (after the length prefix).
 /// Returns the complete RPC reply body (without length prefix).
-fn dispatch_rpc(msg: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
+fn dispatch_rpc(msg: &[u8], ctx: &Arc<NfsContext>, state_mgr: &Arc<StateManager>) -> Vec<u8> {
     // Parse RPC call header:
     //   xid (u32) + call body (msg_type=0 + rpc_version + program + version + procedure + auth)
     let Ok((xid, rest)) = decode_u32(msg) else {
@@ -199,12 +212,18 @@ fn dispatch_rpc(msg: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
         return make_rpc_error(xid, RPC_REPLY_DENIED);
     };
 
-    let args = msg.get(args_offset..).unwrap_or(&[]);
+    // args_offset is relative to `rest` (which starts after the procedure field).
+    // Convert to absolute offset within `msg`.
+    let abs_offset = msg.len() - rest.len() + args_offset;
+    let args = msg.get(abs_offset..).unwrap_or(&[]);
 
-    // Dispatch based on program.
-    let result = match program {
-        NFS_PROGRAM if version == NFS_V3 => procedures::handle_nfs_call(procedure, args, ctx),
-        MOUNT_PROGRAM if version == MOUNT_V3 => mount::handle_mount_call(procedure, args, ctx),
+    // Dispatch based on program and version.
+    let result = match (program, version) {
+        (NFS_PROGRAM, ver) if ver == NFS_V3 => procedures::handle_nfs_call(procedure, args, ctx),
+        (prog, ver) if prog == v4_xdr::NFS4_PROGRAM && ver == v4_xdr::NFS_V4 => {
+            handle_nfs4_call(procedure, args, ctx, state_mgr)
+        }
+        (MOUNT_PROGRAM, ver) if ver == MOUNT_V3 => mount::handle_mount_call(procedure, args, ctx),
         _ => return make_rpc_error(xid, RPC_REPLY_DENIED),
     };
 
@@ -219,6 +238,25 @@ fn dispatch_rpc(msg: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
     encode_u32(&mut reply, RPC_ACCEPT_SUCCESS);
     reply.extend_from_slice(&result);
     reply
+}
+
+/// Handle an `NFSv4` procedure call.
+/// `NFSv4` has only two procedures: NULL (0) and COMPOUND (1).
+fn handle_nfs4_call(
+    proc: u32,
+    args: &[u8],
+    ctx: &Arc<NfsContext>,
+    state_mgr: &Arc<StateManager>,
+) -> Vec<u8> {
+    match proc {
+        v4_xdr::NFSPROC4_NULL => vec![],
+        v4_xdr::NFSPROC4_COMPOUND => compound::handle_compound(args, ctx, state_mgr),
+        _ => {
+            let mut r = Vec::new();
+            v4_xdr::encode_u32(&mut r, v4_xdr::NFS4ERR_INVAL);
+            r
+        }
+    }
 }
 
 /// Build an RPC error reply.
@@ -254,7 +292,7 @@ fn skip_auth(data: &[u8]) -> Option<(&[u8], usize)> {
 #[cfg(test)]
 mod tests {
     use super::super::context::NfsContext;
-    use super::super::xdr::NFS3PROC_NULL;
+    use super::super::xdr::{NFS3PROC_NULL, RPC_REPLY_ACCEPTED};
     use super::{
         NFS_PROGRAM, NFS_V3, NfsServer, NfsServerConfig, RPC_ACCEPT_SUCCESS, RPC_AUTH_NONE,
         RPC_MSG_CALL, RPC_MSG_REPLY, decode_u32, dispatch_rpc, encode_u32,
@@ -276,7 +314,8 @@ mod tests {
         encode_u32(&mut call, RPC_AUTH_NONE);
         encode_u32(&mut call, 0);
 
-        let reply = dispatch_rpc(&call, &test_ctx());
+        let state_mgr = Arc::new(super::super::v4::state::StateManager::new());
+        let reply = dispatch_rpc(&call, &test_ctx(), &state_mgr);
         let (xid, rest) = decode_u32(&reply).unwrap();
         assert_eq!(xid, 1);
         let (msg_type, rest) = decode_u32(rest).unwrap();
@@ -289,6 +328,75 @@ mod tests {
         let (_, rest) = decode_u32(rest).unwrap(); // verifier len
         let (accept, _) = decode_u32(rest).unwrap();
         assert_eq!(accept, RPC_ACCEPT_SUCCESS);
+    }
+
+    #[test]
+    fn dispatch_nfs4_null_procedure() {
+        use super::super::v4::xdr as v4_xdr;
+
+        let mut call = Vec::new();
+        encode_u32(&mut call, 42); // xid
+        encode_u32(&mut call, RPC_MSG_CALL);
+        encode_u32(&mut call, 2); // rpc version
+        encode_u32(&mut call, v4_xdr::NFS4_PROGRAM);
+        encode_u32(&mut call, v4_xdr::NFS_V4);
+        encode_u32(&mut call, v4_xdr::NFSPROC4_NULL);
+        // AUTH_NONE
+        encode_u32(&mut call, RPC_AUTH_NONE);
+        encode_u32(&mut call, 0);
+
+        let state_mgr = Arc::new(super::super::v4::state::StateManager::new());
+        let reply = dispatch_rpc(&call, &test_ctx(), &state_mgr);
+        let (xid, rest) = decode_u32(&reply).unwrap();
+        assert_eq!(xid, 42);
+        let (msg_type, _) = decode_u32(rest).unwrap();
+        assert_eq!(msg_type, RPC_MSG_REPLY);
+    }
+
+    #[test]
+    fn dispatch_nfs4_compound() {
+        use super::super::v4::xdr as v4_xdr;
+
+        // Build a COMPOUND with PUTROOTFH + GETFH.
+        let mut compound_args = Vec::new();
+        v4_xdr::encode_string(&mut compound_args, ""); // tag
+        v4_xdr::encode_u32(&mut compound_args, 0); // minorversion
+        v4_xdr::encode_u32(&mut compound_args, 2); // num ops
+        v4_xdr::encode_u32(&mut compound_args, v4_xdr::OP_PUTROOTFH);
+        v4_xdr::encode_u32(&mut compound_args, v4_xdr::OP_GETFH);
+
+        let mut call = Vec::new();
+        encode_u32(&mut call, 100); // xid
+        encode_u32(&mut call, RPC_MSG_CALL);
+        encode_u32(&mut call, 2); // rpc version
+        encode_u32(&mut call, v4_xdr::NFS4_PROGRAM);
+        encode_u32(&mut call, v4_xdr::NFS_V4);
+        encode_u32(&mut call, v4_xdr::NFSPROC4_COMPOUND);
+        // AUTH_NONE
+        encode_u32(&mut call, RPC_AUTH_NONE);
+        encode_u32(&mut call, 0);
+        call.extend_from_slice(&compound_args);
+
+        let state_mgr = Arc::new(super::super::v4::state::StateManager::new());
+        let reply = dispatch_rpc(&call, &test_ctx(), &state_mgr);
+
+        // Verify RPC reply header.
+        let (xid, rest) = decode_u32(&reply).unwrap();
+        assert_eq!(xid, 100);
+        let (msg_type, rest) = decode_u32(rest).unwrap();
+        assert_eq!(msg_type, RPC_MSG_REPLY);
+        // reply_stat
+        let (reply_stat, rest) = decode_u32(rest).unwrap();
+        assert_eq!(reply_stat, RPC_REPLY_ACCEPTED);
+        // verifier
+        let (_, rest) = decode_u32(rest).unwrap(); // flavor
+        let (_, rest) = decode_u32(rest).unwrap(); // len
+        let (accept, rest) = decode_u32(rest).unwrap();
+        assert_eq!(accept, RPC_ACCEPT_SUCCESS);
+
+        // Parse COMPOUND reply: status.
+        let (compound_status, _) = v4_xdr::decode_u32(rest).unwrap();
+        assert_eq!(compound_status, v4_xdr::NFS4_OK);
     }
 
     #[tokio::test]
