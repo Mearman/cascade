@@ -28,6 +28,11 @@ pub struct AppState {
     pub backends: Arc<tokio::sync::RwLock<Vec<Arc<dyn cascade_engine::backend::Backend>>>>,
     /// State DB for persisting expanded items.
     pub db: Option<Arc<cascade_engine::db::StateDb>>,
+    /// Directories already expanded (by `ItemId` string), to avoid
+    /// redundant API calls when Finder sends repeated PROPFINDs.
+    pub expanded: Arc<RwLock<std::collections::HashSet<String>>>,
+    /// Semaphore limiting concurrent backend API calls during expansion.
+    pub expand_sem: Arc<tokio::sync::Semaphore>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -67,6 +72,8 @@ impl WebDavServer {
             cache_dir,
             backends,
             db,
+            expanded: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            expand_sem: Arc::new(tokio::sync::Semaphore::new(4)),
         };
 
         let app = Router::new().fallback(webdav_handler).with_state(state);
@@ -850,6 +857,17 @@ fn read_items(
 
 /// On-demand expansion: fetch children of a directory from its backend.
 async fn expand_directory(state: &AppState, item_id: &ItemId) {
+    // Skip if already expanded.
+    {
+        let expanded = state
+            .expanded
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if expanded.contains(&item_id.0) {
+            return;
+        }
+    }
+
     let backend_id = item_id.backend_id();
     let native_id = item_id.native_id();
 
@@ -861,6 +879,28 @@ async fn expand_directory(state: &AppState, item_id: &ItemId) {
         tracing::debug!(backend = %backend_id, "no backend found for expansion");
         return;
     };
+
+    // Acquire semaphore — limits concurrent API calls.
+    // SAFETY: the semaphore is owned by AppState and never closed,
+    // so acquire() is infallible at runtime.
+    #[allow(clippy::expect_used)]
+    let _permit = state
+        .expand_sem
+        .acquire()
+        .await
+        .expect("expand semaphore should not be closed");
+
+    // Double-check after acquiring the permit (another request may have
+    // expanded this while we waited).
+    {
+        let expanded = state
+            .expanded
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if expanded.contains(&item_id.0) {
+            return;
+        }
+    }
 
     tracing::info!(native_id = %native_id, "expanding directory");
 
@@ -881,6 +921,12 @@ async fn expand_directory(state: &AppState, item_id: &ItemId) {
                 }
                 items.insert(key, vfs_item);
             }
+            // Mark as expanded.
+            state
+                .expanded
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(item_id.0.clone());
         }
         Err(e) => {
             tracing::warn!(error = %e, "failed to expand directory");
@@ -890,6 +936,19 @@ async fn expand_directory(state: &AppState, item_id: &ItemId) {
 
 /// On-demand expansion: list root children for a virtual backend directory.
 async fn expand_root(state: &AppState, backend_prefix: &str) {
+    let root_key = format!("{backend_prefix}:root");
+
+    // Skip if already expanded.
+    {
+        let expanded = state
+            .expanded
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if expanded.contains(&root_key) {
+            return;
+        }
+    }
+
     let backend = {
         let backends = state.backends.read().await;
         backends.iter().find(|b| b.id() == backend_prefix).cloned()
@@ -898,6 +957,27 @@ async fn expand_root(state: &AppState, backend_prefix: &str) {
         tracing::debug!(backend = %backend_prefix, "no backend found for root expansion");
         return;
     };
+
+    // Acquire semaphore — limits concurrent API calls.
+    // SAFETY: the semaphore is owned by AppState and never closed,
+    // so acquire() is infallible at runtime.
+    #[allow(clippy::expect_used)]
+    let _permit = state
+        .expand_sem
+        .acquire()
+        .await
+        .expect("expand semaphore should not be closed");
+
+    // Double-check after acquiring the permit.
+    {
+        let expanded = state
+            .expanded
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if expanded.contains(&root_key) {
+            return;
+        }
+    }
 
     tracing::info!(backend = %backend_prefix, "expanding backend root");
 
@@ -918,6 +998,12 @@ async fn expand_root(state: &AppState, backend_prefix: &str) {
                 }
                 items.insert(key, vfs_item);
             }
+            // Mark as expanded.
+            state
+                .expanded
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(root_key);
         }
         Err(e) => {
             tracing::warn!(error = %e, "failed to expand backend root");
