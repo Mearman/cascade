@@ -74,8 +74,8 @@ impl WebDavPresenter {
     }
 
     /// Set the backends for on-demand directory expansion.
-    pub fn with_backends(&mut self, backends: Vec<Arc<dyn Backend>>) {
-        *self.backends.blocking_write() = backends;
+    pub async fn with_backends(&self, backends: Vec<Arc<dyn Backend>>) {
+        *self.backends.write().await = backends;
     }
 
     /// Set the state DB for persisting expanded items.

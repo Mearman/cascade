@@ -245,7 +245,7 @@ async fn try_webdav(
         }
         bs
     };
-    presenter.with_backends(all_backends);
+    presenter.with_backends(all_backends).await;
     presenter.with_db(engine.db().clone());
 
     let presenter = Arc::new(presenter);
