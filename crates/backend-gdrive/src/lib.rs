@@ -111,7 +111,10 @@ impl GdriveBackend {
 
         // Refresh if expired.
         if tokens.is_expired() {
-            let http = reqwest::Client::new();
+            let http = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_default();
             let refreshed =
                 auth::refresh_access_token(&http, &self.oauth, &tokens.refresh_token).await?;
             auth::save_tokens(&self.account, &refreshed)?;

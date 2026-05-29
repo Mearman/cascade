@@ -315,7 +315,7 @@ async fn handle_get(state: &AppState, path: &str) -> Response {
             let ip = resolve_full_path(item, &items);
             ip == normalised || ip == path
         });
-        tracing::debug!(path = %normalised, found = found.is_some(), "GET lookup");
+        tracing::debug!(path = %normalised, found = found.is_some(), items_count = items.len(), "GET lookup");
         match found {
             Some(item) => (item.id.0.clone(), item.id.backend_id().to_string()),
             None => return StatusCode::NOT_FOUND.into_response(),
@@ -448,13 +448,13 @@ async fn handle_put(state: &AppState, path: &str, req: Request) -> Response {
         };
 
         if let Some(id) = found_in_items {
-            tracing::debug!(parent = %id.0, "parent found in items");
+            tracing::info!(parent = %id.0, sought = %parent_normalised, "parent found in items");
             id
         } else {
             // Fall back to backend metadata to resolve the parent.
             let parent_path_str = parent_segments.join("/");
             let parent_path = Path::new(&parent_path_str);
-            tracing::info!(path = %parent_normalised, "resolving parent via backend metadata");
+            tracing::debug!(path = %parent_normalised, "parent NOT found in items, trying backend metadata");
             if let Ok(parent_entry) = backend.metadata(parent_path).await {
                 tracing::debug!(parent = %parent_entry.id.0, "parent found via backend");
                 cascade_engine::types::FileId(parent_entry.id.0)
@@ -512,6 +512,7 @@ async fn handle_put(state: &AppState, path: &str, req: Request) -> Response {
                     .items
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                tracing::debug!(key = %key, name = %vfs_item.name, parent = %vfs_item.parent_id.0, "PUT inserted item");
                 items.insert(key, vfs_item);
             }
             StatusCode::CREATED.into_response()

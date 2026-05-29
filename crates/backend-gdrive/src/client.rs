@@ -306,7 +306,7 @@ impl DriveClient {
         body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
 
         let url = format!(
-            "{}/files?uploadType=multipart&supportsAllDrives=true",
+            "{}/files?uploadType=multipart&supportsAllDrives=true&fields=id,name,mimeType,parents,size,modifiedTime,md5Checksum,trashed",
             self.upload_url
         );
         let resp = self
@@ -339,7 +339,7 @@ impl DriveClient {
     ) -> anyhow::Result<DriveFile> {
         self.rate_limiter.acquire().await;
         let url = format!(
-            "{}/files/{file_id}?uploadType=media&supportsAllDrives=true",
+            "{}/files/{file_id}?uploadType=media&supportsAllDrives=true&fields=id,name,mimeType,parents,size,modifiedTime,md5Checksum,trashed",
             self.upload_url
         );
         let resp = self
@@ -368,7 +368,10 @@ impl DriveClient {
         token: &str,
     ) -> anyhow::Result<DriveFile> {
         self.rate_limiter.acquire().await;
-        let url = format!("{}/files?supportsAllDrives=true", self.base_url);
+        let url = format!(
+            "{}/files?supportsAllDrives=true&fields=id,name,mimeType,parents,size,modifiedTime,md5Checksum,trashed",
+            self.base_url
+        );
         let body = serde_json::json!({
             "name": name,
             "mimeType": "application/vnd.google-apps.folder",
