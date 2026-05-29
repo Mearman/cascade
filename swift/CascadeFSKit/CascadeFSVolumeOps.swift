@@ -127,7 +127,7 @@ extension CascadeFSVolume: FSVolume.Operations {
             method: "getItem",
             params: ["id": cascadeItem.cascadeID]
         ) as? [String: Any] {
-            let updated = try CascadeFSItem(json: result)
+            let updated = try await CascadeFSItem(json: result)
             return updated.attributes
         }
         return cascadeItem.attributes
@@ -159,7 +159,7 @@ extension CascadeFSVolume: FSVolume.Operations {
             throw posixError(.ENOENT)
         }
 
-        let child = try CascadeFSItem(json: result)
+        let child = try await CascadeFSItem(json: result)
         dir.addItem(child)
         return (child, name)
     }
@@ -184,7 +184,18 @@ extension CascadeFSVolume: FSVolume.Operations {
             return
         }
 
-        let items = try result.map { try CascadeFSItem(json: $0) }
+        let items = try await withThrowingTaskGroup(of: CascadeFSItem.self) { group in
+            for entry in result {
+                group.addTask {
+                    try await CascadeFSItem(json: entry)
+                }
+            }
+            var collected: [CascadeFSItem] = []
+            for try await item in group {
+                collected.append(item)
+            }
+            return collected
+        }
         for item in items {
             dir.addItem(item)
         }
@@ -265,13 +276,18 @@ extension CascadeFSVolume: FSVolume.ReadWriteOperations {
             throw posixError(.EIO)
         }
 
-        // Write-back to the engine via protocol.
+        // Encode the payload as base64 so it transports cleanly inside the
+        // length-prefixed JSON wire protocol alongside the metadata fields.
+        let payload = contents.base64EncodedString()
+
+        // Write-back to the engine via protocol, carrying the actual payload.
         _ = try await engine.send(
             method: "writeContents",
             params: [
                 "id": cascadeItem.cascadeID,
                 "offset": Int(offset),
                 "length": contents.count,
+                "data": payload,
             ]
         )
 

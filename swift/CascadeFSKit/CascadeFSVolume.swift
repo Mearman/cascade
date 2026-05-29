@@ -17,8 +17,12 @@ final class CascadeFSVolume: FSVolume {
     private let logger = Logger(subsystem: "com.cascade.fskit", category: "CascadeFSVolume")
     let engine: EngineClient
 
+    /// The root item always uses the kernel's well-known root-directory
+    /// identifier. It is never created through the actor-isolated allocator
+    /// because it is built once, synchronously, in the volume constructor.
     private let root: CascadeFSItem = {
-        let item = CascadeFSItem(cascadeID: "root", name: FSFileName(string: "/"))
+        let rootID = UInt64(FSItem.Identifier.rootDirectory.rawValue)
+        let item = CascadeFSItem(cascadeID: "root", name: FSFileName(string: "/"), fileID: rootID)
         item.attributes.parentID = .parentOfRoot
         item.attributes.fileID = .rootDirectory
         item.attributes.uid = 0

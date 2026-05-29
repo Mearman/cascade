@@ -10,6 +10,26 @@
 import Foundation
 import FSKit
 
+/// Actor-isolated file-ID allocator.
+///
+/// FSKit dispatches its callbacks concurrently. A plain `static var`
+/// without synchronisation lets two concurrent `getNextID()` calls return
+/// the same value. Moving the counter behind an actor serialises access
+/// so every item gets a unique ID even under concurrent creation.
+private actor IDAllocator {
+    private var next: UInt64
+
+    init(startingFrom value: UInt64) {
+        next = value
+    }
+
+    func nextID() -> UInt64 {
+        let current = next
+        next += 1
+        return current
+    }
+}
+
 final class CascadeFSItem: FSItem {
 
     /// Cascade engine item identifier (format: "backend:native_id").
@@ -33,18 +53,56 @@ final class CascadeFSItem: FSItem {
     /// Child items for directories.
     private(set) var children: [FSFileName: CascadeFSItem] = [:]
 
-    private static var nextID: UInt64 = FSItem.Identifier.rootDirectory.rawValue + 1
+    /// Shared, actor-isolated ID allocator. Starts above the root-directory ID
+    /// so it never collides with well-known kernel constants.
+    private static let idAllocator = IDAllocator(
+        startingFrom: FSItem.Identifier.rootDirectory.rawValue + 1
+    )
 
-    static func getNextID() -> UInt64 {
-        let current = nextID
-        nextID += 1
-        return current
+    /// Maps cascade parent IDs to their `FSItem.Identifier` values.
+    /// Populated by `CascadeFSVolume` when items are created via engine
+    /// responses, so that children can resolve their real parent instead of
+    /// being flattened to the root.
+    private static var parentRegistry: [String: FSItem.Identifier] = [:]
+
+    /// Serialises mutations to `parentRegistry`.
+    private static let registryLock = NSLock()
+
+    /// Allocate the next unique file ID. The actor ensures that even when
+    /// two FSKit callbacks race through this path they cannot receive the
+    /// same value.
+    ///
+    /// `await` is required because `IDAllocator` is an actor. FSKit's volume
+    /// operations are already `async`, so the suspension cost is negligible.
+    static func allocateID() async -> UInt64 {
+        await idAllocator.nextID()
     }
 
-    init(cascadeID: String, name: FSFileName) {
+    /// Register a mapping from a cascade engine ID to the `FSItem.Identifier`
+    /// that was allocated for the same FSItem.
+    ///
+    /// Called by `CascadeFSVolumeOps` after each new `CascadeFSItem` is
+    /// constructed from an engine response, and then consulted by subsequently
+    /// created children that carry the same cascade ID in their `parent_id`
+    /// field.
+    static func registerParent(_ cascadeID: String, as fsIdentifier: FSItem.Identifier) {
+        registryLock.lock()
+        defer { registryLock.unlock() }
+        parentRegistry[cascadeID] = fsIdentifier
+    }
+
+    /// Look up the `FSItem.Identifier` for a cascade parent ID that was
+    /// previously registered with `registerParent(_:as:)`.
+    static func identifier(forParentCascadeID cascadeID: String) -> FSItem.Identifier? {
+        registryLock.lock()
+        defer { registryLock.unlock() }
+        return parentRegistry[cascadeID]
+    }
+
+    init(cascadeID: String, name: FSFileName, fileID: UInt64) {
         self.cascadeID = cascadeID
         self.name = name
-        self.fileID = CascadeFSItem.getNextID()
+        self.fileID = fileID
 
         var timespec = timespec()
         timespec_get(&timespec, TIME_UTC)
@@ -61,10 +119,11 @@ final class CascadeFSItem: FSItem {
     }
 
     /// Convenience initialiser from a JSON dictionary received from the engine.
-    convenience init(json: [String: Any]) throws {
+    convenience init(json: [String: Any]) async throws {
         let id = json["id"] as? String ?? ""
         let filename = json["filename"] as? String ?? "unknown"
-        self.init(cascadeID: id, name: FSFileName(string: filename))
+        let allocatedID = await CascadeFSItem.allocateID()
+        self.init(cascadeID: id, name: FSFileName(string: filename), fileID: allocatedID)
 
         if let isDir = json["is_directory"] as? Bool, isDir {
             attributes.type = .directory
@@ -85,12 +144,19 @@ final class CascadeFSItem: FSItem {
         if let parentID = json["parent_id"] as? String {
             if parentID == "root" {
                 attributes.parentID = .parentOfRoot
+            } else if let resolved = CascadeFSItem.identifier(forParentCascadeID: parentID) {
+                attributes.parentID = resolved
             } else {
-                // Map parent cascade ID to its FSItem.Identifier if known.
-                // For now we use the numeric representation.
-                attributes.parentID = .rootDirectory
+                // Parent not yet known — leave as the kernel default rather
+                // than falsely claiming root. The parent will be resolved on
+                // the next readdir that includes the real parent.
+                attributes.parentID = FSItem.Identifier.invalid
             }
         }
+
+        // Register this item so subsequent children created from engine
+        // responses can resolve their parent relationship back to us.
+        CascadeFSItem.registerParent(id, as: attributes.fileID)
 
         attributes.uid = 0
         attributes.gid = 0
