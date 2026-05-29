@@ -464,6 +464,15 @@ pub fn stop(ctx: &CliContext) -> anyhow::Result<()> {
     }
 
     let _ = std::fs::remove_file(&ctx.pid_path);
+
+    // Unmount the mount point if it's still mounted.
+    let mount_path = resolve_mount_path_from_config(&ctx.config_dir);
+    if mount_path.is_dir()
+        && let Err(e) = unmount_path(&mount_path)
+    {
+        tracing::debug!(error = %e, "unmount after stop failed (may already be unmounted)");
+    }
+
     println!("Cascade stopped.");
     Ok(())
 }
@@ -551,6 +560,23 @@ fn load_backend_config(config_dir: &Path, name: &str) -> Result<toml::Value> {
 fn resolve_mount_path(path: &str) -> PathBuf {
     let expanded = shellexpand::tilde(path).to_string();
     PathBuf::from(expanded)
+}
+
+/// Resolve the mount path from config.toml, falling back to ~/Cloud.
+fn resolve_mount_path_from_config(config_dir: &Path) -> PathBuf {
+    let main_config = load_main_config(config_dir).ok();
+    let configured = main_config.as_ref().and_then(|c| {
+        let p = c.mount.point.trim().to_string();
+        (!p.is_empty()).then_some(p)
+    });
+    configured.map_or_else(
+        || {
+            dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .join("Cloud")
+        },
+        |p| resolve_mount_path(&p),
+    )
 }
 
 /// Ensure a path exists as a directory, with a message that names the path.
