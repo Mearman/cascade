@@ -162,11 +162,12 @@ jobs:
           set -e
           echo "$OUTPUT"
 
-          # release-plz logs lines like "released cascade 0.2.0 (git-only)".
+          # release-plz logs lines like "released cascade 0.1.1 (git-only)".
+          # The tag is in the format v{VERSION}, not cascade-v{VERSION}.
           if echo "$OUTPUT" | grep -q 'released cascade ';
           then
             VERSION=$(echo "$OUTPUT" | grep 'released cascade ' | head -1 | grep -oP 'released cascade \K[^ ]+')
-            TAG="cascade-v${VERSION}"
+            TAG="v${VERSION}"
             echo "released=true" >> "$GITHUB_OUTPUT"
             echo "version=${TAG}" >> "$GITHUB_OUTPUT"
             echo "Detected release: ${TAG}"
