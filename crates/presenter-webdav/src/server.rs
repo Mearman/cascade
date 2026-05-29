@@ -782,32 +782,51 @@ fn hydrate_children_from_db(state: &AppState, parent_id: &str) -> usize {
 ///
 /// The Google Drive API may return `"root"` or the actual folder ID
 /// (e.g. `0APRsmt7LhxCIUk9PVA`) as the parent. When `list_children`
-/// finds nothing under `{prefix}:root`, this function looks for the
-/// single distinct parent ID that all the backend's direct children share.
+/// finds nothing under `{prefix}:root`, this function queries the DB
+/// for children whose parent is a top-level directory (appears in both
+/// the id and `parent_id` columns) with the backend prefix.
 fn resolve_root_id_from_db(db: &cascade_engine::db::StateDb, prefix: &str) -> Option<String> {
-    // The DB doesn't expose a "distinct parent IDs" query directly,
-    // so we scan all files for this backend and collect unique
-    // parent IDs that look like root-level (i.e. only one segment
-    // after the prefix colon).
     let all = db.list_all_files().ok()?;
     let prefix_colon = format!("{prefix}:");
-    let mut root_candidates: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Collect all IDs for this backend into a set.
+    let ids: std::collections::HashSet<&String> = all
+        .iter()
+        .filter(|e| e.id.0.starts_with(&prefix_colon))
+        .map(|e| &e.id.0)
+        .collect();
+
+    // A root-level child is one whose parent_id is in the id set
+    // (i.e. the parent is a known directory) AND the parent has
+    // at least one child. Find all such parent IDs, then pick
+    // the one that is NOT itself a child of another directory
+    // in the same backend (i.e. its own parent_id is just the
+    // prefix with no real native ID, or it's not in the ids set).
+    let mut root_candidates: std::collections::HashSet<&String> = std::collections::HashSet::new();
     for entry in &all {
         if entry.id.0.starts_with(&prefix_colon)
-            && entry.parent_id.0.starts_with(&prefix_colon)
+            && ids.contains(&entry.parent_id.0)
         {
-            let Some(parent_native) = entry.parent_id.0.strip_prefix(&prefix_colon)
-            else {
-                continue;
-            };
-            if !parent_native.contains(':') {
-                root_candidates.insert(entry.parent_id.0.clone());
-            }
+            root_candidates.insert(&entry.parent_id.0);
         }
     }
-    // If there's exactly one candidate, it's the real root ID.
-    if root_candidates.len() == 1 {
-        return root_candidates.into_iter().next();
+
+    // A root candidate whose own parent_id is NOT in the id set
+    // must be the top-level root (its parent is the virtual root
+    // or the "root" alias which may not be stored as an id).
+    let real_roots: Vec<&String> = root_candidates
+        .iter()
+        .filter(|id| {
+            // Look up this candidate's own parent_id.
+            all.iter()
+                .find(|e| &e.id.0 == **id)
+                .is_none_or(|e| !ids.contains(&e.parent_id.0))
+        })
+        .copied()
+        .collect();
+
+    if real_roots.len() == 1 {
+        return real_roots.into_iter().next().cloned();
     }
     None
 }
