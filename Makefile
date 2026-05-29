@@ -17,4 +17,4 @@ build:
 	cargo build
 
 dev:
-	cargo watch -x "run -- start"
+	RUST_LOG="$${RUST_LOG:-debug}" cargo watch -x "run -- start"
