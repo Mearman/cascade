@@ -117,6 +117,13 @@ async fn changes_initial_call_fetches_start_token_and_returns_empty() {
         .mount(&server)
         .await;
     Mock::given(method("GET"))
+        .and(path("/files"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "files": []
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
         .and(path("/changes"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "changes": [],
@@ -128,7 +135,7 @@ async fn changes_initial_call_fetches_start_token_and_returns_empty() {
     let backend = make_backend(&server);
     let (changes, cursor) = backend.changes(None).await.unwrap();
     assert!(changes.is_empty());
-    assert_eq!(cursor.0, "token-2");
+    assert_eq!(cursor.0, "token-1");
 }
 
 #[tokio::test]
