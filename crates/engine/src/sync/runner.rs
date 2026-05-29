@@ -365,18 +365,40 @@ impl SyncRunner {
     /// Called once after initial sync so the presenter has a complete
     /// view even when no new changes were detected.
     async fn hydrate_presenter(&self) -> anyhow::Result<()> {
-        let files = self.db.list_all_files()?;
-        if files.is_empty() {
-            return Ok(());
-        }
-        tracing::info!(count = files.len(), "hydrating presenter from DB");
-        for entry in &files {
-            let item: VfsItem = entry.clone().into();
-            if let Err(e) = self.presenter.upsert_item(item).await {
-                tracing::debug!(id = %entry.id, error = %e, "failed to hydrate item");
+        // Only hydrate root-level children for each backend.
+        // Deeper directories are loaded on demand by the presenter
+        // when PROPFIND requests them.
+        let backends = self.db.list_backends()?;
+        let mut total = 0;
+        for backend in &backends {
+            let root_id = format!("{}:root", backend.id);
+            // Try the "root" alias first, then discover the real root ID.
+            let mut entries = self.db.list_children(&root_id)?;
+            if entries.is_empty() {
+                // The backend may use a real folder ID instead of "root".
+                // Find it by looking for the most common parent_id.
+                let all = self.db.list_all_files()?;
+                let prefix = format!("{}:", backend.id);
+                let mut counts: std::collections::HashMap<String, usize> =
+                    std::collections::HashMap::new();
+                for entry in &all {
+                    if entry.id.0.starts_with(&prefix) && entry.parent_id.0.starts_with(&prefix) {
+                        *counts.entry(entry.parent_id.0.clone()).or_insert(0) += 1;
+                    }
+                }
+                if let Some((real_root, _)) = counts.into_iter().max_by_key(|(_, c)| *c) {
+                    entries = self.db.list_children(&real_root)?;
+                }
             }
+            for entry in &entries {
+                let item: VfsItem = entry.clone().into();
+                if let Err(e) = self.presenter.upsert_item(item).await {
+                    tracing::debug!(id = %entry.id, error = %e, "failed to hydrate item");
+                }
+            }
+            total += entries.len();
         }
-        tracing::info!(count = files.len(), "presenter hydrated from DB");
+        tracing::info!(count = total, "presenter hydrated from DB");
         Ok(())
     }
 }
