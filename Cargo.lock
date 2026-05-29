@@ -376,6 +376,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "cascade-presenter-fskit"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cascade-engine",
+ "chrono",
+ "proptest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "cascade-presenter-fuse"
 version = "0.1.0"
 dependencies = [
