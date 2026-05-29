@@ -256,12 +256,26 @@ async fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> R
                 expand_root(state, backend_prefix).await;
             }
 
-            // Re-read after hydration or API expansion. Match against
-            // whichever root ID actually had children.
+            // Re-read after hydration or API expansion. The effective root
+            // may still be None if the API returned children under a real
+            // folder ID rather than "root" — discover it from the items.
             let items = read_items(&state.items);
-            let match_root = effective_root
-                .as_deref()
-                .unwrap_or(&root_id);
+            let match_root = effective_root.unwrap_or_else(|| {
+                // Find the most common parent_id among items with this
+                // backend prefix that aren't in the expanded set.
+                let prefix_colon = format!("{backend_prefix}:");
+                let mut counts: std::collections::HashMap<String, usize> =
+                    std::collections::HashMap::new();
+                for item in items.values() {
+                    if item.parent_id.0.starts_with(&prefix_colon) {
+                        *counts.entry(item.parent_id.0.clone()).or_insert(0) += 1;
+                    }
+                }
+                counts
+                    .into_iter()
+                    .max_by_key(|(_, c)| *c)
+                    .map_or_else(|| root_id.clone(), |(id, _)| id)
+            });
             items
                 .values()
                 .filter(|item| item.parent_id.0 == match_root)
