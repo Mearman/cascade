@@ -1,12 +1,11 @@
 #!/bin/bash
 # Pre-push hook: run all quality gates.
 # clippy (warnings as errors), tests, and format verification.
+#
+# The toolchain is pinned via rust-toolchain.toml at the repo root.
+# No hardcoded PATH or RUSTUP_TOOLCHAIN overrides needed.
 
 set -euo pipefail
-
-# Use the mise-managed toolchain directly.
-export PATH="$HOME/.rustup/toolchains/1.89.0-aarch64-apple-darwin/bin:$PATH"
-export RUSTUP_TOOLCHAIN=1.89.0-aarch64-apple-darwin
 
 # Reject merge commits being pushed to main.
 while read -r local_ref local_sha remote_ref remote_sha; do
@@ -50,3 +49,5 @@ if ! cargo test --workspace 2>&1; then
 fi
 
 echo "All checks passed."
+echo "Note: platform-specific code (cfg(not(target_os = \"macos\"))) is only linted on CI."
+echo "      The macOS runner in CI will catch platform-gated issues for both OSes."

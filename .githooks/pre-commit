@@ -12,9 +12,8 @@ if [[ "$branch" == "main" || "$branch" == "origin-main" ]]; then
     fi
 fi
 
-# Use the mise-managed toolchain directly.
-export PATH="$HOME/.rustup/toolchains/1.89.0-aarch64-apple-darwin/bin:$PATH"
-export RUSTUP_TOOLCHAIN=1.89.0-aarch64-apple-darwin
+# The toolchain is pinned via rust-toolchain.toml at the repo root.
+# No hardcoded PATH or RUSTUP_TOOLCHAIN overrides needed.
 
 # Snapshot staged Rust files before formatting.
 staged_rs=()

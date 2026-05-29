@@ -348,7 +348,9 @@ impl Cli {
                 name,
                 client_id,
                 client_secret,
-            } => auth::authenticate(ctx, &name, client_id.as_deref(), client_secret.as_deref()).await,
+            } => {
+                auth::authenticate(ctx, &name, client_id.as_deref(), client_secret.as_deref()).await
+            }
         }
     }
 }

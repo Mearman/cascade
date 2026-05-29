@@ -248,7 +248,9 @@ pub fn backend_add(
                 }
                 cid.to_string()
             } else {
-                println!("\nGoogle Drive requires OAuth credentials (client_id and client_secret).");
+                println!(
+                    "\nGoogle Drive requires OAuth credentials (client_id and client_secret)."
+                );
                 println!("Create a Desktop app OAuth client at https://console.cloud.google.com/");
                 let cid = read_input("Client ID")?;
                 if cid.is_empty() {
