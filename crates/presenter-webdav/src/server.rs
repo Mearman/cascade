@@ -662,8 +662,8 @@ pub fn build_propfind_response(
 
     for child in children {
         let child_path = resolve_full_path(child, items);
-        let child_href = format!("{child_path}/");
-        responses.push_str(&build_response_element(&child_href, child));
+        let child_href = xml_escape(&format!("{child_path}/"));
+        responses.push_str(&build_response_element_escaped(&child_href, child));
     }
 
     format!(
@@ -676,6 +676,11 @@ pub fn build_propfind_response(
 
 /// Build a single `<D:response>` element for a VFS item.
 fn build_response_element(href: &str, item: &VfsItem) -> String {
+    build_response_element_escaped(&xml_escape(href), item)
+}
+
+/// Build a single `<D:response>` element with a pre-escaped href.
+fn build_response_element_escaped(href: &str, item: &VfsItem) -> String {
     let resource_type = if item.is_dir {
         "<D:resourcetype><D:collection/></D:resourcetype>".to_string()
     } else {
@@ -695,7 +700,7 @@ fn build_response_element(href: &str, item: &VfsItem) -> String {
     let content_type = item
         .mime_type
         .as_deref()
-        .map(|m| format!("<D:getcontenttype>{m}</D:getcontenttype>"))
+        .map(|m| format!("<D:getcontenttype>{}</D:getcontenttype>", xml_escape(m)))
         .unwrap_or_default();
 
     format!(
