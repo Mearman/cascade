@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use cascade_engine::engine::{Engine, EngineConfig};
+use cascade_engine::presenter::VfsPresenter;
 use cascade_presenter_nfs::nfs::server::{NfsServer, NfsServerConfig};
+use cascade_presenter_webdav::WebDavPresenter;
 
 use super::init::{BackendConfig, CascadeConfig};
 use super::{CliContext, is_process_alive};
@@ -74,18 +76,116 @@ pub async fn start(ctx: &CliContext, mount_point: Option<&str>) -> Result<()> {
     };
     let engine = Engine::new(engine_config).await?;
 
-    // Create the NFS presenter before starting the engine, so we can wire it
-    // into the sync runner. Remote changes polled from backends will be
-    // forwarded to this presenter so NFS clients see them.
+    // On macOS, prefer WebDAV mounting which works without root.
+    // NFS is the fallback for Linux and older macOS where WebDAV fails.
+    let mount_strategy = select_mount_strategy();
+    tracing::info!(strategy = %mount_strategy, "selected mount strategy");
+
+    #[cfg(target_os = "macos")]
+    match mount_strategy {
+        MountStrategy::WebDav => run_with_webdav(ctx, mount_path, engine).await,
+        MountStrategy::Nfs => run_with_nfs(ctx, mount_path, engine).await,
+    }
+    #[cfg(not(target_os = "macos"))]
+    match mount_strategy {
+        MountStrategy::Nfs => run_with_nfs(ctx, mount_path, engine).await,
+        MountStrategy::WebDav => {
+            anyhow::bail!("WebDAV mounting is not supported on this platform")
+        }
+    }
+}
+
+/// Mount strategy — `WebDAV` preferred on macOS, NFS elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MountStrategy {
+    WebDav,
+    #[allow(dead_code)] // Used on non-macOS platforms
+    Nfs,
+}
+
+impl std::fmt::Display for MountStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WebDav => write!(f, "webdav"),
+            Self::Nfs => write!(f, "nfs"),
+        }
+    }
+}
+
+/// Select the best mount strategy for the current platform.
+const fn select_mount_strategy() -> MountStrategy {
+    #[cfg(target_os = "macos")]
+    {
+        MountStrategy::WebDav
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        MountStrategy::Nfs
+    }
+}
+
+/// Run the daemon using `WebDAV` presenter.
+#[cfg(target_os = "macos")]
+async fn run_with_webdav(ctx: &CliContext, mount_path: PathBuf, engine: Engine) -> Result<()> {
+    let presenter = Arc::new(WebDavPresenter::new(&mount_path));
+    let items = presenter.items().clone();
+
+    let sync_runner = engine.create_sync_runner(presenter.clone());
+    let sync_handle = tokio::spawn(async move {
+        if let Err(e) = sync_runner.run().await {
+            tracing::error!(error = %e, "sync runner exited with error");
+        }
+    });
+
+    let handle = engine.start()?;
+
+    // Start the WebDAV presenter's HTTP server.
+    presenter.start(&mount_path).await?;
+    let webdav_port = {
+        let guard = presenter.server.lock().await;
+        guard
+            .as_ref()
+            .map(cascade_presenter_webdav::server::WebDavServer::port)
+            .context("WebDAV server not started")?
+    };
+
+    mount_webdav(&mount_path, webdav_port)?;
+
+    std::fs::write(&ctx.pid_path, std::process::id().to_string())?;
+
+    println!("Cascade started.");
+    println!("  Mount point: {}", mount_path.display());
+    println!("  WebDAV port: {webdav_port}");
+    println!("  PID: {}", std::process::id());
+    println!();
+    println!("Press Ctrl+C to stop.");
+
+    tokio::signal::ctrl_c().await?;
+
+    tracing::info!("Shutting down...");
+
+    unmount_path(&mount_path)?;
+    presenter.stop().await?;
+    drop(items);
+    sync_handle.abort();
+    engine.shutdown();
+    handle.cache_handle.abort();
+
+    let _ = std::fs::remove_file(&ctx.pid_path);
+
+    tracing::info!("Cascade stopped.");
+    Ok(())
+}
+
+/// Run the daemon using NFS presenter.
+async fn run_with_nfs(ctx: &CliContext, mount_path: PathBuf, engine: Engine) -> Result<()> {
     let presenter = Arc::new(cascade_presenter_nfs::NfsPresenter::with_vfs(
         &mount_path,
         engine.vfs().clone(),
     ));
 
-    // Clone the NFS context before the presenter is moved into the sync runner.
     let nfs_ctx = presenter.context().clone();
 
-    // Build a sync runner with the real presenter and spawn it.
     let sync_runner = engine.create_sync_runner(presenter);
     let sync_handle = tokio::spawn(async move {
         if let Err(e) = sync_runner.run().await {
@@ -93,10 +193,8 @@ pub async fn start(ctx: &CliContext, mount_point: Option<&str>) -> Result<()> {
         }
     });
 
-    // Start engine background tasks (cache manager).
     let handle = engine.start()?;
 
-    // Start NFS server on loopback, sharing the presenter's context.
     let server_config = NfsServerConfig {
         bind_addr: "127.0.0.1:0".parse()?,
         export_path: "/".to_string(),
@@ -105,7 +203,6 @@ pub async fn start(ctx: &CliContext, mount_point: Option<&str>) -> Result<()> {
     let nfs_port = server.local_addr.port();
     tracing::info!(port = nfs_port, "NFS server started");
 
-    // Mount NFS via OS mount command.
     mount_nfs(&mount_path, nfs_port)?;
 
     std::fs::write(&ctx.pid_path, std::process::id().to_string())?;
@@ -117,13 +214,11 @@ pub async fn start(ctx: &CliContext, mount_point: Option<&str>) -> Result<()> {
     println!();
     println!("Press Ctrl+C to stop.");
 
-    // Wait for Ctrl+C.
     tokio::signal::ctrl_c().await?;
 
     tracing::info!("Shutting down...");
 
-    // Clean up.
-    unmount_nfs(&mount_path)?;
+    unmount_path(&mount_path)?;
     server.stop()?;
     sync_handle.abort();
     engine.shutdown();
@@ -252,6 +347,68 @@ fn resolve_mount_path(path: &str) -> PathBuf {
     PathBuf::from(expanded)
 }
 
+/// Mount `WebDAV` filesystem using the OS mount command (macOS).
+/// Uses `/sbin/mount_webdav` which does not require root.
+#[cfg(target_os = "macos")]
+fn mount_webdav(mount_point: &Path, port: u16) -> Result<()> {
+    if !mount_point.exists() {
+        std::fs::create_dir_all(mount_point)?;
+    }
+
+    let url = format!("http://127.0.0.1:{port}/");
+    tracing::info!(url = %url, mount = %mount_point.display(), "mounting WebDAV");
+
+    let output = std::process::Command::new("/sbin/mount_webdav")
+        .arg(&url)
+        .arg(mount_point)
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if is_mounted(mount_point) {
+            tracing::warn!(path = %mount_point.display(), "already mounted");
+            return Ok(());
+        }
+        anyhow::bail!("mount_webdav failed: {stderr}");
+    }
+
+    tracing::info!(path = %mount_point.display(), "WebDAV mounted");
+    Ok(())
+}
+
+/// Build a `mount_webdav` command (for testing command construction).
+#[cfg(test)]
+#[cfg(target_os = "macos")]
+fn webdav_mount_command(mount_point: &Path, port: u16) -> std::process::Command {
+    let url = format!("http://127.0.0.1:{port}/");
+    let mut cmd = std::process::Command::new("/sbin/mount_webdav");
+    cmd.arg(&url).arg(mount_point);
+    cmd
+}
+
+/// Unmount a filesystem at the given path.
+#[cfg(target_os = "macos")]
+fn unmount_path(mount_point: &Path) -> Result<()> {
+    if !is_mounted(mount_point) {
+        tracing::debug!(path = %mount_point.display(), "not mounted, skipping unmount");
+        return Ok(());
+    }
+
+    tracing::info!(path = %mount_point.display(), "unmounting");
+
+    let output = std::process::Command::new("/usr/bin/diskutil")
+        .arg("unmount")
+        .arg(mount_point)
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::warn!(error = %stderr, "unmount failed (will be cleaned up on exit)");
+    }
+
+    Ok(())
+}
+
 /// Mount NFS filesystem using the OS mount command (macOS).
 #[cfg(target_os = "macos")]
 fn mount_nfs(mount_point: &Path, port: u16) -> Result<()> {
@@ -314,26 +471,10 @@ fn osascript_mount_command(mount_point: &Path, port: u16) -> std::process::Comma
     cmd
 }
 
-/// Unmount the NFS filesystem.
-#[cfg(target_os = "macos")]
-fn unmount_nfs(mount_point: &Path) -> Result<()> {
-    if !is_mounted(mount_point) {
-        tracing::debug!(path = %mount_point.display(), "not mounted, skipping unmount");
-        return Ok(());
-    }
-
-    tracing::info!(path = %mount_point.display(), "unmounting NFS");
-
-    let output = std::process::Command::new("/usr/bin/diskutil")
-        .arg("unmount")
-        .arg(mount_point)
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        tracing::warn!(error = %stderr, "unmount failed (will be cleaned up on exit)");
-    }
-
+/// Unmount the NFS filesystem (kept for compatibility with non-macOS code paths).
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::unnecessary_wraps)]
+fn unmount_path(_mount_point: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -357,8 +498,8 @@ fn mount_nfs(_mount_point: &Path, _port: u16) -> Result<()> {
 
 #[cfg(not(target_os = "macos"))]
 #[allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)]
-fn unmount_nfs(_mount_point: &Path) -> Result<()> {
-    Ok(())
+fn mount_webdav(_mount_point: &Path, _port: u16) -> Result<()> {
+    anyhow::bail!("WebDAV mounting is not supported on this platform yet");
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -447,5 +588,39 @@ mod tests {
         assert!(!is_permission_error("Connection refused"));
         assert!(!is_permission_error("No such file or directory"));
         assert!(is_permission_error("Operation not permitted"));
+    }
+
+    // --- WebDAV mount command construction ---
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn webdav_mount_command_constructs_correctly() {
+        let dir = TempDir::new().unwrap();
+        let mount_point = dir.path().join("Cloud");
+        let cmd = webdav_mount_command(&mount_point, 52431);
+
+        assert_eq!(cmd.get_program(), "/sbin/mount_webdav");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(std::ffi::OsStr::to_string_lossy)
+            .map(std::borrow::Cow::into_owned)
+            .collect();
+        assert_eq!(args[0], "http://127.0.0.1:52431/");
+        assert_eq!(args[1], mount_point.to_str().unwrap());
+    }
+
+    #[test]
+    fn mount_strategy_selects_correctly() {
+        let strategy = select_mount_strategy();
+        #[cfg(target_os = "macos")]
+        assert_eq!(strategy, MountStrategy::WebDav);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(strategy, MountStrategy::Nfs);
+    }
+
+    #[test]
+    fn mount_strategy_display() {
+        assert_eq!(MountStrategy::WebDav.to_string(), "webdav");
+        assert_eq!(MountStrategy::Nfs.to_string(), "nfs");
     }
 }
