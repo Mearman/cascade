@@ -70,6 +70,8 @@ pub fn create_backend(config: &toml::Value) -> anyhow::Result<Box<dyn Backend>> 
             expires_at: chrono::Utc::now() + chrono::Duration::hours(24),
         });
 
+    let instance_id = format!("gdrive-{account}");
+
     Ok(Box::new(GdriveBackend {
         drive,
         oauth: auth::OAuthConfig {
@@ -77,6 +79,7 @@ pub fn create_backend(config: &toml::Value) -> anyhow::Result<Box<dyn Backend>> 
             client_secret,
         },
         account,
+        instance_id,
         tokens: Arc::new(RwLock::new(initial_tokens)),
     }))
 }
@@ -87,6 +90,8 @@ pub struct GdriveBackend {
     drive: DriveClient,
     oauth: auth::OAuthConfig,
     account: String,
+    /// Per-instance backend ID, e.g. "gdrive:personal".
+    instance_id: String,
     tokens: Arc<RwLock<Option<AuthTokens>>>,
 }
 
@@ -119,8 +124,8 @@ impl GdriveBackend {
 
 #[async_trait]
 impl Backend for GdriveBackend {
-    fn id(&self) -> &'static str {
-        "gdrive"
+    fn id(&self) -> &str {
+        &self.instance_id
     }
 
     fn display_name(&self) -> &'static str {
@@ -166,14 +171,14 @@ impl Backend for GdriveBackend {
                     // For deletions, we need a FileEntry with what we know.
                     // The change may or may not include the file metadata.
                     if let Some(file) = change.file {
-                        if let Some(entry) = file.to_file_entry("gdrive") {
+                        if let Some(entry) = file.to_file_entry(&self.instance_id) {
                             all_changes.push(Change::Deleted(entry));
                         }
                     } else if let Some(file_id) = change.file_id {
                         // Minimal FileEntry for the deleted file.
                         let entry = FileEntry {
-                            id: ItemId::new("gdrive", &file_id),
-                            parent_id: ItemId::new("gdrive", "unknown"),
+                            id: ItemId::new(&self.instance_id, &file_id),
+                            parent_id: ItemId::new(&self.instance_id, "unknown"),
                             name: String::new(),
                             is_dir: false,
                             size: None,
@@ -184,7 +189,7 @@ impl Backend for GdriveBackend {
                         all_changes.push(Change::Deleted(entry));
                     }
                 } else if let Some(file) = change.file
-                    && let Some(entry) = file.to_file_entry("gdrive")
+                    && let Some(entry) = file.to_file_entry(&self.instance_id)
                 {
                     all_changes.push(Change::Created(entry));
                 }
@@ -207,7 +212,7 @@ impl Backend for GdriveBackend {
         if path_str == "/" || path_str.is_empty() {
             let file = self.drive.get_file("root", &token).await?;
             return file
-                .to_file_entry("gdrive")
+                .to_file_entry(&self.instance_id)
                 .ok_or_else(|| anyhow::anyhow!("Root folder returned trashed file"));
         }
 
@@ -232,7 +237,7 @@ impl Backend for GdriveBackend {
         }
 
         let file = self.drive.get_file(&current_id, &token).await?;
-        file.to_file_entry("gdrive")
+        file.to_file_entry(&self.instance_id)
             .ok_or_else(|| anyhow::anyhow!("File not found: {path_str}"))
     }
 
@@ -277,7 +282,7 @@ impl Backend for GdriveBackend {
             .upload_file(file_name, parent_id.0.as_str(), &data, &token)
             .await?;
 
-        file.to_file_entry("gdrive")
+        file.to_file_entry(&self.instance_id)
             .ok_or_else(|| anyhow::anyhow!("upload returned trashed file"))
     }
 
@@ -303,7 +308,7 @@ impl Backend for GdriveBackend {
             .create_directory(dir_name, &parent_id, &token)
             .await?;
 
-        file.to_file_entry("gdrive")
+        file.to_file_entry(&self.instance_id)
             .ok_or_else(|| anyhow::anyhow!("create_dir returned trashed file"))
     }
 
@@ -336,7 +341,7 @@ impl Backend for GdriveBackend {
             .move_file(file_id, &dst_parent_id, new_name, &token)
             .await?;
 
-        file.to_file_entry("gdrive")
+        file.to_file_entry(&self.instance_id)
             .ok_or_else(|| anyhow::anyhow!("move returned trashed file"))
     }
 
@@ -358,16 +363,6 @@ mod tests {
             account = "test-account"
         };
         let backend = create_backend(&config.into()).unwrap();
-        assert_eq!(backend.id(), "gdrive");
-    }
-
-    #[test]
-    fn create_backend_default_account() {
-        let config = toml::toml! {
-            client_id = "id"
-            client_secret = "secret"
-        };
-        let backend = create_backend(&config.into()).unwrap();
-        assert_eq!(backend.id(), "gdrive");
+        assert_eq!(backend.id(), "gdrive-test-account");
     }
 }

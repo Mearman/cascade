@@ -258,7 +258,7 @@ async fn metadata_root_returns_folder_entry() {
     let entry = backend.metadata(Path::new("/")).await.unwrap();
     assert_eq!(entry.name, "My Drive");
     assert!(entry.is_dir);
-    assert_eq!(entry.id, ItemId::new("gdrive", "root"));
+    assert_eq!(entry.id, ItemId::new("gdrive-test-account", "root"));
 }
 
 #[tokio::test]
@@ -300,7 +300,7 @@ async fn metadata_resolves_nested_path() {
     assert_eq!(entry.name, "note.txt");
     assert!(!entry.is_dir);
     assert_eq!(entry.size, Some(512));
-    assert_eq!(entry.id, ItemId::new("gdrive", "file-1"));
+    assert_eq!(entry.id, ItemId::new("gdrive-test-account", "file-1"));
 }
 
 // ── download ──────────────────────────────────────────────────────────────────
@@ -317,8 +317,8 @@ async fn download_writes_file_content() {
 
     let backend = make_backend(&server);
     let entry = cascade_engine::types::FileEntry {
-        id: ItemId::new("gdrive", "file-dl"),
-        parent_id: ItemId::new("gdrive", "root"),
+        id: ItemId::new("gdrive-test-account", "file-dl"),
+        parent_id: ItemId::new("gdrive-test-account", "root"),
         name: "file.txt".to_string(),
         is_dir: false,
         size: Some(11),
@@ -369,7 +369,7 @@ async fn create_dir_posts_to_files_and_returns_entry() {
         .unwrap();
     assert_eq!(entry.name, "alpha");
     assert!(entry.is_dir);
-    assert_eq!(entry.id, ItemId::new("gdrive", "new-dir"));
+    assert_eq!(entry.id, ItemId::new("gdrive-test-account", "new-dir"));
 }
 
 // ── delete ────────────────────────────────────────────────────────────────────
@@ -387,8 +387,8 @@ async fn delete_patches_file_as_trashed() {
 
     let backend = make_backend(&server);
     let entry = cascade_engine::types::FileEntry {
-        id: ItemId::new("gdrive", "file-del"),
-        parent_id: ItemId::new("gdrive", "root"),
+        id: ItemId::new("gdrive-test-account", "file-del"),
+        parent_id: ItemId::new("gdrive-test-account", "root"),
         name: "x.txt".to_string(),
         is_dir: false,
         size: None,
@@ -426,7 +426,7 @@ async fn upload_file_sends_multipart_and_returns_entry() {
         .await
         .unwrap();
     assert_eq!(entry.name, "report.txt");
-    assert_eq!(entry.id, ItemId::new("gdrive", "uploaded-1"));
+    assert_eq!(entry.id, ItemId::new("gdrive-test-account", "uploaded-1"));
 }
 
 // ── poll_interval ─────────────────────────────────────────────────────────────
