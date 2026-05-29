@@ -410,6 +410,10 @@ fn unmount_path(mount_point: &Path) -> Result<()> {
 }
 
 /// Mount NFS filesystem using the OS mount command (macOS).
+///
+/// On macOS 26+, `NFSv3` mounts fail with permission errors. `NFSv4` works
+/// without admin escalation (matching FUSE-T's approach). We try v4 first,
+/// then fall back to v3 with osascript escalation.
 #[cfg(target_os = "macos")]
 fn mount_nfs(mount_point: &Path, port: u16) -> Result<()> {
     if !mount_point.exists() {
@@ -419,6 +423,37 @@ fn mount_nfs(mount_point: &Path, port: u16) -> Result<()> {
     let nfs_spec = "127.0.0.1:/".to_string();
     tracing::info!(spec = %nfs_spec, port, mount = %mount_point.display(), "mounting NFS");
 
+    // Try `NFSv4` first — works on macOS 26+ without admin privileges.
+    let v4_output = std::process::Command::new("/sbin/mount_nfs")
+        .arg("-o")
+        .arg(format!("vers=4,resvport,port={port}"))
+        .arg(&nfs_spec)
+        .arg(mount_point)
+        .output();
+
+    match v4_output {
+        Ok(output) if output.status.success() => {
+            tracing::info!(path = %mount_point.display(), "`NFSv4` mounted");
+            return Ok(());
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::debug!(
+                path = %mount_point.display(),
+                error = %stderr,
+                "`NFSv4` mount failed, falling back to v3"
+            );
+        }
+        Err(e) => {
+            tracing::debug!(
+                path = %mount_point.display(),
+                error = %e,
+                "mount_nfs command failed for v4, falling back to v3"
+            );
+        }
+    }
+
+    // Fall back to `NFSv3`.
     let output = std::process::Command::new("/sbin/mount_nfs")
         .arg("-o")
         .arg(format!("rw,resvport,port={port}"))
@@ -448,7 +483,7 @@ fn mount_nfs(mount_point: &Path, port: u16) -> Result<()> {
         anyhow::bail!("mount_nfs failed: {stderr}");
     }
 
-    tracing::info!(path = %mount_point.display(), "NFS mounted");
+    tracing::info!(path = %mount_point.display(), "`NFSv3` mounted");
     Ok(())
 }
 
