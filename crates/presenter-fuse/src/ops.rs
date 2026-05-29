@@ -179,7 +179,7 @@ mod linux {
         Request,
     };
 
-    use super::*;
+    use super::{FileAttr, FuseOps};
 
     impl From<FileAttr> for FuseFileAttr {
         fn from(attr: FileAttr) -> Self {
@@ -188,7 +188,7 @@ mod linux {
             } else {
                 FileType::RegularFile
             };
-            FuseFileAttr {
+            Self {
                 ino: INodeNo(attr.inode),
                 size: attr.size,
                 blocks: attr.size.div_ceil(512),
@@ -197,7 +197,7 @@ mod linux {
                 ctime: UNIX_EPOCH,
                 crtime: UNIX_EPOCH,
                 kind,
-                perm: attr.mode as u16,
+                perm: u16::try_from(attr.mode).unwrap_or(0o777),
                 nlink: attr.nlink,
                 uid: attr.uid,
                 gid: attr.gid,
@@ -225,7 +225,7 @@ mod linux {
 
             // Resolve parent ItemId from inode.
             let parent_id = {
-                let map = self.inode_map.lock().unwrap();
+                let map = self.inode_map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 map.get_id(parent_u64).cloned()
             };
 
@@ -238,9 +238,9 @@ mod linux {
             let child_path = format!("{}/{}", parent_id.0, name_str);
             match self.metadata_sync(std::path::Path::new(&child_path)) {
                 Ok(entry) => {
-                    let mut map = self.inode_map.lock().unwrap();
+                    let mut map = self.inode_map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     let child_id = entry.id.clone();
-                    let inode = map.allocate(child_id.clone());
+                    let inode = map.allocate(child_id);
                     let attr = if entry.is_dir {
                         FileAttr::directory(inode)
                     } else {
@@ -257,7 +257,7 @@ mod linux {
 
         fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
             let ino_u64 = u64::from(ino);
-            let map = self.inode_map.lock().unwrap();
+            let map = self.inode_map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
             if ino_u64 == crate::inode::ROOT_INODE {
                 let attr = FileAttr::directory(ino_u64);
@@ -266,26 +266,27 @@ mod linux {
                 return;
             }
 
-            if let Some(id) = map.get_id(ino_u64) {
-                let id_str = id.0.clone();
-                drop(map);
-                match self.metadata_sync(std::path::Path::new(&id_str)) {
-                    Ok(entry) => {
-                        let attr = if entry.is_dir {
-                            FileAttr::directory(ino_u64)
-                        } else {
-                            FileAttr::file(ino_u64, entry.size.unwrap_or(0))
-                        };
-                        let fuse_attr: FuseFileAttr = attr.into();
-                        reply.attr(&Duration::from_secs(1), &fuse_attr);
-                    }
-                    Err(_) => {
-                        reply.error(Errno::ENOENT);
-                    }
-                }
-            } else {
+            let Some(id) = map.get_id(ino_u64) else {
                 drop(map);
                 reply.error(Errno::ENOENT);
+                return;
+            };
+            let id_str = id.0.clone();
+            drop(map);
+
+            match self.metadata_sync(std::path::Path::new(&id_str)) {
+                Ok(entry) => {
+                    let attr = if entry.is_dir {
+                        FileAttr::directory(ino_u64)
+                    } else {
+                        FileAttr::file(ino_u64, entry.size.unwrap_or(0))
+                    };
+                    let fuse_attr: FuseFileAttr = attr.into();
+                    reply.attr(&Duration::from_secs(1), &fuse_attr);
+                }
+                Err(_) => {
+                    reply.error(Errno::ENOENT);
+                }
             }
         }
 
@@ -298,7 +299,7 @@ mod linux {
             mut reply: ReplyDirectory,
         ) {
             let ino_u64 = u64::from(ino);
-            let map = self.inode_map.lock().unwrap();
+            let map = self.inode_map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
             if ino_u64 != crate::inode::ROOT_INODE {
                 // Only root is a directory for now.
@@ -316,22 +317,17 @@ mod linux {
             }
 
             // List children from the VFS tree.
-            let id_str = match map.get_id(ino_u64) {
-                Some(id) => id.0.clone(),
-                None => {
-                    drop(map);
-                    reply.error(Errno::ENOENT);
-                    return;
-                }
+            let Some(id) = map.get_id(ino_u64) else {
+                drop(map);
+                reply.error(Errno::ENOENT);
+                return;
             };
+            let id_str = id.0.clone();
             drop(map);
 
-            let entries = match self.readdir_sync(std::path::Path::new(&id_str)) {
-                Ok(entries) => entries,
-                Err(_) => {
-                    reply.ok();
-                    return;
-                }
+            let Ok(entries) = self.readdir_sync(std::path::Path::new(&id_str)) else {
+                reply.ok();
+                return;
             };
 
             let mut entry_offset = 3u64; // . and .. take 1 and 2
@@ -371,16 +367,18 @@ mod linux {
             tracing::debug!(ino = ino_u64, offset, size, "read");
 
             let path = {
-                let map = self.inode_map.lock().unwrap();
+                let map = self.inode_map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 map.get_id(ino_u64).map(|id| id.0.clone())
             };
 
-            match path {
-                Some(path) => match self.read_sync(std::path::Path::new(&path), offset, size) {
-                    Ok(data) => reply.data(&data),
-                    Err(_) => reply.error(Errno::EIO),
-                },
-                None => reply.error(Errno::ENOENT),
+            let Some(path) = path else {
+                reply.error(Errno::ENOENT);
+                return;
+            };
+
+            match self.read_sync(std::path::Path::new(&path), offset, size) {
+                Ok(data) => reply.data(&data),
+                Err(_) => reply.error(Errno::EIO),
             }
         }
 
