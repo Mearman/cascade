@@ -414,11 +414,44 @@ async fn handle_put(state: &AppState, path: &str, req: Request) -> Response {
         return StatusCode::BAD_REQUEST.into_response();
     };
 
-    // Upload via the backend.
-    let parent_id_str = format!("{backend_id}:root");
-    let file_id = cascade_engine::types::FileId(parent_id_str);
+    // Resolve the parent directory's native ID.
+    let parent_id = if relative.is_empty() {
+        cascade_engine::types::FileId(format!("{backend_id}:root"))
+    } else {
+        // Walk up the path to find the parent directory in items.
+        let parent_segments: Vec<&str> = if relative.len() > 1 {
+            relative
+                .get(..relative.len().saturating_sub(1))
+                .map_or_else(Vec::new, ToOwned::to_owned)
+        } else {
+            vec![]
+        };
+        let parent_normalised = if parent_segments.is_empty() {
+            format!("/{backend_id}/")
+        } else {
+            format!("/{backend_id}/{}", parent_segments.join("/"))
+        };
+        let parent_normalised = normalise_path(&parent_normalised);
+        let found_parent = {
+            let Ok(items) = state.items.read() else {
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            };
+            items
+                .values()
+                .find(|item| {
+                    let ip = resolve_full_path(item, &items);
+                    ip == parent_normalised
+                })
+                .cloned()
+        };
+        match found_parent {
+            Some(p) => cascade_engine::types::FileId(p.id.0),
+            None => cascade_engine::types::FileId(format!("{backend_id}:root")),
+        }
+    };
+
     let mut cursor = std::io::Cursor::new(bytes.clone());
-    match backend.upload(relative_path, &mut cursor, &file_id).await {
+    match backend.upload(relative_path, &mut cursor, &parent_id).await {
         Ok(entry) => {
             // Store the returned entry in the items map.
             let key = entry.id.0.clone();
