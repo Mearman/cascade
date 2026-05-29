@@ -304,7 +304,7 @@ async fn try_webdav(
 /// Try to mount via the NFS presenter.
 ///
 /// Works on all platforms (Linux/macOS).  Same shutdown guarantees as
-/// [`try_fskit`].
+/// the macOS presenter functions.
 async fn try_nfs(
     ctx: &CliContext,
     mount_path: &Path,
