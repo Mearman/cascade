@@ -7,14 +7,15 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use cascade_engine::types::{ItemId, VfsItem};
+use cascade_engine::types::{FileId, ItemId, VfsItem};
 use tokio::net::TcpListener;
 
 /// Shared state passed to all axum handlers.
@@ -138,7 +139,7 @@ async fn webdav_handler(State(state): State<AppState>, req: Request) -> Response
             handle_move(&state, &path, req.headers()).await
         }
         m if m == Method::from_bytes(b"COPY").unwrap_or_default() => {
-            async move { handle_copy(&state, &path, req.headers()) }.await
+            handle_copy(&state, &path, req.headers()).await
         }
         Method::OPTIONS => handle_options(),
         _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
@@ -170,7 +171,7 @@ async fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> R
 
     // Root listing: show each backend as a top-level directory.
     if normalised == "/" {
-        let items = read_items(&state.items);
+        let items = read_items(&state.items).await;
         let mut backends: Vec<String> = items
             .values()
             .filter_map(|item| item.id.0.split(':').next().map(String::from))
@@ -189,7 +190,7 @@ async fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> R
 
     // Find the target item (block scope to drop the guard).
     let target = {
-        let items = read_items(&state.items);
+        let items = read_items(&state.items).await;
         items
             .values()
             .find(|item| resolve_full_path(item, &items) == normalised)
@@ -202,7 +203,7 @@ async fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> R
     } else if let Some(ref t) = target {
         let target_id = t.id.0.clone();
         let cached: Vec<VfsItem> = {
-            let items = read_items(&state.items);
+            let items = read_items(&state.items).await;
             items
                 .values()
                 .filter(|item| item.parent_id.0 == target_id)
@@ -212,10 +213,10 @@ async fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> R
 
         if cached.is_empty() && t.is_dir {
             // Try DB first, fall back to API.
-            if hydrate_children_from_db(state, &target_id) == 0 {
+            if hydrate_children_from_db(state, &target_id).await == 0 {
                 expand_directory(state, &t.id).await;
             }
-            let items = read_items(&state.items);
+            let items = read_items(&state.items).await;
             items
                 .values()
                 .filter(|item| item.parent_id.0 == target_id)
@@ -228,7 +229,7 @@ async fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> R
         let backend_prefix = normalised.trim_start_matches('/').trim_end_matches('/');
         let root_id = format!("{backend_prefix}:root");
         let cached: Vec<VfsItem> = {
-            let items = read_items(&state.items);
+            let items = read_items(&state.items).await;
             items
                 .values()
                 .filter(|item| item.parent_id.0 == root_id)
@@ -241,14 +242,18 @@ async fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> R
             // under the real folder ID (e.g. "0APRsmt7LhxCIUk9PVA")
             // rather than the alias "root", so fall back to resolving
             // the actual root ID from the DB.
-            let hydrated = hydrate_children_from_db(state, &root_id);
+            let hydrated = hydrate_children_from_db(state, &root_id).await;
             let effective_root = if hydrated == 0 {
-                state.db.as_ref().and_then(|db| {
-                    resolve_root_id_from_db(db, backend_prefix).and_then(|real_root| {
-                        let n = hydrate_children_from_db(state, &real_root);
-                        (n > 0).then_some(real_root)
-                    })
-                })
+                if let Some(db) = &state.db {
+                    if let Some(real_root) = resolve_root_id_from_db(db, backend_prefix) {
+                        let n = hydrate_children_from_db(state, &real_root).await;
+                        if n > 0 { Some(real_root) } else { None }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
             } else {
                 Some(root_id.clone())
             };
@@ -260,7 +265,7 @@ async fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> R
             // Re-read after hydration or API expansion. The effective root
             // may still be None if the API returned children under a real
             // folder ID rather than "root" — discover it from the items.
-            let items = read_items(&state.items);
+            let items = read_items(&state.items).await;
             let match_root = effective_root.unwrap_or_else(|| {
                 // Find the most common parent_id among items with this
                 // backend prefix that aren't in the expanded set.
@@ -288,7 +293,7 @@ async fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> R
     };
 
     // Build response.
-    let items = read_items(&state.items);
+    let items = read_items(&state.items).await;
     let child_refs: Vec<&VfsItem> = children.iter().collect();
     let xml = build_propfind_response(&normalised, target.as_ref(), &child_refs, &items);
     (
@@ -304,13 +309,7 @@ async fn handle_get(state: &AppState, path: &str) -> Response {
     let normalised = normalise_path(path);
 
     let (item_id, backend_id) = {
-        let items = match state.items.read() {
-            Ok(guard) => guard,
-            Err(e) => {
-                tracing::error!(error = %e, "failed to read items lock");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-        };
+        let items = state.items.read().await;
         let found = items.values().find(|item| {
             let ip = resolve_full_path(item, &items);
             ip == normalised || ip == path
@@ -344,9 +343,7 @@ async fn handle_get(state: &AppState, path: &str) -> Response {
 
     // Find the FileEntry for this item.
     let file_entry = {
-        let Ok(items) = state.items.read() else {
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        };
+        let items = state.items.read().await;
         items
             .get(&item_id)
             .map(cascade_engine::types::FileEntry::from)
@@ -389,6 +386,7 @@ async fn handle_get(state: &AppState, path: &str) -> Response {
 }
 
 /// Handle `PUT` — store file contents to the cache.
+#[allow(unused_variables)]
 async fn handle_put(state: &AppState, path: &str, req: Request) -> Response {
     let normalised = normalise_path(path);
 
@@ -435,9 +433,7 @@ async fn handle_put(state: &AppState, path: &str, req: Request) -> Response {
 
         // Try in-memory store first.
         let found_in_items = {
-            let Ok(items) = state.items.read() else {
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            };
+            let items = state.items.read().await;
             items
                 .values()
                 .find(|item| {
@@ -448,7 +444,7 @@ async fn handle_put(state: &AppState, path: &str, req: Request) -> Response {
         };
 
         if let Some(id) = found_in_items {
-            tracing::info!(parent = %id.0, sought = %parent_normalised, "parent found in items");
+            tracing::debug!(parent = %id.0, sought = %parent_normalised, "parent found in items");
             id
         } else {
             // Fall back to backend metadata to resolve the parent.
@@ -472,10 +468,8 @@ async fn handle_put(state: &AppState, path: &str, req: Request) -> Response {
 
     // Check if a file with the same name already exists in the parent directory.
     let existing_file_id = {
-        let Ok(items) = state.items.read() else {
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        };
-        let file_normalised = normalise_path(&format!("/{path}"));
+        let items = state.items.read().await;
+        let file_normalised = normalise_path(path);
         items
             .values()
             .find(|item| {
@@ -485,9 +479,12 @@ async fn handle_put(state: &AppState, path: &str, req: Request) -> Response {
             .map(|item| cascade_engine::types::FileId(item.id.0.clone()))
     };
 
+    // Skip backend call entirely to isolate the response issue.
     let result = if let Some(file_id) = existing_file_id {
+        tracing::debug!(file_id = %file_id.0, "PUT overwrite");
         backend.update(&file_id, &mut cursor).await
     } else {
+        tracing::debug!(path = %relative_path.display(), "PUT create");
         backend.upload(relative_path, &mut cursor, &parent_id).await
     };
 
@@ -506,13 +503,9 @@ async fn handle_put(state: &AppState, path: &str, req: Request) -> Response {
                 let _ = tokio::fs::create_dir_all(parent).await;
             }
             let _ = tokio::fs::write(&cache_path, &bytes).await;
-            // Now acquire the lock and insert (no await between lock and unlock).
+            // Now acquire the lock and insert.
             {
-                let mut items = state
-                    .items
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                tracing::debug!(key = %key, name = %vfs_item.name, parent = %vfs_item.parent_id.0, "PUT inserted item");
+                let mut items = state.items.write().await;
                 items.insert(key, vfs_item);
             }
             StatusCode::CREATED.into_response()
@@ -529,13 +522,7 @@ async fn handle_delete(state: &AppState, path: &str) -> Response {
     let normalised = normalise_path(path);
 
     let (item_id, backend_id) = {
-        let items = match state.items.read() {
-            Ok(guard) => guard,
-            Err(e) => {
-                tracing::error!(error = %e, "failed to read items lock");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-        };
+        let items = state.items.read().await;
         let found = items.values().find(|item| {
             let ip = resolve_full_path(item, &items);
             ip == normalised || ip == path
@@ -557,9 +544,7 @@ async fn handle_delete(state: &AppState, path: &str) -> Response {
 
     // Build a FileEntry for the backend.
     let file_entry = {
-        let Ok(items) = state.items.read() else {
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        };
+        let items = state.items.read().await;
         items
             .get(&item_id)
             .map(cascade_engine::types::FileEntry::from)
@@ -577,10 +562,7 @@ async fn handle_delete(state: &AppState, path: &str) -> Response {
             // Remove from cache and in-memory store.
             let cache_path = state.cache_dir.join(safe_filename(&item_id));
             let _ = tokio::fs::remove_file(&cache_path).await;
-            let mut items = state
-                .items
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut items = state.items.write().await;
             items.remove(&item_id);
             StatusCode::NO_CONTENT.into_response()
         }
@@ -597,13 +579,7 @@ async fn handle_mkcol(state: &AppState, path: &str) -> Response {
 
     // Check if it already exists.
     {
-        let items = match state.items.read() {
-            Ok(guard) => guard,
-            Err(e) => {
-                tracing::error!(error = %e, "failed to read items lock");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-        };
+        let items = state.items.read().await;
         let exists = items.values().any(|item| {
             let ip = resolve_full_path(item, &items);
             ip == normalised || ip == path
@@ -636,10 +612,7 @@ async fn handle_mkcol(state: &AppState, path: &str) -> Response {
             if let Some(db) = &state.db {
                 let _ = db.upsert_file(&entry);
             }
-            let mut items = state
-                .items
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut items = state.items.write().await;
             items.insert(entry.id.0.clone(), VfsItem::from(entry));
             StatusCode::CREATED.into_response()
         }
@@ -660,44 +633,45 @@ async fn handle_move(state: &AppState, src_path: &str, headers: &HeaderMap) -> R
     let src_normalised = normalise_path(src_path);
     let dest_normalised = normalise_path(dest);
 
-    // Resolve source item.
-    let (src_key, backend_id) = {
-        let items = match state.items.read() {
-            Ok(guard) => guard,
-            Err(e) => {
-                tracing::error!(error = %e, "failed to read items lock");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-        };
-        let found = items.iter().find(|(_, item)| {
+    // Resolve source item and destination parent from items map.
+    let (src_key, backend_id, new_name) = {
+        let items = state.items.read().await;
+        let Some((src_key, src_item)) = items.iter().find(|(_, item)| {
             let ip = resolve_full_path(item, &items);
             ip == src_normalised || ip == src_path
-        });
-        match found {
-            Some((k, item)) => (k.clone(), item.id.backend_id().to_string()),
-            None => return StatusCode::NOT_FOUND.into_response(),
-        }
+        }) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        let src_key = src_key.clone();
+        let backend_id = src_item.id.backend_id().to_string();
+
+        // Destination filename is the last path component.
+        let new_name = dest_normalised
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .to_string();
+
+        (src_key, backend_id, new_name)
     };
 
-    // Parse relative paths.
-    let src_parts: Vec<&str> = src_normalised.trim_start_matches('/').split('/').collect();
-    let dest_parts: Vec<&str> = dest_normalised.trim_start_matches('/').split('/').collect();
-    if src_parts.len() < 2 || dest_parts.len() < 2 {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
-    let Some(src_relative) = src_parts
-        .get(1..)
-        .map(|p| p.join("/"))
-        .map(|s| Path::new(&s).to_path_buf())
-    else {
-        return StatusCode::BAD_REQUEST.into_response();
-    };
-    let Some(dest_relative) = dest_parts
-        .get(1..)
-        .map(|p| p.join("/"))
-        .map(|s| Path::new(&s).to_path_buf())
-    else {
-        return StatusCode::BAD_REQUEST.into_response();
+    // Resolve destination parent from items map.
+    let dest_parent_id = {
+        let dest_parent_path = dest_normalised
+            .trim_end_matches('/')
+            .rsplit_once('/')
+            .map(|(parent, _)| parent)
+            .unwrap_or("");
+        let dest_parent_normalised = normalise_path(dest_parent_path);
+        let items = state.items.read().await;
+        items
+            .values()
+            .find(|item| {
+                let ip = resolve_full_path(item, &items);
+                ip == dest_parent_normalised
+            })
+            .map(|item| FileId(item.id.0.clone()))
     };
 
     // Find the backend.
@@ -709,30 +683,42 @@ async fn handle_move(state: &AppState, src_path: &str, headers: &HeaderMap) -> R
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    match backend.move_entry(&src_relative, &dest_relative).await {
+    let result = if let Some(ref parent_id) = dest_parent_id {
+        backend
+            .move_by_id(&FileId(src_key.clone()), parent_id, &new_name)
+            .await
+    } else {
+        // Fall back to path-based move if destination parent not in items map.
+        let src_parts: Vec<&str> = src_normalised.trim_start_matches('/').split('/').collect();
+        let dest_parts: Vec<&str> = dest_normalised.trim_start_matches('/').split('/').collect();
+        let src_relative = src_parts.get(1..).map(|p| p.join("/")).unwrap_or_default();
+        let dest_relative = dest_parts.get(1..).map(|p| p.join("/")).unwrap_or_default();
+        backend
+            .move_entry(Path::new(&src_relative), Path::new(&dest_relative))
+            .await
+    };
+
+    match result {
         Ok(entry) => {
             // Persist to state DB: delete old, insert new.
             if let Some(db) = &state.db {
                 let _ = db.delete_file(&ItemId(src_key.clone()));
                 let _ = db.upsert_file(&entry);
             }
-            let mut items = state
-                .items
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut items = state.items.write().await;
             items.remove(&src_key);
             items.insert(entry.id.0.clone(), VfsItem::from(entry));
             StatusCode::CREATED.into_response()
         }
         Err(e) => {
-            tracing::warn!(error = %e, "backend move_entry failed");
+            tracing::warn!(error = %e, "backend move failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
 }
 
 /// Handle `COPY` — copy a resource.
-fn handle_copy(state: &AppState, src_path: &str, headers: &HeaderMap) -> Response {
+async fn handle_copy(state: &AppState, src_path: &str, headers: &HeaderMap) -> Response {
     let dest = headers
         .get("Destination")
         .and_then(|v| v.to_str().ok())
@@ -741,13 +727,7 @@ fn handle_copy(state: &AppState, src_path: &str, headers: &HeaderMap) -> Respons
     let src_normalised = normalise_path(src_path);
     let dest_normalised = normalise_path(dest);
 
-    let mut items = match state.items.write() {
-        Ok(guard) => guard,
-        Err(e) => {
-            tracing::error!(error = %e, "failed to write items lock");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
+    let mut items = state.items.write().await;
 
     // Find source item.
     let src_item = items
@@ -946,7 +926,7 @@ pub fn item_path(item: &VfsItem) -> String {
 
 /// Try to populate children from the state database.
 /// Returns the number of items loaded (zero if no DB or no results).
-fn hydrate_children_from_db(state: &AppState, parent_id: &str) -> usize {
+async fn hydrate_children_from_db(state: &AppState, parent_id: &str) -> usize {
     let Some(db) = &state.db else {
         return 0;
     };
@@ -957,10 +937,7 @@ fn hydrate_children_from_db(state: &AppState, parent_id: &str) -> usize {
         return 0;
     }
     let count = entries.len();
-    let mut items = state
-        .items
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut items = state.items.write().await;
     for entry in entries {
         let key = entry.id.0.clone();
         items.insert(key, VfsItem::from(entry));
@@ -1054,22 +1031,17 @@ fn resolve_full_path(item: &VfsItem, items: &std::collections::HashMap<String, V
 
 /// Normalise a URL path for consistent matching.
 /// Removes trailing slashes, ensures no double slashes.
-fn read_items(
+async fn read_items(
     items: &Arc<RwLock<HashMap<String, VfsItem>>>,
-) -> std::sync::RwLockReadGuard<'_, HashMap<String, VfsItem>> {
-    items
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+) -> tokio::sync::RwLockReadGuard<'_, HashMap<String, VfsItem>> {
+    items.read().await
 }
 
 /// On-demand expansion: fetch children of a directory from its backend.
 async fn expand_directory(state: &AppState, item_id: &ItemId) {
     // Skip if already expanded.
     {
-        let expanded = state
-            .expanded
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let expanded = state.expanded.read().await;
         if expanded.contains(&item_id.0) {
             return;
         }
@@ -1100,10 +1072,7 @@ async fn expand_directory(state: &AppState, item_id: &ItemId) {
     // Double-check after acquiring the permit (another request may have
     // expanded this while we waited).
     {
-        let expanded = state
-            .expanded
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let expanded = state.expanded.read().await;
         if expanded.contains(&item_id.0) {
             return;
         }
@@ -1113,10 +1082,7 @@ async fn expand_directory(state: &AppState, item_id: &ItemId) {
 
     match backend.list_children(native_id).await {
         Ok(entries) => {
-            let mut items = state
-                .items
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut items = state.items.write().await;
             for entry in entries {
                 let key = entry.id.0.clone();
                 let vfs_item = VfsItem::from(entry);
@@ -1129,11 +1095,7 @@ async fn expand_directory(state: &AppState, item_id: &ItemId) {
                 items.insert(key, vfs_item);
             }
             // Mark as expanded.
-            state
-                .expanded
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(item_id.0.clone());
+            state.expanded.write().await.insert(item_id.0.clone());
         }
         Err(e) => {
             tracing::warn!(error = %e, "failed to expand directory");
@@ -1147,10 +1109,7 @@ async fn expand_root(state: &AppState, backend_prefix: &str) {
 
     // Skip if already expanded.
     {
-        let expanded = state
-            .expanded
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let expanded = state.expanded.read().await;
         if expanded.contains(&root_key) {
             return;
         }
@@ -1177,10 +1136,7 @@ async fn expand_root(state: &AppState, backend_prefix: &str) {
 
     // Double-check after acquiring the permit.
     {
-        let expanded = state
-            .expanded
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let expanded = state.expanded.read().await;
         if expanded.contains(&root_key) {
             return;
         }
@@ -1190,10 +1146,7 @@ async fn expand_root(state: &AppState, backend_prefix: &str) {
 
     match backend.list_children("root").await {
         Ok(entries) => {
-            let mut items = state
-                .items
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut items = state.items.write().await;
             for entry in entries {
                 let key = entry.id.0.clone();
                 let vfs_item = VfsItem::from(entry);
@@ -1206,11 +1159,7 @@ async fn expand_root(state: &AppState, backend_prefix: &str) {
                 items.insert(key, vfs_item);
             }
             // Mark as expanded.
-            state
-                .expanded
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(root_key);
+            state.expanded.write().await.insert(root_key);
         }
         Err(e) => {
             tracing::warn!(error = %e, "failed to expand backend root");
@@ -1470,7 +1419,7 @@ mod tests {
         assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
 
         // Verify it appears in items.
-        let items_guard = items.read().unwrap();
+        let items_guard = items.read().await;
         assert!(
             items_guard
                 .values()

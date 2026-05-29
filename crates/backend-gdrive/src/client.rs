@@ -397,7 +397,10 @@ impl DriveClient {
     /// Trash (soft-delete) a file.
     pub async fn trash_file(&self, file_id: &str, token: &str) -> anyhow::Result<()> {
         self.rate_limiter.acquire().await;
-        let url = format!("{}/files/{file_id}?supportsAllDrives=true", self.base_url);
+        let url = format!(
+            "{}/files/{file_id}?supportsAllDrives=true&fields=id",
+            self.base_url
+        );
         let resp = self
             .http
             .patch(&url)
@@ -423,7 +426,10 @@ impl DriveClient {
         token: &str,
     ) -> anyhow::Result<DriveFile> {
         self.rate_limiter.acquire().await;
-        let url = format!("{}/files/{file_id}?supportsAllDrives=true", self.base_url);
+        let url = format!(
+            "{}/files/{file_id}?supportsAllDrives=true&fields=id,name,mimeType,parents,size,modifiedTime,md5Checksum,trashed",
+            self.base_url
+        );
         let mut body = serde_json::Map::new();
         if let Some(name) = new_name {
             body.insert(

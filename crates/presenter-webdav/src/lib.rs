@@ -17,7 +17,8 @@ pub mod server;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 use async_trait::async_trait;
 use cascade_engine::backend::Backend;
@@ -112,10 +113,7 @@ impl VfsPresenter for WebDavPresenter {
     async fn upsert_item(&self, item: VfsItem) -> anyhow::Result<()> {
         tracing::debug!(id = %item.id, name = %item.name, "upsert_item");
         let key = item.id.0.clone();
-        let mut items = self
-            .items
-            .write()
-            .map_err(|e| anyhow::anyhow!("items RwLock poisoned: {e}"))?;
+        let mut items = self.items.write().await;
         items.insert(key, item);
         Ok(())
     }
@@ -123,10 +121,7 @@ impl VfsPresenter for WebDavPresenter {
     async fn delete_item(&self, id: &ItemId) -> anyhow::Result<()> {
         tracing::debug!(id = %id, "delete_item");
         {
-            let mut items = self
-                .items
-                .write()
-                .map_err(|e| anyhow::anyhow!("items RwLock poisoned: {e}"))?;
+            let mut items = self.items.write().await;
             items.remove(&id.0);
         }
         let cache_path = self.cache_path_for(id);
@@ -138,10 +133,7 @@ impl VfsPresenter for WebDavPresenter {
 
     async fn update_state(&self, id: &ItemId, state: CacheState) -> anyhow::Result<()> {
         tracing::debug!(id = %id, state = %state, "update_state");
-        let mut items = self
-            .items
-            .write()
-            .map_err(|e| anyhow::anyhow!("items RwLock poisoned: {e}"))?;
+        let mut items = self.items.write().await;
         if let Some(item) = items.get_mut(&id.0) {
             item.cache_state = state;
         }
@@ -245,7 +237,7 @@ mod tests {
             mime_type: None,
         };
         presenter.upsert_item(item).await.unwrap();
-        let items = presenter.items.read().unwrap();
+        let items = presenter.items.read().await;
         assert!(items.contains_key("gdrive:root"));
     }
 
@@ -265,7 +257,7 @@ mod tests {
         };
         presenter.upsert_item(item).await.unwrap();
         presenter.delete_item(&id).await.unwrap();
-        let items = presenter.items.read().unwrap();
+        let items = presenter.items.read().await;
         assert!(!items.contains_key("gdrive:root"));
     }
 
@@ -288,7 +280,7 @@ mod tests {
             .update_state(&id, CacheState::Cached)
             .await
             .unwrap();
-        let items = presenter.items.read().unwrap();
+        let items = presenter.items.read().await;
         assert_eq!(
             items.get("gdrive:file1").unwrap().cache_state,
             CacheState::Cached

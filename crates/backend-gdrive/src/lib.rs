@@ -14,9 +14,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use cascade_engine::backend::Backend;
-use cascade_engine::types::{Change, Cursor, FileEntry, ItemId, Quota};
+use cascade_engine::types::{Change, Cursor, FileEntry, FileId, ItemId, Quota};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 
 use auth::AuthTokens;
 use client::DriveClient;
@@ -80,7 +80,7 @@ pub fn create_backend(config: &toml::Value) -> anyhow::Result<Box<dyn Backend>> 
         },
         account,
         instance_id,
-        tokens: Arc::new(RwLock::new(initial_tokens)),
+        tokens: Arc::new(Mutex::new(initial_tokens)),
     }))
 }
 
@@ -92,13 +92,13 @@ pub struct GdriveBackend {
     account: String,
     /// Per-instance backend ID, e.g. "gdrive-personal".
     instance_id: String,
-    tokens: Arc<RwLock<Option<AuthTokens>>>,
+    tokens: Arc<Mutex<Option<AuthTokens>>>,
 }
 
 impl GdriveBackend {
     /// Get a valid access token, refreshing if necessary.
     async fn access_token(&self) -> anyhow::Result<String> {
-        let mut tokens = self.tokens.write().await;
+        let mut tokens = self.tokens.lock().await;
 
         // Try loading from Keychain if we don't have tokens yet.
         if tokens.is_none() {
@@ -392,6 +392,27 @@ impl Backend for GdriveBackend {
         let file = self
             .drive
             .move_file(file_id, &dst_parent_id, new_name, &token)
+            .await?;
+
+        file.to_file_entry(&self.instance_id)
+            .ok_or_else(|| anyhow::anyhow!("move returned trashed file"))
+    }
+
+    async fn move_by_id(
+        &self,
+        src_id: &FileId,
+        dst_parent_id: &FileId,
+        new_name: &str,
+    ) -> anyhow::Result<FileEntry> {
+        let token = self.access_token().await?;
+        let file = self
+            .drive
+            .move_file(
+                src_id.native_id(),
+                dst_parent_id.native_id(),
+                Some(new_name),
+                &token,
+            )
             .await?;
 
         file.to_file_entry(&self.instance_id)

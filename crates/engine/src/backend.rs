@@ -60,8 +60,22 @@ pub trait Backend: Send + Sync {
     /// Delete a file or directory.
     async fn delete(&self, file: &FileEntry) -> anyhow::Result<()>;
 
-    /// Move/rename a file or directory.
+    /// Move/rename a file or directory by path.
     async fn move_entry(&self, src: &Path, dst: &Path) -> anyhow::Result<FileEntry>;
+
+    /// Move/rename a file or directory by ID. Takes the source file ID,
+    /// destination parent directory ID, and new filename. Backends that
+    /// can move by ID directly should override this to avoid a slow path
+    /// walk. The default falls back to `move_entry`.
+    async fn move_by_id(
+        &self,
+        src_id: &FileId,
+        dst_parent_id: &FileId,
+        new_name: &str,
+    ) -> anyhow::Result<FileEntry> {
+        let _ = (src_id, dst_parent_id, new_name);
+        anyhow::bail!("move_by_id not implemented, use move_entry")
+    }
 
     /// List immediate children of a directory by its native ID.
     /// Used for on-demand directory expansion in presenters.
@@ -143,6 +157,15 @@ impl Backend for NullBackend {
     }
 
     async fn move_entry(&self, _src: &Path, _dst: &Path) -> anyhow::Result<FileEntry> {
+        anyhow::bail!("null backend cannot move")
+    }
+
+    async fn move_by_id(
+        &self,
+        _src_id: &FileId,
+        _dst_parent_id: &FileId,
+        _new_name: &str,
+    ) -> anyhow::Result<FileEntry> {
         anyhow::bail!("null backend cannot move")
     }
 
