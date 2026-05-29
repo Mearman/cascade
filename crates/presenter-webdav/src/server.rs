@@ -228,14 +228,36 @@ async fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> R
         };
 
         if cached.is_empty() {
-            // Try DB first, fall back to API.
-            if hydrate_children_from_db(state, &root_id) == 0 {
+            // Try DB first. The Google Drive API may store root children
+            // under the real folder ID (e.g. "0APRsmt7LhxCIUk9PVA")
+            // rather than the alias "root", so fall back to resolving
+            // the actual root ID from the DB.
+            let hydrated = hydrate_children_from_db(state, &root_id);
+            let effective_root = if hydrated == 0 {
+                state.db.as_ref().and_then(|db| {
+                    resolve_root_id_from_db(db, backend_prefix)
+                        .and_then(|real_root| {
+                            let n = hydrate_children_from_db(state, &real_root);
+                            (n > 0).then_some(real_root)
+                        })
+                })
+            } else {
+                Some(root_id.clone())
+            };
+
+            if effective_root.is_none() {
                 expand_root(state, backend_prefix).await;
             }
+
+            // Re-read after hydration or API expansion. Match against
+            // whichever root ID actually had children.
             let items = read_items(&state.items);
+            let match_root = effective_root
+                .as_deref()
+                .unwrap_or(&root_id);
             items
                 .values()
-                .filter(|item| item.parent_id.0 == root_id)
+                .filter(|item| item.parent_id.0 == match_root)
                 .cloned()
                 .collect()
         } else {
@@ -742,6 +764,40 @@ fn hydrate_children_from_db(state: &AppState, parent_id: &str) -> usize {
         items.insert(key, VfsItem::from(entry));
     }
     count
+}
+
+/// Resolve the real root folder ID for a backend from the state database.
+///
+/// The Google Drive API may return `"root"` or the actual folder ID
+/// (e.g. `0APRsmt7LhxCIUk9PVA`) as the parent. When `list_children`
+/// finds nothing under `{prefix}:root`, this function looks for the
+/// single distinct parent ID that all the backend's direct children share.
+fn resolve_root_id_from_db(db: &cascade_engine::db::StateDb, prefix: &str) -> Option<String> {
+    // The DB doesn't expose a "distinct parent IDs" query directly,
+    // so we scan all files for this backend and collect unique
+    // parent IDs that look like root-level (i.e. only one segment
+    // after the prefix colon).
+    let all = db.list_all_files().ok()?;
+    let prefix_colon = format!("{prefix}:");
+    let mut root_candidates: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for entry in &all {
+        if entry.id.0.starts_with(&prefix_colon)
+            && entry.parent_id.0.starts_with(&prefix_colon)
+        {
+            let Some(parent_native) = entry.parent_id.0.strip_prefix(&prefix_colon)
+            else {
+                continue;
+            };
+            if !parent_native.contains(':') {
+                root_candidates.insert(entry.parent_id.0.clone());
+            }
+        }
+    }
+    // If there's exactly one candidate, it's the real root ID.
+    if root_candidates.len() == 1 {
+        return root_candidates.into_iter().next();
+    }
+    None
 }
 
 /// Resolve the full path for an item by walking its parent chain.
