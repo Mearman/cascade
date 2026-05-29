@@ -215,6 +215,7 @@ dependencies = [
  "cascade-engine",
  "cascade-expr",
  "cascade-p2p",
+ "cascade-presenter-fskit",
  "cascade-presenter-fuse",
  "cascade-presenter-nfs",
  "cascade-presenter-webdav",

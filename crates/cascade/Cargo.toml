@@ -15,6 +15,7 @@ cascade-backend-gdrive = { path = "../backend-gdrive" }
 cascade-backend-s3 = { path = "../backend-s3" }
 cascade-presenter-nfs = { path = "../presenter-nfs" }
 cascade-presenter-webdav = { path = "../presenter-webdav" }
+cascade-presenter-fskit = { path = "../presenter-fskit" }
 clap.workspace = true
 tokio.workspace = true
 anyhow.workspace = true

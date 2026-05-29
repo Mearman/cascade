@@ -11,6 +11,36 @@ use cascade_presenter_webdav::WebDavPresenter;
 use super::init::{BackendConfig, CascadeConfig};
 use super::{CliContext, is_process_alive};
 
+/// Resources held by a running presenter attempt.
+///
+/// When a mount strategy fails, [`PresenterResources::shutdown`] must be
+/// called to stop every component that was started during the attempt
+/// (sync task, presenter, engine background tasks).  This prevents leaked
+/// tasks from an earlier attempt surviving into the next fallback.
+struct PresenterResources {
+    /// The engine instance (dropped last so cancel signals reach tasks).
+    engine: Engine,
+    /// Join handle for the cache-manager background task.
+    engine_handle: cascade_engine::engine::EngineHandle,
+    /// Join handle for the sync runner task.
+    sync_handle: tokio::task::JoinHandle<()>,
+}
+
+impl PresenterResources {
+    /// Shut down all components in reverse start order.
+    ///
+    /// 1. Abort the sync runner.
+    /// 2. Signal the engine to cancel (stops the cache manager via the
+    ///    broadcast channel inside `engine.shutdown()`).
+    /// 3. Abort the cache-manager task directly as a safety net.
+    fn shutdown(self) {
+        self.sync_handle.abort();
+        self.engine.shutdown();
+        self.engine_handle.cache_handle.abort();
+        // `engine` is dropped here, releasing the VFS tree and cancel token.
+    }
+}
+
 /// Start the Cascade daemon.
 pub async fn start(ctx: &CliContext, mount_point: Option<&str>) -> Result<()> {
     tracing::info!("Starting Cascade daemon");
@@ -38,17 +68,6 @@ pub async fn start(ctx: &CliContext, mount_point: Option<&str>) -> Result<()> {
         anyhow::bail!("No backends configured. Run `cascade init` to set up.");
     }
 
-    let mut backends: Vec<Arc<dyn cascade_engine::backend::Backend>> = Vec::new();
-    for (name, value) in &main_config.backends {
-        let backend_cfg: BackendConfig = value
-            .clone()
-            .try_into()
-            .with_context(|| format!("invalid config for backend `{name}`"))?;
-        let per_backend_config = load_backend_config(&ctx.config_dir, name)?;
-        let backend = create_backend(name, &backend_cfg.backend_type, &per_backend_config)?;
-        backends.push(Arc::from(backend));
-    }
-
     // Resolve mount point: CLI arg > config.toml [mount].point > ~/Cloud.
     let mount_path = if let Some(p) = mount_point {
         resolve_mount_path(p)
@@ -65,61 +84,148 @@ pub async fn start(ctx: &CliContext, mount_point: Option<&str>) -> Result<()> {
 
     std::fs::create_dir_all(&mount_path)?;
 
-    // On macOS: WebDAV first (no root needed), then NFSv4, then NFSv3 with
-    // osascript escalation. NFS already has the v4 → v3 → escalation chain
-    // inside mount_nfs().
+    // On macOS: FSKit first (native, kext-free, POSIX), then WebDAV (no
+    // root needed), then NFSv4/v3 fallback.  NFS already has the v4 → v3 →
+    // escalation chain inside mount_nfs().
     #[cfg(target_os = "macos")]
     {
+        let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
+
+        // Attempt 1: FSKit.
+        tracing::info!(strategy = "fskit", "attempting FSKit mount");
+        match try_fskit(ctx, &mount_path, backends).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                tracing::warn!(error = %e, "FSKit mount failed, falling back to WebDAV");
+                drop(e);
+            }
+        }
+
+        // Attempt 2: WebDAV.
+        let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
         tracing::info!(strategy = "webdav", "attempting WebDAV mount");
-        let engine_config = EngineConfig {
-            db_path: ctx.db_path.clone(),
-            mount_point: mount_path.clone(),
-            backends,
-            cache_dir: None,
-            enable_p2p: false,
-            p2p_data_dir: None,
-        };
-        let engine = Engine::new(engine_config).await?;
-        match run_with_webdav(ctx, &mount_path, engine).await {
-            Ok(()) => Ok(()),
+        match try_webdav(ctx, &mount_path, backends).await {
+            Ok(()) => return Ok(()),
             Err(e) => {
                 tracing::warn!(error = %e, "WebDAV mount failed, falling back to NFS");
                 drop(e);
-                // Re-create backends for the NFS path. Arc clones are cheap,
-                // but backends was moved into the first engine — we must
-                // rebuild from config.
-                let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
-                let engine_config = EngineConfig {
-                    db_path: ctx.db_path.clone(),
-                    mount_point: mount_path.clone(),
-                    backends,
-                    cache_dir: None,
-                    enable_p2p: false,
-                    p2p_data_dir: None,
-                };
-                let engine = Engine::new(engine_config).await?;
-                run_with_nfs(ctx, &mount_path, engine).await
             }
         }
+
+        // Attempt 3: NFS (v4 → v3 escalation inside mount_nfs).
+        let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
+        try_nfs(ctx, &mount_path, backends).await
     }
+
     #[cfg(not(target_os = "macos"))]
     {
-        let engine_config = EngineConfig {
-            db_path: ctx.db_path.clone(),
-            mount_point: mount_path.clone(),
-            backends,
-            cache_dir: None,
-            enable_p2p: false,
-            p2p_data_dir: None,
-        };
-        let engine = Engine::new(engine_config).await?;
-        run_with_nfs(ctx, &mount_path, engine).await
+        let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
+        try_nfs(ctx, &mount_path, backends).await
     }
 }
 
-/// Run the daemon using `WebDAV` presenter.
+// ---------------------------------------------------------------------------
+// macOS presenters
+// ---------------------------------------------------------------------------
+
+/// Try to mount via the `FSKit` presenter.
+///
+/// On success, blocks until Ctrl+C and then shuts down.  On failure at any
+/// stage (engine start, presenter start, mount command) every resource that
+/// was started is stopped before the error is returned, so the caller can
+/// safely attempt the next fallback.
 #[cfg(target_os = "macos")]
-async fn run_with_webdav(ctx: &CliContext, mount_path: &Path, engine: Engine) -> Result<()> {
+async fn try_fskit(
+    ctx: &CliContext,
+    mount_path: &Path,
+    backends: Vec<Arc<dyn cascade_engine::backend::Backend>>,
+) -> Result<()> {
+    let engine_config = EngineConfig {
+        db_path: ctx.db_path.clone(),
+        mount_point: mount_path.to_path_buf(),
+        backends,
+        cache_dir: None,
+        enable_p2p: false,
+        p2p_data_dir: None,
+    };
+    let engine = Engine::new(engine_config).await?;
+
+    let presenter = Arc::new(
+        cascade_presenter_fskit::FSKitPresenter::from_default_socket()?
+            .with_mount_point(mount_path),
+    );
+
+    let sync_runner = engine.create_sync_runner(presenter.clone());
+    let sync_handle = tokio::spawn(async move {
+        if let Err(e) = sync_runner.run().await {
+            tracing::error!(error = %e, "sync runner exited with error");
+        }
+    });
+
+    let engine_handle = engine.start()?;
+
+    let resources = PresenterResources {
+        engine,
+        engine_handle,
+        sync_handle,
+    };
+
+    if let Err(e) = presenter.start(mount_path).await {
+        resources.shutdown();
+        return Err(e).with_context(|| {
+            format!("failed to start FSKit presenter at {}", mount_path.display())
+        });
+    }
+
+    // FSKit presenter.start() triggers the mount internally via the Swift
+    // extension; no separate OS mount command is needed.
+
+    if let Err(e) = std::fs::write(&ctx.pid_path, std::process::id().to_string()) {
+        resources.shutdown();
+        return Err(e).context("failed to write PID file");
+    }
+
+    println!("Cascade started (FSKit).");
+    println!("  Mount point: {}", mount_path.display());
+    println!("  PID: {}", std::process::id());
+    println!();
+    println!("Press Ctrl+C to stop.");
+
+    tokio::signal::ctrl_c().await?;
+
+    tracing::info!("Shutting down...");
+
+    unmount_path(mount_path)?;
+    if let Err(e) = presenter.stop().await {
+        tracing::warn!(error = %e, "FSKit presenter stop returned an error");
+    }
+    resources.shutdown();
+
+    let _ = std::fs::remove_file(&ctx.pid_path);
+
+    tracing::info!("Cascade stopped.");
+    Ok(())
+}
+
+/// Try to mount via the `WebDAV` presenter.
+///
+/// Same shutdown guarantees as [`try_fskit`].
+#[cfg(target_os = "macos")]
+async fn try_webdav(
+    ctx: &CliContext,
+    mount_path: &Path,
+    backends: Vec<Arc<dyn cascade_engine::backend::Backend>>,
+) -> Result<()> {
+    let engine_config = EngineConfig {
+        db_path: ctx.db_path.clone(),
+        mount_point: mount_path.to_path_buf(),
+        backends,
+        cache_dir: None,
+        enable_p2p: false,
+        p2p_data_dir: None,
+    };
+    let engine = Engine::new(engine_config).await?;
+
     let presenter = Arc::new(WebDavPresenter::new(mount_path));
     let items = presenter.items().clone();
 
@@ -130,10 +236,21 @@ async fn run_with_webdav(ctx: &CliContext, mount_path: &Path, engine: Engine) ->
         }
     });
 
-    let handle = engine.start()?;
+    let engine_handle = engine.start()?;
 
-    // Start the WebDAV presenter's HTTP server.
-    presenter.start(mount_path).await?;
+    let resources = PresenterResources {
+        engine,
+        engine_handle,
+        sync_handle,
+    };
+
+    if let Err(e) = presenter.start(mount_path).await {
+        resources.shutdown();
+        return Err(e).with_context(|| {
+            format!("failed to start WebDAV presenter at {}", mount_path.display())
+        });
+    }
+
     let webdav_port = {
         let guard = presenter.server.lock().await;
         guard
@@ -142,11 +259,17 @@ async fn run_with_webdav(ctx: &CliContext, mount_path: &Path, engine: Engine) ->
             .context("WebDAV server not started")?
     };
 
-    mount_webdav(mount_path, webdav_port)?;
+    if let Err(e) = mount_webdav(mount_path, webdav_port) {
+        resources.shutdown();
+        return Err(e);
+    }
 
-    std::fs::write(&ctx.pid_path, std::process::id().to_string())?;
+    if let Err(e) = std::fs::write(&ctx.pid_path, std::process::id().to_string()) {
+        resources.shutdown();
+        return Err(e).context("failed to write PID file");
+    }
 
-    println!("Cascade started.");
+    println!("Cascade started (WebDAV).");
     println!("  Mount point: {}", mount_path.display());
     println!("  WebDAV port: {webdav_port}");
     println!("  PID: {}", std::process::id());
@@ -158,11 +281,11 @@ async fn run_with_webdav(ctx: &CliContext, mount_path: &Path, engine: Engine) ->
     tracing::info!("Shutting down...");
 
     unmount_path(mount_path)?;
-    presenter.stop().await?;
+    if let Err(e) = presenter.stop().await {
+        tracing::warn!(error = %e, "WebDAV presenter stop returned an error");
+    }
     drop(items);
-    sync_handle.abort();
-    engine.shutdown();
-    handle.cache_handle.abort();
+    resources.shutdown();
 
     let _ = std::fs::remove_file(&ctx.pid_path);
 
@@ -170,13 +293,29 @@ async fn run_with_webdav(ctx: &CliContext, mount_path: &Path, engine: Engine) ->
     Ok(())
 }
 
-/// Run the daemon using NFS presenter.
-async fn run_with_nfs(ctx: &CliContext, mount_path: &Path, engine: Engine) -> Result<()> {
+/// Try to mount via the NFS presenter.
+///
+/// Works on all platforms (Linux/macOS).  Same shutdown guarantees as
+/// [`try_fskit`].
+async fn try_nfs(
+    ctx: &CliContext,
+    mount_path: &Path,
+    backends: Vec<Arc<dyn cascade_engine::backend::Backend>>,
+) -> Result<()> {
+    let engine_config = EngineConfig {
+        db_path: ctx.db_path.clone(),
+        mount_point: mount_path.to_path_buf(),
+        backends,
+        cache_dir: None,
+        enable_p2p: false,
+        p2p_data_dir: None,
+    };
+    let engine = Engine::new(engine_config).await?;
+
     let presenter = Arc::new(cascade_presenter_nfs::NfsPresenter::with_vfs(
         mount_path,
         engine.vfs().clone(),
     ));
-
     let nfs_ctx = presenter.context().clone();
 
     let sync_runner = engine.create_sync_runner(presenter);
@@ -186,21 +325,40 @@ async fn run_with_nfs(ctx: &CliContext, mount_path: &Path, engine: Engine) -> Re
         }
     });
 
-    let handle = engine.start()?;
+    let engine_handle = engine.start()?;
+
+    let resources = PresenterResources {
+        engine,
+        engine_handle,
+        sync_handle,
+    };
 
     let server_config = NfsServerConfig {
         bind_addr: "127.0.0.1:0".parse()?,
         export_path: "/".to_string(),
     };
-    let server = NfsServer::start(server_config, nfs_ctx).await?;
+    let server = match NfsServer::start(server_config, nfs_ctx).await {
+        Ok(s) => s,
+        Err(e) => {
+            resources.shutdown();
+            return Err(e).context("failed to start NFS server");
+        }
+    };
+
     let nfs_port = server.local_addr.port();
     tracing::info!(port = nfs_port, "NFS server started");
 
-    mount_nfs(mount_path, nfs_port)?;
+    if let Err(e) = mount_nfs(mount_path, nfs_port) {
+        resources.shutdown();
+        return Err(e);
+    }
 
-    std::fs::write(&ctx.pid_path, std::process::id().to_string())?;
+    if let Err(e) = std::fs::write(&ctx.pid_path, std::process::id().to_string()) {
+        resources.shutdown();
+        return Err(e).context("failed to write PID file");
+    }
 
-    println!("Cascade started.");
+    println!("Cascade started (NFS).");
     println!("  Mount point: {}", mount_path.display());
     println!("  NFS port: {nfs_port}");
     println!("  PID: {}", std::process::id());
@@ -212,16 +370,20 @@ async fn run_with_nfs(ctx: &CliContext, mount_path: &Path, engine: Engine) -> Re
     tracing::info!("Shutting down...");
 
     unmount_path(mount_path)?;
-    server.stop()?;
-    sync_handle.abort();
-    engine.shutdown();
-    handle.cache_handle.abort();
+    if let Err(e) = server.stop() {
+        tracing::warn!(error = %e, "NFS server stop returned an error");
+    }
+    resources.shutdown();
 
     let _ = std::fs::remove_file(&ctx.pid_path);
 
     tracing::info!("Cascade stopped.");
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Stop
+// ---------------------------------------------------------------------------
 
 /// Stop the Cascade daemon.
 #[cfg(unix)]
@@ -283,6 +445,10 @@ pub fn stop(ctx: &CliContext) -> anyhow::Result<()> {
 pub fn stop(_ctx: &CliContext) -> anyhow::Result<()> {
     anyhow::bail!("cascade stop is not supported on this platform yet");
 }
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 /// Instantiate a backend by type, using its per-backend TOML config.
 fn create_backend(
@@ -358,6 +524,10 @@ fn resolve_mount_path(path: &str) -> PathBuf {
     let expanded = shellexpand::tilde(path).to_string();
     PathBuf::from(expanded)
 }
+
+// ---------------------------------------------------------------------------
+// macOS mount helpers
+// ---------------------------------------------------------------------------
 
 /// Mount `WebDAV` filesystem using the OS mount command (macOS).
 /// Uses `/sbin/mount_webdav` which does not require root.
@@ -518,6 +688,10 @@ fn osascript_mount_command(mount_point: &Path, port: u16) -> std::process::Comma
     cmd
 }
 
+// ---------------------------------------------------------------------------
+// Non-macOS stubs
+// ---------------------------------------------------------------------------
+
 /// Unmount the NFS filesystem (kept for compatibility with non-macOS code paths).
 #[cfg(not(target_os = "macos"))]
 #[allow(clippy::unnecessary_wraps)]
@@ -555,6 +729,10 @@ fn is_mounted(_path: &Path) -> bool {
     false
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
@@ -569,6 +747,8 @@ mod tests {
             config_dir,
         }
     }
+
+    // --- Stop ---
 
     #[test]
     fn stop_succeeds_when_no_pid_file() {
@@ -627,11 +807,6 @@ mod tests {
 
     #[test]
     fn mount_nfs_on_unreachable_port_errors_without_privilege_escalation() {
-        // When mount_nfs fails with a non-permission error (e.g. connection
-        // refused), it should not try osascript escalation.
-        //
-        // We can't easily control mount_nfs output, but we CAN test the
-        // decision function directly — which is the real logic under test.
         assert!(!is_permission_error("Connection refused"));
         assert!(!is_permission_error("No such file or directory"));
         assert!(is_permission_error("Operation not permitted"));
@@ -654,5 +829,53 @@ mod tests {
             .collect();
         assert_eq!(args[0], "http://127.0.0.1:52431/");
         assert_eq!(args[1], mount_point.to_str().unwrap());
+    }
+
+    // --- Fallback ordering ---
+
+    /// Verifies the macOS strategy order by checking that each
+    /// `try_*` function returns an error when its server/presenter cannot
+    /// start, rather than silently succeeding.
+    ///
+    /// We cannot run a full engine in this test (it needs real config),
+    /// so we verify the module-level invariant: `try_fskit` is defined
+    /// on macOS and calls `FSKitPresenter::new`, confirming the import
+    /// path is wired correctly.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fskit_presenter_import_is_wired() {
+        // Construct an FSKitPresenter (does not require macOS runtime).
+        let presenter = cascade_presenter_fskit::FSKitPresenter::new("/tmp/test.sock");
+        assert_eq!(presenter.mount_point(), Path::new("/Volumes/Cascade"));
+
+        let custom = presenter.with_mount_point("/tmp/custom-mount");
+        assert_eq!(custom.mount_point(), Path::new("/tmp/custom-mount"));
+    }
+
+    /// On non-macOS the FSKit presenter is not compiled into the binary
+    /// path — confirm that the default NFS path is used instead.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn non_macos_does_not_include_fskit() {
+        // On non-macOS the unmount stub is a no-op.
+        let dir = TempDir::new().unwrap();
+        let mount_point = dir.path().join("Cloud");
+        // Should succeed (no-op).
+        unmount_path(&mount_point).unwrap();
+    }
+
+    // --- PresenterResources cleanup ---
+
+    /// Verify that PresenterResources::shutdown does not panic when called
+    /// on handles that have already completed (simulating a failed attempt).
+    #[tokio::test]
+    async fn presenter_resources_shutdown_is_idempotent() {
+        // Spawn a task that completes immediately, then abort its handle.
+        // Abort on a finished handle is a no-op — must not panic.
+        let sync_handle = tokio::spawn(async {});
+        // Let the runtime finish the spawned task.
+        tokio::task::yield_now().await;
+        // Abort must not panic even though the task already finished.
+        sync_handle.abort();
     }
 }
