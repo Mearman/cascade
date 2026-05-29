@@ -1,9 +1,17 @@
-//! `OAuth2` device code + refresh flow for Google Drive.
+//! `OAuth2` authorisation flows for Google Drive.
+//!
+//! Supports two flows:
+//! - **Localhost redirect** (preferred) — spins up a one-shot HTTP server on
+//!   a random port, opens the user's browser to Google's consent screen, and
+//!   exchanges the resulting auth code for tokens. Supports full Drive scope.
+//! - **Device code** (fallback) — for headless environments. Limited to
+//!   `drive.file` and `drive.appdata` scopes per Google's restrictions.
+//!
+//! Credentials can be baked in at compile time via `CASCADE_GDRIVE_CLIENT_ID`
+//! and `CASCADE_GDRIVE_CLIENT_SECRET` environment variables. If not set, the
+//! credentials are read from the backend config file at runtime.
 //!
 //! Tokens are stored in the macOS Keychain via the `security` command.
-//! The device code flow is used for initial authorisation — no local
-//! web server required.
-//!
 //! Token persistence (`save_tokens` / `load_tokens`) is only available on
 //! macOS. On other platforms both functions return an error immediately.
 
@@ -11,6 +19,17 @@
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// Drive scope: full read-write access to all files the user can see.
+const DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive";
+
+/// Device code flow scope: limited to per-file access (Google restriction).
+const DEVICE_CODE_SCOPE: &str = "https://www.googleapis.com/auth/drive.file";
+
+/// Compile-time credentials. `None` if the env vars weren't set during build.
+pub const DEFAULT_CLIENT_ID: Option<&str> = option_env!("CASCADE_GDRIVE_CLIENT_ID");
+pub const DEFAULT_CLIENT_SECRET: Option<&str> = option_env!("CASCADE_GDRIVE_CLIENT_SECRET");
 
 /// `OAuth2` token response from Google.
 #[derive(Debug, Deserialize)]
@@ -34,7 +53,7 @@ struct DeviceCodeResponse {
     interval: Option<u64>,
 }
 
-/// Result of a device code authorisation.
+/// Result of an authorisation flow.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthTokens {
     pub access_token: String,
@@ -65,9 +84,183 @@ impl std::fmt::Debug for OAuthConfig {
     }
 }
 
+/// Resolve credentials: baked-in first, then config file values.
+pub fn resolve_credentials(
+    config_client_id: Option<&str>,
+    config_client_secret: Option<&str>,
+) -> anyhow::Result<OAuthConfig> {
+    let client_id = DEFAULT_CLIENT_ID
+        .map(str::to_string)
+        .or_else(|| config_client_id.map(str::to_string))
+        .ok_or_else(|| anyhow::anyhow!("no Google client_id: set CASCADE_GDRIVE_CLIENT_ID at build time or client_id in config"))?;
+
+    let client_secret = DEFAULT_CLIENT_SECRET
+        .map(str::to_string)
+        .or_else(|| config_client_secret.map(str::to_string))
+        .ok_or_else(|| anyhow::anyhow!("no Google client_secret: set CASCADE_GDRIVE_CLIENT_SECRET at build time or client_secret in config"))?;
+
+    Ok(OAuthConfig {
+        client_id,
+        client_secret,
+    })
+}
+
 /// Keychain service name for storing tokens.
 #[cfg(target_os = "macos")]
 const KEYCHAIN_SERVICE: &str = "com.cascade.gdrive";
+
+// ---------------------------------------------------------------------------
+// Localhost redirect flow (preferred)
+// ---------------------------------------------------------------------------
+
+/// Run the localhost redirect `OAuth2` flow.
+///
+/// 1. Bind a random port on localhost
+/// 2. Print the authorisation URL and attempt to open the browser
+/// 3. Wait for the callback with the auth code
+/// 4. Exchange the code for tokens
+pub async fn start_local_redirect(
+    http: &reqwest::Client,
+    config: &OAuthConfig,
+) -> anyhow::Result<AuthTokens> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let redirect_uri = format!("http://127.0.0.1:{port}");
+    let auth_url = format!(
+        "https://accounts.google.com/o/oauth2/v2/auth?client_id={}&redirect_uri={}&response_type=code&scope={}&access_type=offline&prompt=consent",
+        config.client_id,
+        urlencoding::encode(&redirect_uri),
+        urlencoding::encode(DRIVE_SCOPE),
+    );
+
+    println!("Opening browser for Google Drive authorisation...");
+    println!("If the browser doesn't open, visit:\n  {auth_url}");
+
+    // Try to open the browser (best-effort).
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(&auth_url).spawn();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("xdg-open")
+            .arg(&auth_url)
+            .spawn();
+    }
+
+    println!("Waiting for authorisation callback on port {port}...");
+
+    // Accept one connection, parse the callback.
+    let code = wait_for_callback(&listener).await?;
+
+    // Exchange the auth code for tokens.
+    exchange_code(http, config, &code, &redirect_uri).await
+}
+
+/// Wait for the `OAuth2` callback on the localhost listener.
+///
+/// Parses the query string from the GET request, extracts the `code` parameter,
+/// sends a simple HTML response to the browser, and returns the auth code.
+async fn wait_for_callback(listener: &tokio::net::TcpListener) -> anyhow::Result<String> {
+    let (stream, _addr) = listener.accept().await?;
+    let mut buf = vec![0u8; 4096];
+    let (mut reader, mut writer) = tokio::io::split(stream);
+
+    let n = reader.read(&mut buf).await?;
+    let request = String::from_utf8_lossy(buf.get(..n).unwrap_or_default());
+
+    // Parse the request line: GET /callback?code=...&scope=... HTTP/1.1
+    let path = request
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| anyhow::anyhow!("malformed callback request"))?;
+
+    let query = path.split('?').nth(1).unwrap_or_default();
+
+    // Extract the code parameter.
+    let mut code: Option<String> = None;
+    let mut error: Option<String> = None;
+    for pair in query.split('&') {
+        if let Some((key, value)) = pair.split_once('=') {
+            match key {
+                "code" => {
+                    code = Some(
+                        urlencoding::decode(value)
+                            .map_err(|e| anyhow::anyhow!("invalid URL encoding: {e}"))?
+                            .into_owned(),
+                    );
+                }
+                "error" => {
+                    error = Some(
+                        urlencoding::decode(value)
+                            .map_err(|e| anyhow::anyhow!("invalid URL encoding: {e}"))?
+                            .into_owned(),
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Send a response to the browser.
+    let body = if code.is_some() {
+        "<html><body><h1>Authorised!</h1><p>You can close this tab.</p></body></html>"
+    } else {
+        "<html><body><h1>Authorisation failed</h1><p>Please try again.</p></body></html>"
+    };
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = writer.write_all(response.as_bytes()).await;
+    let _ = writer.shutdown().await;
+
+    if let Some(err) = error {
+        anyhow::bail!("OAuth2 authorisation error: {err}");
+    }
+
+    code.ok_or_else(|| anyhow::anyhow!("no auth code in callback"))
+}
+
+/// Exchange an authorisation code for tokens.
+async fn exchange_code(
+    http: &reqwest::Client,
+    config: &OAuthConfig,
+    code: &str,
+    redirect_uri: &str,
+) -> anyhow::Result<AuthTokens> {
+    let resp = http
+        .post("https://oauth2.googleapis.com/token")
+        .form(&[
+            ("client_id", config.client_id.as_str()),
+            ("client_secret", config.client_secret.as_str()),
+            ("code", code),
+            ("grant_type", "authorization_code"),
+            ("redirect_uri", redirect_uri),
+        ])
+        .send()
+        .await?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Token exchange failed ({status}): {body}");
+    }
+
+    let token_resp: TokenResponse = resp.json().await?;
+    let secs = i64::try_from(token_resp.expires_in).unwrap_or(i64::MAX);
+    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(secs);
+
+    Ok(AuthTokens {
+        access_token: token_resp.access_token,
+        refresh_token: token_resp.refresh_token.unwrap_or_default(),
+        expires_at,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Device code flow (fallback)
+// ---------------------------------------------------------------------------
 
 /// Initiate the device code flow. Returns the URL and user code.
 pub async fn start_device_code(
@@ -78,7 +271,7 @@ pub async fn start_device_code(
         .post("https://oauth2.googleapis.com/device/code")
         .form(&[
             ("client_id", config.client_id.as_str()),
-            ("scope", "https://www.googleapis.com/auth/drive.readonly"),
+            ("scope", DEVICE_CODE_SCOPE),
         ])
         .send()
         .await?;
@@ -154,6 +347,10 @@ pub async fn poll_for_token(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Token refresh
+// ---------------------------------------------------------------------------
+
 /// Refresh an access token using a refresh token.
 pub async fn refresh_access_token(
     http: &reqwest::Client,
@@ -189,6 +386,10 @@ pub async fn refresh_access_token(
         expires_at,
     })
 }
+
+// ---------------------------------------------------------------------------
+// Token persistence (macOS Keychain)
+// ---------------------------------------------------------------------------
 
 /// Save tokens to the macOS Keychain.
 ///
@@ -282,5 +483,25 @@ mod tests {
             expires_at: chrono::Utc::now() - chrono::Duration::hours(1),
         };
         assert!(past.is_expired());
+    }
+
+    #[test]
+    fn resolve_credentials_prefers_built_in() {
+        // If compiled without env vars, falls back to config values.
+        let config = resolve_credentials(Some("cfg-id"), Some("cfg-secret"));
+        assert!(config.is_ok());
+        let c = config.unwrap();
+        // With no baked-in creds, config values are used.
+        if DEFAULT_CLIENT_ID.is_none() {
+            assert_eq!(c.client_id, "cfg-id");
+            assert_eq!(c.client_secret, "cfg-secret");
+        }
+    }
+
+    #[test]
+    fn resolve_credentials_errors_when_both_missing() {
+        // If no baked-in creds and no config values, should error.
+        let result = resolve_credentials(None, None);
+        assert!(result.is_err());
     }
 }

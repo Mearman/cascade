@@ -119,6 +119,7 @@ impl FileProviderBridge {
     }
 
     #[cfg(not(target_os = "macos"))]
+    #[allow(clippy::unused_async)]
     async fn send_request(&self, request: &Request) -> Result<Response> {
         bail!(
             "File Provider bridge request {} requires macOS; socket {} is not available on this platform",
