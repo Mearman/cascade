@@ -5,6 +5,7 @@
 //! macOS `mount_webdav` can connect without root.
 
 use std::collections::HashMap;
+use std::fmt::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
@@ -183,7 +184,7 @@ fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> Respons
                     return false;
                 }
                 // Parent is the path component before the last '/'.
-                let parent = child_path.rfind('/').map(|i| &child_path[..i]).unwrap_or("");
+                let parent = child_path.rsplit_once('/').map_or("", |(before, _)| before);
                 parent == normalised.trim_end_matches('/')
             })
             .collect()
@@ -518,7 +519,10 @@ pub fn build_root_response(backends: &[String]) -> String {
          </D:response>",
     );
     for backend in backends {
-        responses.push_str(&format!(
+        // SAFETY: write! to String is infallible.
+        #[allow(clippy::expect_used)]
+        let _ = write!(
+            responses,
             "<D:response>\
              <D:href>/{}/</D:href>\
              <D:propstat>\
@@ -528,8 +532,8 @@ pub fn build_root_response(backends: &[String]) -> String {
              <D:status>HTTP/1.1 200 OK</D:status>\
              </D:propstat>\
              </D:response>",
-            xml_escape(&backend),
-        ));
+            xml_escape(backend),
+        );
     }
     format!(
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
@@ -539,6 +543,7 @@ pub fn build_root_response(backends: &[String]) -> String {
     )
 }
 
+#[must_use]
 pub fn build_propfind_response(
     href: &str,
     target: Option<&VfsItem>,
@@ -550,7 +555,10 @@ pub fn build_propfind_response(
     if let Some(item) = target {
         responses.push_str(&build_response_element(&root_href, item));
     } else {
-        responses.push_str(&format!(
+        // SAFETY: write! to String is infallible.
+        #[allow(clippy::expect_used)]
+        let _ = write!(
+            responses,
             "<D:response>\
              <D:href>{root_href}</D:href>\
              <D:propstat>\
@@ -560,7 +568,7 @@ pub fn build_propfind_response(
              <D:status>HTTP/1.1 200 OK</D:status>\
              </D:propstat>\
              </D:response>",
-        ));
+        );
     }
 
     for child in children {

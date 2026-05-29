@@ -173,7 +173,10 @@ async fn try_fskit(
     if let Err(e) = presenter.start(mount_path).await {
         resources.shutdown();
         return Err(e).with_context(|| {
-            format!("failed to start FSKit presenter at {}", mount_path.display())
+            format!(
+                "failed to start FSKit presenter at {}",
+                mount_path.display()
+            )
         });
     }
 
@@ -247,7 +250,10 @@ async fn try_webdav(
     if let Err(e) = presenter.start(mount_path).await {
         resources.shutdown();
         return Err(e).with_context(|| {
-            format!("failed to start WebDAV presenter at {}", mount_path.display())
+            format!(
+                "failed to start WebDAV presenter at {}",
+                mount_path.display()
+            )
         });
     }
 
@@ -773,8 +779,9 @@ mod tests {
         assert!(!ctx.pid_path.exists());
     }
 
-    // --- Permission escalation ---
+    // -- Permission escalation (macOS only) ---
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn is_permission_error_detects_operation_not_permitted() {
         assert!(is_permission_error(
@@ -782,11 +789,13 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn is_permission_error_rejects_other_errors() {
         assert!(!is_permission_error("mount_nfs: No such file or directory"));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn osascript_mount_command_constructs_correctly() {
         let dir = TempDir::new().unwrap();
@@ -805,6 +814,7 @@ mod tests {
         assert!(args[1].contains(mount_point.to_str().unwrap()));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn mount_nfs_on_unreachable_port_errors_without_privilege_escalation() {
         assert!(!is_permission_error("Connection refused"));
