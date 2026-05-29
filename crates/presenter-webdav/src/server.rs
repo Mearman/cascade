@@ -147,45 +147,49 @@ fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> Respons
         }
     };
 
-    // Normalise path — strip leading slash for matching against ItemId components.
     let normalised = normalise_path(path);
 
-    // Find the item matching this path.
-    let target = items.values().find(|item| {
-        let item_path = item_path(item);
-        item_path == normalised || item_path == path || path == "/" && item_path.is_empty()
-    });
+    // Root listing: show each backend as a top-level directory.
+    if normalised == "/" {
+        let mut backends: Vec<String> = items
+            .values()
+            .filter_map(|item| item.id.0.split(':').next().map(String::from))
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        backends.sort();
+        let xml = build_root_response(&backends);
+        return (
+            StatusCode::MULTI_STATUS,
+            [(header::CONTENT_TYPE, "application/xml; charset=utf-8")],
+            xml,
+        )
+            .into_response();
+    }
 
-    // Also find children if depth is not "0".
+    // Non-root: find the item whose path matches.
+    let target = items.values().find(|item| item_path(item) == normalised);
+
+    // Find children: items whose parent_id matches the target's id, or
+    // whose item_path parent matches normalised.
     let children: Vec<&VfsItem> = if depth == "0" {
         Vec::new()
     } else {
         items
             .values()
             .filter(|item| {
-                let item_path = item_path(item);
-                if path == "/" {
-                    // Root listing: all items whose path has no further slashes.
-                    !item_path.is_empty()
-                        && item_path.matches('/').count() <= 1
-                        && item_path != normalised
-                } else {
-                    let prefix = if normalised.starts_with('/') {
-                        normalised.clone()
-                    } else {
-                        format!("/{normalised}")
-                    };
-                    let prefix = prefix.trim_end_matches('/');
-                    let Some(suffix) = item_path.strip_prefix(&format!("{prefix}/")) else {
-                        return false;
-                    };
-                    !suffix.is_empty() && !suffix.contains('/')
+                let child_path = item_path(item);
+                if child_path == normalised {
+                    return false;
                 }
+                // Parent is the path component before the last '/'.
+                let parent = child_path.rfind('/').map(|i| &child_path[..i]).unwrap_or("");
+                parent == normalised.trim_end_matches('/')
             })
             .collect()
     };
 
-    let xml = build_propfind_response(path, target, &children);
+    let xml = build_propfind_response(&normalised, target, &children);
     (
         StatusCode::MULTI_STATUS,
         [(header::CONTENT_TYPE, "application/xml; charset=utf-8")],
@@ -500,40 +504,68 @@ fn handle_copy(state: &AppState, src_path: &str, headers: &HeaderMap) -> Respons
 
 /// Build a PROPFIND multistatus XML response.
 #[must_use]
+pub fn build_root_response(backends: &[String]) -> String {
+    let mut responses = String::new();
+    responses.push_str(
+        "<D:response>\
+         <D:href>/</D:href>\
+         <D:propstat>\
+         <D:prop>\
+         <D:resourcetype><D:collection/></D:resourcetype>\
+         </D:prop>\
+         <D:status>HTTP/1.1 200 OK</D:status>\
+         </D:propstat>\
+         </D:response>",
+    );
+    for backend in backends {
+        responses.push_str(&format!(
+            "<D:response>\
+             <D:href>/{}/</D:href>\
+             <D:propstat>\
+             <D:prop>\
+             <D:resourcetype><D:collection/></D:resourcetype>\
+             </D:prop>\
+             <D:status>HTTP/1.1 200 OK</D:status>\
+             </D:propstat>\
+             </D:response>",
+            xml_escape(&backend),
+        ));
+    }
+    format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+         <D:multistatus xmlns:D=\"DAV:\">\
+         {responses}\
+         </D:multistatus>"
+    )
+}
+
 pub fn build_propfind_response(
     href: &str,
     target: Option<&VfsItem>,
     children: &[&VfsItem],
 ) -> String {
     let mut responses = String::new();
-
-    // The root href for the target.
     let root_href = xml_escape(href);
 
     if let Some(item) = target {
         responses.push_str(&build_response_element(&root_href, item));
     } else {
-        // No explicit target — treat as root collection.
-        #[allow(clippy::literal_string_with_formatting_args)]
-        responses.push_str(
+        responses.push_str(&format!(
             "<D:response>\
-             <D:href>/{root_href}</D:href>\
+             <D:href>{root_href}</D:href>\
              <D:propstat>\
              <D:prop>\
              <D:resourcetype><D:collection/></D:resourcetype>\
-             <D:getlastmodified>Thu, 01 Jan 1970 00:00:00 GMT</D:getlastmodified>\
              </D:prop>\
              <D:status>HTTP/1.1 200 OK</D:status>\
              </D:propstat>\
              </D:response>",
-        );
+        ));
     }
 
     for child in children {
-        let child_href = format!(
-            "/{}/",
-            xml_escape(&item_path(child)).trim_start_matches('/')
-        );
+        let child_path = item_path(child);
+        let child_href = format!("{child_path}/");
         responses.push_str(&build_response_element(&child_href, child));
     }
 

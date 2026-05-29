@@ -93,6 +93,13 @@ impl SyncRunner {
         // are uploaded before entering the polling loop.
         self.flush_dirty_files().await;
 
+        // Hydrate the presenter with all existing DB items.
+        // The sync loop only emits incremental changes, so without this
+        // the presenter would remain empty on restart when no new changes exist.
+        if let Err(e) = self.hydrate_presenter().await {
+            tracing::warn!(error = %e, "failed to hydrate presenter from DB");
+        }
+
         // Polling loop.
         loop {
             let interval = self.effective_poll_interval().await;
@@ -352,6 +359,25 @@ impl SyncRunner {
         }
 
         flushed
+    }
+
+    /// Hydrate the presenter with all existing items from the state DB.
+    /// Called once after initial sync so the presenter has a complete
+    /// view even when no new changes were detected.
+    async fn hydrate_presenter(&self) -> anyhow::Result<()> {
+        let files = self.db.list_all_files()?;
+        if files.is_empty() {
+            return Ok(());
+        }
+        tracing::info!(count = files.len(), "hydrating presenter from DB");
+        for entry in &files {
+            let item: VfsItem = entry.clone().into();
+            if let Err(e) = self.presenter.upsert_item(item).await {
+                tracing::debug!(id = %entry.id, error = %e, "failed to hydrate item");
+            }
+        }
+        tracing::info!(count = files.len(), "presenter hydrated from DB");
+        Ok(())
     }
 }
 
