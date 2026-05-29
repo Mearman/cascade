@@ -90,7 +90,7 @@ pub struct GdriveBackend {
     drive: DriveClient,
     oauth: auth::OAuthConfig,
     account: String,
-    /// Per-instance backend ID, e.g. "gdrive:personal".
+    /// Per-instance backend ID, e.g. "gdrive-personal".
     instance_id: String,
     tokens: Arc<RwLock<Option<AuthTokens>>>,
 }
@@ -121,36 +121,31 @@ impl GdriveBackend {
         Ok(tokens.access_token.clone())
     }
 
-    /// Walk the full Drive tree starting from root, returning all files
-    /// as `Change::Created`. Used for initial sync when no cursor exists.
-    async fn full_tree_walk(&self, token: &str) -> anyhow::Result<Vec<Change>> {
+    /// List immediate children of the Drive root directory.
+    /// Used for initial sync to populate top-level items quickly.
+    async fn list_root_children(&self, token: &str) -> anyhow::Result<Vec<Change>> {
         let mut all_changes = Vec::new();
-        let mut queue = vec!["root".to_string()];
+        let mut page_token: Option<String> = None;
 
-        while let Some(parent_id) = queue.pop() {
-            let mut page_token: Option<String> = None;
-            loop {
-                let resp = self
-                    .drive
-                    .list_files(&parent_id, token, page_token.as_deref())
-                    .await?;
+        loop {
+            let resp = self
+                .drive
+                .list_files("root", token, page_token.as_deref())
+                .await?;
 
-                for file in resp.files {
-                    let is_dir = file.mime_type == "application/vnd.google-apps.folder";
-                    if let Some(entry) = file.to_file_entry(&self.instance_id) {
-                        if is_dir {
-                            queue.push(file.id.clone());
-                        }
-                        all_changes.push(Change::Created(entry));
-                    }
-                }
-
-                match resp.next_page_token {
-                    Some(next) => page_token = Some(next),
-                    None => break,
+            for file in resp.files {
+                if let Some(entry) = file.to_file_entry(&self.instance_id) {
+                    all_changes.push(Change::Created(entry));
                 }
             }
+
+            match resp.next_page_token {
+                Some(next) => page_token = Some(next),
+                None => break,
+            }
         }
+
+        tracing::info!(backend = %self.instance_id, count = all_changes.len(), "listed root children");
 
         Ok(all_changes)
     }
@@ -187,11 +182,11 @@ impl Backend for GdriveBackend {
     async fn changes(&self, cursor: Option<&Cursor>) -> anyhow::Result<(Vec<Change>, Cursor)> {
         let token = self.access_token().await?;
 
-        // No cursor → initial sync: walk the full Drive tree.
+        // No cursor → initial sync: list root-level children only.
         let Some(cursor) = cursor else {
-            let all_changes = self.full_tree_walk(&token).await?;
+            let root_changes = self.list_root_children(&token).await?;
             let start_token = self.drive.get_start_page_token(&token).await?;
-            return Ok((all_changes, Cursor(start_token)));
+            return Ok((root_changes, Cursor(start_token)));
         };
 
         let page_token = cursor.0.clone();
@@ -384,6 +379,32 @@ impl Backend for GdriveBackend {
     async fn poll_interval(&self) -> Option<Duration> {
         #[allow(unknown_lints, clippy::duration_suboptimal_units)]
         Some(Duration::from_secs(60))
+    }
+
+    async fn list_children(&self, parent_native_id: &str) -> anyhow::Result<Vec<FileEntry>> {
+        let token = self.access_token().await?;
+        let mut all_entries = Vec::new();
+        let mut page_token: Option<String> = None;
+
+        loop {
+            let resp = self
+                .drive
+                .list_files(parent_native_id, &token, page_token.as_deref())
+                .await?;
+
+            for file in resp.files {
+                if let Some(entry) = file.to_file_entry(&self.instance_id) {
+                    all_entries.push(entry);
+                }
+            }
+
+            match resp.next_page_token {
+                Some(next) => page_token = Some(next),
+                None => break,
+            }
+        }
+
+        Ok(all_entries)
     }
 }
 

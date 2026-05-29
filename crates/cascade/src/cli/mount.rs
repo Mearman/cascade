@@ -231,7 +231,24 @@ async fn try_webdav(
     };
     let engine = Engine::new(engine_config).await?;
 
-    let presenter = Arc::new(WebDavPresenter::new(mount_path));
+    let mut presenter = WebDavPresenter::new(mount_path);
+
+    // Pass backends and DB for on-demand directory expansion.
+    let all_backends: Vec<Arc<dyn cascade_engine::backend::Backend>> = {
+        let vfs = engine
+            .vfs()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut bs: Vec<Arc<dyn cascade_engine::backend::Backend>> = vec![vfs.root().clone()];
+        for (_, backend) in vfs.children() {
+            bs.push(backend.clone());
+        }
+        bs
+    };
+    presenter.with_backends(all_backends);
+    presenter.with_db(engine.db().clone());
+
+    let presenter = Arc::new(presenter);
     let items = presenter.items().clone();
 
     let sync_runner = engine.create_sync_runner(presenter.clone());

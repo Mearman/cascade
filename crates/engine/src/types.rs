@@ -219,6 +219,21 @@ impl From<FileEntry> for VfsItem {
     }
 }
 
+impl From<&VfsItem> for FileEntry {
+    fn from(item: &VfsItem) -> Self {
+        Self {
+            id: item.id.clone(),
+            parent_id: item.parent_id.clone(),
+            name: item.name.clone(),
+            is_dir: item.is_dir,
+            size: item.size,
+            mod_time: item.mod_time,
+            mime_type: item.mime_type.clone(),
+            hash: None,
+        }
+    }
+}
+
 /// Storage quota information.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Quota {

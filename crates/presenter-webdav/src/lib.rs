@@ -20,6 +20,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
+use cascade_engine::backend::Backend;
+use cascade_engine::db::StateDb;
 use cascade_engine::presenter::VfsPresenter;
 use cascade_engine::types::{CacheState, ItemId, VfsItem};
 use server::WebDavServer;
@@ -28,7 +30,6 @@ use server::WebDavServer;
 const CACHE_DIR_NAME: &str = "cascade/cache";
 
 /// `WebDAV` presenter using an HTTP server on loopback.
-#[derive(Debug)]
 pub struct WebDavPresenter {
     #[allow(dead_code)] // Used for mount/unmount commands
     mount_point: PathBuf,
@@ -38,6 +39,18 @@ pub struct WebDavPresenter {
     items: Arc<RwLock<HashMap<String, VfsItem>>>,
     /// Running server handle (set after start).
     pub server: Arc<tokio::sync::Mutex<Option<WebDavServer>>>,
+    /// Backends for on-demand directory expansion.
+    backends: Arc<tokio::sync::RwLock<Vec<Arc<dyn Backend>>>>,
+    /// State DB for persisting expanded items.
+    db: Option<Arc<StateDb>>,
+}
+
+impl std::fmt::Debug for WebDavPresenter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebDavPresenter")
+            .field("mount_point", &self.mount_point)
+            .finish_non_exhaustive()
+    }
 }
 
 impl WebDavPresenter {
@@ -49,6 +62,8 @@ impl WebDavPresenter {
             cache_dir: dirs_cache_dir(),
             items: Arc::new(RwLock::new(HashMap::new())),
             server: Arc::new(tokio::sync::Mutex::new(None)),
+            backends: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            db: None,
         }
     }
 
@@ -56,6 +71,16 @@ impl WebDavPresenter {
     #[must_use]
     pub fn default_mount() -> Self {
         Self::new("/mnt/cascade")
+    }
+
+    /// Set the backends for on-demand directory expansion.
+    pub fn with_backends(&mut self, backends: Vec<Arc<dyn Backend>>) {
+        *self.backends.blocking_write() = backends;
+    }
+
+    /// Set the state DB for persisting expanded items.
+    pub fn with_db(&mut self, db: Arc<StateDb>) {
+        self.db = Some(db);
     }
 
     /// Get the items map (for server access).
@@ -155,8 +180,14 @@ impl VfsPresenter for WebDavPresenter {
             mount_point = %mount_point.display(),
             "starting WebDAV presenter"
         );
-        let server =
-            WebDavServer::start("127.0.0.1:0", self.items.clone(), self.cache_dir.clone()).await?;
+        let server = WebDavServer::start(
+            "127.0.0.1:0",
+            self.items.clone(),
+            self.cache_dir.clone(),
+            self.backends.clone(),
+            self.db.clone(),
+        )
+        .await?;
         let port = server.port();
         tracing::info!(port, "WebDAV server started");
         let mut guard = self.server.lock().await;

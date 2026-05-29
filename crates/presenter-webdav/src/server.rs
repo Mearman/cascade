@@ -14,16 +14,26 @@ use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use cascade_engine::types::VfsItem;
+use cascade_engine::types::{ItemId, VfsItem};
 use tokio::net::TcpListener;
 
 /// Shared state passed to all axum handlers.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AppState {
     /// In-memory VFS items keyed by `ItemId` string.
     pub items: Arc<RwLock<HashMap<String, VfsItem>>>,
     /// On-disk cache directory.
     pub cache_dir: PathBuf,
+    /// Backends for on-demand directory expansion.
+    pub backends: Arc<tokio::sync::RwLock<Vec<Arc<dyn cascade_engine::backend::Backend>>>>,
+    /// State DB for persisting expanded items.
+    pub db: Option<Arc<cascade_engine::db::StateDb>>,
+}
+
+impl std::fmt::Debug for AppState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppState").finish_non_exhaustive()
+    }
 }
 
 /// Running `WebDAV` server handle.
@@ -46,11 +56,18 @@ impl WebDavServer {
         bind_addr: &str,
         items: Arc<RwLock<HashMap<String, VfsItem>>>,
         cache_dir: PathBuf,
+        backends: Arc<tokio::sync::RwLock<Vec<Arc<dyn cascade_engine::backend::Backend>>>>,
+        db: Option<Arc<cascade_engine::db::StateDb>>,
     ) -> anyhow::Result<Self> {
         let listener = TcpListener::bind(bind_addr).await?;
         let port = listener.local_addr()?.port();
 
-        let state = AppState { items, cache_dir };
+        let state = AppState {
+            items,
+            cache_dir,
+            backends,
+            db,
+        };
 
         let app = Router::new().fallback(webdav_handler).with_state(state);
 
@@ -106,7 +123,7 @@ async fn webdav_handler(State(state): State<AppState>, req: Request) -> Response
         Method::DELETE => handle_delete(&state, &path).await,
         m if m == Method::from_bytes(b"MKCOL").unwrap_or_default() => handle_mkcol(&state, &path),
         m if m == Method::from_bytes(b"PROPFIND").unwrap_or_default() => {
-            handle_propfind(&state, &path, req.headers())
+            handle_propfind(&state, &path, req.headers()).await
         }
         m if m == Method::from_bytes(b"MOVE").unwrap_or_default() => {
             handle_move(&state, &path, req.headers())
@@ -134,24 +151,17 @@ fn handle_options() -> Response {
 }
 
 /// Handle `PROPFIND` — return `WebDAV` XML metadata for a resource.
-fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> Response {
+async fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> Response {
     let depth = headers
         .get("Depth")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("1");
 
-    let items = match state.items.read() {
-        Ok(guard) => guard,
-        Err(e) => {
-            tracing::error!(error = %e, "failed to read items lock");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-
     let normalised = normalise_path(path);
 
     // Root listing: show each backend as a top-level directory.
     if normalised == "/" {
+        let items = read_items(&state.items);
         let mut backends: Vec<String> = items
             .values()
             .filter_map(|item| item.id.0.split(':').next().map(String::from))
@@ -168,33 +178,69 @@ fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> Respons
             .into_response();
     }
 
-    // Non-root: find the item whose resolved path matches.
-    let target = items
-        .values()
-        .find(|item| resolve_full_path(item, &items) == normalised);
-
-    // Find children.
-    let children: Vec<&VfsItem> = if depth == "0" {
-        Vec::new()
-    } else if let Some(t) = &target {
-        // Real directory: children have this item as parent.
-        let target_id = &t.id.0;
+    // Find the target item (block scope to drop the guard).
+    let target = {
+        let items = read_items(&state.items);
         items
             .values()
-            .filter(|item| &item.parent_id.0 == target_id)
-            .collect()
-    } else {
-        // Virtual backend directory (e.g. /gdrive): children are items
-        // whose parent_id is the backend root (e.g. gdrive:root).
-        let backend_prefix = normalised.trim_start_matches('/').trim_end_matches('/');
-        let root_id = format!("{backend_prefix}:root");
-        items
-            .values()
-            .filter(|item| item.parent_id.0 == root_id)
-            .collect()
+            .find(|item| resolve_full_path(item, &items) == normalised)
+            .cloned()
     };
 
-    let xml = build_propfind_response(&normalised, target, &children, &items);
+    // Find children, expanding directories on demand if empty.
+    let children: Vec<VfsItem> = if depth == "0" {
+        Vec::new()
+    } else if let Some(ref t) = target {
+        let target_id = t.id.0.clone();
+        let cached: Vec<VfsItem> = {
+            let items = read_items(&state.items);
+            items
+                .values()
+                .filter(|item| item.parent_id.0 == target_id)
+                .cloned()
+                .collect()
+        };
+
+        if cached.is_empty() && t.is_dir {
+            expand_directory(state, &t.id).await;
+            let items = read_items(&state.items);
+            items
+                .values()
+                .filter(|item| item.parent_id.0 == target_id)
+                .cloned()
+                .collect()
+        } else {
+            cached
+        }
+    } else {
+        let backend_prefix = normalised.trim_start_matches('/').trim_end_matches('/');
+        let root_id = format!("{backend_prefix}:root");
+        let cached: Vec<VfsItem> = {
+            let items = read_items(&state.items);
+            items
+                .values()
+                .filter(|item| item.parent_id.0 == root_id)
+                .cloned()
+                .collect()
+        };
+
+        if cached.is_empty() {
+            expand_root(state, backend_prefix).await;
+            let items = read_items(&state.items);
+            items
+                .values()
+                .filter(|item| item.parent_id.0 == root_id)
+                .cloned()
+                .collect()
+        } else {
+            cached
+        }
+    };
+
+    // Build response.
+    let items = read_items(&state.items);
+    let child_refs: Vec<&VfsItem> = children.iter().collect();
+    let xml = build_propfind_response(&normalised, target.as_ref(), &child_refs, &items);
     (
         StatusCode::MULTI_STATUS,
         [(header::CONTENT_TYPE, "application/xml; charset=utf-8")],
@@ -703,6 +749,91 @@ fn resolve_full_path(item: &VfsItem, items: &std::collections::HashMap<String, V
 
 /// Normalise a URL path for consistent matching.
 /// Removes trailing slashes, ensures no double slashes.
+fn read_items(
+    items: &Arc<RwLock<HashMap<String, VfsItem>>>,
+) -> std::sync::RwLockReadGuard<'_, HashMap<String, VfsItem>> {
+    items
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// On-demand expansion: fetch children of a directory from its backend.
+async fn expand_directory(state: &AppState, item_id: &ItemId) {
+    let backend_id = item_id.backend_id();
+    let native_id = item_id.native_id();
+
+    let backend = {
+        let backends = state.backends.read().await;
+        backends.iter().find(|b| b.id() == backend_id).cloned()
+    };
+    let Some(backend) = backend else {
+        tracing::debug!(backend = %backend_id, "no backend found for expansion");
+        return;
+    };
+
+    tracing::info!(native_id = %native_id, "expanding directory");
+
+    match backend.list_children(native_id).await {
+        Ok(entries) => {
+            let mut items = state
+                .items
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for entry in entries {
+                let key = entry.id.0.clone();
+                let vfs_item = VfsItem::from(entry);
+                if let Some(db) = &state.db {
+                    let file_entry = cascade_engine::types::FileEntry::from(&vfs_item);
+                    if let Err(e) = db.upsert_file(&file_entry) {
+                        tracing::debug!(error = %e, "failed to persist expanded item");
+                    }
+                }
+                items.insert(key, vfs_item);
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to expand directory");
+        }
+    }
+}
+
+/// On-demand expansion: list root children for a virtual backend directory.
+async fn expand_root(state: &AppState, backend_prefix: &str) {
+    let backend = {
+        let backends = state.backends.read().await;
+        backends.iter().find(|b| b.id() == backend_prefix).cloned()
+    };
+    let Some(backend) = backend else {
+        tracing::debug!(backend = %backend_prefix, "no backend found for root expansion");
+        return;
+    };
+
+    tracing::info!(backend = %backend_prefix, "expanding backend root");
+
+    match backend.list_children("root").await {
+        Ok(entries) => {
+            let mut items = state
+                .items
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for entry in entries {
+                let key = entry.id.0.clone();
+                let vfs_item = VfsItem::from(entry);
+                if let Some(db) = &state.db {
+                    let file_entry = cascade_engine::types::FileEntry::from(&vfs_item);
+                    if let Err(e) = db.upsert_file(&file_entry) {
+                        tracing::debug!(error = %e, "failed to persist expanded item");
+                    }
+                }
+                items.insert(key, vfs_item);
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to expand backend root");
+        }
+    }
+}
+
 fn normalise_path(path: &str) -> String {
     let p = path.trim_end_matches('/');
     if p.is_empty() {
@@ -816,9 +947,15 @@ mod tests {
     async fn server_starts_and_stops() {
         let items = Arc::new(RwLock::new(HashMap::new()));
         let cache_dir = tempfile::tempdir().unwrap();
-        let server = WebDavServer::start("127.0.0.1:0", items, cache_dir.path().to_path_buf())
-            .await
-            .unwrap();
+        let server = WebDavServer::start(
+            "127.0.0.1:0",
+            items,
+            cache_dir.path().to_path_buf(),
+            Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            None,
+        )
+        .await
+        .unwrap();
         assert!(server.port() > 0);
         server.stop().unwrap();
     }
@@ -827,10 +964,15 @@ mod tests {
     async fn server_propfind_returns_multistatus() {
         let items = Arc::new(RwLock::new(HashMap::new()));
         let cache_dir = tempfile::tempdir().unwrap();
-        let server =
-            WebDavServer::start("127.0.0.1:0", items.clone(), cache_dir.path().to_path_buf())
-                .await
-                .unwrap();
+        let server = WebDavServer::start(
+            "127.0.0.1:0",
+            items.clone(),
+            cache_dir.path().to_path_buf(),
+            Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            None,
+        )
+        .await
+        .unwrap();
         let port = server.port();
 
         let client = reqwest::Client::new();
@@ -856,9 +998,15 @@ mod tests {
     async fn server_get_returns_not_found_for_missing() {
         let items = Arc::new(RwLock::new(HashMap::new()));
         let cache_dir = tempfile::tempdir().unwrap();
-        let server = WebDavServer::start("127.0.0.1:0", items, cache_dir.path().to_path_buf())
-            .await
-            .unwrap();
+        let server = WebDavServer::start(
+            "127.0.0.1:0",
+            items,
+            cache_dir.path().to_path_buf(),
+            Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            None,
+        )
+        .await
+        .unwrap();
         let port = server.port();
 
         let client = reqwest::Client::new();
@@ -876,9 +1024,15 @@ mod tests {
     async fn server_put_and_get_roundtrip() {
         let items = Arc::new(RwLock::new(HashMap::new()));
         let cache_dir = tempfile::tempdir().unwrap();
-        let server = WebDavServer::start("127.0.0.1:0", items, cache_dir.path().to_path_buf())
-            .await
-            .unwrap();
+        let server = WebDavServer::start(
+            "127.0.0.1:0",
+            items,
+            cache_dir.path().to_path_buf(),
+            Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            None,
+        )
+        .await
+        .unwrap();
         let port = server.port();
 
         let client = reqwest::Client::new();
@@ -909,10 +1063,15 @@ mod tests {
     async fn server_mkcol_creates_directory() {
         let items = Arc::new(RwLock::new(HashMap::new()));
         let cache_dir = tempfile::tempdir().unwrap();
-        let server =
-            WebDavServer::start("127.0.0.1:0", items.clone(), cache_dir.path().to_path_buf())
-                .await
-                .unwrap();
+        let server = WebDavServer::start(
+            "127.0.0.1:0",
+            items.clone(),
+            cache_dir.path().to_path_buf(),
+            Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            None,
+        )
+        .await
+        .unwrap();
         let port = server.port();
 
         let client = reqwest::Client::new();
@@ -941,10 +1100,15 @@ mod tests {
     async fn server_delete_removes_item() {
         let items = Arc::new(RwLock::new(HashMap::new()));
         let cache_dir = tempfile::tempdir().unwrap();
-        let server =
-            WebDavServer::start("127.0.0.1:0", items.clone(), cache_dir.path().to_path_buf())
-                .await
-                .unwrap();
+        let server = WebDavServer::start(
+            "127.0.0.1:0",
+            items.clone(),
+            cache_dir.path().to_path_buf(),
+            Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            None,
+        )
+        .await
+        .unwrap();
         let port = server.port();
 
         let client = reqwest::Client::new();
@@ -972,9 +1136,15 @@ mod tests {
     async fn server_options_returns_dav_header() {
         let items = Arc::new(RwLock::new(HashMap::new()));
         let cache_dir = tempfile::tempdir().unwrap();
-        let server = WebDavServer::start("127.0.0.1:0", items, cache_dir.path().to_path_buf())
-            .await
-            .unwrap();
+        let server = WebDavServer::start(
+            "127.0.0.1:0",
+            items,
+            cache_dir.path().to_path_buf(),
+            Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            None,
+        )
+        .await
+        .unwrap();
         let port = server.port();
 
         let client = reqwest::Client::new();

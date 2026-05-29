@@ -55,6 +55,13 @@ pub trait Backend: Send + Sync {
     /// Move/rename a file or directory.
     async fn move_entry(&self, src: &Path, dst: &Path) -> anyhow::Result<FileEntry>;
 
+    /// List immediate children of a directory by its native ID.
+    /// Used for on-demand directory expansion in presenters.
+    /// Returns an empty vec for backends that don't support this.
+    async fn list_children(&self, _parent_native_id: &str) -> anyhow::Result<Vec<FileEntry>> {
+        Ok(vec![])
+    }
+
     /// Recommended poll interval for this backend. Returns `None` if the
     /// backend doesn't support polling (use fixed interval from config).
     async fn poll_interval(&self) -> Option<Duration>;
