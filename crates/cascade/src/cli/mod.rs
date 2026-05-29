@@ -223,6 +223,14 @@ pub enum Commands {
         /// Mount path (relative path in VFS, e.g. Work/Projects)
         #[arg(long)]
         mount_path: Option<String>,
+
+        /// OAuth client ID (gdrive only)
+        #[arg(long)]
+        client_id: Option<String>,
+
+        /// OAuth client secret (gdrive only)
+        #[arg(long)]
+        client_secret: Option<String>,
     },
 
     /// Remove a backend
@@ -232,11 +240,19 @@ pub enum Commands {
         name: String,
     },
 
-    /// Authenticate a backend (runs `OAuth2` device-code flow)
+    /// Authenticate a backend (runs `OAuth2` flow)
     #[command(name = "backend-auth")]
     BackendAuth {
         /// Backend name
         name: String,
+
+        /// Override the OAuth client ID (takes priority over config and built-in)
+        #[arg(long)]
+        client_id: Option<String>,
+
+        /// Override the OAuth client secret (takes priority over config and built-in)
+        #[arg(long)]
+        client_secret: Option<String>,
     },
 }
 
@@ -317,9 +333,22 @@ impl Cli {
                 backend_type,
                 name,
                 mount_path,
-            } => cache::backend_add(ctx, &backend_type, name.as_deref(), mount_path.as_deref()),
+                client_id,
+                client_secret,
+            } => cache::backend_add(
+                ctx,
+                &backend_type,
+                name.as_deref(),
+                mount_path.as_deref(),
+                client_id.as_deref(),
+                client_secret.as_deref(),
+            ),
             Commands::BackendRemove { name } => cache::backend_remove(ctx, &name),
-            Commands::BackendAuth { name } => auth::authenticate(ctx, &name).await,
+            Commands::BackendAuth {
+                name,
+                client_id,
+                client_secret,
+            } => auth::authenticate(ctx, &name, client_id.as_deref(), client_secret.as_deref()).await,
         }
     }
 }

@@ -171,6 +171,8 @@ pub fn backend_add(
     backend_type: &str,
     name: Option<&str>,
     mount_path: Option<&str>,
+    cli_client_id: Option<&str>,
+    cli_client_secret: Option<&str>,
 ) -> Result<()> {
     std::fs::create_dir_all(&ctx.config_dir)?;
 
@@ -239,18 +241,37 @@ pub fn backend_add(
             std::fs::write(&config_path, &config_str)?;
         }
         "gdrive" => {
-            println!("\nGoogle Drive requires OAuth credentials (client_id and client_secret).");
-            println!("You can set these up at https://console.cloud.google.com/");
+            // Use CLI flags if provided, otherwise prompt interactively.
+            let client_id = if let Some(cid) = cli_client_id {
+                if cid.is_empty() {
+                    anyhow::bail!("--client-id must not be empty");
+                }
+                cid.to_string()
+            } else {
+                println!("\nGoogle Drive requires OAuth credentials (client_id and client_secret).");
+                println!("Create a Desktop app OAuth client at https://console.cloud.google.com/");
+                let cid = read_input("Client ID")?;
+                if cid.is_empty() {
+                    anyhow::bail!("client_id is required");
+                }
+                cid
+            };
 
-            let client_id = read_input("Client ID")?;
-            if client_id.is_empty() {
-                anyhow::bail!("client_id is required");
-            }
-
-            let client_secret = read_input("Client secret")?;
-            if client_secret.is_empty() {
-                anyhow::bail!("client_secret is required");
-            }
+            let client_secret = if let Some(csec) = cli_client_secret {
+                if csec.is_empty() {
+                    anyhow::bail!("--client-secret must not be empty");
+                }
+                csec.to_string()
+            } else if cli_client_id.is_some() {
+                // --client-id was given but not --client-secret — error.
+                anyhow::bail!("--client-secret is required when --client-id is provided");
+            } else {
+                let csec = read_input("Client secret")?;
+                if csec.is_empty() {
+                    anyhow::bail!("client_secret is required");
+                }
+                csec
+            };
 
             let mut full_config = toml::Table::new();
             full_config.insert(

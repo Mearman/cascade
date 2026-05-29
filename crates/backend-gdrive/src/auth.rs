@@ -84,20 +84,25 @@ impl std::fmt::Debug for OAuthConfig {
     }
 }
 
-/// Resolve credentials: baked-in first, then config file values.
+/// Resolve credentials: explicit values first, then config file, then
+/// compile-time defaults.
+///
+/// This precedence order lets users bring their own OAuth client (highest
+/// priority) and falls back to the built-in credentials only when nothing
+/// else is provided.
 pub fn resolve_credentials(
     config_client_id: Option<&str>,
     config_client_secret: Option<&str>,
 ) -> anyhow::Result<OAuthConfig> {
-    let client_id = DEFAULT_CLIENT_ID
+    let client_id = config_client_id
         .map(str::to_string)
-        .or_else(|| config_client_id.map(str::to_string))
-        .ok_or_else(|| anyhow::anyhow!("no Google client_id: set CASCADE_GDRIVE_CLIENT_ID at build time or client_id in config"))?;
+        .or_else(|| DEFAULT_CLIENT_ID.map(str::to_string))
+        .ok_or_else(|| anyhow::anyhow!("no Google client_id: set client_id in config or CASCADE_GDRIVE_CLIENT_ID at build time"))?;
 
-    let client_secret = DEFAULT_CLIENT_SECRET
+    let client_secret = config_client_secret
         .map(str::to_string)
-        .or_else(|| config_client_secret.map(str::to_string))
-        .ok_or_else(|| anyhow::anyhow!("no Google client_secret: set CASCADE_GDRIVE_CLIENT_SECRET at build time or client_secret in config"))?;
+        .or_else(|| DEFAULT_CLIENT_SECRET.map(str::to_string))
+        .ok_or_else(|| anyhow::anyhow!("no Google client_secret: set client_secret in config or CASCADE_GDRIVE_CLIENT_SECRET at build time"))?;
 
     Ok(OAuthConfig {
         client_id,
@@ -486,16 +491,13 @@ mod tests {
     }
 
     #[test]
-    fn resolve_credentials_prefers_built_in() {
-        // If compiled without env vars, falls back to config values.
+    fn resolve_credentials_prefers_config_over_built_in() {
+        // Config values take priority over compile-time defaults.
         let config = resolve_credentials(Some("cfg-id"), Some("cfg-secret"));
         assert!(config.is_ok());
         let c = config.unwrap();
-        // With no baked-in creds, config values are used.
-        if DEFAULT_CLIENT_ID.is_none() {
-            assert_eq!(c.client_id, "cfg-id");
-            assert_eq!(c.client_secret, "cfg-secret");
-        }
+        assert_eq!(c.client_id, "cfg-id");
+        assert_eq!(c.client_secret, "cfg-secret");
     }
 
     #[test]

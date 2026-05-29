@@ -15,7 +15,12 @@ use super::CliContext;
 ///
 /// Tries the localhost redirect flow first (full `drive` scope). Falls back
 /// to the device code flow (`drive.file` scope only) if the redirect fails.
-pub async fn authenticate(ctx: &CliContext, name: &str) -> anyhow::Result<()> {
+pub async fn authenticate(
+    ctx: &CliContext,
+    name: &str,
+    cli_client_id: Option<&str>,
+    cli_client_secret: Option<&str>,
+) -> anyhow::Result<()> {
     let config_path = ctx.config_dir.join(format!("{name}.toml"));
 
     let raw = std::fs::read_to_string(&config_path)
@@ -36,7 +41,11 @@ pub async fn authenticate(ctx: &CliContext, name: &str) -> anyhow::Result<()> {
     let config_client_id = config.get("client_id").and_then(|v| v.as_str());
     let config_client_secret = config.get("client_secret").and_then(|v| v.as_str());
 
-    let oauth = resolve_credentials(config_client_id, config_client_secret)?;
+    // CLI flags > config file > compile-time defaults.
+    let effective_client_id = cli_client_id.or(config_client_id);
+    let effective_client_secret = cli_client_secret.or(config_client_secret);
+
+    let oauth = resolve_credentials(effective_client_id, effective_client_secret)?;
 
     let http = reqwest::Client::new();
 
@@ -89,7 +98,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let ctx = make_ctx(&dir);
 
-        let result = authenticate(&ctx, "missing").await;
+        let result = authenticate(&ctx, "missing", None, None).await;
         assert!(result.is_err());
     }
 
@@ -101,7 +110,7 @@ mod tests {
         let config_path = ctx.config_dir.join("mybackup.toml");
         std::fs::write(&config_path, "type = \"s3\"\n").unwrap();
 
-        let result = authenticate(&ctx, "mybackup").await;
+        let result = authenticate(&ctx, "mybackup", None, None).await;
         assert!(result.is_err());
     }
 
@@ -109,10 +118,8 @@ mod tests {
     fn resolve_credentials_from_config() {
         let oauth =
             resolve_credentials(Some("test-client-id"), Some("test-client-secret")).unwrap();
-        // If baked-in creds exist, they take priority; otherwise config values.
-        if cascade_backend_gdrive::auth::DEFAULT_CLIENT_ID.is_none() {
-            assert_eq!(oauth.client_id, "test-client-id");
-            assert_eq!(oauth.client_secret, "test-client-secret");
-        }
+        // Config values take priority over compile-time defaults.
+        assert_eq!(oauth.client_id, "test-client-id");
+        assert_eq!(oauth.client_secret, "test-client-secret");
     }
 }
