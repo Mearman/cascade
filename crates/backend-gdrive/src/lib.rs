@@ -310,7 +310,7 @@ impl Backend for GdriveBackend {
 
         let file = self
             .drive
-            .upload_file(file_name, parent_id.0.as_str(), &data, &token)
+            .upload_file(file_name, parent_id.native_id(), &data, &token)
             .await?;
 
         file.to_file_entry(&self.instance_id)

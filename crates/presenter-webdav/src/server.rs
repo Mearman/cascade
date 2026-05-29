@@ -315,6 +315,7 @@ async fn handle_get(state: &AppState, path: &str) -> Response {
             let ip = resolve_full_path(item, &items);
             ip == normalised || ip == path
         });
+        tracing::debug!(path = %normalised, found = found.is_some(), "GET lookup");
         match found {
             Some(item) => (item.id.0.clone(), item.id.backend_id().to_string()),
             None => return StatusCode::NOT_FOUND.into_response(),

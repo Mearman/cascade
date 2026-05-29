@@ -38,6 +38,16 @@ impl fmt::Display for ItemId {
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FileId(pub String);
 
+impl FileId {
+    /// Extract the native ID part after the colon.
+    /// Format: `"{backend_id}:{native_id}"`. Returns the full string if
+    /// no colon is present (bare native ID).
+    #[must_use]
+    pub fn native_id(&self) -> &str {
+        self.0.split_once(':').map_or(&self.0, |(_, native)| native)
+    }
+}
+
 impl fmt::Display for FileId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
