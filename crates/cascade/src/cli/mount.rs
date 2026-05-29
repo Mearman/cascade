@@ -4,8 +4,10 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use cascade_engine::engine::{Engine, EngineConfig};
+#[cfg(target_os = "macos")]
 use cascade_engine::presenter::VfsPresenter;
 use cascade_presenter_nfs::nfs::server::{NfsServer, NfsServerConfig};
+#[cfg(target_os = "macos")]
 use cascade_presenter_webdav::WebDavPresenter;
 
 use super::init::{BackendConfig, CascadeConfig};
@@ -724,7 +726,7 @@ fn mount_nfs(_mount_point: &Path, _port: u16) -> Result<()> {
 }
 
 #[cfg(not(target_os = "macos"))]
-#[allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps)]
+#[allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps, dead_code)]
 fn mount_webdav(_mount_point: &Path, _port: u16) -> Result<()> {
     anyhow::bail!("WebDAV mounting is not supported on this platform yet");
 }
