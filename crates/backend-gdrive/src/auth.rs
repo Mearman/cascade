@@ -123,9 +123,9 @@ pub async fn start_local_redirect(
     http: &reqwest::Client,
     config: &OAuthConfig,
 ) -> anyhow::Result<AuthTokens> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let listener = tokio::net::TcpListener::bind("localhost:0").await?;
     let port = listener.local_addr()?.port();
-    let redirect_uri = format!("http://127.0.0.1:{port}");
+    let redirect_uri = format!("http://localhost:{port}");
     let auth_url = format!(
         "https://accounts.google.com/o/oauth2/v2/auth?client_id={}&redirect_uri={}&response_type=code&scope={}&access_type=offline&prompt=consent",
         config.client_id,
