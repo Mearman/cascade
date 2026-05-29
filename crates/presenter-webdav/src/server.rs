@@ -168,29 +168,33 @@ fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> Respons
             .into_response();
     }
 
-    // Non-root: find the item whose path matches.
-    let target = items.values().find(|item| item_path(item) == normalised);
+    // Non-root: find the item whose resolved path matches.
+    let target = items
+        .values()
+        .find(|item| resolve_full_path(item, &items) == normalised);
 
-    // Find children: items whose parent_id matches the target's id, or
-    // whose item_path parent matches normalised.
+    // Find children.
     let children: Vec<&VfsItem> = if depth == "0" {
         Vec::new()
-    } else {
+    } else if let Some(t) = &target {
+        // Real directory: children have this item as parent.
+        let target_id = &t.id.0;
         items
             .values()
-            .filter(|item| {
-                let child_path = item_path(item);
-                if child_path == normalised {
-                    return false;
-                }
-                // Parent is the path component before the last '/'.
-                let parent = child_path.rsplit_once('/').map_or("", |(before, _)| before);
-                parent == normalised.trim_end_matches('/')
-            })
+            .filter(|item| &item.parent_id.0 == target_id)
+            .collect()
+    } else {
+        // Virtual backend directory (e.g. /gdrive): children are items
+        // whose parent_id is the backend root (e.g. gdrive:root).
+        let backend_prefix = normalised.trim_start_matches('/').trim_end_matches('/');
+        let root_id = format!("{backend_prefix}:root");
+        items
+            .values()
+            .filter(|item| item.parent_id.0 == root_id)
             .collect()
     };
 
-    let xml = build_propfind_response(&normalised, target, &children);
+    let xml = build_propfind_response(&normalised, target, &children, &items);
     (
         StatusCode::MULTI_STATUS,
         [(header::CONTENT_TYPE, "application/xml; charset=utf-8")],
@@ -213,7 +217,10 @@ async fn handle_get(state: &AppState, path: &str) -> Response {
         };
         items
             .values()
-            .find(|item| item_path(item) == normalised || item_path(item) == path)
+            .find(|item| {
+                resolve_full_path(item, &items) == normalised
+                    || resolve_full_path(item, &items) == path
+            })
             .map(|item| item.id.0.clone())
     };
 
@@ -250,7 +257,10 @@ async fn handle_put(state: &AppState, path: &str, req: Request) -> Response {
         };
         items
             .values()
-            .find(|item| item_path(item) == normalised || item_path(item) == path)
+            .find(|item| {
+                resolve_full_path(item, &items) == normalised
+                    || resolve_full_path(item, &items) == path
+            })
             .map(|item| item.id.0.clone())
     };
 
@@ -319,7 +329,10 @@ async fn handle_delete(state: &AppState, path: &str) -> Response {
         };
         items
             .values()
-            .find(|item| item_path(item) == normalised || item_path(item) == path)
+            .find(|item| {
+                resolve_full_path(item, &items) == normalised
+                    || resolve_full_path(item, &items) == path
+            })
             .map(|item| item.id.0.clone())
     };
 
@@ -362,7 +375,7 @@ fn handle_mkcol(state: &AppState, path: &str) -> Response {
             }
         };
         let exists = items.values().any(|item| {
-            let ip = item_path(item);
+            let ip = resolve_full_path(item, &items);
             ip == normalised || ip == path
         });
         if exists {
@@ -428,7 +441,7 @@ fn handle_move(state: &AppState, src_path: &str, headers: &HeaderMap) -> Respons
     let src_key = items
         .iter()
         .find(|(_, item)| {
-            let ip = item_path(item);
+            let ip = resolve_full_path(item, &items);
             ip == src_normalised || ip == src_path
         })
         .map(|(k, _)| k.clone());
@@ -470,7 +483,7 @@ fn handle_copy(state: &AppState, src_path: &str, headers: &HeaderMap) -> Respons
     let src_item = items
         .values()
         .find(|item| {
-            let ip = item_path(item);
+            let ip = resolve_full_path(item, &items);
             ip == src_normalised || ip == src_path
         })
         .cloned();
@@ -544,10 +557,12 @@ pub fn build_root_response(backends: &[String]) -> String {
 }
 
 #[must_use]
+#[allow(clippy::implicit_hasher)]
 pub fn build_propfind_response(
     href: &str,
     target: Option<&VfsItem>,
     children: &[&VfsItem],
+    items: &std::collections::HashMap<String, VfsItem>,
 ) -> String {
     let mut responses = String::new();
     let root_href = xml_escape(href);
@@ -572,7 +587,7 @@ pub fn build_propfind_response(
     }
 
     for child in children {
-        let child_path = item_path(child);
+        let child_path = resolve_full_path(child, items);
         let child_href = format!("{child_path}/");
         responses.push_str(&build_response_element(&child_href, child));
     }
@@ -646,8 +661,43 @@ pub fn item_path(item: &VfsItem) -> String {
     let id = &item.id.0;
     if id.starts_with('/') {
         id.clone()
+    } else if let Some((backend, _file_id)) = id.split_once(':') {
+        format!("/{backend}/{}", item.name)
     } else {
-        format!("/{}", id.replace(':', "/"))
+        format!("/{}", item.name)
+    }
+}
+
+/// Resolve the full path for an item by walking its parent chain.
+/// Produces paths like `/gdrive/huggingface_hub/cli/command.py`
+/// instead of the flat `/gdrive/command.py`.
+fn resolve_full_path(item: &VfsItem, items: &std::collections::HashMap<String, VfsItem>) -> String {
+    let mut parts = vec![item.name.clone()];
+    let mut current_parent = item.parent_id.0.clone();
+
+    // Walk up the parent chain until we hit a root-level item
+    // (one whose parent_id is just the backend prefix like "gdrive:root"
+    // or whose parent_id has no ":" separator).
+    let mut seen = std::collections::HashSet::new();
+    while let Some(parent) = items.get(&current_parent) {
+        if !seen.insert(current_parent.clone()) {
+            break; // cycle detected
+        }
+        parts.push(parent.name.clone());
+        current_parent = parent.parent_id.0.clone();
+    }
+
+    // The remaining current_parent should be like "gdrive:root" or "gdrive:".
+    // Extract the backend prefix.
+    let backend = current_parent
+        .split_once(':')
+        .map_or("", |(prefix, _)| prefix);
+
+    parts.reverse();
+    if backend.is_empty() {
+        format!("/{}", parts.join("/"))
+    } else {
+        format!("/{backend}/{}", parts.join("/"))
     }
 }
 
@@ -691,7 +741,8 @@ mod tests {
 
     #[test]
     fn propfind_xml_root_collection() {
-        let xml = build_propfind_response("/", None, &[]);
+        let empty = HashMap::new();
+        let xml = build_propfind_response("/", None, &[], &empty);
         assert!(xml.contains("<?xml version=\"1.0\""));
         assert!(xml.contains("DAV:"));
         assert!(xml.contains("<D:collection/>"));
@@ -701,7 +752,8 @@ mod tests {
     #[test]
     fn propfind_xml_with_file() {
         let item = make_item("test.txt", false);
-        let xml = build_propfind_response("/gdrive/test.txt", Some(&item), &[]);
+        let empty = HashMap::new();
+        let xml = build_propfind_response("/gdrive/test.txt", Some(&item), &[], &empty);
         // Item has size=None, so no content-length element.
         assert!(!xml.contains("<D:collection/>"));
         assert!(xml.contains("/gdrive/test.txt"));
@@ -711,7 +763,8 @@ mod tests {
     fn propfind_xml_with_file_with_size() {
         let mut item = make_item("test.txt", false);
         item.size = Some(1024);
-        let xml = build_propfind_response("/gdrive/test.txt", Some(&item), &[]);
+        let empty = HashMap::new();
+        let xml = build_propfind_response("/gdrive/test.txt", Some(&item), &[], &empty);
         assert!(xml.contains("<D:getcontentlength>1024</D:getcontentlength>"));
         assert!(!xml.contains("<D:collection/>"));
         assert!(xml.contains("/gdrive/test.txt"));
@@ -720,7 +773,8 @@ mod tests {
     #[test]
     fn propfind_xml_with_directory() {
         let item = make_item("Documents", true);
-        let xml = build_propfind_response("/gdrive/Documents", Some(&item), &[]);
+        let empty = HashMap::new();
+        let xml = build_propfind_response("/gdrive/Documents", Some(&item), &[], &empty);
         assert!(xml.contains("<D:collection/>"));
         assert!(xml.contains("/gdrive/Documents"));
     }
@@ -729,7 +783,8 @@ mod tests {
     fn propfind_xml_with_children() {
         let parent = make_item("Documents", true);
         let child = make_item("readme.txt", false);
-        let xml = build_propfind_response("/gdrive/Documents", Some(&parent), &[&child]);
+        let empty = HashMap::new();
+        let xml = build_propfind_response("/gdrive/Documents", Some(&parent), &[&child], &empty);
         assert!(xml.contains("<D:collection/>"));
         assert!(xml.contains("readme.txt"));
         // Two responses — parent + child.
