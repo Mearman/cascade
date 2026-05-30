@@ -366,34 +366,33 @@ async fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> R
         }
     }
 
-    // Find children, expanding directories on demand if empty.
+    // Find children, expanding directories on demand if not already
+    // fully hydrated this session. Trusting the in-memory items map
+    // alone is unsafe: a sync cycle may have inserted a handful of
+    // items while the DB has hundreds. Use `state.expanded` as the
+    // authoritative "this directory's children are fully cached"
+    // signal, populating from DB or API on first access per session.
     let children: Vec<VfsItem> = if depth == "0" {
         Vec::new()
     } else if let Some(ref t) = target {
         let target_id = t.id.0.clone();
-        let cached: Vec<VfsItem> = {
-            let items = read_items(&state.items).await;
-            items
-                .values()
-                .filter(|item| item.parent_id.0 == target_id)
-                .cloned()
-                .collect()
-        };
+        let is_expanded = state.expanded.read().await.contains(&target_id);
 
-        if cached.is_empty() && t.is_dir {
-            // Try DB first, fall back to API.
-            if hydrate_children_from_db(state, &target_id).await == 0 {
+        if !is_expanded && t.is_dir {
+            let hydrated = hydrate_children_from_db(state, &target_id).await;
+            if hydrated > 0 {
+                state.expanded.write().await.insert(target_id.clone());
+            } else {
                 expand_directory(state, &t.id).await;
             }
-            let items = read_items(&state.items).await;
-            items
-                .values()
-                .filter(|item| item.parent_id.0 == target_id)
-                .cloned()
-                .collect()
-        } else {
-            cached
         }
+
+        let items = read_items(&state.items).await;
+        items
+            .values()
+            .filter(|item| item.parent_id.0 == target_id)
+            .cloned()
+            .collect()
     } else {
         // target is None and the path is a top-level backend root (the
         // multi-component guard above already returned 404 for anything
