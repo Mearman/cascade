@@ -132,6 +132,8 @@ impl GdriveBackend {
 
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
+            .pool_max_idle_per_host(0)
+            .http1_only()
             .build()
             .unwrap_or_default();
         let refreshed = auth::refresh_access_token(&http, &self.oauth, &refresh_token).await?;

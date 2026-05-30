@@ -20,8 +20,28 @@ use tokio::net::TcpListener;
 
 /// Build a response with an explicit empty body and Content-Length: 0.
 ///
-/// Workaround for axum/hyper 1.x bug where responses without a body
-/// are sometimes never flushed to the TCP socket.
+/// Run an async future on a completely separate OS thread with its own
+/// tokio runtime, blocking the current thread until it completes.
+/// This avoids any `.await` on the axum runtime after body consumption,
+/// working around a hyper 1.x bug where responses get stuck.
+fn run_isolated_blocking<F, T>(future: F) -> T
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("isolated runtime");
+        let result = rt.block_on(future);
+        let _ = tx.send(result);
+    });
+    rx.recv().expect("isolated thread panicked")
+}
+
+/// Build a response with explicit Content-Length: 0.
 fn empty_response(status: StatusCode) -> Response {
     let mut resp = Response::new(axum::body::Body::empty());
     *resp.status_mut() = status;
@@ -405,7 +425,6 @@ async fn handle_get(state: &AppState, path: &str) -> Response {
 }
 
 /// Handle `PUT` — store file contents to the cache.
-#[allow(unused_variables)]
 async fn handle_put(state: &AppState, path: &str, req: Request) -> Response {
     let normalised = normalise_path(path);
 
@@ -496,14 +515,18 @@ async fn handle_put(state: &AppState, path: &str, req: Request) -> Response {
             .map(|item| cascade_engine::types::FileId(item.id.0.clone()))
     };
 
-    let result = if let Some(file_id) = existing_file_id {
-        backend.update(&file_id, &mut cursor).await
-    } else {
-        let relative_path = relative_path.to_path_buf();
-        backend
-            .upload(&relative_path, &mut cursor, &parent_id)
-            .await
-    };
+    let relative_path_owned = relative_path.to_path_buf();
+    let result = tokio::task::block_in_place(|| {
+        run_isolated_blocking(async move {
+            if let Some(file_id) = existing_file_id {
+                backend.update(&file_id, &mut cursor).await
+            } else {
+                backend
+                    .upload(&relative_path_owned, &mut cursor, &parent_id)
+                    .await
+            }
+        })
+    });
 
     match result {
         Ok(entry) => {
