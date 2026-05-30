@@ -125,7 +125,7 @@ async fn webdav_handler(State(state): State<AppState>, req: Request) -> Response
 
     tracing::debug!(method = %method, path = %path, "WebDAV request");
 
-    match method {
+    let mut resp = match method {
         Method::GET => handle_get(&state, &path).await,
         Method::PUT => handle_put(&state, &path, req).await,
         Method::DELETE => handle_delete(&state, &path).await,
@@ -143,7 +143,14 @@ async fn webdav_handler(State(state): State<AppState>, req: Request) -> Response
         }
         Method::OPTIONS => handle_options(),
         _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
-    }
+    };
+
+    // Force Connection: close on all responses to work around axum 0.8
+    // HTTP/1.1 keep-alive bug where responses after body consumption
+    // are never flushed.
+    resp.headers_mut()
+        .insert(header::CONNECTION, HeaderValue::from_static("close"));
+    resp
 }
 
 /// Handle `OPTIONS` — return `WebDAV` compliance headers.
@@ -407,11 +414,9 @@ async fn handle_put(state: &AppState, path: &str, req: Request) -> Response {
         return StatusCode::NOT_FOUND.into_response();
     };
 
-    // Read the request body.
-    let body_bytes = axum::body::to_bytes(req.into_body(), 100 * 1024 * 1024).await;
-    let Ok(bytes) = body_bytes else {
-        return StatusCode::BAD_REQUEST.into_response();
-    };
+    let bytes = axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024)
+        .await
+        .unwrap_or_default();
 
     // Resolve the parent directory's native ID.
     let parent_id = if relative.is_empty() {
@@ -479,31 +484,27 @@ async fn handle_put(state: &AppState, path: &str, req: Request) -> Response {
             .map(|item| cascade_engine::types::FileId(item.id.0.clone()))
     };
 
-    // Skip backend call entirely to isolate the response issue.
     let result = if let Some(file_id) = existing_file_id {
-        tracing::debug!(file_id = %file_id.0, "PUT overwrite");
         backend.update(&file_id, &mut cursor).await
     } else {
-        tracing::debug!(path = %relative_path.display(), "PUT create");
-        backend.upload(relative_path, &mut cursor, &parent_id).await
+        let relative_path = relative_path.to_path_buf();
+        backend
+            .upload(&relative_path, &mut cursor, &parent_id)
+            .await
     };
 
     match result {
         Ok(entry) => {
-            // Persist to state DB.
             if let Some(db) = &state.db {
                 let _ = db.upsert_file(&entry);
             }
-            // Store the returned entry in the items map.
             let key = entry.id.0.clone();
             let vfs_item = VfsItem::from(entry);
-            // Also cache locally for fast reads.
             let cache_path = state.cache_dir.join(safe_filename(&key));
             if let Some(parent) = cache_path.parent() {
                 let _ = tokio::fs::create_dir_all(parent).await;
             }
             let _ = tokio::fs::write(&cache_path, &bytes).await;
-            // Now acquire the lock and insert.
             {
                 let mut items = state.items.write().await;
                 items.insert(key, vfs_item);

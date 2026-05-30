@@ -98,6 +98,18 @@ pub struct GdriveBackend {
 impl GdriveBackend {
     /// Get a valid access token, refreshing if necessary.
     async fn access_token(&self) -> anyhow::Result<String> {
+        // Fast path: check if token is still valid without holding the lock
+        // across an await.
+        {
+            let tokens = self.tokens.lock().await;
+            if let Some(t) = tokens.as_ref() {
+                if !t.is_expired() {
+                    return Ok(t.access_token.clone());
+                }
+            }
+        }
+
+        // Slow path: need to refresh. Re-acquire the lock.
         let mut tokens = self.tokens.lock().await;
 
         // Try loading from Keychain if we don't have tokens yet.
@@ -109,19 +121,25 @@ impl GdriveBackend {
             anyhow::anyhow!("Not authenticated. Run `cascade backend auth gdrive`")
         })?;
 
-        // Refresh if expired.
-        if tokens.is_expired() {
-            let http = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .build()
-                .unwrap_or_default();
-            let refreshed =
-                auth::refresh_access_token(&http, &self.oauth, &tokens.refresh_token).await?;
-            auth::save_tokens(&self.account, &refreshed)?;
-            *tokens = refreshed;
+        // Double-check: another task may have refreshed while we waited.
+        if !tokens.is_expired() {
+            return Ok(tokens.access_token.clone());
         }
 
-        Ok(tokens.access_token.clone())
+        // Refresh — extract what we need, drop the lock, do the HTTP call,
+        // then re-acquire and update.
+        let refresh_token = tokens.refresh_token.clone();
+
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_default();
+        let refreshed = auth::refresh_access_token(&http, &self.oauth, &refresh_token).await?;
+        auth::save_tokens(&self.account, &refreshed)?;
+
+        let mut tokens = self.tokens.lock().await;
+        *tokens = Some(refreshed);
+        Ok(tokens.as_ref().expect("just set").access_token.clone())
     }
 
     /// List immediate children of the Drive root directory.

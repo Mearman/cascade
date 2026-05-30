@@ -95,6 +95,8 @@ impl DriveClient {
         Self {
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
+                .pool_max_idle_per_host(0)
+                .http1_only()
                 .build()
                 .unwrap_or_default(),
             rate_limiter: RateLimiter::new(10_000),
