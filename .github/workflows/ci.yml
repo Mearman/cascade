@@ -195,6 +195,9 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Build
         run: cargo build --release --target aarch64-apple-darwin -p cascade
+        env:
+          CASCADE_GDRIVE_CLIENT_ID: ${{ secrets.CASCADE_GDRIVE_CLIENT_ID }}
+          CASCADE_GDRIVE_CLIENT_SECRET: ${{ secrets.CASCADE_GDRIVE_CLIENT_SECRET }}
       - name: Package archive
         run: |
           mkdir -p dist
@@ -228,6 +231,9 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Build
         run: cargo build --release --target x86_64-apple-darwin -p cascade
+        env:
+          CASCADE_GDRIVE_CLIENT_ID: ${{ secrets.CASCADE_GDRIVE_CLIENT_ID }}
+          CASCADE_GDRIVE_CLIENT_SECRET: ${{ secrets.CASCADE_GDRIVE_CLIENT_SECRET }}
       - name: Package archive
         run: |
           mkdir -p dist
@@ -260,6 +266,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
       - name: Build
         run: cargo build --release --target x86_64-unknown-linux-gnu -p cascade
+        env:
+          CASCADE_GDRIVE_CLIENT_ID: ${{ secrets.CASCADE_GDRIVE_CLIENT_ID }}
+          CASCADE_GDRIVE_CLIENT_SECRET: ${{ secrets.CASCADE_GDRIVE_CLIENT_SECRET }}
       - name: Package archive
         run: |
           mkdir -p dist
@@ -299,6 +308,8 @@ jobs:
         run: cargo build --release --target aarch64-unknown-linux-gnu -p cascade
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CASCADE_GDRIVE_CLIENT_ID: ${{ secrets.CASCADE_GDRIVE_CLIENT_ID }}
+          CASCADE_GDRIVE_CLIENT_SECRET: ${{ secrets.CASCADE_GDRIVE_CLIENT_SECRET }}
       - name: Package archive
         run: |
           mkdir -p dist
