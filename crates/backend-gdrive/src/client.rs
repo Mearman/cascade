@@ -3,7 +3,25 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use super::model::{AboutResponse, ChangesResponse, DriveFile, FileListResponse};
+use super::model::{AboutResponse, ChangesResponse, DriveFile, FileListResponse, SharedDriveListResponse};
+
+/// Describes the kind of listing to perform against the Drive files.list endpoint.
+#[derive(Debug)]
+pub enum ListQuery {
+    /// List the immediate children of a directory.
+    ///
+    /// `drive_id` must be set when the directory lives inside a shared drive so
+    /// that Drive scopes the query with `corpora=drive&driveId=<id>`. Omit for
+    /// My Drive folders (uses `corpora=user`).
+    ChildrenOf {
+        parent_id: String,
+        drive_id: Option<String>,
+    },
+    /// Items shared directly with the authenticated user (`sharedWithMe=true`).
+    SharedWithMe,
+    /// Items currently in the user's Bin (`trashed=true`).
+    Trashed,
+}
 
 /// Token-bucket rate limiter for Google Drive API.
 /// Allows ~10,000 requests per 100 seconds per user.
@@ -151,33 +169,86 @@ impl DriveClient {
         Ok(file)
     }
 
-    /// List files in a directory (children of a parent).
+    /// List files using the given query strategy.
+    ///
+    /// `page_token` continues a paged listing. See [`ListQuery`] for the
+    /// three supported listing modes.
     pub async fn list_files(
         &self,
-        parent_id: &str,
+        query: &ListQuery,
         token: &str,
         page_token: Option<&str>,
     ) -> anyhow::Result<FileListResponse> {
-        let query = format!("'{parent_id}' in parents and trashed = false");
-        let mut params = vec![
-            ("q", query.as_str()),
-            (
-                "fields",
-                "nextPageToken,files(id,name,mimeType,parents,size,modifiedTime,md5Checksum,trashed)",
-            ),
-            ("pageSize", "100"),
-            ("supportsAllDrives", "true"),
-            ("includeItemsFromAllDrives", "true"),
-            ("orderBy", "name"),
-        ];
-        let owned_token;
+        // Build owned strings before constructing the params slice so that
+        // all references remain valid for the duration of the call.
+        let q_str: String;
+        let drive_id_str: String;
+        let page_token_str: String;
+
+        let mut params: Vec<(&str, &str)> = Vec::new();
+
+        match query {
+            ListQuery::ChildrenOf { parent_id, drive_id } => {
+                q_str = format!("'{parent_id}' in parents and trashed = false");
+                params.push(("q", &q_str));
+                if let Some(did) = drive_id {
+                    drive_id_str = did.clone();
+                    params.push(("corpora", "drive"));
+                    params.push(("driveId", &drive_id_str));
+                    params.push(("includeItemsFromAllDrives", "true"));
+                    params.push(("supportsAllDrives", "true"));
+                } else {
+                    params.push(("corpora", "user"));
+                    params.push(("supportsAllDrives", "true"));
+                    params.push(("includeItemsFromAllDrives", "true"));
+                }
+            }
+            ListQuery::SharedWithMe => {
+                q_str = "sharedWithMe = true and trashed = false".to_string();
+                params.push(("q", &q_str));
+                params.push(("corpora", "user"));
+            }
+            ListQuery::Trashed => {
+                q_str = "trashed = true".to_string();
+                params.push(("q", &q_str));
+                params.push(("corpora", "user"));
+            }
+        }
+
+        params.push((
+            "fields",
+            "nextPageToken,files(id,name,mimeType,parents,size,modifiedTime,md5Checksum,trashed,driveId)",
+        ));
+        params.push(("pageSize", "100"));
+        params.push(("orderBy", "name"));
+
         if let Some(pt) = page_token {
-            owned_token = pt.to_string();
-            params.push(("pageToken", owned_token.as_str()));
+            page_token_str = pt.to_string();
+            params.push(("pageToken", &page_token_str));
         }
 
         let resp = self.authenticated_get("files", token, &params).await?;
         let list = resp.json::<FileListResponse>().await?;
+        Ok(list)
+    }
+
+    /// List shared drives the authenticated user is a member of.
+    pub async fn list_shared_drives(
+        &self,
+        token: &str,
+        page_token: Option<&str>,
+    ) -> anyhow::Result<SharedDriveListResponse> {
+        let page_token_str: String;
+        let mut params: Vec<(&str, &str)> = vec![
+            ("fields", "nextPageToken,drives(id,name)"),
+            ("pageSize", "100"),
+        ];
+        if let Some(pt) = page_token {
+            page_token_str = pt.to_string();
+            params.push(("pageToken", &page_token_str));
+        }
+        let resp = self.authenticated_get("drives", token, &params).await?;
+        let list = resp.json::<SharedDriveListResponse>().await?;
         Ok(list)
     }
 
@@ -198,7 +269,7 @@ impl DriveClient {
             ("q", query.as_str()),
             (
                 "fields",
-                "files(id,name,mimeType,parents,size,modifiedTime,md5Checksum,trashed)",
+                "files(id,name,mimeType,parents,size,modifiedTime,md5Checksum,trashed,driveId)",
             ),
             ("pageSize", "1"),
             ("supportsAllDrives", "true"),
