@@ -443,6 +443,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "urlencoding",
 ]
 
 [[package]]

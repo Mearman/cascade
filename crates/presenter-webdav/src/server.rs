@@ -1299,7 +1299,12 @@ fn normalise_path(path: &str) -> String {
         .split_once("://")
         .and_then(|(_, rest)| rest.find('/').and_then(|i| rest.get(i..)))
         .unwrap_or(path);
-    let p = path.trim_end_matches('/');
+    // Percent-decode so paths containing spaces and other non-ASCII characters
+    // (e.g. "/gdrive-personal/My%20Drive") match the resolved item paths,
+    // which are decoded UTF-8.
+    let decoded =
+        urlencoding::decode(path).map_or_else(|_| path.to_string(), std::borrow::Cow::into_owned);
+    let p = decoded.trim_end_matches('/');
     if p.is_empty() {
         "/".to_string()
     } else if p.starts_with('/') {
