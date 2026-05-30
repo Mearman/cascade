@@ -358,6 +358,18 @@ async fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> R
             .trim_start_matches('/')
             .trim_end_matches('/');
         let root_id = format!("{backend_prefix}:root");
+
+        // Expand the root on first access. expand_root normalises every
+        // root-level item's parent_id to the alias, so a simple alias
+        // filter below reliably covers all root children regardless of
+        // what the backend API returned as the native parent ID.
+        let is_expanded = state.expanded.read().await.contains(&root_id);
+        if !is_expanded {
+            expand_root(state, backend_prefix).await;
+        }
+
+        // After expansion all root children use the alias. If the store
+        // is still empty (e.g. completely fresh backend), try DB.
         let cached: Vec<VfsItem> = {
             let items = read_items(&state.items).await;
             items
@@ -368,53 +380,11 @@ async fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> R
         };
 
         if cached.is_empty() {
-            // Try DB first. The Google Drive API may store root children
-            // under the real folder ID (e.g. "0APRsmt7LhxCIUk9PVA")
-            // rather than the alias "root", so fall back to resolving
-            // the actual root ID from the DB.
-            let hydrated = hydrate_children_from_db(state, &root_id).await;
-            let effective_root = if hydrated == 0 {
-                if let Some(db) = &state.db {
-                    if let Some(real_root) = resolve_root_id_from_db(db, backend_prefix) {
-                        let n = hydrate_children_from_db(state, &real_root).await;
-                        if n > 0 { Some(real_root) } else { None }
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                Some(root_id.clone())
-            };
-
-            if effective_root.is_none() {
-                expand_root(state, backend_prefix).await;
-            }
-
-            // Re-read after hydration or API expansion. The effective root
-            // may still be None if the API returned children under a real
-            // folder ID rather than "root" — discover it from the items.
+            hydrate_children_from_db(state, &root_id).await;
             let items = read_items(&state.items).await;
-            let match_root = effective_root.unwrap_or_else(|| {
-                // Find the most common parent_id among items with this
-                // backend prefix that aren't in the expanded set.
-                let prefix_colon = format!("{backend_prefix}:");
-                let mut counts: std::collections::HashMap<String, usize> =
-                    std::collections::HashMap::new();
-                for item in items.values() {
-                    if item.parent_id.0.starts_with(&prefix_colon) {
-                        *counts.entry(item.parent_id.0.clone()).or_insert(0) += 1;
-                    }
-                }
-                counts
-                    .into_iter()
-                    .max_by_key(|(_, c)| *c)
-                    .map_or_else(|| root_id.clone(), |(id, _)| id)
-            });
             items
                 .values()
-                .filter(|item| item.parent_id.0 == match_root)
+                .filter(|item| item.parent_id.0 == root_id)
                 .cloned()
                 .collect()
         } else {
@@ -606,6 +576,7 @@ async fn handle_put(state: &AppState, path: &str, req: Request) -> Response {
             .map(|item| cascade_engine::types::FileId(item.id.0.clone()))
     };
 
+    let parent_id_str = parent_id.0.clone();
     let relative_path_owned = relative_path.to_path_buf();
     let result = tokio::task::block_in_place(|| {
         run_isolated_blocking(async move {
@@ -620,7 +591,11 @@ async fn handle_put(state: &AppState, path: &str, req: Request) -> Response {
     });
 
     match result {
-        Ok(entry) => {
+        Ok(mut entry) => {
+            // Normalise the parent_id to the value we resolved from the items
+            // store, so uploaded files appear in the correct PROPFIND listing
+            // regardless of which parent ID the backend API returns.
+            entry.parent_id = cascade_engine::types::ItemId(parent_id_str);
             if let Some(db) = &state.db {
                 let _ = db.upsert_file(&entry);
             }
@@ -794,8 +769,15 @@ async fn handle_mkcol(state: &AppState, path: &str) -> Response {
     };
 
     match create_result {
-        Ok(entry) => {
-            // Persist to state DB.
+        Ok(mut entry) => {
+            // Normalise the parent_id to match what we used to locate the
+            // parent in the items store. Drive API returns the real folder ID
+            // (e.g. "0APRsmt7...") even when we passed the "root" alias, so
+            // the new item would end up in a different PROPFIND bucket than
+            // its siblings unless we rewrite it here.
+            if let Some(ref parent_id) = parent_found_in_items {
+                entry.parent_id = cascade_engine::types::ItemId(parent_id.0.clone());
+            }
             if let Some(db) = &state.db {
                 let _ = db.upsert_file(&entry);
             }
@@ -1134,57 +1116,6 @@ async fn hydrate_children_from_db(state: &AppState, parent_id: &str) -> usize {
     count
 }
 
-/// Resolve the real root folder ID for a backend from the state database.
-///
-/// The Google Drive API may return `"root"` or the actual folder ID
-/// (e.g. `0APRsmt7LhxCIUk9PVA`) as the parent. When `list_children`
-/// finds nothing under `{prefix}:root`, this function queries the DB
-/// for children whose parent is a top-level directory (appears in both
-/// the id and `parent_id` columns) with the backend prefix.
-fn resolve_root_id_from_db(db: &cascade_engine::db::StateDb, prefix: &str) -> Option<String> {
-    let all = db.list_all_files().ok()?;
-    let prefix_colon = format!("{prefix}:");
-
-    // Collect all IDs for this backend into a set.
-    let ids: std::collections::HashSet<&String> = all
-        .iter()
-        .filter(|e| e.id.0.starts_with(&prefix_colon))
-        .map(|e| &e.id.0)
-        .collect();
-
-    // A root-level child is one whose parent_id is in the id set
-    // (i.e. the parent is a known directory) AND the parent has
-    // at least one child. Find all such parent IDs, then pick
-    // the one that is NOT itself a child of another directory
-    // in the same backend (i.e. its own parent_id is just the
-    // prefix with no real native ID, or it's not in the ids set).
-    let mut root_candidates: std::collections::HashSet<&String> = std::collections::HashSet::new();
-    for entry in &all {
-        if entry.id.0.starts_with(&prefix_colon) && ids.contains(&entry.parent_id.0) {
-            root_candidates.insert(&entry.parent_id.0);
-        }
-    }
-
-    // A root candidate whose own parent_id is NOT in the id set
-    // must be the top-level root (its parent is the virtual root
-    // or the "root" alias which may not be stored as an id).
-    let real_roots: Vec<&String> = root_candidates
-        .iter()
-        .filter(|id| {
-            // Look up this candidate's own parent_id.
-            all.iter()
-                .find(|e| &e.id.0 == **id)
-                .is_none_or(|e| !ids.contains(&e.parent_id.0))
-        })
-        .copied()
-        .collect();
-
-    if real_roots.len() == 1 {
-        return real_roots.into_iter().next().cloned();
-    }
-    None
-}
-
 /// Resolve the full path for an item by walking its parent chain.
 /// Produces paths like `/gdrive/huggingface_hub/cli/command.py`
 /// instead of the flat `/gdrive/command.py`.
@@ -1338,7 +1269,12 @@ async fn expand_root(state: &AppState, backend_prefix: &str) {
             let mut items = state.items.write().await;
             for entry in entries {
                 let key = entry.id.0.clone();
-                let vfs_item = VfsItem::from(entry);
+                let mut vfs_item = VfsItem::from(entry);
+                // Normalise the parent_id to the root alias. The Drive API
+                // returns the real folder ID (e.g. "0APRsmt7...") as the
+                // parent of root-level items, but the PROPFIND listing filters
+                // by the alias so all root children must use it consistently.
+                vfs_item.parent_id = cascade_engine::types::ItemId(root_key.clone());
                 if let Some(db) = &state.db {
                     let file_entry = cascade_engine::types::FileEntry::from(&vfs_item);
                     if let Err(e) = db.upsert_file(&file_entry) {
