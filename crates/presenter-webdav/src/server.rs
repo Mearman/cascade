@@ -179,6 +179,12 @@ async fn webdav_handler(State(state): State<AppState>, req: Request) -> Response
         m if m == Method::from_bytes(b"COPY").unwrap_or_default() => {
             handle_copy(&state, &path, req.headers()).await
         }
+        m if m == Method::from_bytes(b"LOCK").unwrap_or_default() => {
+            handle_lock(&path)
+        }
+        m if m == Method::from_bytes(b"UNLOCK").unwrap_or_default() => {
+            empty_response(StatusCode::NO_CONTENT)
+        }
         Method::OPTIONS => handle_options(),
         _ => empty_response(StatusCode::METHOD_NOT_ALLOWED),
     };
@@ -196,13 +202,70 @@ fn handle_options() -> Response {
     let mut resp = empty_response(StatusCode::NO_CONTENT);
     resp.headers_mut().insert(
         header::ALLOW,
-        HeaderValue::from_static("GET, PUT, DELETE, MKCOL, PROPFIND, MOVE, COPY, OPTIONS, HEAD"),
+        HeaderValue::from_static(
+            "GET, PUT, DELETE, MKCOL, PROPFIND, MOVE, COPY, LOCK, UNLOCK, OPTIONS, HEAD",
+        ),
     );
     resp.headers_mut().insert(
         header::HeaderName::from_static("dav"),
         HeaderValue::from_static("1, 2"),
     );
     resp
+}
+
+/// Handle `LOCK` — return a stub write lock so macOS can proceed with PUT.
+///
+/// We do not enforce locking; the token is synthetic and not stored.
+/// UNLOCK always succeeds (204).  This is sufficient for a single-writer
+/// client like macOS Finder / shell redirection.
+fn handle_lock(path: &str) -> Response {
+    let token = format!("urn:uuid:{}", uuid_v4());
+    let href = xml_escape(path);
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+         <D:prop xmlns:D=\"DAV:\">\
+           <D:lockdiscovery>\
+             <D:activelock>\
+               <D:locktype><D:write/></D:locktype>\
+               <D:lockscope><D:exclusive/></D:lockscope>\
+               <D:depth>0</D:depth>\
+               <D:timeout>Second-3600</D:timeout>\
+               <D:locktoken><D:href>{token}</D:href></D:locktoken>\
+               <D:lockroot><D:href>{href}</D:href></D:lockroot>\
+             </D:activelock>\
+           </D:lockdiscovery>\
+         </D:prop>"
+    );
+    let lock_token_header = format!("<{token}>");
+    let mut resp = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/xml; charset=utf-8")
+        .header(
+            header::HeaderName::from_static("lock-token"),
+            lock_token_header,
+        )
+        .body(Body::from(xml))
+        .unwrap_or_else(|_| empty_response(StatusCode::INTERNAL_SERVER_ERROR));
+    resp.headers_mut()
+        .insert(header::CONNECTION, HeaderValue::from_static("close"));
+    resp
+}
+
+/// Generate a random UUID v4 (used for synthetic lock tokens).
+fn uuid_v4() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!(
+        "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+        (t & 0xffff_ffff) as u32,
+        (t >> 32 & 0xffff) as u16,
+        (t >> 48 & 0x0fff) as u16,
+        0x8000u16 | ((t >> 60 & 0x3fff) as u16),
+        t >> 16 & 0xffff_ffff_ffff_u128,
+    )
 }
 
 /// Handle `PROPFIND` — return `WebDAV` XML metadata for a resource.
@@ -242,6 +305,23 @@ async fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> R
             .cloned()
     };
 
+    // If the path isn't in the VFS, return 404 unless it is a top-level
+    // backend path (e.g. `/gdrive-personal`) which is a virtual root with
+    // no corresponding VfsItem. Any deeper path that is absent must return
+    // 404 so that macOS sends MKCOL / PUT rather than treating the missing
+    // path as an existing empty directory.
+    if target.is_none() {
+        let component_count = normalised
+            .trim_start_matches('/')
+            .trim_end_matches('/')
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .count();
+        if component_count != 1 {
+            return empty_response(StatusCode::NOT_FOUND);
+        }
+    }
+
     // Find children, expanding directories on demand if empty.
     let children: Vec<VfsItem> = if depth == "0" {
         Vec::new()
@@ -271,22 +351,12 @@ async fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> R
             cached
         }
     } else {
-        // The path is not in the VFS. Only the top-level backend paths
-        // (e.g. `/gdrive-personal`) are virtual roots — anything deeper that
-        // doesn't exist must return 404 so that macOS sends MKCOL / PUT
-        // instead of treating the missing path as an existing directory.
-        let path_components: Vec<&str> = normalised
+        // target is None and the path is a top-level backend root (the
+        // multi-component guard above already returned 404 for anything
+        // deeper). Expand root-level children for this backend.
+        let backend_prefix = normalised
             .trim_start_matches('/')
-            .trim_end_matches('/')
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .collect();
-        let Some(&backend_prefix) = path_components.first() else {
-            return empty_response(StatusCode::NOT_FOUND);
-        };
-        if path_components.len() != 1 {
-            return empty_response(StatusCode::NOT_FOUND);
-        }
+            .trim_end_matches('/');
         let root_id = format!("{backend_prefix}:root");
         let cached: Vec<VfsItem> = {
             let items = read_items(&state.items).await;
