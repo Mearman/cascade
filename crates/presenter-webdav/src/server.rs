@@ -648,7 +648,45 @@ async fn handle_mkcol(state: &AppState, path: &str) -> Response {
         return empty_response(StatusCode::NOT_FOUND);
     };
 
-    match backend.create_dir(relative_path).await {
+    // Resolve the parent directory ID from the in-memory store if possible.
+    // This avoids a Drive API round-trip that would fail for freshly created
+    // parents not yet indexed by the Drive listing.
+    let dir_name = relative
+        .last()
+        .copied()
+        .unwrap_or("New Folder");
+    let parent_segments = relative
+        .get(..relative.len().saturating_sub(1))
+        .unwrap_or(&[]);
+    let parent_found_in_items = if parent_segments.is_empty() {
+        // Parent is the backend root.
+        Some(cascade_engine::types::FileId(
+            format!("{backend_id}:root"),
+        ))
+    } else {
+        let parent_normalised = normalise_path(&format!(
+            "/{backend_id}/{}",
+            parent_segments.join("/")
+        ));
+        let items = state.items.read().await;
+        items
+            .values()
+            .find(|item| {
+                let ip = resolve_full_path(item, &items);
+                ip == parent_normalised
+            })
+            .map(|p| cascade_engine::types::FileId(p.id.0.clone()))
+    };
+
+    let create_result = if let Some(ref parent_id) = parent_found_in_items {
+        tracing::debug!(parent = %parent_id.0, dir = dir_name, "MKCOL: using parent ID from items");
+        backend.create_dir_with_parent(dir_name, parent_id).await
+    } else {
+        tracing::debug!(path = %relative_path.display(), "MKCOL: parent not in items, using path walk");
+        backend.create_dir(relative_path).await
+    };
+
+    match create_result {
         Ok(entry) => {
             // Persist to state DB.
             if let Some(db) = &state.db {

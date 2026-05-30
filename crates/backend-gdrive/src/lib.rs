@@ -390,6 +390,21 @@ impl Backend for GdriveBackend {
             .ok_or_else(|| anyhow::anyhow!("create_dir returned trashed file"))
     }
 
+    async fn create_dir_with_parent(
+        &self,
+        name: &str,
+        parent_id: &cascade_engine::types::FileId,
+    ) -> anyhow::Result<FileEntry> {
+        let token = self.access_token().await?;
+        let native_parent = parent_id.native_id();
+        let file = self
+            .drive
+            .create_directory(name, native_parent, &token)
+            .await?;
+        file.to_file_entry(&self.instance_id)
+            .ok_or_else(|| anyhow::anyhow!("create_dir_with_parent returned trashed file"))
+    }
+
     async fn delete(&self, file: &FileEntry) -> anyhow::Result<()> {
         let token = self.access_token().await?;
         let file_id = file.id.native_id();

@@ -57,6 +57,21 @@ pub trait Backend: Send + Sync {
     /// Create a directory.
     async fn create_dir(&self, path: &Path) -> anyhow::Result<FileEntry>;
 
+    /// Create a directory given the parent's known `FileId` and the new name.
+    ///
+    /// Backends that can create a directory without re-walking the path (e.g.
+    /// Google Drive, which addresses nodes by opaque ID) should override this
+    /// to avoid a round-trip Drive API walk. The default falls back to
+    /// `create_dir`.
+    async fn create_dir_with_parent(
+        &self,
+        name: &str,
+        parent_id: &FileId,
+    ) -> anyhow::Result<FileEntry> {
+        let _ = parent_id;
+        self.create_dir(Path::new(name)).await
+    }
+
     /// Delete a file or directory.
     async fn delete(&self, file: &FileEntry) -> anyhow::Result<()>;
 
@@ -149,6 +164,14 @@ impl Backend for NullBackend {
     }
 
     async fn create_dir(&self, _path: &Path) -> anyhow::Result<FileEntry> {
+        anyhow::bail!("null backend cannot create directories")
+    }
+
+    async fn create_dir_with_parent(
+        &self,
+        _name: &str,
+        _parent_id: &FileId,
+    ) -> anyhow::Result<FileEntry> {
         anyhow::bail!("null backend cannot create directories")
     }
 
