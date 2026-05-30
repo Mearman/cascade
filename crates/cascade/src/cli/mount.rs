@@ -633,9 +633,7 @@ fn ensure_directory(path: &Path, label: &str) -> Result<()> {
                 anyhow::bail!("{label} {} exists but is not a directory", path.display());
             }
         }
-        Err(e) => {
-            Err(e).with_context(|| format!("failed to create {label} at {}", path.display()))
-        }
+        Err(e) => Err(e).with_context(|| format!("failed to create {label} at {}", path.display())),
     }
 }
 

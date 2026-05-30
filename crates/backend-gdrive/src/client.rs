@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use cascade_engine::backend::BackendError;
 
-use super::model::{AboutResponse, ChangesResponse, DriveFile, FileListResponse, SharedDriveListResponse};
+use super::model::{
+    AboutResponse, ChangesResponse, DriveFile, FileListResponse, SharedDriveListResponse,
+};
 
 /// Describes the kind of listing to perform against the Drive files.list endpoint.
 #[derive(Debug)]
@@ -207,7 +209,10 @@ impl DriveClient {
         let mut params: Vec<(&str, &str)> = Vec::new();
 
         match query {
-            ListQuery::ChildrenOf { parent_id, drive_id } => {
+            ListQuery::ChildrenOf {
+                parent_id,
+                drive_id,
+            } => {
                 q_str = format!("'{parent_id}' in parents and trashed = false");
                 params.push(("q", &q_str));
                 if let Some(did) = drive_id {

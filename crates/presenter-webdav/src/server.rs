@@ -23,14 +23,12 @@ use tokio::net::TcpListener;
 /// permission / not-found / read-only / conflict via `BackendError`; anything
 /// else falls back to 500 Internal Server Error.
 fn backend_error_status(e: &anyhow::Error) -> StatusCode {
-    e.downcast_ref::<BackendError>().map_or(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        |be| match be {
+    e.downcast_ref::<BackendError>()
+        .map_or(StatusCode::INTERNAL_SERVER_ERROR, |be| match be {
             BackendError::Forbidden(_) | BackendError::ReadOnly(_) => StatusCode::FORBIDDEN,
             BackendError::NotFound(_) => StatusCode::NOT_FOUND,
             BackendError::Conflict(_) => StatusCode::CONFLICT,
-        },
-    )
+        })
 }
 
 /// Return true for filenames macOS generates as filesystem metadata that
@@ -223,9 +221,7 @@ async fn webdav_handler(State(state): State<AppState>, req: Request) -> Response
         m if m == Method::from_bytes(b"COPY").unwrap_or_default() => {
             handle_copy(&state, &path, req.headers()).await
         }
-        m if m == Method::from_bytes(b"LOCK").unwrap_or_default() => {
-            handle_lock(&path)
-        }
+        m if m == Method::from_bytes(b"LOCK").unwrap_or_default() => handle_lock(&path),
         m if m == Method::from_bytes(b"UNLOCK").unwrap_or_default() => {
             empty_response(StatusCode::NO_CONTENT)
         }
@@ -397,9 +393,7 @@ async fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> R
         // target is None and the path is a top-level backend root (the
         // multi-component guard above already returned 404 for anything
         // deeper). Expand root-level children for this backend.
-        let backend_prefix = normalised
-            .trim_start_matches('/')
-            .trim_end_matches('/');
+        let backend_prefix = normalised.trim_start_matches('/').trim_end_matches('/');
         let root_id = format!("{backend_prefix}:root");
 
         // Expand the root on first access. expand_root normalises every
@@ -548,11 +542,13 @@ async fn populate_cache(
             let status = backend_error_status(&e);
             tracing::warn!(error = %e, ?status, "backend download failed");
             let _ = tokio::fs::remove_file(cache_path).await;
-            Err(empty_response(if status == StatusCode::INTERNAL_SERVER_ERROR {
-                StatusCode::NOT_FOUND
-            } else {
-                status
-            }))
+            Err(empty_response(
+                if status == StatusCode::INTERNAL_SERVER_ERROR {
+                    StatusCode::NOT_FOUND
+                } else {
+                    status
+                },
+            ))
         }
     }
 }
@@ -946,23 +942,16 @@ async fn handle_mkcol(state: &AppState, path: &str) -> Response {
     // Resolve the parent directory ID from the in-memory store if possible.
     // This avoids a Drive API round-trip that would fail for freshly created
     // parents not yet indexed by the Drive listing.
-    let dir_name = relative
-        .last()
-        .copied()
-        .unwrap_or("New Folder");
+    let dir_name = relative.last().copied().unwrap_or("New Folder");
     let parent_segments = relative
         .get(..relative.len().saturating_sub(1))
         .unwrap_or(&[]);
     let parent_found_in_items = if parent_segments.is_empty() {
         // Parent is the backend root.
-        Some(cascade_engine::types::FileId(
-            format!("{backend_id}:root"),
-        ))
+        Some(cascade_engine::types::FileId(format!("{backend_id}:root")))
     } else {
-        let parent_normalised = normalise_path(&format!(
-            "/{backend_id}/{}",
-            parent_segments.join("/")
-        ));
+        let parent_normalised =
+            normalise_path(&format!("/{backend_id}/{}", parent_segments.join("/")));
         let items = state.items.read().await;
         items
             .values()

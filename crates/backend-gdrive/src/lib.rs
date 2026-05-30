@@ -606,9 +606,7 @@ impl Backend for GdriveBackend {
                 let first = trash_entries
                     .into_iter()
                     .find(|e| e.name == *name)
-                    .ok_or_else(|| {
-                        BackendError::NotFound(format!("Path not found: {path_str}"))
-                    })?;
+                    .ok_or_else(|| BackendError::NotFound(format!("Path not found: {path_str}")))?;
 
                 if path_rest.is_empty() {
                     return Ok(first);
@@ -633,7 +631,11 @@ impl Backend for GdriveBackend {
             _ => {
                 // Legacy path without a virtual view prefix — walk from Drive root,
                 // treating first as the first component to resolve.
-                ("root".to_string(), None::<String>, all_components.as_slice())
+                (
+                    "root".to_string(),
+                    None::<String>,
+                    all_components.as_slice(),
+                )
             }
         };
 
@@ -989,9 +991,7 @@ impl Backend for GdriveBackend {
                 ("__trash", "Bin"),
             ]
             .iter()
-            .map(|(id, name)| {
-                Self::make_synthetic_dir(&self.instance_id, id, "root", name)
-            })
+            .map(|(id, name)| Self::make_synthetic_dir(&self.instance_id, id, "root", name))
             .collect()),
 
             // My Drive: list personal Drive root, reparent items to __mydrive
@@ -1084,11 +1084,7 @@ impl Backend for GdriveBackend {
                         Some(native_id.to_string())
                     } else {
                         drop(sd_ids);
-                        self.folder_drive_ids
-                            .read()
-                            .await
-                            .get(native_id)
-                            .cloned()
+                        self.folder_drive_ids.read().await.get(native_id).cloned()
                     }
                 };
 
