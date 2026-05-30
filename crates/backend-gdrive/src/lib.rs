@@ -8,6 +8,7 @@ pub mod auth;
 pub mod client;
 pub mod model;
 
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,10 +17,10 @@ use async_trait::async_trait;
 use cascade_engine::backend::Backend;
 use cascade_engine::types::{Change, Cursor, FileEntry, FileId, ItemId, Quota};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use auth::AuthTokens;
-use client::DriveClient;
+use client::{DriveClient, ListQuery};
 
 /// Create a Google Drive backend from config.
 ///
@@ -81,6 +82,8 @@ pub fn create_backend(config: &toml::Value) -> anyhow::Result<Box<dyn Backend>> 
         account,
         instance_id,
         tokens: Arc::new(Mutex::new(initial_tokens)),
+        shared_drive_ids: Arc::new(RwLock::new(HashSet::new())),
+        folder_drive_ids: Arc::new(RwLock::new(HashMap::new())),
     }))
 }
 
@@ -93,6 +96,12 @@ pub struct GdriveBackend {
     /// Per-instance backend ID, e.g. "gdrive-personal".
     instance_id: String,
     tokens: Arc<Mutex<Option<AuthTokens>>>,
+    /// IDs of shared drives this user is a member of.
+    /// Populated on first `list_children("__shared_drives")` call.
+    shared_drive_ids: Arc<RwLock<HashSet<String>>>,
+    /// Maps a folder's native ID to the shared drive it lives in.
+    /// Populated incrementally as shared-drive directories are listed.
+    folder_drive_ids: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl GdriveBackend {
@@ -102,10 +111,10 @@ impl GdriveBackend {
         // across an await.
         {
             let tokens = self.tokens.lock().await;
-            if let Some(t) = tokens.as_ref() {
-                if !t.is_expired() {
-                    return Ok(t.access_token.clone());
-                }
+            if let Some(t) = tokens.as_ref()
+                && !t.is_expired()
+            {
+                return Ok(t.access_token.clone());
             }
         }
 
@@ -153,21 +162,109 @@ impl GdriveBackend {
         Ok(access_token)
     }
 
-    /// List immediate children of the Drive root directory.
-    /// Used for initial sync to populate top-level items quickly.
-    async fn list_root_children(&self, token: &str) -> anyhow::Result<Vec<Change>> {
-        let mut all_changes = Vec::new();
+    /// Build a synthetic directory `FileEntry` with no cloud-side counterpart.
+    fn make_synthetic_dir(
+        backend_id: &str,
+        native_id: &str,
+        parent_native_id: &str,
+        name: &str,
+    ) -> FileEntry {
+        FileEntry {
+            id: ItemId::new(backend_id, native_id),
+            parent_id: ItemId::new(backend_id, parent_native_id),
+            name: name.to_string(),
+            is_dir: true,
+            size: None,
+            mod_time: None,
+            mime_type: Some("application/vnd.google-apps.folder".to_string()),
+            hash: None,
+        }
+    }
+
+    /// Return the four virtual top-level directories as `Change::Created` events
+    /// for the initial sync snapshot. No Drive API call is needed.
+    fn virtual_root_entries(&self) -> Vec<Change> {
+        [
+            ("__mydrive", "My Drive"),
+            ("__shared_drives", "Shared drives"),
+            ("__shared_with_me", "Shared with me"),
+            ("__trash", "Bin"),
+        ]
+        .iter()
+        .map(|(id, name)| {
+            Change::Created(Self::make_synthetic_dir(
+                &self.instance_id,
+                id,
+                "root",
+                name,
+            ))
+        })
+        .collect()
+    }
+
+    /// Look up a shared drive by display name, listing all shared drives if
+    /// needed to populate the cache. Returns the shared drive's native ID.
+    async fn resolve_shared_drive_id(
+        &self,
+        drive_name: &str,
+        token: &str,
+    ) -> anyhow::Result<String> {
+        // Check the in-memory cache first (ids are keyed by name in the
+        // shared_drive_ids set but we need name→id, so scan folder_drive_ids
+        // which maps folder_id → drive_id; shared drive roots map to themselves).
+        // Simplest: list shared drives and match by name, with no extra cache.
         let mut page_token: Option<String> = None;
+        loop {
+            let resp = self
+                .drive
+                .list_shared_drives(token, page_token.as_deref())
+                .await?;
+            for sd in &resp.drives {
+                if sd.name == drive_name {
+                    return Ok(sd.id.clone());
+                }
+            }
+            match resp.next_page_token {
+                Some(next) => page_token = Some(next),
+                None => break,
+            }
+        }
+        anyhow::bail!("Shared drive not found: {drive_name}")
+    }
+
+    /// Page through a `list_files` query, returning all entries.
+    ///
+    /// Items from shared-drive listings (`drive_id` set in the file's metadata)
+    /// are recorded in `folder_drive_ids` so subsequent child lookups can scope
+    /// their queries correctly.
+    async fn list_files_all_pages(
+        &self,
+        query: &ListQuery,
+        token: &str,
+    ) -> anyhow::Result<Vec<FileEntry>> {
+        let mut all = Vec::new();
+        let mut page_token: Option<String> = None;
+        let mut drive_id_updates: Vec<(String, String)> = Vec::new();
 
         loop {
             let resp = self
                 .drive
-                .list_files("root", token, page_token.as_deref())
+                .list_files(query, token, page_token.as_deref())
                 .await?;
+
+            for file in &resp.files {
+                // Record drive_id so nested folders can be listed with the
+                // correct shared-drive scope.
+                if let Some(did) = &file.drive_id
+                    && file.mime_type == "application/vnd.google-apps.folder"
+                {
+                    drive_id_updates.push((file.id.clone(), did.clone()));
+                }
+            }
 
             for file in resp.files {
                 if let Some(entry) = file.to_file_entry(&self.instance_id) {
-                    all_changes.push(Change::Created(entry));
+                    all.push(entry);
                 }
             }
 
@@ -177,9 +274,42 @@ impl GdriveBackend {
             }
         }
 
-        tracing::info!(backend = %self.instance_id, count = all_changes.len(), "listed root children");
+        if !drive_id_updates.is_empty() {
+            let mut cache = self.folder_drive_ids.write().await;
+            for (id, did) in drive_id_updates {
+                cache.insert(id, did);
+            }
+        }
 
-        Ok(all_changes)
+        Ok(all)
+    }
+
+    /// Same as `list_files_all_pages` but for the Bin view.
+    ///
+    /// Uses `to_trash_entry` so all returned items carry `parent_id = __trash`
+    /// regardless of their original Drive parent.
+    async fn list_trash_all_pages(&self, token: &str) -> anyhow::Result<Vec<FileEntry>> {
+        let mut all = Vec::new();
+        let mut page_token: Option<String> = None;
+        let query = ListQuery::Trashed;
+
+        loop {
+            let resp = self
+                .drive
+                .list_files(&query, token, page_token.as_deref())
+                .await?;
+
+            for file in resp.files {
+                all.push(file.to_trash_entry(&self.instance_id));
+            }
+
+            match resp.next_page_token {
+                Some(next) => page_token = Some(next),
+                None => break,
+            }
+        }
+
+        Ok(all)
     }
 }
 
@@ -214,11 +344,12 @@ impl Backend for GdriveBackend {
     async fn changes(&self, cursor: Option<&Cursor>) -> anyhow::Result<(Vec<Change>, Cursor)> {
         let token = self.access_token().await?;
 
-        // No cursor → initial sync: list root-level children only.
+        // No cursor → initial sync: emit the four virtual root directories and
+        // record a Changes start-page token so incremental polling works from
+        // this point on. Real file content is loaded on-demand via list_children.
         let Some(cursor) = cursor else {
-            let root_changes = self.list_root_children(&token).await?;
             let start_token = self.drive.get_start_page_token(&token).await?;
-            return Ok((root_changes, Cursor(start_token)));
+            return Ok((self.virtual_root_entries(), Cursor(start_token)));
         };
 
         let page_token = cursor.0.clone();
@@ -271,30 +402,84 @@ impl Backend for GdriveBackend {
         let token = self.access_token().await?;
         let path_str = path.to_string_lossy();
 
-        // For root, use "root".
         if path_str == "/" || path_str.is_empty() {
-            let file = self.drive.get_file("root", &token).await?;
-            return file
-                .to_file_entry(&self.instance_id)
-                .ok_or_else(|| anyhow::anyhow!("Root folder returned trashed file"));
+            return Ok(Self::make_synthetic_dir(
+                &self.instance_id,
+                "root",
+                "root",
+                "Google Drive",
+            ));
         }
 
-        // Walk the path components.
-        let components: Vec<&str> = path
+        let all_components: Vec<&str> = path
             .components()
             .filter_map(|c| c.as_os_str().to_str())
             .filter(|s| !s.is_empty() && *s != "/")
             .collect();
 
-        let mut current_id = "root".to_string();
-        for component in &components {
-            let children = self.drive.list_files(&current_id, &token, None).await?;
-            let found = children.files.iter().find(|f| f.name == *component);
+        // Split at the first component to avoid indexing_slicing lint violations.
+        let Some((first, remaining)) = all_components.split_first() else {
+            anyhow::bail!("Empty path");
+        };
 
-            match found {
-                Some(f) => {
-                    f.id.clone_into(&mut current_id);
+        // Strip the virtual view prefix so we know which Drive root to walk
+        // from, and return synthetic entries when the path resolves to a view
+        // root itself.
+        let (mut current_id, drive_id, walk_components) = match *first {
+            "My Drive" => {
+                if remaining.is_empty() {
+                    return Ok(Self::make_synthetic_dir(
+                        &self.instance_id,
+                        "__mydrive",
+                        "root",
+                        "My Drive",
+                    ));
                 }
+                ("root".to_string(), None::<String>, remaining)
+            }
+            "Shared drives" => {
+                let Some((drive_name, path_rest)) = remaining.split_first() else {
+                    return Ok(Self::make_synthetic_dir(
+                        &self.instance_id,
+                        "__shared_drives",
+                        "root",
+                        "Shared drives",
+                    ));
+                };
+                let did = self.resolve_shared_drive_id(drive_name, &token).await?;
+                if path_rest.is_empty() {
+                    return Ok(Self::make_synthetic_dir(
+                        &self.instance_id,
+                        &did,
+                        "__shared_drives",
+                        drive_name,
+                    ));
+                }
+                let start = did.clone();
+                (start, Some(did), path_rest)
+            }
+            "Shared with me" => {
+                anyhow::bail!("write operations are not supported in 'Shared with me'")
+            }
+            "Bin" => {
+                anyhow::bail!("write operations are not supported in 'Bin'")
+            }
+            _ => {
+                // Legacy path without a virtual view prefix — walk from Drive root,
+                // treating first as the first component to resolve.
+                ("root".to_string(), None::<String>, all_components.as_slice())
+            }
+        };
+
+        for component in walk_components {
+            let q = ListQuery::ChildrenOf {
+                parent_id: current_id.clone(),
+                drive_id: drive_id.clone(),
+            };
+            let resp = self.drive.list_files(&q, &token, None).await?;
+            let found = resp.files.iter().find(|f| f.name == *component);
+            match found {
+                Some(f) => current_id.clone_from(&f.id),
                 None => anyhow::bail!("Path not found: {path_str}"),
             }
         }
@@ -329,6 +514,14 @@ impl Backend for GdriveBackend {
         reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
         parent_id: &cascade_engine::types::FileId,
     ) -> anyhow::Result<FileEntry> {
+        let native_parent = parent_id.native_id();
+        if native_parent == "__trash" {
+            anyhow::bail!("Bin is read-only — restore files via `cascade backend restore`");
+        }
+        if native_parent == "__shared_with_me" {
+            anyhow::bail!("Cannot create files directly in 'Shared with me'");
+        }
+
         let token = self.access_token().await?;
 
         // Read all data from the reader.
@@ -362,7 +555,7 @@ impl Backend for GdriveBackend {
         tokio::io::AsyncReadExt::read_to_end(reader, &mut data).await?;
 
         let native_id = file_id.native_id();
-        let file = self.drive.update_file(&native_id, &data, &token).await?;
+        let file = self.drive.update_file(native_id, &data, &token).await?;
 
         file.to_file_entry(&self.instance_id)
             .ok_or_else(|| anyhow::anyhow!("update returned trashed file"))
@@ -399,6 +592,13 @@ impl Backend for GdriveBackend {
         name: &str,
         parent_id: &cascade_engine::types::FileId,
     ) -> anyhow::Result<FileEntry> {
+        let native_parent = parent_id.native_id();
+        if native_parent == "__trash" {
+            anyhow::bail!("Bin is read-only — restore files via `cascade backend restore`");
+        }
+        if native_parent == "__shared_with_me" {
+            anyhow::bail!("Cannot create directories directly in 'Shared with me'");
+        }
         let token = self.access_token().await?;
         let native_parent = parent_id.native_id();
         let file = self
@@ -469,29 +669,116 @@ impl Backend for GdriveBackend {
     }
 
     async fn list_children(&self, parent_native_id: &str) -> anyhow::Result<Vec<FileEntry>> {
-        let token = self.access_token().await?;
-        let mut all_entries = Vec::new();
-        let mut page_token: Option<String> = None;
+        match parent_native_id {
+            // Virtual root: return the four top-level view directories.
+            "root" => Ok([
+                ("__mydrive", "My Drive"),
+                ("__shared_drives", "Shared drives"),
+                ("__shared_with_me", "Shared with me"),
+                ("__trash", "Bin"),
+            ]
+            .iter()
+            .map(|(id, name)| {
+                Self::make_synthetic_dir(&self.instance_id, id, "root", name)
+            })
+            .collect()),
 
-        loop {
-            let resp = self
-                .drive
-                .list_files(parent_native_id, &token, page_token.as_deref())
-                .await?;
-
-            for file in resp.files {
-                if let Some(entry) = file.to_file_entry(&self.instance_id) {
-                    all_entries.push(entry);
-                }
+            // My Drive: list personal Drive root, reparent items to __mydrive
+            // so PROPFIND filtering is consistent (Drive returns the real folder
+            // ID as parent, which differs from the alias used by the presenter).
+            "__mydrive" => {
+                let token = self.access_token().await?;
+                let q = ListQuery::ChildrenOf {
+                    parent_id: "root".to_string(),
+                    drive_id: None,
+                };
+                let entries = self.list_files_all_pages(&q, &token).await?;
+                Ok(entries
+                    .into_iter()
+                    .map(|mut e| {
+                        e.parent_id = ItemId::new(&self.instance_id, "__mydrive");
+                        e
+                    })
+                    .collect())
             }
 
-            match resp.next_page_token {
-                Some(next) => page_token = Some(next),
-                None => break,
+            // Shared drives: return one directory per shared drive.
+            "__shared_drives" => {
+                let token = self.access_token().await?;
+                let mut all = Vec::new();
+                let mut page_token: Option<String> = None;
+                let mut new_ids: Vec<String> = Vec::new();
+                loop {
+                    let resp = self
+                        .drive
+                        .list_shared_drives(&token, page_token.as_deref())
+                        .await?;
+                    for sd in &resp.drives {
+                        new_ids.push(sd.id.clone());
+                        all.push(sd.to_file_entry(&self.instance_id));
+                    }
+                    match resp.next_page_token {
+                        Some(next) => page_token = Some(next),
+                        None => break,
+                    }
+                }
+                // Cache the shared drive IDs so nested lookups can scope their
+                // queries with corpora=drive.
+                if !new_ids.is_empty() {
+                    let mut cache = self.shared_drive_ids.write().await;
+                    for id in new_ids {
+                        cache.insert(id);
+                    }
+                }
+                Ok(all)
+            }
+
+            // Shared with me: flat listing reparented to __shared_with_me.
+            "__shared_with_me" => {
+                let token = self.access_token().await?;
+                let q = ListQuery::SharedWithMe;
+                let entries = self.list_files_all_pages(&q, &token).await?;
+                Ok(entries
+                    .into_iter()
+                    .map(|mut e| {
+                        e.parent_id = ItemId::new(&self.instance_id, "__shared_with_me");
+                        e
+                    })
+                    .collect())
+            }
+
+            // Bin: trashed items, reparented to __trash.
+            "__trash" => {
+                let token = self.access_token().await?;
+                self.list_trash_all_pages(&token).await
+            }
+
+            // Regular folder: resolve the shared-drive scope from caches and
+            // list with the appropriate corpora.
+            native_id => {
+                let drive_id = {
+                    // A shared drive root maps to itself as the drive_id.
+                    let sd_ids = self.shared_drive_ids.read().await;
+                    if sd_ids.contains(native_id) {
+                        Some(native_id.to_string())
+                    } else {
+                        drop(sd_ids);
+                        self.folder_drive_ids
+                            .read()
+                            .await
+                            .get(native_id)
+                            .cloned()
+                    }
+                };
+
+                let token = self.access_token().await?;
+                let q = ListQuery::ChildrenOf {
+                    parent_id: native_id.to_string(),
+                    drive_id,
+                };
+                self.list_files_all_pages(&q, &token).await
             }
         }
-
-        Ok(all_entries)
     }
 }
 

@@ -116,25 +116,24 @@ async fn changes_initial_call_fetches_start_token_and_returns_empty() {
         })))
         .mount(&server)
         .await;
-    Mock::given(method("GET"))
-        .and(path("/files"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "files": []
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/changes"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "changes": [],
-            "newStartPageToken": "token-2"
-        })))
-        .mount(&server)
-        .await;
 
     let backend = make_backend(&server);
     let (changes, cursor) = backend.changes(None).await.unwrap();
-    assert!(changes.is_empty());
+
+    // The initial snapshot returns the four virtual root directories rather
+    // than listing actual Drive files. Real content is loaded on demand.
+    assert_eq!(changes.len(), 4);
+    let names: Vec<&str> = changes
+        .iter()
+        .filter_map(|c| match c {
+            cascade_engine::types::Change::Created(e) => Some(e.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(names.contains(&"My Drive"));
+    assert!(names.contains(&"Shared drives"));
+    assert!(names.contains(&"Shared with me"));
+    assert!(names.contains(&"Bin"));
     assert_eq!(cursor.0, "token-1");
 }
 
@@ -252,18 +251,10 @@ async fn changes_handles_pagination() {
 
 #[tokio::test]
 async fn metadata_root_returns_folder_entry() {
+    // The root is now a synthetic entry — no Drive API call is made.
     let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/files/root"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(folder_json("root", "My Drive", "root")),
-        )
-        .mount(&server)
-        .await;
-
     let backend = make_backend(&server);
     let entry = backend.metadata(Path::new("/")).await.unwrap();
-    assert_eq!(entry.name, "My Drive");
     assert!(entry.is_dir);
     assert_eq!(entry.id, ItemId::new("gdrive-test-account", "root"));
 }
