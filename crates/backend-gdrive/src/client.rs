@@ -58,7 +58,6 @@ impl RateLimiter {
 
 /// Google Drive API HTTP client.
 pub struct DriveClient {
-    http: reqwest::Client,
     rate_limiter: RateLimiter,
     base_url: String,
     upload_url: String,
@@ -88,17 +87,20 @@ impl DriveClient {
         )
     }
 
+    fn http() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .pool_max_idle_per_host(0)
+            .http1_only()
+            .build()
+            .unwrap_or_default()
+    }
+
     /// Construct a client with custom base URLs — used in integration tests
     /// to point at a mock server instead of the real Drive API.
     #[must_use]
     pub fn with_urls(base_url: String, upload_url: String) -> Self {
         Self {
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .pool_max_idle_per_host(0)
-                .http1_only()
-                .build()
-                .unwrap_or_default(),
             rate_limiter: RateLimiter::new(10_000),
             base_url,
             upload_url,
@@ -114,8 +116,7 @@ impl DriveClient {
     ) -> anyhow::Result<reqwest::Response> {
         self.rate_limiter.acquire().await;
         let url = format!("{}/{path}", self.base_url);
-        let resp = self
-            .http
+        let resp = Self::http()
             .get(&url)
             .bearer_auth(token)
             .query(query)
@@ -215,8 +216,7 @@ impl DriveClient {
     ) -> anyhow::Result<reqwest::Response> {
         self.rate_limiter.acquire().await;
         let url = format!("{}/files/{file_id}", self.base_url);
-        let resp = self
-            .http
+        let resp = Self::http()
             .get(&url)
             .bearer_auth(token)
             .query(&[("alt", "media"), ("supportsAllDrives", "true")])
@@ -311,8 +311,7 @@ impl DriveClient {
             "{}/files?uploadType=multipart&supportsAllDrives=true&fields=id,name,mimeType,parents,size,modifiedTime,md5Checksum,trashed",
             self.upload_url
         );
-        let resp = self
-            .http
+        let resp = Self::http()
             .post(&url)
             .bearer_auth(token)
             .header(
@@ -344,8 +343,7 @@ impl DriveClient {
             "{}/files/{file_id}?uploadType=media&supportsAllDrives=true&fields=id,name,mimeType,parents,size,modifiedTime,md5Checksum,trashed",
             self.upload_url
         );
-        let resp = self
-            .http
+        let resp = Self::http()
             .patch(&url)
             .bearer_auth(token)
             .header("Content-Type", "application/octet-stream")
@@ -379,8 +377,7 @@ impl DriveClient {
             "mimeType": "application/vnd.google-apps.folder",
             "parents": [parent_id]
         });
-        let resp = self
-            .http
+        let resp = Self::http()
             .post(&url)
             .bearer_auth(token)
             .json(&body)
@@ -403,8 +400,7 @@ impl DriveClient {
             "{}/files/{file_id}?supportsAllDrives=true&fields=id",
             self.base_url
         );
-        let resp = self
-            .http
+        let resp = Self::http()
             .patch(&url)
             .bearer_auth(token)
             .json(&serde_json::json!({"trashed": true}))
@@ -441,8 +437,7 @@ impl DriveClient {
         }
         let body = serde_json::Value::Object(body);
         // The addParents/removeParents params handle parent change.
-        let resp = self
-            .http
+        let resp = Self::http()
             .patch(&url)
             .bearer_auth(token)
             .query(&[
