@@ -272,6 +272,18 @@ impl SyncRunner {
     /// one failing upload does not block the rest.
     ///
     /// Returns the number of files successfully uploaded.
+    ///
+    /// # Write-back mechanism
+    ///
+    /// This function is the upload half of the write-back cache: a presenter
+    /// that writes data to a local `cache_dir` should call
+    /// `StateDb::mark_dirty` after the write so that this function picks it
+    /// up on the next sync cycle and uploads to the backend.
+    ///
+    /// Currently no presenter implements write-back (the `WebDAV` PUT path
+    /// uploads directly; the NFS WRITE proc returns ROFS), so this
+    /// function always returns 0 in production. The mechanism is in place for
+    /// future write-back presenters (FUSE, local-backend adopt-and-sync).
     async fn flush_dirty_files(&self) -> usize {
         let dirty_files = match self.db.list_dirty_files() {
             Ok(files) => files,
