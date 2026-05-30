@@ -109,26 +109,30 @@ impl GdriveBackend {
             }
         }
 
-        // Slow path: need to refresh. Re-acquire the lock.
-        let mut tokens = self.tokens.lock().await;
+        // Slow path: acquire the lock, extract the refresh token, then drop the
+        // guard before making any network calls. Holding a tokio MutexGuard
+        // across an `.await` and then calling `.lock()` again on the same mutex
+        // deadlocks the task — the guard must be released first.
+        let refresh_token = {
+            let mut guard = self.tokens.lock().await;
 
-        // Try loading from Keychain if we don't have tokens yet.
-        if tokens.is_none() {
-            *tokens = auth::load_tokens(&self.account)?;
-        }
+            // Try loading from Keychain if we don't have tokens yet.
+            if guard.is_none() {
+                *guard = auth::load_tokens(&self.account)?;
+            }
 
-        let tokens = tokens.as_mut().ok_or_else(|| {
-            anyhow::anyhow!("Not authenticated. Run `cascade backend auth gdrive`")
-        })?;
+            let token_ref = guard.as_mut().ok_or_else(|| {
+                anyhow::anyhow!("Not authenticated. Run `cascade backend auth gdrive`")
+            })?;
 
-        // Double-check: another task may have refreshed while we waited.
-        if !tokens.is_expired() {
-            return Ok(tokens.access_token.clone());
-        }
+            // Another task may have refreshed while we waited for the lock.
+            if !token_ref.is_expired() {
+                return Ok(token_ref.access_token.clone());
+            }
 
-        // Refresh — extract what we need, drop the lock, do the HTTP call,
-        // then re-acquire and update.
-        let refresh_token = tokens.refresh_token.clone();
+            token_ref.refresh_token.clone()
+            // guard is dropped here — mutex released before the HTTP call.
+        };
 
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
@@ -139,9 +143,9 @@ impl GdriveBackend {
         let refreshed = auth::refresh_access_token(&http, &self.oauth, &refresh_token).await?;
         auth::save_tokens(&self.account, &refreshed)?;
 
-        let mut tokens = self.tokens.lock().await;
-        *tokens = Some(refreshed);
-        let access_token = tokens
+        let mut guard = self.tokens.lock().await;
+        *guard = Some(refreshed);
+        let access_token = guard
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("tokens unexpectedly empty after refresh"))?
             .access_token
