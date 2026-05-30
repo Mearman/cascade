@@ -3,6 +3,8 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
+use cascade_engine::backend::BackendError;
+
 use super::model::{AboutResponse, ChangesResponse, DriveFile, FileListResponse, SharedDriveListResponse};
 
 /// Describes the kind of listing to perform against the Drive files.list endpoint.
@@ -21,6 +23,23 @@ pub enum ListQuery {
     SharedWithMe,
     /// Items currently in the user's Bin (`trashed=true`).
     Trashed,
+    /// Immediate children of a folder that is itself trashed. Uses
+    /// `q='<id>' in parents and trashed=true` so descendants of a trashed
+    /// folder become navigable inside the Bin view.
+    ChildrenOfTrashed { parent_id: String },
+}
+
+/// Map a Drive API HTTP error response to a typed error so presenters can
+/// translate it to an accurate status code (403, 404, etc.) instead of a
+/// generic 500.
+fn drive_api_error(context: &str, status: reqwest::StatusCode, body: String) -> anyhow::Error {
+    let msg = format!("{context} ({status}): {body}");
+    match status.as_u16() {
+        403 => BackendError::Forbidden(msg).into(),
+        404 => BackendError::NotFound(msg).into(),
+        409 => BackendError::Conflict(msg).into(),
+        _ => anyhow::Error::msg(msg),
+    }
 }
 
 /// Token-bucket rate limiter for Google Drive API.
@@ -145,7 +164,7 @@ impl DriveClient {
         let status = resp.status();
         if status.is_client_error() || status.is_server_error() {
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Drive API error {status}: {body}");
+            return Err(drive_api_error("Drive API error", status, body));
         }
         Ok(resp)
     }
@@ -212,6 +231,13 @@ impl DriveClient {
                 q_str = "trashed = true".to_string();
                 params.push(("q", &q_str));
                 params.push(("corpora", "user"));
+            }
+            ListQuery::ChildrenOfTrashed { parent_id } => {
+                q_str = format!("'{parent_id}' in parents and trashed = true");
+                params.push(("q", &q_str));
+                params.push(("corpora", "user"));
+                params.push(("supportsAllDrives", "true"));
+                params.push(("includeItemsFromAllDrives", "true"));
             }
         }
 
@@ -298,7 +324,7 @@ impl DriveClient {
         let status = resp.status();
         if status.is_client_error() || status.is_server_error() {
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Drive download error {status}: {body}");
+            return Err(drive_api_error("Drive download error", status, body));
         }
         Ok(resp)
     }
@@ -397,7 +423,7 @@ impl DriveClient {
         let status = resp.status();
         if status.is_client_error() || status.is_server_error() {
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Drive upload error {status}: {body}");
+            return Err(drive_api_error("Drive upload error", status, body));
         }
         let file = resp.json::<DriveFile>().await?;
         Ok(file)
@@ -426,7 +452,7 @@ impl DriveClient {
         let status = resp.status();
         if status.is_client_error() || status.is_server_error() {
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Drive update error {status}: {body}");
+            return Err(drive_api_error("Drive update error", status, body));
         }
         let file = resp.json::<DriveFile>().await?;
         Ok(file)
@@ -459,7 +485,7 @@ impl DriveClient {
         let status = resp.status();
         if status.is_client_error() || status.is_server_error() {
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Drive create_dir error {status}: {body}");
+            return Err(drive_api_error("Drive create_dir error", status, body));
         }
         let file = resp.json::<DriveFile>().await?;
         Ok(file)
@@ -482,7 +508,7 @@ impl DriveClient {
         let status = resp.status();
         if status.is_client_error() || status.is_server_error() {
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Drive trash error {status}: {body}");
+            return Err(drive_api_error("Drive trash error", status, body));
         }
         Ok(())
     }
@@ -504,7 +530,7 @@ impl DriveClient {
         let status = resp.status();
         if status.is_client_error() || status.is_server_error() {
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Drive untrash error {status}: {body}");
+            return Err(drive_api_error("Drive untrash error", status, body));
         }
         Ok(())
     }
@@ -551,7 +577,7 @@ impl DriveClient {
         let status = resp.status();
         if status.is_client_error() || status.is_server_error() {
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Drive move error {status}: {body}");
+            return Err(drive_api_error("Drive move error", status, body));
         }
         let file = resp.json::<DriveFile>().await?;
         Ok(file)

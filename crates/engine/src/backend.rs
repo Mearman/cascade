@@ -7,6 +7,31 @@ use async_trait::async_trait;
 
 use crate::types::{Change, Cursor, FileEntry, FileId, Quota};
 
+/// A backend-level error category that presenters can map to specific
+/// HTTP status codes (or equivalent OS error codes for FUSE/File Provider).
+///
+/// Backends return `anyhow::Error` and wrap a `BackendError` inside it
+/// when the error has a well-defined category; presenters can downcast
+/// to recover the category. Returning a plain `anyhow::Error` (e.g.
+/// `anyhow::anyhow!(...)`) means "generic failure" and maps to 500.
+#[derive(Debug, thiserror::Error)]
+pub enum BackendError {
+    /// The operation was rejected because the caller lacks permission
+    /// (e.g. Drive 403, or a write to a read-only virtual directory).
+    #[error("permission denied: {0}")]
+    Forbidden(String),
+    /// The target resource does not exist.
+    #[error("not found: {0}")]
+    NotFound(String),
+    /// The operation cannot be performed because the destination is a
+    /// read-only view (e.g. Bin, Shared with me).
+    #[error("read-only: {0}")]
+    ReadOnly(String),
+    /// The operation conflicts with the current state (e.g. name taken).
+    #[error("conflict: {0}")]
+    Conflict(String),
+}
+
 // Note: Box<dyn Backend> is the owned concrete return type from create_backend.
 // Trait-object dyn Backend is used via Arc<dyn Backend> in VfsTree.
 

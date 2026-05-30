@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use cascade_engine::backend::Backend;
+use cascade_engine::backend::{Backend, BackendError};
 use cascade_engine::types::{Change, Cursor, FileEntry, FileId, ItemId, Quota};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, RwLock};
@@ -85,6 +85,7 @@ pub fn create_backend(config: &toml::Value) -> anyhow::Result<Box<dyn Backend>> 
         shared_drive_ids: Arc::new(RwLock::new(HashSet::new())),
         folder_drive_ids: Arc::new(RwLock::new(HashMap::new())),
         my_drive_root_id: Arc::new(RwLock::new(None)),
+        trashed_ids: Arc::new(RwLock::new(HashSet::new())),
     }))
 }
 
@@ -107,6 +108,12 @@ pub struct GdriveBackend {
     /// items whose `parents` field references it can be rewritten to the
     /// `__mydrive` virtual view ID.
     my_drive_root_id: Arc<RwLock<Option<String>>>,
+    /// Drive folder IDs known to be trashed.
+    ///
+    /// Populated by the Bin listing and by trashed-child listings so that
+    /// `list_children` of a trashed folder switches to a `trashed=true`
+    /// query (descendants of a trashed folder remain trashed in Drive).
+    trashed_ids: Arc<RwLock<HashSet<String>>>,
 }
 
 impl GdriveBackend {
@@ -318,11 +325,14 @@ impl GdriveBackend {
     /// Same as `list_files_all_pages` but for the Bin view.
     ///
     /// Uses `to_trash_entry` so all returned items carry `parent_id = __trash`
-    /// regardless of their original Drive parent.
+    /// regardless of their original Drive parent. Folder IDs are recorded
+    /// in `trashed_ids` so subsequent `list_children` calls for those
+    /// folders can switch to a trashed-aware query.
     async fn list_trash_all_pages(&self, token: &str) -> anyhow::Result<Vec<FileEntry>> {
         let mut all = Vec::new();
         let mut page_token: Option<String> = None;
         let query = ListQuery::Trashed;
+        let mut new_trashed: Vec<String> = Vec::new();
 
         loop {
             let resp = self
@@ -330,6 +340,11 @@ impl GdriveBackend {
                 .list_files(&query, token, page_token.as_deref())
                 .await?;
 
+            for file in &resp.files {
+                if file.mime_type == "application/vnd.google-apps.folder" {
+                    new_trashed.push(file.id.clone());
+                }
+            }
             for file in resp.files {
                 all.push(file.to_trash_entry(&self.instance_id));
             }
@@ -337,6 +352,60 @@ impl GdriveBackend {
             match resp.next_page_token {
                 Some(next) => page_token = Some(next),
                 None => break,
+            }
+        }
+
+        if !new_trashed.is_empty() {
+            let mut cache = self.trashed_ids.write().await;
+            for id in new_trashed {
+                cache.insert(id);
+            }
+        }
+
+        Ok(all)
+    }
+
+    /// List the immediate children of a trashed folder, keeping their real
+    /// parent ID (the folder we're inside) rather than rewriting to
+    /// `__trash`. Folder children are added to `trashed_ids` so further
+    /// descent works the same way.
+    async fn list_trashed_children_all_pages(
+        &self,
+        parent_id: &str,
+        token: &str,
+    ) -> anyhow::Result<Vec<FileEntry>> {
+        let mut all = Vec::new();
+        let mut page_token: Option<String> = None;
+        let query = ListQuery::ChildrenOfTrashed {
+            parent_id: parent_id.to_string(),
+        };
+        let mut new_trashed: Vec<String> = Vec::new();
+
+        loop {
+            let resp = self
+                .drive
+                .list_files(&query, token, page_token.as_deref())
+                .await?;
+
+            for file in &resp.files {
+                if file.mime_type == "application/vnd.google-apps.folder" {
+                    new_trashed.push(file.id.clone());
+                }
+            }
+            for file in resp.files {
+                all.push(file.to_file_entry_keeping_trashed(&self.instance_id));
+            }
+
+            match resp.next_page_token {
+                Some(next) => page_token = Some(next),
+                None => break,
+            }
+        }
+
+        if !new_trashed.is_empty() {
+            let mut cache = self.trashed_ids.write().await;
+            for id in new_trashed {
+                cache.insert(id);
             }
         }
 
@@ -531,12 +600,35 @@ impl Backend for GdriveBackend {
                         "Bin",
                     ));
                 };
-                if !path_rest.is_empty() {
-                    anyhow::bail!("nested paths under 'Bin' not supported");
+
+                // First level: find the named item in the Bin listing.
+                let trash_entries = self.list_trash_all_pages(&token).await?;
+                let first = trash_entries
+                    .into_iter()
+                    .find(|e| e.name == *name)
+                    .ok_or_else(|| {
+                        BackendError::NotFound(format!("Path not found: {path_str}"))
+                    })?;
+
+                if path_rest.is_empty() {
+                    return Ok(first);
                 }
-                let entries = self.list_trash_all_pages(&token).await?;
-                let found = entries.into_iter().find(|e| e.name == *name);
-                return found.ok_or_else(|| anyhow::anyhow!("Path not found: {path_str}"));
+
+                // Walk deeper using trashed-aware listings — descendants
+                // of a trashed folder are themselves trashed in Drive.
+                let mut current = first;
+                for component in path_rest {
+                    let children = self
+                        .list_trashed_children_all_pages(current.id.native_id(), &token)
+                        .await?;
+                    current = children
+                        .into_iter()
+                        .find(|e| e.name == *component)
+                        .ok_or_else(|| {
+                            BackendError::NotFound(format!("Path not found: {path_str}"))
+                        })?;
+                }
+                return Ok(current);
             }
             _ => {
                 // Legacy path without a virtual view prefix — walk from Drive root,
@@ -590,13 +682,23 @@ impl Backend for GdriveBackend {
     ) -> anyhow::Result<FileEntry> {
         let native_parent = parent_id.native_id();
         if native_parent == "__trash" {
-            anyhow::bail!("Bin is read-only — restore files via `cascade backend restore`");
+            return Err(BackendError::ReadOnly(
+                "Bin is read-only — restore files via `cascade backend restore`".to_string(),
+            )
+            .into());
         }
         if native_parent == "__shared_with_me" {
-            anyhow::bail!("Cannot create files directly in 'Shared with me'");
+            return Err(BackendError::ReadOnly(
+                "Cannot create files directly in 'Shared with me'".to_string(),
+            )
+            .into());
         }
         if native_parent == "__shared_drives" {
-            anyhow::bail!("Cannot create files at the 'Shared drives' root — pick a specific drive");
+            return Err(BackendError::Forbidden(
+                "Cannot create files at the 'Shared drives' root — pick a specific drive"
+                    .to_string(),
+            )
+            .into());
         }
 
         let token = self.access_token().await?;
@@ -667,15 +769,25 @@ impl Backend for GdriveBackend {
         };
 
         let drive_parent = match parent_native.as_str() {
-            "__trash" => anyhow::bail!(
-                "Bin is read-only — restore files via `cascade backend restore`"
-            ),
-            "__shared_with_me" => {
-                anyhow::bail!("Cannot create directories directly in 'Shared with me'")
+            "__trash" => {
+                return Err(BackendError::ReadOnly(
+                    "Bin is read-only — restore files via `cascade backend restore`".to_string(),
+                )
+                .into());
             }
-            "__shared_drives" => anyhow::bail!(
-                "Cannot create directories at the 'Shared drives' root — pick a specific drive"
-            ),
+            "__shared_with_me" => {
+                return Err(BackendError::ReadOnly(
+                    "Cannot create directories directly in 'Shared with me'".to_string(),
+                )
+                .into());
+            }
+            "__shared_drives" => {
+                return Err(BackendError::Forbidden(
+                    "Cannot create directories at the 'Shared drives' root — pick a specific drive"
+                        .to_string(),
+                )
+                .into());
+            }
             "__mydrive" => self.my_drive_root(&token).await?,
             other => other.to_string(),
         };
@@ -700,15 +812,23 @@ impl Backend for GdriveBackend {
     ) -> anyhow::Result<FileEntry> {
         let native_parent = parent_id.native_id();
         if native_parent == "__trash" {
-            anyhow::bail!("Bin is read-only — restore files via `cascade backend restore`");
+            return Err(BackendError::ReadOnly(
+                "Bin is read-only — restore files via `cascade backend restore`".to_string(),
+            )
+            .into());
         }
         if native_parent == "__shared_with_me" {
-            anyhow::bail!("Cannot create directories directly in 'Shared with me'");
+            return Err(BackendError::ReadOnly(
+                "Cannot create directories directly in 'Shared with me'".to_string(),
+            )
+            .into());
         }
         if native_parent == "__shared_drives" {
-            anyhow::bail!(
+            return Err(BackendError::Forbidden(
                 "Cannot create directories at the 'Shared drives' root — pick a specific drive"
-            );
+                    .to_string(),
+            )
+            .into());
         }
         let token = self.access_token().await?;
 
@@ -814,9 +934,10 @@ impl Backend for GdriveBackend {
         // Disallow direct moves into the virtual roots that have no
         // single Drive-level parent.
         if dst_native == "__shared_drives" || dst_native == "__shared_with_me" {
-            anyhow::bail!(
+            return Err(BackendError::Forbidden(format!(
                 "cannot move directly into virtual directory '{dst_native}' — pick a real folder under it"
-            );
+            ))
+            .into());
         }
 
         // If the source is currently trashed, untrash it first. A drag out
@@ -944,8 +1065,18 @@ impl Backend for GdriveBackend {
             }
 
             // Regular folder: resolve the shared-drive scope from caches and
-            // list with the appropriate corpora.
+            // list with the appropriate corpora. If the folder is itself
+            // trashed, switch to a `trashed=true` query so its (also
+            // trashed) descendants are listed instead of appearing empty.
             native_id => {
+                let token = self.access_token().await?;
+                let is_trashed = self.trashed_ids.read().await.contains(native_id);
+                if is_trashed {
+                    return self
+                        .list_trashed_children_all_pages(native_id, &token)
+                        .await;
+                }
+
                 let drive_id = {
                     // A shared drive root maps to itself as the drive_id.
                     let sd_ids = self.shared_drive_ids.read().await;
@@ -961,7 +1092,6 @@ impl Backend for GdriveBackend {
                     }
                 };
 
-                let token = self.access_token().await?;
                 let q = ListQuery::ChildrenOf {
                     parent_id: native_id.to_string(),
                     drive_id,

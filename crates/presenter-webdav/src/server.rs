@@ -15,8 +15,23 @@ use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use cascade_engine::backend::BackendError;
 use cascade_engine::types::{FileId, ItemId, VfsItem};
 use tokio::net::TcpListener;
+
+/// Map a backend error to an appropriate HTTP status code. Backends signal
+/// permission / not-found / read-only / conflict via `BackendError`; anything
+/// else falls back to 500 Internal Server Error.
+fn backend_error_status(e: &anyhow::Error) -> StatusCode {
+    e.downcast_ref::<BackendError>().map_or(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        |be| match be {
+            BackendError::Forbidden(_) | BackendError::ReadOnly(_) => StatusCode::FORBIDDEN,
+            BackendError::NotFound(_) => StatusCode::NOT_FOUND,
+            BackendError::Conflict(_) => StatusCode::CONFLICT,
+        },
+    )
+}
 
 /// Build a response with an explicit empty body and Content-Length: 0.
 ///
@@ -478,9 +493,14 @@ async fn handle_get(state: &AppState, path: &str) -> Response {
             )
         }
         Err(e) => {
-            tracing::warn!(error = %e, "backend download failed");
+            let status = backend_error_status(&e);
+            tracing::warn!(error = %e, ?status, "backend download failed");
             let _ = tokio::fs::remove_file(&download_cache).await;
-            empty_response(StatusCode::NOT_FOUND)
+            empty_response(if status == StatusCode::INTERNAL_SERVER_ERROR {
+                StatusCode::NOT_FOUND
+            } else {
+                status
+            })
         }
     }
 }
@@ -613,8 +633,9 @@ async fn handle_put(state: &AppState, path: &str, req: Request) -> Response {
             empty_response(StatusCode::CREATED)
         }
         Err(e) => {
-            tracing::warn!(error = %e, "backend upload failed");
-            empty_response(StatusCode::INTERNAL_SERVER_ERROR)
+            let status = backend_error_status(&e);
+            tracing::warn!(error = %e, ?status, "backend upload failed");
+            empty_response(status)
         }
     }
 }
@@ -691,8 +712,9 @@ async fn handle_delete(state: &AppState, path: &str) -> Response {
             empty_response(StatusCode::NO_CONTENT)
         }
         Err(e) => {
-            tracing::warn!(error = %e, "backend delete failed");
-            empty_response(StatusCode::INTERNAL_SERVER_ERROR)
+            let status = backend_error_status(&e);
+            tracing::warn!(error = %e, ?status, "backend delete failed");
+            empty_response(status)
         }
     }
 }
@@ -788,8 +810,9 @@ async fn handle_mkcol(state: &AppState, path: &str) -> Response {
             empty_response(StatusCode::CREATED)
         }
         Err(e) => {
-            tracing::warn!(error = %e, "backend create_dir failed");
-            empty_response(StatusCode::INTERNAL_SERVER_ERROR)
+            let status = backend_error_status(&e);
+            tracing::warn!(error = %e, ?status, "backend create_dir failed");
+            empty_response(status)
         }
     }
 }
@@ -880,8 +903,9 @@ async fn handle_move(state: &AppState, src_path: &str, headers: &HeaderMap) -> R
             empty_response(StatusCode::CREATED)
         }
         Err(e) => {
-            tracing::warn!(error = %e, "backend move failed");
-            empty_response(StatusCode::INTERNAL_SERVER_ERROR)
+            let status = backend_error_status(&e);
+            tracing::warn!(error = %e, ?status, "backend move failed");
+            empty_response(status)
         }
     }
 }
