@@ -626,8 +626,8 @@ impl Backend for S3Backend {
 
         let size = u64::try_from(data.len()).unwrap_or(u64::MAX);
         let parent_key = key
-            .rfind('/')
-            .map_or(String::new(), |i| key[..i].to_string());
+            .rsplit_once('/')
+            .map_or_else(String::new, |(prefix, _)| prefix.to_owned());
         let parent_id = ItemId::new(&self.backend_id, &parent_key);
         let name = key.rsplit('/').next().unwrap_or(&key).to_string();
 

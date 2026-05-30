@@ -24,21 +24,27 @@ use tokio::net::TcpListener;
 /// tokio runtime, blocking the current thread until it completes.
 /// This avoids any `.await` on the axum runtime after body consumption,
 /// working around a hyper 1.x bug where responses get stuck.
-fn run_isolated_blocking<F, T>(future: F) -> T
+fn run_isolated_blocking<F, T>(future: F) -> anyhow::Result<T>
 where
-    F: std::future::Future<Output = T> + Send + 'static,
+    F: std::future::Future<Output = anyhow::Result<T>> + Send + 'static,
     T: Send + 'static,
 {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
+        match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .expect("isolated runtime");
-        let result = rt.block_on(future);
-        let _ = tx.send(result);
+        {
+            Ok(rt) => {
+                let _ = tx.send(rt.block_on(future));
+            }
+            Err(e) => {
+                let _ = tx.send(Err(anyhow::anyhow!("isolated runtime build failed: {e}")));
+            }
+        }
     });
-    rx.recv().expect("isolated thread panicked")
+    rx.recv()
+        .map_err(|e| anyhow::anyhow!("isolated thread terminated without result: {e}"))?
 }
 
 /// Build a response with explicit Content-Length: 0.
@@ -699,8 +705,7 @@ async fn handle_move(state: &AppState, src_path: &str, headers: &HeaderMap) -> R
         let dest_parent_path = dest_normalised
             .trim_end_matches('/')
             .rsplit_once('/')
-            .map(|(parent, _)| parent)
-            .unwrap_or("");
+            .map_or("", |(parent, _)| parent);
         let dest_parent_normalised = normalise_path(dest_parent_path);
         let items = state.items.read().await;
         items
@@ -1205,6 +1210,12 @@ async fn expand_root(state: &AppState, backend_prefix: &str) {
 }
 
 fn normalise_path(path: &str) -> String {
+    // Strip scheme+authority from absolute URIs (e.g. WebDAV Destination headers
+    // arrive as "http://host:port/path" per RFC 4918).
+    let path = path
+        .split_once("://")
+        .and_then(|(_, rest)| rest.find('/').and_then(|i| rest.get(i..)))
+        .unwrap_or(path);
     let p = path.trim_end_matches('/');
     if p.is_empty() {
         "/".to_string()
@@ -1305,6 +1316,14 @@ mod tests {
     #[test]
     fn normalise_path_empty_is_root() {
         assert_eq!(normalise_path(""), "/");
+    }
+
+    #[test]
+    fn normalise_path_strips_absolute_uri() {
+        assert_eq!(
+            normalise_path("http://localhost:50217/gdrive-personal/a/b.txt"),
+            "/gdrive-personal/a/b.txt"
+        );
     }
 
     #[test]

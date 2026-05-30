@@ -99,6 +99,7 @@ impl DriveClient {
     /// Construct a client with custom base URLs — used in integration tests
     /// to point at a mock server instead of the real Drive API.
     #[must_use]
+    #[allow(clippy::missing_const_for_fn)]
     pub fn with_urls(base_url: String, upload_url: String) -> Self {
         Self {
             rate_limiter: RateLimiter::new(10_000),

@@ -141,7 +141,12 @@ impl GdriveBackend {
 
         let mut tokens = self.tokens.lock().await;
         *tokens = Some(refreshed);
-        Ok(tokens.as_ref().expect("just set").access_token.clone())
+        let access_token = tokens
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("tokens unexpectedly empty after refresh"))?
+            .access_token
+            .clone();
+        Ok(access_token)
     }
 
     /// List immediate children of the Drive root directory.
