@@ -41,6 +41,16 @@ impl DriveFile {
         self.to_file_entry_with_parent(backend_id, Some("__trash"))
     }
 
+    /// Convert to a `FileEntry` without applying the trash filter.
+    ///
+    /// Used when listing children of a trashed folder, where the items'
+    /// real parent (the trashed folder itself) is preserved so the
+    /// `WebDAV` presenter can show them nested correctly.
+    #[must_use]
+    pub fn to_file_entry_keeping_trashed(&self, backend_id: &str) -> FileEntry {
+        self.to_file_entry_with_parent(backend_id, None)
+    }
+
     /// Internal conversion helper.
     ///
     /// `override_parent` forces a specific native parent ID instead of using
