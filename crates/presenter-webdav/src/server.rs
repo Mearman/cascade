@@ -33,6 +33,34 @@ fn backend_error_status(e: &anyhow::Error) -> StatusCode {
     )
 }
 
+/// Return true for filenames macOS generates as filesystem metadata that
+/// shouldn't be persisted to a cloud backend.
+///
+/// `._*` `AppleDouble` files hold extended attributes (Finder tags, custom
+/// icons, quarantine flags, …) that don't survive a round-trip to Drive
+/// anyway; without filtering they pile up alongside every real file.
+/// `.DS_Store` is per-folder Finder UI state. The other entries are
+/// volume-level metadata directories Finder/Spotlight may try to create.
+fn is_macos_junk(name: &str) -> bool {
+    name.starts_with("._")
+        || name == ".DS_Store"
+        || name == ".Spotlight-V100"
+        || name == ".Trashes"
+        || name == ".fseventsd"
+        || name == ".TemporaryItems"
+        || name == ".DocumentRevisions-V100"
+        || name == ".VolumeIcon.icns"
+}
+
+/// Extract the trailing path component for the junk-file check.
+fn last_component(normalised_path: &str) -> &str {
+    normalised_path
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+}
+
 /// Build a response with an explicit empty body and Content-Length: 0.
 ///
 /// Run an async future on a completely separate OS thread with its own
@@ -407,9 +435,14 @@ async fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> R
         }
     };
 
-    // Build response.
+    // Build response. Hide any macOS metadata files that slipped into
+    // the cache from before the upload guard existed; Finder will neither
+    // try to re-create them nor offer to delete them when invisible.
     let items = read_items(&state.items).await;
-    let child_refs: Vec<&VfsItem> = children.iter().collect();
+    let child_refs: Vec<&VfsItem> = children
+        .iter()
+        .filter(|c| !is_macos_junk(&c.name))
+        .collect();
     let xml = build_propfind_response(&normalised, target.as_ref(), &child_refs, &items);
     (
         StatusCode::MULTI_STATUS,
@@ -508,6 +541,14 @@ async fn handle_get(state: &AppState, path: &str) -> Response {
 /// Handle `PUT` — store file contents to the cache.
 async fn handle_put(state: &AppState, path: &str, req: Request) -> Response {
     let normalised = normalise_path(path);
+
+    // Reject macOS filesystem metadata (AppleDouble sidecars, .DS_Store,
+    // …). Returning 403 makes Finder skip the write silently rather than
+    // polluting the cloud backend with sidecar files for every real file.
+    if is_macos_junk(last_component(&normalised)) {
+        tracing::debug!(path = %normalised, "rejecting macOS metadata write");
+        return empty_response(StatusCode::FORBIDDEN);
+    }
 
     // Parse backend prefix and relative path.
     let parts: Vec<&str> = normalised.trim_start_matches('/').split('/').collect();
@@ -722,6 +763,14 @@ async fn handle_delete(state: &AppState, path: &str) -> Response {
 /// Handle `MKCOL` — create a directory.
 async fn handle_mkcol(state: &AppState, path: &str) -> Response {
     let normalised = normalise_path(path);
+
+    // Reject macOS volume-metadata directories (`.Spotlight-V100`,
+    // `.Trashes`, `.fseventsd`, …) so Spotlight/Finder don't seed them
+    // into every backend on first access.
+    if is_macos_junk(last_component(&normalised)) {
+        tracing::debug!(path = %normalised, "rejecting macOS metadata mkdir");
+        return empty_response(StatusCode::FORBIDDEN);
+    }
 
     // Check if it already exists.
     {
