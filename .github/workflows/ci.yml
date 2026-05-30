@@ -206,7 +206,7 @@ jobs:
           tar czf cascade-aarch64-macos.tar.gz cascade
           shasum -a 256 cascade-aarch64-macos.tar.gz | awk '{print $1}' > cascade-aarch64-macos.tar.gz.sha256
       - name: Upload to release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
           tag_name: ${{ needs.release.outputs.version }}
           files: dist/cascade-aarch64-macos.tar.gz*
@@ -242,7 +242,7 @@ jobs:
           tar czf cascade-x86_64-macos.tar.gz cascade
           shasum -a 256 cascade-x86_64-macos.tar.gz | awk '{print $1}' > cascade-x86_64-macos.tar.gz.sha256
       - name: Upload to release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
           tag_name: ${{ needs.release.outputs.version }}
           files: dist/cascade-x86_64-macos.tar.gz*
@@ -277,7 +277,7 @@ jobs:
           tar czf cascade-x86_64-linux.tar.gz cascade
           sha256sum cascade-x86_64-linux.tar.gz | awk '{print $1}' > cascade-x86_64-linux.tar.gz.sha256
       - name: Upload to release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
           tag_name: ${{ needs.release.outputs.version }}
           files: dist/cascade-x86_64-linux.tar.gz*
@@ -318,7 +318,7 @@ jobs:
           tar czf cascade-aarch64-linux.tar.gz cascade
           sha256sum cascade-aarch64-linux.tar.gz | awk '{print $1}' > cascade-aarch64-linux.tar.gz.sha256
       - name: Upload to release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
           tag_name: ${{ needs.release.outputs.version }}
           files: dist/cascade-aarch64-linux.tar.gz*
