@@ -487,6 +487,28 @@ impl DriveClient {
         Ok(())
     }
 
+    /// Restore a trashed file by clearing the `trashed` flag.
+    pub async fn untrash_file(&self, file_id: &str, token: &str) -> anyhow::Result<()> {
+        self.rate_limiter.acquire().await;
+        let url = format!(
+            "{}/files/{file_id}?supportsAllDrives=true&fields=id",
+            self.base_url
+        );
+        let resp = Self::http()
+            .patch(&url)
+            .bearer_auth(token)
+            .json(&serde_json::json!({"trashed": false}))
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if status.is_client_error() || status.is_server_error() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Drive untrash error {status}: {body}");
+        }
+        Ok(())
+    }
+
     /// Move a file to a new parent and/or rename it.
     pub async fn move_file(
         &self,

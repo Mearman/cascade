@@ -51,10 +51,14 @@ impl DriveFile {
         backend_id: &str,
         override_parent: Option<&str>,
     ) -> FileEntry {
+        // Default to the My Drive virtual directory when no explicit override
+        // and no parent is supplied. Items with empty parents from the
+        // Changes stream (e.g. orphans) would otherwise leak to the mount
+        // root via the `root` alias.
         let parent_id = override_parent.map_or_else(
             || {
                 self.parents.first().map_or_else(
-                    || ItemId::new(backend_id, "root"),
+                    || ItemId::new(backend_id, "__mydrive"),
                     |p| ItemId::new(backend_id, p),
                 )
             },

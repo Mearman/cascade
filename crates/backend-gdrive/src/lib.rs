@@ -84,6 +84,7 @@ pub fn create_backend(config: &toml::Value) -> anyhow::Result<Box<dyn Backend>> 
         tokens: Arc::new(Mutex::new(initial_tokens)),
         shared_drive_ids: Arc::new(RwLock::new(HashSet::new())),
         folder_drive_ids: Arc::new(RwLock::new(HashMap::new())),
+        my_drive_root_id: Arc::new(RwLock::new(None)),
     }))
 }
 
@@ -102,6 +103,10 @@ pub struct GdriveBackend {
     /// Maps a folder's native ID to the shared drive it lives in.
     /// Populated incrementally as shared-drive directories are listed.
     folder_drive_ids: Arc<RwLock<HashMap<String, String>>>,
+    /// The real Drive folder ID of the user's My Drive root, cached so
+    /// items whose `parents` field references it can be rewritten to the
+    /// `__mydrive` virtual view ID.
+    my_drive_root_id: Arc<RwLock<Option<String>>>,
 }
 
 impl GdriveBackend {
@@ -284,6 +289,32 @@ impl GdriveBackend {
         Ok(all)
     }
 
+    /// Resolve and cache the real Drive folder ID of the user's My Drive root.
+    ///
+    /// The `/files/root` endpoint resolves the special `root` alias to the
+    /// actual folder ID. We cache it so changes-stream items whose `parents`
+    /// reference this ID can be rewritten to the `__mydrive` virtual view.
+    async fn my_drive_root(&self, token: &str) -> anyhow::Result<String> {
+        {
+            let cache = self.my_drive_root_id.read().await;
+            if let Some(id) = cache.as_ref() {
+                return Ok(id.clone());
+            }
+        }
+        let file = self.drive.get_file("root", token).await?;
+        let mut cache = self.my_drive_root_id.write().await;
+        *cache = Some(file.id.clone());
+        Ok(file.id)
+    }
+
+    /// Rewrite a parent ID that points at the real My Drive root to the
+    /// `__mydrive` virtual view ID so the entry appears in the right place.
+    fn rewrite_my_drive_parent(&self, entry: &mut FileEntry, my_drive_root: &str) {
+        if entry.parent_id.native_id() == my_drive_root {
+            entry.parent_id = ItemId::new(&self.instance_id, "__mydrive");
+        }
+    }
+
     /// Same as `list_files_all_pages` but for the Bin view.
     ///
     /// Uses `to_trash_entry` so all returned items carry `parent_id = __trash`
@@ -355,6 +386,7 @@ impl Backend for GdriveBackend {
         let page_token = cursor.0.clone();
         let mut all_changes = Vec::new();
         let mut current_token = page_token;
+        let my_drive_root = self.my_drive_root(&token).await?;
 
         // Fetch all pages.
         loop {
@@ -365,7 +397,8 @@ impl Backend for GdriveBackend {
                     // For deletions, we need a FileEntry with what we know.
                     // The change may or may not include the file metadata.
                     if let Some(file) = change.file {
-                        if let Some(entry) = file.to_file_entry(&self.instance_id) {
+                        if let Some(mut entry) = file.to_file_entry(&self.instance_id) {
+                            self.rewrite_my_drive_parent(&mut entry, &my_drive_root);
                             all_changes.push(Change::Deleted(entry));
                         }
                     } else if let Some(file_id) = change.file_id {
@@ -383,8 +416,9 @@ impl Backend for GdriveBackend {
                         all_changes.push(Change::Deleted(entry));
                     }
                 } else if let Some(file) = change.file
-                    && let Some(entry) = file.to_file_entry(&self.instance_id)
+                    && let Some(mut entry) = file.to_file_entry(&self.instance_id)
                 {
+                    self.rewrite_my_drive_parent(&mut entry, &my_drive_root);
                     all_changes.push(Change::Created(entry));
                 }
             }
@@ -459,10 +493,40 @@ impl Backend for GdriveBackend {
                 (start, Some(did), path_rest)
             }
             "Shared with me" => {
-                anyhow::bail!("write operations are not supported in 'Shared with me'")
+                let Some((name, path_rest)) = remaining.split_first() else {
+                    return Ok(Self::make_synthetic_dir(
+                        &self.instance_id,
+                        "__shared_with_me",
+                        "root",
+                        "Shared with me",
+                    ));
+                };
+                if !path_rest.is_empty() {
+                    anyhow::bail!(
+                        "nested paths under 'Shared with me' not supported in metadata yet"
+                    );
+                }
+                let entries = self
+                    .list_files_all_pages(&ListQuery::SharedWithMe, &token)
+                    .await?;
+                let found = entries.into_iter().find(|e| e.name == *name);
+                return found.ok_or_else(|| anyhow::anyhow!("Path not found: {path_str}"));
             }
             "Bin" => {
-                anyhow::bail!("write operations are not supported in 'Bin'")
+                let Some((name, path_rest)) = remaining.split_first() else {
+                    return Ok(Self::make_synthetic_dir(
+                        &self.instance_id,
+                        "__trash",
+                        "root",
+                        "Bin",
+                    ));
+                };
+                if !path_rest.is_empty() {
+                    anyhow::bail!("nested paths under 'Bin' not supported");
+                }
+                let entries = self.list_trash_all_pages(&token).await?;
+                let found = entries.into_iter().find(|e| e.name == *name);
+                return found.ok_or_else(|| anyhow::anyhow!("Path not found: {path_str}"));
             }
             _ => {
                 // Legacy path without a virtual view prefix — walk from Drive root,
@@ -521,6 +585,9 @@ impl Backend for GdriveBackend {
         if native_parent == "__shared_with_me" {
             anyhow::bail!("Cannot create files directly in 'Shared with me'");
         }
+        if native_parent == "__shared_drives" {
+            anyhow::bail!("Cannot create files at the 'Shared drives' root — pick a specific drive");
+        }
 
         let token = self.access_token().await?;
 
@@ -533,15 +600,25 @@ impl Backend for GdriveBackend {
             .and_then(|n| n.to_str())
             .unwrap_or("untitled");
 
-        let native_parent = parent_id.native_id();
+        // `__mydrive` is the user's real Drive root — Drive's upload API
+        // needs the actual folder ID, not the virtual view alias.
+        let drive_parent = if native_parent == "__mydrive" {
+            self.my_drive_root(&token).await?
+        } else {
+            native_parent.to_string()
+        };
 
         let file = self
             .drive
-            .upload_file(file_name, native_parent, &data, &token)
+            .upload_file(file_name, &drive_parent, &data, &token)
             .await?;
 
-        file.to_file_entry(&self.instance_id)
-            .ok_or_else(|| anyhow::anyhow!("upload returned trashed file"))
+        let mut entry = file
+            .to_file_entry(&self.instance_id)
+            .ok_or_else(|| anyhow::anyhow!("upload returned trashed file"))?;
+        let my_drive_root = self.my_drive_root(&token).await?;
+        self.rewrite_my_drive_parent(&mut entry, &my_drive_root);
+        Ok(entry)
     }
 
     async fn update(
@@ -569,22 +646,41 @@ impl Backend for GdriveBackend {
             .and_then(|n| n.to_str())
             .unwrap_or("New Folder");
 
-        // Resolve parent directory.
+        // Resolve parent directory. `__mydrive`/`__trash`/etc. need to be
+        // translated to real Drive IDs or rejected before hitting the API.
         let parent = path.parent().unwrap_or_else(|| Path::new("/"));
-        let parent_id = if parent == Path::new("") || parent == Path::new("/") {
+        let parent_native = if parent == Path::new("") || parent == Path::new("/") {
             "root".to_string()
         } else {
             let parent_entry = self.metadata(parent).await?;
             parent_entry.id.native_id().to_string()
         };
 
+        let drive_parent = match parent_native.as_str() {
+            "__trash" => anyhow::bail!(
+                "Bin is read-only — restore files via `cascade backend restore`"
+            ),
+            "__shared_with_me" => {
+                anyhow::bail!("Cannot create directories directly in 'Shared with me'")
+            }
+            "__shared_drives" => anyhow::bail!(
+                "Cannot create directories at the 'Shared drives' root — pick a specific drive"
+            ),
+            "__mydrive" => self.my_drive_root(&token).await?,
+            other => other.to_string(),
+        };
+
         let file = self
             .drive
-            .create_directory(dir_name, &parent_id, &token)
+            .create_directory(dir_name, &drive_parent, &token)
             .await?;
 
-        file.to_file_entry(&self.instance_id)
-            .ok_or_else(|| anyhow::anyhow!("create_dir returned trashed file"))
+        let mut entry = file
+            .to_file_entry(&self.instance_id)
+            .ok_or_else(|| anyhow::anyhow!("create_dir returned trashed file"))?;
+        let my_drive_root = self.my_drive_root(&token).await?;
+        self.rewrite_my_drive_parent(&mut entry, &my_drive_root);
+        Ok(entry)
     }
 
     async fn create_dir_with_parent(
@@ -599,14 +695,29 @@ impl Backend for GdriveBackend {
         if native_parent == "__shared_with_me" {
             anyhow::bail!("Cannot create directories directly in 'Shared with me'");
         }
+        if native_parent == "__shared_drives" {
+            anyhow::bail!(
+                "Cannot create directories at the 'Shared drives' root — pick a specific drive"
+            );
+        }
         let token = self.access_token().await?;
-        let native_parent = parent_id.native_id();
+
+        let drive_parent = if native_parent == "__mydrive" {
+            self.my_drive_root(&token).await?
+        } else {
+            native_parent.to_string()
+        };
+
         let file = self
             .drive
-            .create_directory(name, native_parent, &token)
+            .create_directory(name, &drive_parent, &token)
             .await?;
-        file.to_file_entry(&self.instance_id)
-            .ok_or_else(|| anyhow::anyhow!("create_dir_with_parent returned trashed file"))
+        let mut entry = file
+            .to_file_entry(&self.instance_id)
+            .ok_or_else(|| anyhow::anyhow!("create_dir_with_parent returned trashed file"))?;
+        let my_drive_root = self.my_drive_root(&token).await?;
+        self.rewrite_my_drive_parent(&mut entry, &my_drive_root);
+        Ok(entry)
     }
 
     async fn delete(&self, file: &FileEntry) -> anyhow::Result<()> {
@@ -624,11 +735,30 @@ impl Backend for GdriveBackend {
 
         // Resolve destination parent.
         let dst_parent = dst.parent().unwrap_or_else(|| Path::new("/"));
-        let dst_parent_id = if dst_parent == Path::new("") || dst_parent == Path::new("/") {
+        let dst_parent_native = if dst_parent == Path::new("") || dst_parent == Path::new("/") {
             "root".to_string()
         } else {
             let parent_entry = self.metadata(dst_parent).await?;
             parent_entry.id.native_id().to_string()
+        };
+
+        // Destination is the Bin → map to a trash operation.
+        if dst_parent_native == "__trash" {
+            self.drive.trash_file(file_id, &token).await?;
+            let file = self.drive.get_file(file_id, &token).await?;
+            return Ok(file.to_trash_entry(&self.instance_id));
+        }
+
+        // Source currently trashed → untrash before moving.
+        let src_drive_file = self.drive.get_file(file_id, &token).await?;
+        if src_drive_file.trashed {
+            self.drive.untrash_file(file_id, &token).await?;
+        }
+
+        let dst_parent_id = if dst_parent_native == "__mydrive" {
+            self.my_drive_root(&token).await?
+        } else {
+            dst_parent_native
         };
 
         let new_name = dst.file_name().and_then(|n| n.to_str());
@@ -638,8 +768,12 @@ impl Backend for GdriveBackend {
             .move_file(file_id, &dst_parent_id, new_name, &token)
             .await?;
 
-        file.to_file_entry(&self.instance_id)
-            .ok_or_else(|| anyhow::anyhow!("move returned trashed file"))
+        let mut entry = file
+            .to_file_entry(&self.instance_id)
+            .ok_or_else(|| anyhow::anyhow!("move returned trashed file"))?;
+        let my_drive_root = self.my_drive_root(&token).await?;
+        self.rewrite_my_drive_parent(&mut entry, &my_drive_root);
+        Ok(entry)
     }
 
     async fn move_by_id(
@@ -649,18 +783,52 @@ impl Backend for GdriveBackend {
         new_name: &str,
     ) -> anyhow::Result<FileEntry> {
         let token = self.access_token().await?;
+        let src_native = src_id.native_id();
+        let dst_native = dst_parent_id.native_id();
+
+        // Move into Bin: maps to `trash_file` rather than a parent change.
+        // The file may live anywhere — My Drive, a shared drive, or already
+        // be trashed — but a destination of `__trash` always means trash it.
+        if dst_native == "__trash" {
+            self.drive.trash_file(src_native, &token).await?;
+            let file = self.drive.get_file(src_native, &token).await?;
+            return Ok(file.to_trash_entry(&self.instance_id));
+        }
+
+        // Disallow direct moves into the virtual roots that have no
+        // single Drive-level parent.
+        if dst_native == "__shared_drives" || dst_native == "__shared_with_me" {
+            anyhow::bail!(
+                "cannot move directly into virtual directory '{dst_native}' — pick a real folder under it"
+            );
+        }
+
+        // If the source is currently trashed, untrash it first. A drag out
+        // of Bin is the natural "restore" gesture.
+        let current = self.drive.get_file(src_native, &token).await?;
+        if current.trashed {
+            self.drive.untrash_file(src_native, &token).await?;
+        }
+
+        // `__mydrive` is the user's real Drive root — resolve once and use
+        // the real folder ID with Drive's addParents/removeParents semantics.
+        let drive_parent = if dst_native == "__mydrive" {
+            self.my_drive_root(&token).await?
+        } else {
+            dst_native.to_string()
+        };
+
         let file = self
             .drive
-            .move_file(
-                src_id.native_id(),
-                dst_parent_id.native_id(),
-                Some(new_name),
-                &token,
-            )
+            .move_file(src_native, &drive_parent, Some(new_name), &token)
             .await?;
 
-        file.to_file_entry(&self.instance_id)
-            .ok_or_else(|| anyhow::anyhow!("move returned trashed file"))
+        let mut entry = file
+            .to_file_entry(&self.instance_id)
+            .ok_or_else(|| anyhow::anyhow!("move returned trashed file"))?;
+        let my_drive_root = self.my_drive_root(&token).await?;
+        self.rewrite_my_drive_parent(&mut entry, &my_drive_root);
+        Ok(entry)
     }
 
     async fn poll_interval(&self) -> Option<Duration> {

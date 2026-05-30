@@ -42,6 +42,22 @@ fn make_backend(server: &MockServer) -> Box<dyn Backend> {
     create_backend(&toml::Value::Table(table)).unwrap()
 }
 
+/// Register a default `/files/root` response so tests that exercise paths
+/// invoking `my_drive_root()` (changes stream, upload, create_dir, move)
+/// don't fail with a 404 from the mock server.
+async fn mock_drive_root(server: &MockServer, real_root_id: &str) {
+    Mock::given(method("GET"))
+        .and(path("/files/root"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": real_root_id,
+            "name": "My Drive",
+            "mimeType": "application/vnd.google-apps.folder",
+            "trashed": false
+        })))
+        .mount(server)
+        .await;
+}
+
 /// Minimal camelCase JSON for a regular file.
 fn file_json(id: &str, name: &str, parent: &str, size: u64) -> serde_json::Value {
     json!({
@@ -140,6 +156,7 @@ async fn changes_initial_call_fetches_start_token_and_returns_empty() {
 #[tokio::test]
 async fn changes_detects_created_file() {
     let server = MockServer::start().await;
+    mock_drive_root(&server, "real-root-id").await;
     Mock::given(method("GET"))
         .and(path("/changes"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -174,6 +191,7 @@ async fn changes_detects_created_file() {
 #[tokio::test]
 async fn changes_detects_deleted_file() {
     let server = MockServer::start().await;
+    mock_drive_root(&server, "real-root-id").await;
     Mock::given(method("GET"))
         .and(path("/changes"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -205,6 +223,7 @@ async fn changes_detects_deleted_file() {
 #[tokio::test]
 async fn changes_handles_pagination() {
     let server = MockServer::start().await;
+    mock_drive_root(&server, "real-root-id").await;
     // Page 1 — has a nextPageToken.
     Mock::given(method("GET"))
         .and(path("/changes"))
@@ -336,6 +355,7 @@ async fn download_writes_file_content() {
 #[tokio::test]
 async fn create_dir_posts_to_files_and_returns_entry() {
     let server = MockServer::start().await;
+    mock_drive_root(&server, "real-root-id").await;
     // Parent directory lookup — resolving "projects" path.
     Mock::given(method("GET"))
         .and(path("/files"))
@@ -402,6 +422,7 @@ async fn delete_patches_file_as_trashed() {
 #[tokio::test]
 async fn upload_file_sends_multipart_and_returns_entry() {
     let server = MockServer::start().await;
+    mock_drive_root(&server, "real-root-id").await;
     Mock::given(method("POST"))
         .and(path("/files"))
         .and(query_param("uploadType", "multipart"))
