@@ -607,8 +607,16 @@ fn ensure_directory(path: &Path, label: &str) -> Result<()> {
         anyhow::bail!("{label} {} exists but is not a directory", path.display());
     }
 
-    std::fs::create_dir_all(path)
-        .with_context(|| format!("failed to create {label} at {}", path.display()))
+    match std::fs::create_dir_all(path) {
+        Ok(()) => Ok(()),
+        // After force-unmounting a dead WebDAV mount the VFS teardown is not
+        // always instantaneous. `mkdir` returns EEXIST but `stat` confirms the
+        // path is already a plain directory — treat that as success.
+        Err(_) if path.is_dir() => Ok(()),
+        Err(e) => {
+            Err(e).with_context(|| format!("failed to create {label} at {}", path.display()))
+        }
+    }
 }
 
 /// Read a text file with the file path included in the error message.
@@ -664,6 +672,7 @@ fn evict_stale_mount(mount_point: &Path) {
 
     // `umount` handles stacked mounts (multiple mounts on the same path)
     // but only removes one per invocation. Call it in a loop until clean.
+    let mut evicted = false;
     loop {
         let result = std::process::Command::new("/sbin/umount")
             .arg(mount_point)
@@ -672,6 +681,7 @@ fn evict_stale_mount(mount_point: &Path) {
         match result {
             Ok(o) if o.status.success() => {
                 tracing::info!(path = %path_str, "stale mount evicted");
+                evicted = true;
             }
             Ok(_) => break, // no more mounts to remove
             Err(e) => {
@@ -681,6 +691,28 @@ fn evict_stale_mount(mount_point: &Path) {
                     "failed to run umount; startup may fail"
                 );
                 break;
+            }
+        }
+    }
+
+    // Dead WebDAV mounts (server no longer running) block plain `umount`
+    // because the VFS tries to contact the server. If we still see the mount
+    // after the loop, force-detach it with `diskutil unmount force`.
+    if !evicted {
+        let force = std::process::Command::new("/usr/sbin/diskutil")
+            .args(["unmount", "force"])
+            .arg(mount_point)
+            .output();
+        match force {
+            Ok(o) if o.status.success() => {
+                tracing::info!(path = %path_str, "stale mount force-evicted via diskutil");
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                tracing::warn!(path = %path_str, stderr = %stderr, "diskutil force unmount failed");
+            }
+            Err(e) => {
+                tracing::warn!(path = %path_str, error = %e, "failed to run diskutil unmount force");
             }
         }
     }
