@@ -44,7 +44,7 @@ impl PresenterResources {
 }
 
 /// Start the Cascade daemon.
-pub async fn start(ctx: &CliContext, mount_point: Option<&str>) -> Result<()> {
+pub async fn start(ctx: &CliContext, mount_point: Option<&str>, no_mount: bool) -> Result<()> {
     tracing::info!("Starting Cascade daemon");
 
     ensure_directory(&ctx.config_dir, "config directory")?;
@@ -93,24 +93,28 @@ pub async fn start(ctx: &CliContext, mount_point: Option<&str>) -> Result<()> {
     // On macOS: FSKit first (native, kext-free, POSIX), then WebDAV (no
     // root needed), then NFSv4/v3 fallback.  NFS already has the v4 → v3 →
     // escalation chain inside mount_nfs().
+    //
+    // FSKit self-mounts via the Swift extension and cannot be used without
+    // mounting, so it is skipped when --no-mount is set.
     #[cfg(target_os = "macos")]
     {
-        let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
-
-        // Attempt 1: FSKit.
-        tracing::info!(strategy = "fskit", "attempting FSKit mount");
-        match try_fskit(ctx, &mount_path, backends).await {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                tracing::warn!(error = %e, "FSKit mount failed, falling back to WebDAV");
-                drop(e);
+        // Attempt 1: FSKit (skipped if --no-mount since FSKit always self-mounts).
+        if !no_mount {
+            let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
+            tracing::info!(strategy = "fskit", "attempting FSKit mount");
+            match try_fskit(ctx, &mount_path, backends).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    tracing::warn!(error = %e, "FSKit mount failed, falling back to WebDAV");
+                    drop(e);
+                }
             }
         }
 
         // Attempt 2: WebDAV.
         let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
         tracing::info!(strategy = "webdav", "attempting WebDAV mount");
-        match try_webdav(ctx, &mount_path, backends).await {
+        match try_webdav(ctx, &mount_path, backends, no_mount).await {
             Ok(()) => return Ok(()),
             Err(e) => {
                 tracing::warn!(error = %e, "WebDAV mount failed, falling back to NFS");
@@ -120,13 +124,13 @@ pub async fn start(ctx: &CliContext, mount_point: Option<&str>) -> Result<()> {
 
         // Attempt 3: NFS (v4 → v3 escalation inside mount_nfs).
         let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
-        try_nfs(ctx, &mount_path, backends).await
+        try_nfs(ctx, &mount_path, backends, no_mount).await
     }
 
     #[cfg(not(target_os = "macos"))]
     {
         let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
-        try_nfs(ctx, &mount_path, backends).await
+        try_nfs(ctx, &mount_path, backends, no_mount).await
     }
 }
 
@@ -224,6 +228,7 @@ async fn try_webdav(
     ctx: &CliContext,
     mount_path: &Path,
     backends: Vec<Arc<dyn cascade_engine::backend::Backend>>,
+    no_mount: bool,
 ) -> Result<()> {
     let engine_config = EngineConfig {
         db_path: ctx.db_path.clone(),
@@ -288,20 +293,25 @@ async fn try_webdav(
             .context("WebDAV server not started")?
     };
 
-    if let Err(e) = mount_webdav(mount_path, webdav_port) {
-        resources.shutdown();
-        return Err(e);
+    if no_mount {
+        println!("Cascade started (WebDAV, no-mount).");
+        println!("  WebDAV URL: http://localhost:{webdav_port}");
+    } else {
+        if let Err(e) = mount_webdav(mount_path, webdav_port) {
+            resources.shutdown();
+            return Err(e);
+        }
+        println!("Cascade started (WebDAV).");
+        println!("  Mount point: {}", mount_path.display());
+        println!("  WebDAV port: {webdav_port}");
     }
+    println!("  PID: {}", std::process::id());
 
     if let Err(e) = write_pid_file(&ctx.pid_path) {
         resources.shutdown();
         return Err(e);
     }
 
-    println!("Cascade started (WebDAV).");
-    println!("  Mount point: {}", mount_path.display());
-    println!("  WebDAV port: {webdav_port}");
-    println!("  PID: {}", std::process::id());
     println!();
     println!("Press Ctrl+C to stop.");
 
@@ -309,7 +319,9 @@ async fn try_webdav(
 
     tracing::info!("Shutting down...");
 
-    unmount_path(mount_path)?;
+    if !no_mount {
+        unmount_path(mount_path)?;
+    }
     if let Err(e) = presenter.stop().await {
         tracing::warn!(error = %e, "WebDAV presenter stop returned an error");
     }
@@ -330,6 +342,7 @@ async fn try_nfs(
     ctx: &CliContext,
     mount_path: &Path,
     backends: Vec<Arc<dyn cascade_engine::backend::Backend>>,
+    no_mount: bool,
 ) -> Result<()> {
     let engine_config = EngineConfig {
         db_path: ctx.db_path.clone(),
@@ -377,9 +390,11 @@ async fn try_nfs(
     let nfs_port = server.local_addr.port();
     tracing::info!(port = nfs_port, "NFS server started");
 
-    if let Err(e) = mount_nfs(mount_path, nfs_port) {
-        resources.shutdown();
-        return Err(e);
+    if !no_mount {
+        if let Err(e) = mount_nfs(mount_path, nfs_port) {
+            resources.shutdown();
+            return Err(e);
+        }
     }
 
     if let Err(e) = write_pid_file(&ctx.pid_path) {
@@ -387,10 +402,15 @@ async fn try_nfs(
         return Err(e);
     }
 
-    println!("Cascade started (NFS).");
-    println!("  Mount point: {}", mount_path.display());
+    if no_mount {
+        println!("Cascade started (NFS, no-mount).");
+    } else {
+        println!("Cascade started (NFS).");
+        println!("  Mount point: {}", mount_path.display());
+    }
     println!("  NFS port: {nfs_port}");
     println!("  PID: {}", std::process::id());
+
     println!();
     println!("Press Ctrl+C to stop.");
 
@@ -398,7 +418,9 @@ async fn try_nfs(
 
     tracing::info!("Shutting down...");
 
-    unmount_path(mount_path)?;
+    if !no_mount {
+        unmount_path(mount_path)?;
+    }
     if let Err(e) = server.stop() {
         tracing::warn!(error = %e, "NFS server stop returned an error");
     }

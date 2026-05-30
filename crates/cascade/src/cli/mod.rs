@@ -162,6 +162,10 @@ pub enum Commands {
         /// Mount point override
         #[arg(long)]
         mount_point: Option<String>,
+
+        /// Start the server without mounting the filesystem — useful for e2e testing against localhost
+        #[arg(long)]
+        no_mount: bool,
     },
 
     /// Stop the daemon and unmount
@@ -253,6 +257,11 @@ pub enum Commands {
         /// Override the OAuth client secret (takes priority over config and built-in)
         #[arg(long)]
         client_secret: Option<String>,
+
+        /// Use the device code flow instead of the localhost redirect.
+        /// Device code grants per-file access (drive.file scope) only.
+        #[arg(long)]
+        device_code: bool,
     },
 }
 
@@ -310,11 +319,14 @@ impl Cli {
                     client_secret,
                 },
             ),
-            Commands::Start { mount_point } => mount::start(ctx, mount_point.as_deref()).await,
+            Commands::Start {
+                mount_point,
+                no_mount,
+            } => mount::start(ctx, mount_point.as_deref(), no_mount).await,
             Commands::Stop => mount::stop(ctx),
             Commands::Restart => {
                 mount::stop(ctx)?;
-                mount::start(ctx, None).await
+                mount::start(ctx, None, false).await
             }
             Commands::Status => status::show(ctx),
             Commands::Pin { path } => cache::pin(ctx, &path),
@@ -348,8 +360,16 @@ impl Cli {
                 name,
                 client_id,
                 client_secret,
+                device_code,
             } => {
-                auth::authenticate(ctx, &name, client_id.as_deref(), client_secret.as_deref()).await
+                auth::authenticate(
+                    ctx,
+                    &name,
+                    client_id.as_deref(),
+                    client_secret.as_deref(),
+                    device_code,
+                )
+                .await
             }
         }
     }
