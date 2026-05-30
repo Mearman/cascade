@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7](https://github.com/Mearman/cascade/compare/v0.1.6...v0.1.7) - 2026-05-30
+
+### Added
+
+- *(cli)* add --no-mount flag to skip macOS WebDAV/NFS auto-mount
+- *(cli)* unmount WebDAV mount on cascade stop
+- *(webdav)* lazy-load directory contents on demand
+
+### Fixed
+
+- *(mount)* recover from stale WebDAV mounts whose server is dead
+- *(mount)* force-evict dead WebDAV mounts and handle residual EEXIST
+- *(auth)* replace silent OAuth fallback with explicit --device-code flag
+- *(mount)* evict stale mounts on startup and use localhost for WebDAV
+- *(webdav)* avoid blocking the tokio runtime while wiring backends
+
+### Other
+
+- cargo fmt
+- *(mount)* replace raw fs calls with path-aware error helpers
+
 ## [0.1.6](https://github.com/Mearman/cascade/compare/v0.1.5...v0.1.6) - 2026-05-29
 
 ### Other
