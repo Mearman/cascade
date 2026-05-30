@@ -415,9 +415,19 @@ impl Backend for GdriveBackend {
                         };
                         all_changes.push(Change::Deleted(entry));
                     }
-                } else if let Some(file) = change.file
-                    && let Some(mut entry) = file.to_file_entry(&self.instance_id)
-                {
+                } else if let Some(file) = change.file {
+                    // Trashed items must route to the Bin view, not be
+                    // dropped — otherwise files the user trashes via
+                    // drive.google.com (or our own trash_file call) stay
+                    // stuck at their old location in the local cache.
+                    let mut entry = if file.trashed {
+                        file.to_trash_entry(&self.instance_id)
+                    } else {
+                        let Some(e) = file.to_file_entry(&self.instance_id) else {
+                            continue;
+                        };
+                        e
+                    };
                     self.rewrite_my_drive_parent(&mut entry, &my_drive_root);
                     all_changes.push(Change::Created(entry));
                 }
@@ -765,7 +775,13 @@ impl Backend for GdriveBackend {
 
         let file = self
             .drive
-            .move_file(file_id, &dst_parent_id, new_name, &token)
+            .move_file(
+                file_id,
+                &dst_parent_id,
+                &src_drive_file.parents,
+                new_name,
+                &token,
+            )
             .await?;
 
         let mut entry = file
@@ -820,7 +836,13 @@ impl Backend for GdriveBackend {
 
         let file = self
             .drive
-            .move_file(src_native, &drive_parent, Some(new_name), &token)
+            .move_file(
+                src_native,
+                &drive_parent,
+                &current.parents,
+                Some(new_name),
+                &token,
+            )
             .await?;
 
         let mut entry = file

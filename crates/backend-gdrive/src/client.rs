@@ -510,10 +510,16 @@ impl DriveClient {
     }
 
     /// Move a file to a new parent and/or rename it.
+    ///
+    /// `remove_parents` should list the file's current parent IDs that need
+    /// to be detached. Shared-drive items require exactly one parent, so
+    /// `addParents` alone (without a matching `removeParents`) returns 403
+    /// `teamDrivesParentLimit` on them.
     pub async fn move_file(
         &self,
         file_id: &str,
         new_parent_id: &str,
+        remove_parents: &[String],
         new_name: Option<&str>,
         token: &str,
     ) -> anyhow::Result<DriveFile> {
@@ -530,13 +536,13 @@ impl DriveClient {
             );
         }
         let body = serde_json::Value::Object(body);
-        // The addParents/removeParents params handle parent change.
+        let remove_csv = remove_parents.join(",");
         let resp = Self::http()
             .patch(&url)
             .bearer_auth(token)
             .query(&[
                 ("addParents", new_parent_id),
-                ("removeParents", ""), // API removes all current parents when addParents + removeParents specified
+                ("removeParents", remove_csv.as_str()),
             ])
             .json(&body)
             .send()
