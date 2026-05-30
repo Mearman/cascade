@@ -167,6 +167,24 @@ impl StateDb {
         Ok(())
     }
 
+    /// Delete a file or directory and every descendant in one statement.
+    pub fn delete_subtree(&self, root_id: &ItemId) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        conn.execute(
+            "WITH RECURSIVE subtree(id) AS (
+                SELECT id FROM files WHERE id = ?1
+                UNION ALL
+                SELECT f.id FROM files f INNER JOIN subtree s ON f.parent_id = s.id
+             )
+             DELETE FROM files WHERE id IN (SELECT id FROM subtree)",
+            [&root_id.0],
+        )?;
+        Ok(())
+    }
+
     /// Update the cache state of a file.
     pub fn update_cache_state(&self, id: &ItemId, state: CacheState) -> Result<()> {
         let conn = self

@@ -271,7 +271,22 @@ async fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> R
             cached
         }
     } else {
-        let backend_prefix = normalised.trim_start_matches('/').trim_end_matches('/');
+        // The path is not in the VFS. Only the top-level backend paths
+        // (e.g. `/gdrive-personal`) are virtual roots — anything deeper that
+        // doesn't exist must return 404 so that macOS sends MKCOL / PUT
+        // instead of treating the missing path as an existing directory.
+        let path_components: Vec<&str> = normalised
+            .trim_start_matches('/')
+            .trim_end_matches('/')
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
+        let Some(&backend_prefix) = path_components.first() else {
+            return empty_response(StatusCode::NOT_FOUND);
+        };
+        if path_components.len() != 1 {
+            return empty_response(StatusCode::NOT_FOUND);
+        }
         let root_id = format!("{backend_prefix}:root");
         let cached: Vec<VfsItem> = {
             let items = read_items(&state.items).await;
@@ -597,15 +612,37 @@ async fn handle_delete(state: &AppState, path: &str) -> Response {
 
     match backend.delete(&file_entry).await {
         Ok(()) => {
-            // Remove from state DB.
+            // Collect the deleted item and all its descendants from the in-memory
+            // VFS so they can be evicted from both the DB and the store together.
+            let to_remove: Vec<String> = {
+                let items = state.items.read().await;
+                let mut ids = vec![item_id.clone()];
+                let mut queue = vec![item_id.clone()];
+                while let Some(parent) = queue.pop() {
+                    let children: Vec<String> = items
+                        .values()
+                        .filter(|item| item.parent_id.0 == parent)
+                        .map(|item| item.id.0.clone())
+                        .collect();
+                    queue.extend(children.clone());
+                    ids.extend(children);
+                }
+                ids
+            };
+
+            // Remove the whole subtree from the DB in one statement.
             if let Some(db) = &state.db {
-                let _ = db.delete_file(&ItemId(item_id.clone()));
+                let _ = db.delete_subtree(&ItemId(item_id.clone()));
             }
-            // Remove from cache and in-memory store.
-            let cache_path = state.cache_dir.join(safe_filename(&item_id));
-            let _ = tokio::fs::remove_file(&cache_path).await;
+
+            // Evict cache files and VFS entries for every removed ID.
             let mut items = state.items.write().await;
-            items.remove(&item_id);
+            for id in &to_remove {
+                let cache_path = state.cache_dir.join(safe_filename(id));
+                let _ = tokio::fs::remove_file(&cache_path).await;
+                items.remove(id);
+            }
+
             empty_response(StatusCode::NO_CONTENT)
         }
         Err(e) => {
@@ -900,7 +937,9 @@ pub fn build_propfind_response(
     if let Some(item) = target {
         responses.push_str(&build_response_element(&root_href, item));
     } else {
-        // SAFETY: write! to String is infallible.
+        // Emit a virtual collection entry. This is only reached for backend
+        // root paths (e.g. `/gdrive-personal`) which have no corresponding
+        // VfsItem — handle_propfind returns 404 for any deeper missing path.
         #[allow(clippy::expect_used)]
         let _ = write!(
             responses,
