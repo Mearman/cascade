@@ -207,7 +207,8 @@ async fn webdav_handler(State(state): State<AppState>, req: Request) -> Response
     tracing::debug!(method = %method, path = %path, "WebDAV request");
 
     let mut resp = match method {
-        Method::GET => handle_get(&state, &path).await,
+        Method::GET => handle_get(&state, &path, req.headers()).await,
+        Method::HEAD => handle_head(&state, &path).await,
         Method::PUT => handle_put(&state, &path, req).await,
         Method::DELETE => handle_delete(&state, &path).await,
         m if m == Method::from_bytes(b"MKCOL").unwrap_or_default() => {
@@ -453,7 +454,7 @@ async fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> R
 }
 
 /// Handle `GET` — return file contents from the cache.
-async fn handle_get(state: &AppState, path: &str) -> Response {
+async fn handle_get(state: &AppState, path: &str, headers: &HeaderMap) -> Response {
     let normalised = normalise_path(path);
 
     let (item_id, backend_id) = {
@@ -469,73 +470,215 @@ async fn handle_get(state: &AppState, path: &str) -> Response {
         }
     };
 
-    // Try local cache first.
     let cache_path = state.cache_dir.join(safe_filename(&item_id));
-    if let Ok(data) = tokio::fs::read(&cache_path).await {
-        let mut response = Response::new(Body::from(data));
-        response.headers_mut().insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/octet-stream"),
-        );
-        return response;
+
+    // Cache miss → download. We hold the response until the full file
+    // lands in the cache, then stream it (or a Range of it) back.
+    if tokio::fs::metadata(&cache_path).await.is_err()
+        && let Err(resp) = populate_cache(state, &item_id, &backend_id, &cache_path).await
+    {
+        return resp;
     }
 
-    // Fall back to backend download.
+    serve_from_cache(&cache_path, headers).await
+}
+
+/// Read-only response (no body) for `HEAD`. Returns the Content-Length
+/// from the items map so clients can stat without forcing a download.
+async fn handle_head(state: &AppState, path: &str) -> Response {
+    let normalised = normalise_path(path);
+    let items = state.items.read().await;
+    let Some(item) = items.values().find(|item| {
+        let ip = resolve_full_path(item, &items);
+        ip == normalised || ip == path
+    }) else {
+        return empty_response(StatusCode::NOT_FOUND);
+    };
+    let size = item.size.unwrap_or(0);
+    let accept_ranges = HeaderValue::from_static("bytes");
+    let content_type = HeaderValue::from_static("application/octet-stream");
+    let mut resp = Response::new(Body::empty());
+    *resp.status_mut() = StatusCode::OK;
+    let h = resp.headers_mut();
+    h.insert(header::CONTENT_TYPE, content_type);
+    h.insert(header::ACCEPT_RANGES, accept_ranges);
+    if let Ok(v) = HeaderValue::from_str(&size.to_string()) {
+        h.insert(header::CONTENT_LENGTH, v);
+    }
+    resp
+}
+
+/// Download `item_id` from its backend into `cache_path`. Returns
+/// `Err(response)` if the download failed so the caller can pass that
+/// response through unmodified.
+async fn populate_cache(
+    state: &AppState,
+    item_id: &str,
+    backend_id: &str,
+    cache_path: &std::path::Path,
+) -> std::result::Result<(), Response> {
     let backend = {
         let backends = state.backends.read().await;
         backends.iter().find(|b| b.id() == backend_id).cloned()
     };
     let Some(backend) = backend else {
-        return empty_response(StatusCode::NOT_FOUND);
+        return Err(empty_response(StatusCode::NOT_FOUND));
     };
 
-    // Find the FileEntry for this item.
     let file_entry = {
         let items = state.items.read().await;
         items
-            .get(&item_id)
+            .get(item_id)
             .map(cascade_engine::types::FileEntry::from)
     };
     let Some(file_entry) = file_entry else {
-        return empty_response(StatusCode::NOT_FOUND);
+        return Err(empty_response(StatusCode::NOT_FOUND));
     };
 
-    // Download to a cache file, then serve it.
     let _ = tokio::fs::create_dir_all(&state.cache_dir).await;
-    let download_cache = state.cache_dir.join(safe_filename(&item_id));
-    let mut file = match tokio::fs::File::create(&download_cache).await {
+    let mut file = match tokio::fs::File::create(cache_path).await {
         Ok(f) => f,
         Err(e) => {
             tracing::error!(error = %e, "failed to create cache file");
-            return empty_response(StatusCode::INTERNAL_SERVER_ERROR);
+            return Err(empty_response(StatusCode::INTERNAL_SERVER_ERROR));
         }
     };
     match backend.download(&file_entry, &mut file).await {
-        Ok(()) => {
-            drop(file);
-            tokio::fs::read(&download_cache).await.map_or_else(
-                |_| empty_response(StatusCode::INTERNAL_SERVER_ERROR),
-                |data| {
-                    let mut response = Response::new(Body::from(data));
-                    response.headers_mut().insert(
-                        header::CONTENT_TYPE,
-                        HeaderValue::from_static("application/octet-stream"),
-                    );
-                    response
-                },
-            )
-        }
+        Ok(()) => Ok(()),
         Err(e) => {
             let status = backend_error_status(&e);
             tracing::warn!(error = %e, ?status, "backend download failed");
-            let _ = tokio::fs::remove_file(&download_cache).await;
-            empty_response(if status == StatusCode::INTERNAL_SERVER_ERROR {
+            let _ = tokio::fs::remove_file(cache_path).await;
+            Err(empty_response(if status == StatusCode::INTERNAL_SERVER_ERROR {
                 StatusCode::NOT_FOUND
             } else {
                 status
-            })
+            }))
         }
     }
+}
+
+/// Stream the cache file as the response body, honouring an optional
+/// `Range: bytes=…` header. Returns 206 Partial Content for satisfied
+/// ranges, 416 Range Not Satisfiable for invalid ones, or 200 OK for
+/// full reads. Body is streamed via `ReaderStream` so we never hold the
+/// file in memory.
+async fn serve_from_cache(cache_path: &std::path::Path, headers: &HeaderMap) -> Response {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
+    use tokio_util::io::ReaderStream;
+
+    let Ok(file) = tokio::fs::File::open(cache_path).await else {
+        return empty_response(StatusCode::NOT_FOUND);
+    };
+    let Ok(meta) = file.metadata().await else {
+        return empty_response(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+    let total = meta.len();
+
+    let range_header = headers
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let parsed = range_header.as_deref().map(|r| parse_range(r, total));
+
+    match parsed {
+        // No Range header → full file, 200 OK.
+        None => {
+            let stream = ReaderStream::new(file);
+            let mut resp = Response::new(Body::from_stream(stream));
+            let h = resp.headers_mut();
+            h.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/octet-stream"),
+            );
+            h.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+            if let Ok(v) = HeaderValue::from_str(&total.to_string()) {
+                h.insert(header::CONTENT_LENGTH, v);
+            }
+            resp
+        }
+        // Invalid range → 416 with Content-Range: */<total>.
+        Some(Err(())) => {
+            let mut resp = empty_response(StatusCode::RANGE_NOT_SATISFIABLE);
+            if let Ok(v) = HeaderValue::from_str(&format!("bytes */{total}")) {
+                resp.headers_mut().insert(header::CONTENT_RANGE, v);
+            }
+            resp
+        }
+        // Satisfied range → 206 Partial Content streaming start..=end.
+        Some(Ok((start, end))) => {
+            let length = end - start + 1;
+            let mut file = file;
+            if file.seek(SeekFrom::Start(start)).await.is_err() {
+                return empty_response(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+            let stream = ReaderStream::new(file.take(length));
+            let mut resp = Response::new(Body::from_stream(stream));
+            *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+            let h = resp.headers_mut();
+            h.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/octet-stream"),
+            );
+            h.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+            if let Ok(v) = HeaderValue::from_str(&length.to_string()) {
+                h.insert(header::CONTENT_LENGTH, v);
+            }
+            if let Ok(v) = HeaderValue::from_str(&format!("bytes {start}-{end}/{total}")) {
+                h.insert(header::CONTENT_RANGE, v);
+            }
+            resp
+        }
+    }
+}
+
+/// Parse an HTTP `Range: bytes=…` header value against a known content
+/// length. Returns the inclusive byte range on success.
+///
+/// Accepts the three common forms:
+/// - `bytes=N-M` — bytes N..=M
+/// - `bytes=N-`  — bytes N..=end
+/// - `bytes=-N`  — last N bytes
+///
+/// Multi-range requests (`bytes=0-99,200-299`) are not supported and
+/// return `Err(())` — the caller will reply with 416. This is RFC 7233
+/// compliant (servers MAY refuse multipart byteranges).
+fn parse_range(header: &str, total: u64) -> std::result::Result<(u64, u64), ()> {
+    if total == 0 {
+        return Err(());
+    }
+    let spec = header.strip_prefix("bytes=").ok_or(())?;
+    if spec.contains(',') {
+        return Err(());
+    }
+    let (start_s, end_s) = spec.split_once('-').ok_or(())?;
+
+    let (start, end) = match (start_s, end_s) {
+        ("", "") => return Err(()),
+        ("", n) => {
+            // Suffix: last `n` bytes.
+            let n: u64 = n.parse().map_err(|_| ())?;
+            if n == 0 {
+                return Err(());
+            }
+            let n = n.min(total);
+            (total - n, total - 1)
+        }
+        (s, "") => {
+            let start: u64 = s.parse().map_err(|_| ())?;
+            (start, total - 1)
+        }
+        (s, e) => {
+            let start: u64 = s.parse().map_err(|_| ())?;
+            let end: u64 = e.parse().map_err(|_| ())?;
+            (start, end.min(total - 1))
+        }
+    };
+
+    if start > end || start >= total {
+        return Err(());
+    }
+    Ok((start, end))
 }
 
 /// Handle `PUT` — store file contents to the cache.
@@ -1398,6 +1541,46 @@ fn safe_filename(id: &str) -> String {
 mod tests {
     use super::*;
     use cascade_engine::types::{CacheState, ItemId};
+
+    #[test]
+    fn parse_range_full_form() {
+        assert_eq!(parse_range("bytes=0-99", 1000), Ok((0, 99)));
+        assert_eq!(parse_range("bytes=500-999", 1000), Ok((500, 999)));
+    }
+
+    #[test]
+    fn parse_range_open_ended() {
+        assert_eq!(parse_range("bytes=500-", 1000), Ok((500, 999)));
+        assert_eq!(parse_range("bytes=0-", 1000), Ok((0, 999)));
+    }
+
+    #[test]
+    fn parse_range_suffix() {
+        assert_eq!(parse_range("bytes=-100", 1000), Ok((900, 999)));
+        // Suffix larger than total clamps to whole file.
+        assert_eq!(parse_range("bytes=-2000", 1000), Ok((0, 999)));
+    }
+
+    #[test]
+    fn parse_range_end_clamps_to_size() {
+        assert_eq!(parse_range("bytes=0-9999", 1000), Ok((0, 999)));
+    }
+
+    #[test]
+    fn parse_range_rejects_invalid() {
+        assert!(parse_range("bytes=", 1000).is_err());
+        assert!(parse_range("bytes=-", 1000).is_err());
+        assert!(parse_range("bytes=abc", 1000).is_err());
+        assert!(parse_range("range=0-99", 1000).is_err());
+        // start past end of file
+        assert!(parse_range("bytes=1000-", 1000).is_err());
+        // start > end
+        assert!(parse_range("bytes=500-100", 1000).is_err());
+        // multi-range not supported
+        assert!(parse_range("bytes=0-99,200-299", 1000).is_err());
+        // zero-byte file
+        assert!(parse_range("bytes=0-", 0).is_err());
+    }
 
     fn make_item(name: &str, is_dir: bool) -> VfsItem {
         VfsItem {
