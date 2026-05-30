@@ -602,21 +602,54 @@ fn resolve_mount_path_from_config(config_dir: &Path) -> PathBuf {
 }
 
 /// Ensure a path exists as a directory, with a message that names the path.
+///
+/// On macOS a stale `WebDAV` mount can leave the path in a state where
+/// `stat` and other syscalls hang against the dead server. We attempt
+/// `create_dir_all` first and only fall back to `stat`-style checks
+/// after confirming the path is not a live mount entry — that way a
+/// broken mount produces a clear actionable error instead of hanging.
 fn ensure_directory(path: &Path, label: &str) -> Result<()> {
-    if path.exists() && !path.is_dir() {
-        anyhow::bail!("{label} {} exists but is not a directory", path.display());
-    }
-
     match std::fs::create_dir_all(path) {
         Ok(()) => Ok(()),
-        // After force-unmounting a dead WebDAV mount the VFS teardown is not
-        // always instantaneous. `mkdir` returns EEXIST but `stat` confirms the
-        // path is already a plain directory — treat that as success.
-        Err(_) if path.is_dir() => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // The path exists. If it's still a live mount entry the
+            // eviction earlier in startup didn't take, and any `stat`
+            // call would hang against the dead server. Surface that
+            // explicitly with recovery instructions.
+            #[cfg(target_os = "macos")]
+            if path_is_in_mount_table(path) {
+                anyhow::bail!(
+                    "{label} {} is still listed as an active mount — please run `sudo umount -f {}` and try again",
+                    path.display(),
+                    path.display()
+                );
+            }
+            // Safe to `stat` now: not a mount, so the syscall returns
+            // immediately. Reject the case where the path is a regular
+            // file rather than a directory.
+            if path.is_dir() {
+                Ok(())
+            } else {
+                anyhow::bail!("{label} {} exists but is not a directory", path.display());
+            }
+        }
         Err(e) => {
             Err(e).with_context(|| format!("failed to create {label} at {}", path.display()))
         }
     }
+}
+
+/// Return true if `path` appears in the `mount` table output. Used to
+/// distinguish "EEXIST because of a stale mount we couldn't evict" from
+/// "EEXIST because the directory already exists as expected".
+#[cfg(target_os = "macos")]
+fn path_is_in_mount_table(path: &Path) -> bool {
+    let path_str = path.to_string_lossy();
+    let Ok(output) = std::process::Command::new("/sbin/mount").output() else {
+        return false;
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.lines().any(|line| line.contains(&*path_str))
 }
 
 /// Read a text file with the file path included in the error message.
@@ -635,15 +668,55 @@ fn write_pid_file(path: &Path) -> Result<()> {
 // macOS mount helpers
 // ---------------------------------------------------------------------------
 
+/// Run a subprocess with a hard timeout. If the child does not exit
+/// within `timeout`, it is killed and `None` is returned. Used to keep
+/// daemon startup snappy even when unmount commands stall on a dead
+/// `WebDAV` server (which can otherwise hang for minutes).
+#[cfg(target_os = "macos")]
+fn run_with_timeout(
+    cmd: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> Option<std::process::Output> {
+    use std::process::Stdio;
+
+    let Ok(mut child) = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() else {
+        return None;
+    };
+
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => {
+                return child.wait_with_output().ok();
+            }
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
 /// Remove stale `WebDAV` or NFS mounts on the given path left behind by a
 /// previous Cascade run that exited without clean shutdown.
 ///
 /// Detects mounts whose remote endpoint is `http://127.0.0.1:` (`WebDAV`) or
 /// `127.0.0.1:/` (NFS) — Cascade-only patterns — so it never touches mounts
 /// belonging to other programs.
+///
+/// Attempts, in order: `umount -f`, then `diskutil unmount force`. Each
+/// command runs with a hard timeout because dead `WebDAV` mounts can make
+/// kernel syscalls (including the unmount path itself) hang indefinitely
+/// while the VFS waits for a server that will never respond.
 #[cfg(target_os = "macos")]
 fn evict_stale_mount(mount_point: &Path) {
     let path_str = mount_point.to_string_lossy();
+    let cmd_timeout = std::time::Duration::from_secs(5);
 
     let output = match std::process::Command::new("/sbin/mount").output() {
         Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
@@ -670,49 +743,39 @@ fn evict_stale_mount(mount_point: &Path) {
         tracing::warn!(path = %path_str, entry, "evicting stale mount");
     }
 
-    // `umount` handles stacked mounts (multiple mounts on the same path)
-    // but only removes one per invocation. Call it in a loop until clean.
-    let mut evicted = false;
-    loop {
-        let result = std::process::Command::new("/sbin/umount")
-            .arg(mount_point)
-            .output();
-
-        match result {
-            Ok(o) if o.status.success() => {
-                tracing::info!(path = %path_str, "stale mount evicted");
-                evicted = true;
+    // `umount -f` (force) skips the "flush dirty buffers" path, which is
+    // what hangs on a dead WebDAV server. Loop because stacked mounts on
+    // the same path need one call per layer.
+    for _ in 0..=stale.len() {
+        let mut cmd = std::process::Command::new("/sbin/umount");
+        cmd.arg("-f").arg(mount_point);
+        match run_with_timeout(&mut cmd, cmd_timeout) {
+            Some(o) if o.status.success() => {
+                tracing::info!(path = %path_str, "stale mount evicted via umount -f");
             }
-            Ok(_) => break, // no more mounts to remove
-            Err(e) => {
-                tracing::warn!(
-                    path = %path_str,
-                    error = %e,
-                    "failed to run umount; startup may fail"
-                );
+            Some(_) => break, // umount returned non-zero: nothing more to remove
+            None => {
+                tracing::warn!(path = %path_str, "umount -f timed out; falling back to diskutil");
                 break;
             }
         }
     }
 
-    // Dead WebDAV mounts (server no longer running) block plain `umount`
-    // because the VFS tries to contact the server. If we still see the mount
-    // after the loop, force-detach it with `diskutil unmount force`.
-    if !evicted {
-        let force = std::process::Command::new("/usr/sbin/diskutil")
-            .args(["unmount", "force"])
-            .arg(mount_point)
-            .output();
-        match force {
-            Ok(o) if o.status.success() => {
+    // Verify by re-reading the mount table — if anything matching is left
+    // (stacked or stuck) try the heavier `diskutil unmount force`.
+    if path_is_in_mount_table(mount_point) {
+        let mut cmd = std::process::Command::new("/usr/sbin/diskutil");
+        cmd.args(["unmount", "force"]).arg(mount_point);
+        match run_with_timeout(&mut cmd, cmd_timeout) {
+            Some(o) if o.status.success() => {
                 tracing::info!(path = %path_str, "stale mount force-evicted via diskutil");
             }
-            Ok(o) => {
+            Some(o) => {
                 let stderr = String::from_utf8_lossy(&o.stderr);
                 tracing::warn!(path = %path_str, stderr = %stderr, "diskutil force unmount failed");
             }
-            Err(e) => {
-                tracing::warn!(path = %path_str, error = %e, "failed to run diskutil unmount force");
+            None => {
+                tracing::warn!(path = %path_str, "diskutil unmount force timed out");
             }
         }
     }
