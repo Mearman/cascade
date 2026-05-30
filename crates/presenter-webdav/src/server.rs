@@ -18,6 +18,18 @@ use axum::response::{IntoResponse, Response};
 use cascade_engine::types::{FileId, ItemId, VfsItem};
 use tokio::net::TcpListener;
 
+/// Build a response with an explicit empty body and Content-Length: 0.
+///
+/// Workaround for axum/hyper 1.x bug where responses without a body
+/// are sometimes never flushed to the TCP socket.
+fn empty_response(status: StatusCode) -> Response {
+    let mut resp = Response::new(axum::body::Body::empty());
+    *resp.status_mut() = status;
+    resp.headers_mut()
+        .insert(header::CONTENT_LENGTH, HeaderValue::from_static("0"));
+    resp
+}
+
 /// Shared state passed to all axum handlers.
 #[derive(Clone)]
 pub struct AppState {
@@ -142,7 +154,7 @@ async fn webdav_handler(State(state): State<AppState>, req: Request) -> Response
             handle_copy(&state, &path, req.headers()).await
         }
         Method::OPTIONS => handle_options(),
-        _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
+        _ => empty_response(StatusCode::METHOD_NOT_ALLOWED),
     };
 
     // Force Connection: close on all responses to work around axum 0.8
@@ -155,7 +167,7 @@ async fn webdav_handler(State(state): State<AppState>, req: Request) -> Response
 
 /// Handle `OPTIONS` — return `WebDAV` compliance headers.
 fn handle_options() -> Response {
-    let mut resp = StatusCode::NO_CONTENT.into_response();
+    let mut resp = empty_response(StatusCode::NO_CONTENT);
     resp.headers_mut().insert(
         header::ALLOW,
         HeaderValue::from_static("GET, PUT, DELETE, MKCOL, PROPFIND, MOVE, COPY, OPTIONS, HEAD"),
@@ -324,7 +336,7 @@ async fn handle_get(state: &AppState, path: &str) -> Response {
         tracing::debug!(path = %normalised, found = found.is_some(), items_count = items.len(), "GET lookup");
         match found {
             Some(item) => (item.id.0.clone(), item.id.backend_id().to_string()),
-            None => return StatusCode::NOT_FOUND.into_response(),
+            None => return empty_response(StatusCode::NOT_FOUND),
         }
     };
 
@@ -345,7 +357,7 @@ async fn handle_get(state: &AppState, path: &str) -> Response {
         backends.iter().find(|b| b.id() == backend_id).cloned()
     };
     let Some(backend) = backend else {
-        return StatusCode::NOT_FOUND.into_response();
+        return empty_response(StatusCode::NOT_FOUND);
     };
 
     // Find the FileEntry for this item.
@@ -356,7 +368,7 @@ async fn handle_get(state: &AppState, path: &str) -> Response {
             .map(cascade_engine::types::FileEntry::from)
     };
     let Some(file_entry) = file_entry else {
-        return StatusCode::NOT_FOUND.into_response();
+        return empty_response(StatusCode::NOT_FOUND);
     };
 
     // Download to a cache file, then serve it.
@@ -366,14 +378,14 @@ async fn handle_get(state: &AppState, path: &str) -> Response {
         Ok(f) => f,
         Err(e) => {
             tracing::error!(error = %e, "failed to create cache file");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return empty_response(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
     match backend.download(&file_entry, &mut file).await {
         Ok(()) => {
             drop(file);
             tokio::fs::read(&download_cache).await.map_or_else(
-                |_| StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                |_| empty_response(StatusCode::INTERNAL_SERVER_ERROR),
                 |data| {
                     let mut response = Response::new(Body::from(data));
                     response.headers_mut().insert(
@@ -387,7 +399,7 @@ async fn handle_get(state: &AppState, path: &str) -> Response {
         Err(e) => {
             tracing::warn!(error = %e, "backend download failed");
             let _ = tokio::fs::remove_file(&download_cache).await;
-            StatusCode::NOT_FOUND.into_response()
+            empty_response(StatusCode::NOT_FOUND)
         }
     }
 }
@@ -400,7 +412,7 @@ async fn handle_put(state: &AppState, path: &str, req: Request) -> Response {
     // Parse backend prefix and relative path.
     let parts: Vec<&str> = normalised.trim_start_matches('/').split('/').collect();
     let Some((&backend_id, relative)) = parts.split_first() else {
-        return StatusCode::BAD_REQUEST.into_response();
+        return empty_response(StatusCode::BAD_REQUEST);
     };
     let relative_path = relative.join("/");
     let relative_path = Path::new(&relative_path);
@@ -411,7 +423,7 @@ async fn handle_put(state: &AppState, path: &str, req: Request) -> Response {
         backends.iter().find(|b| b.id() == backend_id).cloned()
     };
     let Some(backend) = backend else {
-        return StatusCode::NOT_FOUND.into_response();
+        return empty_response(StatusCode::NOT_FOUND);
     };
 
     let bytes = axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024)
@@ -509,11 +521,11 @@ async fn handle_put(state: &AppState, path: &str, req: Request) -> Response {
                 let mut items = state.items.write().await;
                 items.insert(key, vfs_item);
             }
-            StatusCode::CREATED.into_response()
+            empty_response(StatusCode::CREATED)
         }
         Err(e) => {
             tracing::warn!(error = %e, "backend upload failed");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            empty_response(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }
@@ -530,7 +542,7 @@ async fn handle_delete(state: &AppState, path: &str) -> Response {
         });
         match found {
             Some(item) => (item.id.0.clone(), item.id.backend_id().to_string()),
-            None => return StatusCode::NOT_FOUND.into_response(),
+            None => return empty_response(StatusCode::NOT_FOUND),
         }
     };
 
@@ -540,7 +552,7 @@ async fn handle_delete(state: &AppState, path: &str) -> Response {
         backends.iter().find(|b| b.id() == backend_id).cloned()
     };
     let Some(backend) = backend else {
-        return StatusCode::NOT_FOUND.into_response();
+        return empty_response(StatusCode::NOT_FOUND);
     };
 
     // Build a FileEntry for the backend.
@@ -551,7 +563,7 @@ async fn handle_delete(state: &AppState, path: &str) -> Response {
             .map(cascade_engine::types::FileEntry::from)
     };
     let Some(file_entry) = file_entry else {
-        return StatusCode::NOT_FOUND.into_response();
+        return empty_response(StatusCode::NOT_FOUND);
     };
 
     match backend.delete(&file_entry).await {
@@ -565,11 +577,11 @@ async fn handle_delete(state: &AppState, path: &str) -> Response {
             let _ = tokio::fs::remove_file(&cache_path).await;
             let mut items = state.items.write().await;
             items.remove(&item_id);
-            StatusCode::NO_CONTENT.into_response()
+            empty_response(StatusCode::NO_CONTENT)
         }
         Err(e) => {
             tracing::warn!(error = %e, "backend delete failed");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            empty_response(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }
@@ -586,14 +598,14 @@ async fn handle_mkcol(state: &AppState, path: &str) -> Response {
             ip == normalised || ip == path
         });
         if exists {
-            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+            return empty_response(StatusCode::METHOD_NOT_ALLOWED);
         }
     }
 
     // Parse backend prefix and relative path.
     let parts: Vec<&str> = normalised.trim_start_matches('/').split('/').collect();
     let Some((&backend_id, relative)) = parts.split_first() else {
-        return StatusCode::BAD_REQUEST.into_response();
+        return empty_response(StatusCode::BAD_REQUEST);
     };
     let relative_path = relative.join("/");
     let relative_path = Path::new(&relative_path);
@@ -604,7 +616,7 @@ async fn handle_mkcol(state: &AppState, path: &str) -> Response {
         backends.iter().find(|b| b.id() == backend_id).cloned()
     };
     let Some(backend) = backend else {
-        return StatusCode::NOT_FOUND.into_response();
+        return empty_response(StatusCode::NOT_FOUND);
     };
 
     match backend.create_dir(relative_path).await {
@@ -617,11 +629,11 @@ async fn handle_mkcol(state: &AppState, path: &str) -> Response {
             let key = entry.id.0.clone();
             let vfs_item = VfsItem::from(entry);
             items.insert(key, vfs_item);
-            StatusCode::CREATED.into_response()
+            empty_response(StatusCode::CREATED)
         }
         Err(e) => {
             tracing::warn!(error = %e, "backend create_dir failed");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            empty_response(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }
@@ -643,7 +655,7 @@ async fn handle_move(state: &AppState, src_path: &str, headers: &HeaderMap) -> R
             let ip = resolve_full_path(item, &items);
             ip == src_normalised || ip == src_path
         }) else {
-            return StatusCode::NOT_FOUND.into_response();
+            return empty_response(StatusCode::NOT_FOUND);
         };
         let src_key = src_key.clone();
         let backend_id = src_item.id.backend_id().to_string();
@@ -683,7 +695,7 @@ async fn handle_move(state: &AppState, src_path: &str, headers: &HeaderMap) -> R
         backends.iter().find(|b| b.id() == backend_id).cloned()
     };
     let Some(backend) = backend else {
-        return StatusCode::NOT_FOUND.into_response();
+        return empty_response(StatusCode::NOT_FOUND);
     };
 
     let result = if let Some(ref parent_id) = dest_parent_id {
@@ -691,7 +703,6 @@ async fn handle_move(state: &AppState, src_path: &str, headers: &HeaderMap) -> R
             .move_by_id(&FileId(src_key.clone()), parent_id, &new_name)
             .await
     } else {
-        // Fall back to path-based move if destination parent not in items map.
         let src_parts: Vec<&str> = src_normalised.trim_start_matches('/').split('/').collect();
         let dest_parts: Vec<&str> = dest_normalised.trim_start_matches('/').split('/').collect();
         let src_relative = src_parts.get(1..).map(|p| p.join("/")).unwrap_or_default();
@@ -711,11 +722,11 @@ async fn handle_move(state: &AppState, src_path: &str, headers: &HeaderMap) -> R
             let mut items = state.items.write().await;
             items.remove(&src_key);
             items.insert(entry.id.0.clone(), VfsItem::from(entry));
-            StatusCode::CREATED.into_response()
+            empty_response(StatusCode::CREATED)
         }
         Err(e) => {
             tracing::warn!(error = %e, "backend move failed");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            empty_response(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }
@@ -742,7 +753,7 @@ async fn handle_copy(state: &AppState, src_path: &str, headers: &HeaderMap) -> R
         .cloned();
 
     let Some(src_item) = src_item else {
-        return StatusCode::NOT_FOUND.into_response();
+        return empty_response(StatusCode::NOT_FOUND);
     };
 
     // Create a copy with a new ID.
@@ -762,7 +773,7 @@ async fn handle_copy(state: &AppState, src_path: &str, headers: &HeaderMap) -> R
     };
     items.insert(copy.id.0.clone(), copy);
 
-    StatusCode::CREATED.into_response()
+    empty_response(StatusCode::CREATED)
 }
 
 // ---------------------------------------------------------------------------
