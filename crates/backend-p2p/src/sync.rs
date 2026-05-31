@@ -405,13 +405,36 @@ impl SyncEngine {
                 continue;
             }
             let local = self.index.get(&file.name)?;
-            if let Some(local) = &local
-                && local.modified >= file.modified
-            {
-                continue;
+            if let Some(local) = &local {
+                // Delete wins on equal timestamps; otherwise strict
+                // greater-than means the local row is newer and the
+                // incoming one is stale.
+                if file.deleted {
+                    if local.modified > file.modified {
+                        continue;
+                    }
+                } else if local.modified >= file.modified {
+                    continue;
+                }
             }
             if file.deleted {
-                self.index.mark_deleted(&file.name)?;
+                if local.is_some() {
+                    self.index.mark_deleted(&file.name)?;
+                } else {
+                    // Tombstone for a path we have never seen. Insert a
+                    // synthetic deleted row so we can propagate the
+                    // delete to peers that join later.
+                    let entry = IndexEntry {
+                        path: file.name.clone(),
+                        is_dir: false,
+                        size: 0,
+                        modified: file.modified,
+                        block_hashes: vec![],
+                        deleted: true,
+                        version: 0,
+                    };
+                    self.index.upsert(&entry)?;
+                }
                 continue;
             }
             let mut hash_blob = Vec::with_capacity(file.block_hashes.len() * 32);
