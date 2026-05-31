@@ -139,6 +139,8 @@ fn bep_message_strategy() -> impl Strategy<Value = BepMessage> {
                 sequence,
                 block_size: 128 * 1024,
                 deleted: false,
+                invalid: false,
+                no_permissions: false,
                 version: Version::default(),
                 block_hashes: vec![hash],
             },

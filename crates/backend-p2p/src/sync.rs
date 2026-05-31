@@ -534,6 +534,16 @@ impl SyncEngine {
                 debug!("ignoring file_type {} for {}", file.file_type, file.name);
                 continue;
             }
+            if file.invalid || file.no_permissions {
+                tracing::debug!(
+                    target: "cascade::backend::p2p",
+                    path = %file.name,
+                    invalid = file.invalid,
+                    no_permissions = file.no_permissions,
+                    "skipping unhealthy index entry",
+                );
+                continue;
+            }
             let local = self.index.get(&file.name)?;
             let incoming_version = file.version.clone();
             // The version vector to persist alongside the incoming row.
@@ -788,6 +798,12 @@ fn entry_to_file_info(entry: &IndexEntry) -> Result<FileInfo> {
         sequence: u64::try_from(entry.row_version).unwrap_or(0),
         block_size,
         deleted: entry.deleted,
+        // The backend has no mid-write or permission-denied state for
+        // an `IndexEntry` today, so locally-produced rows always emit
+        // these flags as false. The receive path respects the wire
+        // fields when peers set them.
+        invalid: false,
+        no_permissions: false,
         version: Version {
             counters: entry.version.clone(),
         },
@@ -1051,6 +1067,8 @@ mod tests {
                     sequence: 0,
                     block_size: 128 * 1024,
                     deleted: false,
+                    invalid: false,
+                    no_permissions: false,
                     version: Version {
                         counters: vec![(1, 2)],
                     },
@@ -1091,6 +1109,8 @@ mod tests {
                     sequence: 0,
                     block_size: 128 * 1024,
                     deleted: false,
+                    invalid: false,
+                    no_permissions: false,
                     version: Version {
                         counters: vec![(1, 3)],
                     },
@@ -1132,6 +1152,8 @@ mod tests {
                     sequence: 0,
                     block_size: 128 * 1024,
                     deleted: false,
+                    invalid: false,
+                    no_permissions: false,
                     version: Version {
                         counters: vec![(1, 1), (2, 2)],
                     },
@@ -1211,6 +1233,8 @@ mod tests {
                     sequence: 0,
                     block_size: 128 * 1024,
                     deleted: false,
+                    invalid: false,
+                    no_permissions: false,
                     version: Version {
                         counters: vec![(2, 1)],
                     },
@@ -1265,6 +1289,8 @@ mod tests {
                     sequence: 0,
                     block_size: 128 * 1024,
                     deleted: false,
+                    invalid: false,
+                    no_permissions: false,
                     version: Version {
                         counters: vec![(2, 1)],
                     },
@@ -1298,6 +1324,8 @@ mod tests {
                     sequence: 0,
                     block_size: 128 * 1024,
                     deleted: false,
+                    invalid: false,
+                    no_permissions: false,
                     version: Version::default(),
                     block_hashes: vec![],
                 }],
@@ -1335,6 +1363,8 @@ mod tests {
                     sequence: 0,
                     block_size: 128 * 1024,
                     deleted: true,
+                    invalid: false,
+                    no_permissions: false,
                     version: Version {
                         counters: vec![(1, 2)],
                     },
@@ -1363,6 +1393,8 @@ mod tests {
                     block_size: 128 * 1024,
                     block_hashes: vec![],
                     deleted: true,
+                    invalid: false,
+                    no_permissions: false,
                     version: Version {
                         counters: vec![(7, 1)],
                     },
@@ -1393,6 +1425,8 @@ mod tests {
                     sequence: 0,
                     block_size: 128 * 1024,
                     deleted: false,
+                    invalid: false,
+                    no_permissions: false,
                     version: Version::default(),
                     block_hashes: vec![[0u8; 32]],
                 }],
@@ -1451,6 +1485,8 @@ mod tests {
                         sequence: 7,
                         block_size: 128 * 1024,
                         deleted: false,
+                        invalid: false,
+                        no_permissions: false,
                         version: Version {
                             counters: vec![(1, 1)],
                         },
@@ -1464,6 +1500,8 @@ mod tests {
                         sequence: 15,
                         block_size: 128 * 1024,
                         deleted: false,
+                        invalid: false,
+                        no_permissions: false,
                         version: Version {
                             counters: vec![(1, 1)],
                         },
@@ -1494,6 +1532,8 @@ mod tests {
                     sequence: 4,
                     block_size: 128 * 1024,
                     deleted: false,
+                    invalid: false,
+                    no_permissions: false,
                     version: Version {
                         counters: vec![(1, 1)],
                     },
@@ -1532,6 +1572,64 @@ mod tests {
         assert_eq!(delta.len(), 1);
         assert_eq!(delta[0].name, "three.txt");
         assert_eq!(delta[0].sequence, 3);
+    }
+
+    #[tokio::test]
+    async fn merge_files_skips_invalid_entries() {
+        let (_dir, engine) = make_engine("f").await;
+        engine
+            .merge_files(
+                "peer-x",
+                &[FileInfo {
+                    name: "midwrite.txt".into(),
+                    file_type: FILE_TYPE_FILE,
+                    size: 99,
+                    modified: 1_000_000_000,
+                    sequence: 1,
+                    block_size: 128 * 1024,
+                    deleted: false,
+                    invalid: true,
+                    no_permissions: false,
+                    version: Version {
+                        counters: vec![(1, 1)],
+                    },
+                    block_hashes: vec![[1u8; 32]],
+                }],
+            )
+            .unwrap();
+        assert!(
+            engine.index.get("midwrite.txt").unwrap().is_none(),
+            "invalid entries must not be upserted",
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_files_skips_no_permissions_entries() {
+        let (_dir, engine) = make_engine("f").await;
+        engine
+            .merge_files(
+                "peer-x",
+                &[FileInfo {
+                    name: "secret.txt".into(),
+                    file_type: FILE_TYPE_FILE,
+                    size: 99,
+                    modified: 1_000_000_000,
+                    sequence: 1,
+                    block_size: 128 * 1024,
+                    deleted: false,
+                    invalid: false,
+                    no_permissions: true,
+                    version: Version {
+                        counters: vec![(1, 1)],
+                    },
+                    block_hashes: vec![[1u8; 32]],
+                }],
+            )
+            .unwrap();
+        assert!(
+            engine.index.get("secret.txt").unwrap().is_none(),
+            "no_permissions entries must not be upserted",
+        );
     }
 
     /// The accept loop must observe the `cancel` watch and exit. Without

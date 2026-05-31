@@ -211,6 +211,26 @@ pub struct FileInfo {
     /// the peer should mark its local copy deleted (subject to the
     /// version-vector comparison on `version`).
     pub deleted: bool,
+    /// When `true`, the row's content is mid-write or otherwise in an
+    /// inconsistent state on the sender. Receivers must NOT request
+    /// blocks for this entry and must not upsert its content; the row
+    /// is silently skipped at debug-log level.
+    ///
+    /// Currently only respected on receive — local producers do not
+    /// emit `invalid: true` yet because the backend has no
+    /// mid-write state for an `IndexEntry`. The wire field is in
+    /// place so producers can be added later without a protocol bump.
+    pub invalid: bool,
+    /// When `true`, the sending device exists and knows about the file
+    /// but cannot share its content (typically a permission-denied
+    /// error reading the local row). Receivers must not request blocks
+    /// for this entry and must not upsert its content.
+    ///
+    /// Currently only respected on receive — local producers do not
+    /// emit `no_permissions: true` yet because the backend has no
+    /// per-row permission-check infrastructure. The wire field is in
+    /// place so producers can be added later without a protocol bump.
+    pub no_permissions: bool,
     /// Per-file version vector. Used to detect concurrent edits that
     /// happened on disconnected peers — a strict generalisation of the
     /// previous `modified`-only LWW comparison.
@@ -344,6 +364,8 @@ fn encode_file_infos(buf: &mut Vec<u8>, files: &[FileInfo]) -> Result<()> {
         encode_u64(buf, fi.sequence);
         encode_u32(buf, fi.block_size);
         encode_u32(buf, u32::from(fi.deleted));
+        encode_u32(buf, u32::from(fi.invalid));
+        encode_u32(buf, u32::from(fi.no_permissions));
         encode_version(buf, &fi.version)?;
         encode_u32(
             buf,
@@ -476,6 +498,8 @@ fn decode_file_infos(data: &[u8]) -> Result<(Vec<FileInfo>, &[u8])> {
         let (sequence, rest) = decode_u64(rest)?;
         let (block_size, rest) = decode_u32(rest)?;
         let (deleted_flag, rest) = decode_u32(rest)?;
+        let (invalid_flag, rest) = decode_u32(rest)?;
+        let (no_permissions_flag, rest) = decode_u32(rest)?;
         let (version, rest) = decode_version(rest)?;
         let (hash_count, mut rest) = decode_u32(rest)?;
         let mut block_hashes = Vec::with_capacity(hash_count as usize);
@@ -497,6 +521,8 @@ fn decode_file_infos(data: &[u8]) -> Result<(Vec<FileInfo>, &[u8])> {
             sequence,
             block_size,
             deleted: deleted_flag != 0,
+            invalid: invalid_flag != 0,
+            no_permissions: no_permissions_flag != 0,
             version,
             block_hashes,
         });
@@ -560,6 +586,8 @@ mod tests {
                 sequence: 0,
                 block_size: 128 * 1024,
                 deleted: false,
+                invalid: false,
+                no_permissions: false,
                 version: Version::default(),
                 block_hashes: vec![[0xAB; 32]],
             }],
@@ -579,6 +607,8 @@ mod tests {
                     sequence: 0,
                     block_size: 128 * 1024,
                     deleted: false,
+                    invalid: false,
+                    no_permissions: false,
                     version: Version::default(),
                     block_hashes: vec![[1u8; 32]],
                 },
@@ -590,6 +620,8 @@ mod tests {
                     sequence: 0,
                     block_size: 128 * 1024,
                     deleted: false,
+                    invalid: false,
+                    no_permissions: false,
                     version: Version::default(),
                     block_hashes: vec![[2u8; 32], [3u8; 32]],
                 },
@@ -609,6 +641,8 @@ mod tests {
                 sequence: 0,
                 block_size: 512 * 1024,
                 deleted: false,
+                invalid: false,
+                no_permissions: false,
                 version: Version::default(),
                 block_hashes: vec![[0xFF; 32], [0xEE; 32]],
             }],
@@ -627,6 +661,8 @@ mod tests {
                 sequence: 0,
                 block_size: 128 * 1024,
                 deleted: true,
+                invalid: false,
+                no_permissions: false,
                 version: Version::default(),
                 block_hashes: vec![],
             }],
@@ -645,6 +681,8 @@ mod tests {
                 sequence: 0,
                 block_size: 128 * 1024,
                 deleted: false,
+                invalid: false,
+                no_permissions: false,
                 version: Version::default(),
                 block_hashes: vec![[0x77; 32]],
             }],
@@ -663,6 +701,8 @@ mod tests {
                 sequence: 0,
                 block_size: 128 * 1024,
                 deleted: false,
+                invalid: false,
+                no_permissions: false,
                 version: Version {
                     counters: vec![(7, 3), (42, 1), (1024, 9)],
                 },
