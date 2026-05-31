@@ -50,7 +50,7 @@ use cascade_p2p::identity::DeviceIdentity;
 use cascade_p2p::protocol::{BepMessage, FileInfo, Folder, Version};
 use cascade_p2p::store::BlockStore;
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use crate::index::{FolderIndex, IndexEntry};
@@ -144,6 +144,16 @@ pub struct SyncEngine {
     /// entry key in version vectors. Stable across restarts because
     /// it is derived from the persistent `DeviceIdentity::device_id`.
     device_short_id: u64,
+    /// Friendly name for the LOCAL device. When `Some`, used in place
+    /// of the opaque short device id when stamping conflict-copy paths.
+    /// Seeded from `P2pBackendConfig::device_name`.
+    local_device_name: Option<String>,
+    /// Friendly-name map `device_id → name`, seeded from the static
+    /// peer config at startup. Only used today to give human-readable
+    /// labels in logs and conflict-copy paths generated locally; peers
+    /// do not exchange friendly names over the wire (that would require
+    /// a protocol extension, which is deliberately out of scope).
+    peer_names: Arc<RwLock<HashMap<String, String>>>,
     /// Device IDs we are willing to talk to.
     trusted: Arc<Mutex<Vec<String>>>,
     peers: Arc<Mutex<HashMap<String, PeerHandle>>>,
@@ -164,9 +174,55 @@ impl SyncEngine {
             blocks,
             identity,
             device_short_id,
+            local_device_name: None,
+            peer_names: Arc::new(RwLock::new(HashMap::new())),
             trusted: Arc::new(Mutex::new(Vec::new())),
             peers: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Set the friendly name for the LOCAL device. Used by
+    /// `persist_conflict_copy` when stamping conflict-copy paths;
+    /// without it, the first eight characters of the device id are used
+    /// as the fallback identifier.
+    ///
+    /// Builder-style so this can be threaded through `P2pBackend::open`
+    /// without changing the public `SyncEngine::new` signature.
+    #[must_use]
+    pub fn with_local_device_name(mut self, name: Option<String>) -> Self {
+        self.local_device_name = name;
+        self
+    }
+
+    /// Seed the `device_id → friendly name` map from a list of
+    /// `(device_id, name)` pairs. Existing entries are overwritten.
+    /// Entries with empty names are ignored — an empty friendly name
+    /// is treated as "no friendly name set".
+    pub async fn seed_peer_names<I>(&self, entries: I)
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
+        let mut map = self.peer_names.write().await;
+        for (device_id, name) in entries {
+            if name.is_empty() {
+                continue;
+            }
+            map.insert(device_id, name);
+        }
+    }
+
+    /// Look up the friendly name previously seeded for `device_id`, if
+    /// any. Returns `None` when the device id is unknown or has no
+    /// friendly name set.
+    pub async fn peer_name(&self, device_id: &str) -> Option<String> {
+        let map = self.peer_names.read().await;
+        map.get(device_id).cloned()
+    }
+
+    /// Friendly name for the LOCAL device, if configured.
+    #[must_use]
+    pub fn local_device_name(&self) -> Option<&str> {
+        self.local_device_name.as_deref()
     }
 
     /// This device's short id, used as the entry key in version
