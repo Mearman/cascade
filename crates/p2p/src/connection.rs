@@ -252,26 +252,44 @@ impl tokio_rustls::rustls::server::danger::ClientCertVerifier for TrustedClientC
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &tokio_rustls::rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &tokio_rustls::rustls::DigitallySignedStruct,
     ) -> std::result::Result<
         tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
         tokio_rustls::rustls::Error,
     > {
-        Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
+        let provider =
+            tokio_rustls::rustls::crypto::CryptoProvider::get_default().ok_or_else(|| {
+                tokio_rustls::rustls::Error::General("no rustls CryptoProvider installed".into())
+            })?;
+        tokio_rustls::rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &provider.signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &tokio_rustls::rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &tokio_rustls::rustls::DigitallySignedStruct,
     ) -> std::result::Result<
         tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
         tokio_rustls::rustls::Error,
     > {
-        Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
+        let provider =
+            tokio_rustls::rustls::crypto::CryptoProvider::get_default().ok_or_else(|| {
+                tokio_rustls::rustls::Error::General("no rustls CryptoProvider installed".into())
+            })?;
+        tokio_rustls::rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &provider.signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<tokio_rustls::rustls::SignatureScheme> {
@@ -322,26 +340,44 @@ impl tokio_rustls::rustls::client::danger::ServerCertVerifier for TrustedServerC
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &tokio_rustls::rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &tokio_rustls::rustls::DigitallySignedStruct,
     ) -> std::result::Result<
         tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
         tokio_rustls::rustls::Error,
     > {
-        Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
+        let provider =
+            tokio_rustls::rustls::crypto::CryptoProvider::get_default().ok_or_else(|| {
+                tokio_rustls::rustls::Error::General("no rustls CryptoProvider installed".into())
+            })?;
+        tokio_rustls::rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &provider.signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &tokio_rustls::rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &tokio_rustls::rustls::DigitallySignedStruct,
     ) -> std::result::Result<
         tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
         tokio_rustls::rustls::Error,
     > {
-        Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
+        let provider =
+            tokio_rustls::rustls::crypto::CryptoProvider::get_default().ok_or_else(|| {
+                tokio_rustls::rustls::Error::General("no rustls CryptoProvider installed".into())
+            })?;
+        tokio_rustls::rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &provider.signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<tokio_rustls::rustls::SignatureScheme> {
@@ -591,5 +627,100 @@ mod tests {
         let address = listener.local_addr().unwrap();
         drop(listener);
         address
+    }
+
+    /// Build a DigitallySignedStruct via the public Codec path —
+    /// rustls keeps its constructor `pub(crate)`, so we synthesise the
+    /// on-wire form and parse it back.
+    fn forged_dss(
+        scheme: tokio_rustls::rustls::SignatureScheme,
+        signature: &[u8],
+    ) -> tokio_rustls::rustls::DigitallySignedStruct {
+        use tokio_rustls::rustls::internal::msgs::codec::{Codec, Reader};
+
+        let mut encoded = Vec::new();
+        scheme.encode(&mut encoded);
+        // length-prefixed signature, big-endian u16.
+        let len = u16::try_from(signature.len()).unwrap();
+        encoded.extend_from_slice(&len.to_be_bytes());
+        encoded.extend_from_slice(signature);
+
+        let mut reader = Reader::init(&encoded);
+        tokio_rustls::rustls::DigitallySignedStruct::read(&mut reader).unwrap()
+    }
+
+    /// A corrupted DigitallySignedStruct must be rejected by the signature
+    /// verifier — the previous implementation accepted everything blindly.
+    ///
+    /// This exercises the verifier method directly rather than driving a
+    /// real handshake. Producing a forged-but-syntactically-valid signed
+    /// handshake transcript would require reimplementing pieces of the TLS
+    /// state machine; testing the verifier itself with garbage signature
+    /// bytes is sufficient to prove that the fix calls into the real
+    /// rustls crypto path (which rejects the bytes) rather than returning
+    /// an unconditional assertion.
+    #[test]
+    fn server_cert_verifier_rejects_forged_signature() {
+        use tokio_rustls::rustls::SignatureScheme;
+        use tokio_rustls::rustls::client::danger::ServerCertVerifier;
+
+        ensure_crypto_provider();
+
+        let identity = DeviceIdentity::generate().unwrap();
+        let certs = load_certs(&identity.cert_pem).unwrap();
+        let cert = certs.into_iter().next().unwrap();
+
+        let verifier = TrustedServerCertVerifier {
+            expected_device_id: identity.device_id.clone(),
+        };
+
+        // Garbage signature bytes that cannot have come from any real key.
+        let dss = forged_dss(SignatureScheme::ECDSA_NISTP256_SHA256, &[0u8; 64]);
+        let message = b"not the real handshake transcript";
+
+        let result12 = verifier.verify_tls12_signature(message, &cert, &dss);
+        assert!(
+            result12.is_err(),
+            "expected TLS1.2 signature verification to reject forged bytes"
+        );
+
+        let result13 = verifier.verify_tls13_signature(message, &cert, &dss);
+        assert!(
+            result13.is_err(),
+            "expected TLS1.3 signature verification to reject forged bytes"
+        );
+    }
+
+    /// Same as above for the server-side ClientCertVerifier — exercising
+    /// the client-cert signature path on the server.
+    #[test]
+    fn client_cert_verifier_rejects_forged_signature() {
+        use tokio_rustls::rustls::SignatureScheme;
+        use tokio_rustls::rustls::server::danger::ClientCertVerifier;
+
+        ensure_crypto_provider();
+
+        let identity = DeviceIdentity::generate().unwrap();
+        let certs = load_certs(&identity.cert_pem).unwrap();
+        let cert = certs.into_iter().next().unwrap();
+
+        let verifier = TrustedClientCertVerifier {
+            trusted_device_ids: vec![identity.device_id.clone()],
+        };
+
+        let dss = forged_dss(SignatureScheme::ECDSA_NISTP256_SHA256, &[0u8; 64]);
+        let message = b"not the real handshake transcript";
+
+        let result12 = verifier.verify_tls12_signature(message, &cert, &dss);
+        assert!(
+            result12.is_err(),
+            "expected TLS1.2 signature verification to reject forged bytes"
+        );
+
+        let result13 = verifier.verify_tls13_signature(message, &cert, &dss);
+        assert!(
+            result13.is_err(),
+            "expected TLS1.3 signature verification to reject forged bytes"
+        );
     }
 }
