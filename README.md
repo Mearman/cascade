@@ -141,7 +141,7 @@ Integration tests live inside each crate's `tests/` directory rather than at wor
 
 - **`Backend` trait** — every cloud provider and the local filesystem implement this. The engine never sees provider-specific APIs. Each backend crate exposes `create_backend(config) -> Result<Box<dyn Backend>>`.
 - **`VfsTree`** — composes multiple backends into a single tree, routed by longest-prefix match. Cross-backend moves trigger download + upload + delete.
-- **`VfsPresenter` trait** — platform-agnostic interface for presenting the VFS to the OS. Compile-time selection: File Provider on macOS, FUSE on Linux, WinFSP on Windows, NFS as universal fallback.
+- **`VfsPresenter` trait** — platform-agnostic interface for presenting the VFS to the OS. Compile-time selection: FSKit on macOS (with WebDAV and NFS fallbacks), FUSE on Linux (with NFS fallback), WebDAV via WebClient on Windows, NFS as universal fallback.
 - **`.cascade` config walk** — like `.gitignore`: files in each directory layer with child-overrides-parent precedence. Four formats (gitignore-style, TOML, YAML, JSON) all deserialise to `CascadeConfig`.
 - **Expression language** — PEG grammar evaluated against `EvalContext` (file, device, disk, network, power, time, peer). Used for conditional rules in `.cascade` files.
 - **P2P engine** — based on Syncthing's BEP v1. Sits between VFS and cache as an optimisation layer, not as a backend. Cloud remains the authority for cloud-backed folders.
