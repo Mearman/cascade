@@ -550,3 +550,234 @@ jobs:
             Write-Host "version mismatch: installed=$installed expected=$expected"
             exit 1
           }
+
+  smoke-macos:
+    name: Smoke test (macOS — daemon + mount)
+    needs: [release, update-tap]
+    if: needs.release.outputs.released == 'true'
+    runs-on: macos-latest
+    steps:
+      - name: Install via Homebrew tap
+        run: |
+          brew tap Mearman/cascade
+          brew install Mearman/cascade/cascade
+      - name: Prepare smoke config (local backend)
+        run: |
+          set -eux
+          SMOKE="$RUNNER_TEMP/cascade-smoke"
+          mkdir -p "$SMOKE/config" "$SMOKE/storage" "$SMOKE/mount"
+          cat > "$SMOKE/config/config.toml" <<TOML
+          [backends.smoke]
+          type = "local"
+          root_path = "$SMOKE/storage"
+          [mount]
+          point = "$SMOKE/mount"
+          TOML
+          cat > "$SMOKE/config/smoke.toml" <<TOML
+          type = "local"
+          root_path = "$SMOKE/storage"
+          id = "smoke"
+          display_name = "Smoke"
+          TOML
+          echo "SMOKE=$SMOKE" >> "$GITHUB_ENV"
+      - name: Tier 2 — daemon up with --no-mount
+        run: |
+          set -eux
+          cascade --config "$SMOKE/config" start --no-mount > "$SMOKE/daemon.log" 2>&1 &
+          DAEMON=$!
+          echo "DAEMON=$DAEMON" >> "$GITHUB_ENV"
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            sleep 1
+            cascade --config "$SMOKE/config" status 2>/dev/null | grep -q "Running: true" && break
+          done
+          cascade --config "$SMOKE/config" status | tee /tmp/status1.txt
+          grep -q "Running: true" /tmp/status1.txt
+          grep -q "smoke" /tmp/status1.txt
+          cascade --config "$SMOKE/config" stop
+          wait $DAEMON 2>/dev/null || true
+      - name: Tier 3 — actual WebDAV mount + file round-trip
+        run: |
+          set -eux
+          echo "pre-seeded" > "$SMOKE/storage/hello.txt"
+          cascade --config "$SMOKE/config" start > "$SMOKE/mount.log" 2>&1 &
+          DAEMON=$!
+          for i in $(seq 1 30); do
+            sleep 1
+            mount | grep -q "$SMOKE/mount" && break
+          done
+          mount | grep "$SMOKE/mount"
+          ls -la "$SMOKE/mount/smoke/"
+          cat "$SMOKE/mount/smoke/hello.txt" | grep -q "pre-seeded"
+          cascade --config "$SMOKE/config" stop
+          wait $DAEMON 2>/dev/null || true
+      - name: Dump daemon log on failure
+        if: failure()
+        run: |
+          echo "=== daemon.log ==="; cat "$SMOKE/daemon.log" || true
+          echo "=== mount.log ==="; cat "$SMOKE/mount.log" || true
+
+  smoke-linux:
+    name: Smoke test (Linux — daemon + FUSE mount)
+    needs: [release, update-tap]
+    if: needs.release.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install FUSE
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse3-3
+      - name: Install Homebrew on Linux
+        run: |
+          /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" </dev/null
+          echo "/home/linuxbrew/.linuxbrew/bin" >> "$GITHUB_PATH"
+      - name: Install via Homebrew tap
+        run: |
+          brew tap Mearman/cascade
+          brew install Mearman/cascade/cascade
+      - name: Prepare smoke config (local backend)
+        run: |
+          set -eux
+          SMOKE="$RUNNER_TEMP/cascade-smoke"
+          mkdir -p "$SMOKE/config" "$SMOKE/storage" "$SMOKE/mount"
+          cat > "$SMOKE/config/config.toml" <<TOML
+          [backends.smoke]
+          type = "local"
+          root_path = "$SMOKE/storage"
+          [mount]
+          point = "$SMOKE/mount"
+          TOML
+          cat > "$SMOKE/config/smoke.toml" <<TOML
+          type = "local"
+          root_path = "$SMOKE/storage"
+          id = "smoke"
+          display_name = "Smoke"
+          TOML
+          echo "SMOKE=$SMOKE" >> "$GITHUB_ENV"
+      - name: Tier 2 — daemon up with --no-mount
+        run: |
+          set -eux
+          cascade --config "$SMOKE/config" start --no-mount > "$SMOKE/daemon.log" 2>&1 &
+          DAEMON=$!
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            sleep 1
+            cascade --config "$SMOKE/config" status 2>/dev/null | grep -q "Running: true" && break
+          done
+          cascade --config "$SMOKE/config" status | tee /tmp/status1.txt
+          grep -q "Running: true" /tmp/status1.txt
+          grep -q "smoke" /tmp/status1.txt
+          cascade --config "$SMOKE/config" stop
+          wait $DAEMON 2>/dev/null || true
+      - name: Tier 3 — actual FUSE mount + file read
+        run: |
+          set -eux
+          echo "pre-seeded" > "$SMOKE/storage/hello.txt"
+          cascade --config "$SMOKE/config" start > "$SMOKE/mount.log" 2>&1 &
+          DAEMON=$!
+          for i in $(seq 1 30); do
+            sleep 1
+            mount | grep -q "$SMOKE/mount" && break
+          done
+          mount | grep "$SMOKE/mount" || (echo "FUSE mount did not appear within 30s"; cat "$SMOKE/mount.log"; exit 1)
+          ls -la "$SMOKE/mount/" || true
+          cascade --config "$SMOKE/config" stop
+          wait $DAEMON 2>/dev/null || true
+      - name: Dump daemon log on failure
+        if: failure()
+        run: |
+          echo "=== daemon.log ==="; cat "$SMOKE/daemon.log" || true
+          echo "=== mount.log ==="; cat "$SMOKE/mount.log" || true
+
+  smoke-windows:
+    name: Smoke test (Windows — daemon + WebDAV mount)
+    needs: [release, update-scoop]
+    if: needs.release.outputs.released == 'true'
+    runs-on: windows-latest
+    steps:
+      - name: Install Scoop
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+          Invoke-RestMethod -Uri https://get.scoop.sh | Invoke-Expression
+          Add-Content $env:GITHUB_PATH "$env:USERPROFILE\scoop\shims"
+      - name: Add bucket and install cascade
+        shell: pwsh
+        run: |
+          scoop bucket add cascade https://github.com/Mearman/scoop-cascade
+          scoop install cascade
+      - name: Ensure WebClient service is running
+        shell: pwsh
+        run: |
+          Set-Service -Name WebClient -StartupType Automatic
+          Start-Service -Name WebClient
+          Get-Service -Name WebClient
+      - name: Prepare smoke config (local backend)
+        shell: pwsh
+        run: |
+          $smoke = "$env:RUNNER_TEMP\cascade-smoke"
+          $storage = "$smoke\storage"
+          $mount = "$smoke\mount"
+          $config = "$smoke\config"
+          New-Item -ItemType Directory -Force -Path $config, $storage, $mount | Out-Null
+          $storageFwd = $storage -replace '\\','/'
+          $mountFwd = $mount -replace '\\','/'
+          @"
+          [backends.smoke]
+          type = "local"
+          root_path = "$storageFwd"
+          [mount]
+          point = "$mountFwd"
+          "@ | Out-File -Encoding utf8 -NoNewline "$config\config.toml"
+          @"
+          type = "local"
+          root_path = "$storageFwd"
+          id = "smoke"
+          display_name = "Smoke"
+          "@ | Out-File -Encoding utf8 -NoNewline "$config\smoke.toml"
+          "SMOKE=$smoke" | Add-Content -Path $env:GITHUB_ENV
+      - name: Tier 2 — daemon up with --no-mount
+        shell: pwsh
+        run: |
+          $smoke = $env:SMOKE
+          $proc = Start-Process -FilePath cascade -ArgumentList "--config","$smoke\config","start","--no-mount" -PassThru -RedirectStandardOutput "$smoke\daemon.log" -RedirectStandardError "$smoke\daemon.err"
+          for ($i = 0; $i -lt 10; $i++) {
+            Start-Sleep -Seconds 1
+            $status = (cascade --config "$smoke\config" status 2>$null)
+            if ($status -match "Running: true") { break }
+          }
+          $status = cascade --config "$smoke\config" status
+          Write-Host $status
+          if (-not ($status -match "Running: true")) { throw "daemon did not report running" }
+          if (-not ($status -match "smoke")) { throw "backend not registered" }
+          cascade --config "$smoke\config" stop
+          Wait-Process -Id $proc.Id -Timeout 10 -ErrorAction SilentlyContinue
+      - name: Tier 3 — actual WebDAV mount via net use
+        shell: pwsh
+        run: |
+          $smoke = $env:SMOKE
+          "pre-seeded" | Out-File -Encoding ascii -NoNewline "$smoke\storage\hello.txt"
+          $proc = Start-Process -FilePath cascade -ArgumentList "--config","$smoke\config","start" -PassThru -RedirectStandardOutput "$smoke\mount.log" -RedirectStandardError "$smoke\mount.err"
+          $drive = $null
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 1
+            $netuse = (net use) 2>$null
+            if ($netuse -match '([A-Z]:)\s+\\\\localhost') { $drive = $matches[1]; break }
+            if ($netuse -match '([A-Z]:)\s+http://localhost') { $drive = $matches[1]; break }
+          }
+          if (-not $drive) {
+            Write-Host (Get-Content "$smoke\mount.log" -ErrorAction SilentlyContinue)
+            Write-Host (Get-Content "$smoke\mount.err" -ErrorAction SilentlyContinue)
+            throw "no WebDAV drive mapped within 30s"
+          }
+          Write-Host "Mapped drive: $drive"
+          Get-ChildItem $drive
+          cascade --config "$smoke\config" stop
+          Wait-Process -Id $proc.Id -Timeout 10 -ErrorAction SilentlyContinue
+      - name: Dump daemon log on failure
+        if: failure()
+        shell: pwsh
+        run: |
+          $smoke = $env:SMOKE
+          if (Test-Path "$smoke\daemon.log") { Write-Host "=== daemon.log ==="; Get-Content "$smoke\daemon.log" }
+          if (Test-Path "$smoke\daemon.err") { Write-Host "=== daemon.err ==="; Get-Content "$smoke\daemon.err" }
+          if (Test-Path "$smoke\mount.log") { Write-Host "=== mount.log ==="; Get-Content "$smoke\mount.log" }
+          if (Test-Path "$smoke\mount.err") { Write-Host "=== mount.err ==="; Get-Content "$smoke\mount.err" }

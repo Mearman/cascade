@@ -734,6 +734,8 @@ fn create_backend(
             .with_context(|| format!("failed to create gdrive backend `{name}`")),
         "s3" => cascade_backend_s3::create_backend(config)
             .with_context(|| format!("failed to create s3 backend `{name}`")),
+        "local" => cascade_backend_local::create_backend(config)
+            .with_context(|| format!("failed to create local backend `{name}`")),
         other => anyhow::bail!("unsupported backend type: {other}"),
     }
 }
