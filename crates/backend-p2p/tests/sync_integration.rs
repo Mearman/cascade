@@ -506,6 +506,89 @@ async fn concurrent_downloads_do_not_serialise() {
     assert_eq!(out3, p3);
 }
 
+/// WAN gossip introduces peers transitively through a shared
+/// intermediary. Three nodes in a chain: A trusts B, B trusts C; A
+/// and C have no direct trust relationship and never connect. After
+/// B broadcasts a gossip frame, A's peer book should contain an
+/// entry for C — proving the gossip path works end-to-end at the
+/// wire level.
+///
+/// The test triggers the broadcast manually via `broadcast_gossip()`
+/// instead of waiting for the 60s timer in the spawned loop.
+#[tokio::test]
+async fn wan_gossip_introduces_peers_transitively() {
+    let a = Node::new("a", "shared").await;
+    let b = Node::new("b", "shared").await;
+    let c = Node::new("c", "shared").await;
+
+    // A↔B and B↔C trust each other, but A and C do NOT — without
+    // gossip A would never learn about C.
+    mutual_trust(&a, &b).await;
+    mutual_trust(&b, &c).await;
+
+    // B listens; A and C dial in. B becomes the shared introducer.
+    let (_cancel_tx_b, cancel_rx_b) = tokio::sync::watch::channel(false);
+    let (addr_b, _b_task) = b
+        .backend
+        .sync()
+        .start_listener("127.0.0.1:0".parse().unwrap(), cancel_rx_b)
+        .await
+        .unwrap();
+    a.backend
+        .sync()
+        .connect_to(Peer {
+            device_id: b.device_id(),
+            address: addr_b,
+        })
+        .await
+        .unwrap();
+    c.backend
+        .sync()
+        .connect_to(Peer {
+            device_id: b.device_id(),
+            address: addr_b,
+        })
+        .await
+        .unwrap();
+
+    // Let the handshakes settle and `record_peer` populate B's peer
+    // book with both A and C.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Sanity: B knows about both A and C.
+    {
+        let book_b = b.backend.sync().peer_book().read().await;
+        assert!(
+            book_b.get(&a.device_id()).is_some(),
+            "B should know A before gossip",
+        );
+        assert!(
+            book_b.get(&c.device_id()).is_some(),
+            "B should know C before gossip",
+        );
+    }
+
+    // Trigger the gossip broadcast directly instead of waiting for
+    // the 60s periodic loop in `P2pBackend::open`.
+    b.backend.sync().broadcast_gossip().await;
+
+    // A should learn about C transitively. Poll the peer book for up
+    // to a generous window to absorb scheduling jitter.
+    let mut found = false;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let book_a = a.backend.sync().peer_book().read().await;
+        if book_a.get(&c.device_id()).is_some() {
+            found = true;
+            break;
+        }
+    }
+    assert!(
+        found,
+        "A's peer book should contain C after B broadcasts gossip",
+    );
+}
+
 /// Block-fetch fallback: A has a block, B does not. B's `download`
 /// must satisfy the read by pulling the block from A.
 #[tokio::test]

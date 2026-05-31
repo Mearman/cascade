@@ -9,6 +9,12 @@ use cascade_p2p::wan::{GossipMessage, GossipPeer, PeerBook};
 use proptest::prelude::*;
 use std::net::SocketAddr;
 
+// Disambiguate `protocol::GossipPeer` (the wire shape) from
+// `wan::GossipPeer` (the storage shape, imported above without a
+// prefix). The proptest strategy generates wire-shape values to feed
+// the BEP encode/decode round-trip.
+use cascade_p2p::protocol::GossipPeer as WireGossipPeer;
+
 /// Block splitting is deterministic: same data always produces same blocks.
 #[test]
 fn block_splitting_deterministic() {
@@ -178,6 +184,21 @@ fn bep_message_strategy() -> impl Strategy<Value = BepMessage> {
 
     let close = ".{0,50}".prop_map(|reason| BepMessage::Close { reason });
 
+    let wire_peer = (
+        ".{0,20}",
+        prop::collection::vec(".{1,30}", 0..4),
+        any::<i64>(),
+    )
+        .prop_map(
+            |(device_id, addresses, last_seen_unix_seconds)| WireGossipPeer {
+                device_id,
+                addresses,
+                last_seen_unix_seconds,
+            },
+        );
+    let gossip =
+        prop::collection::vec(wire_peer, 0..5).prop_map(|peers| BepMessage::Gossip { peers });
+
     prop_oneof![
         cluster_config,
         index,
@@ -186,6 +207,7 @@ fn bep_message_strategy() -> impl Strategy<Value = BepMessage> {
         response,
         Just(BepMessage::Ping),
         close,
+        gossip,
     ]
 }
 
