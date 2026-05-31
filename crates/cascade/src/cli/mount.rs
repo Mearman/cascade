@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use cascade_engine::engine::{Engine, EngineConfig};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use cascade_engine::presenter::VfsPresenter;
 use cascade_presenter_nfs::nfs::server::{NfsServer, NfsServerConfig};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use cascade_presenter_webdav::WebDavPresenter;
 
 use super::init::{BackendConfig, CascadeConfig};
