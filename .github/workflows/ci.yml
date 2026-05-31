@@ -410,3 +410,63 @@ jobs:
           git add Formula/cascade.rb
           git diff --cached --quiet || git commit -m "chore: update formula to ${VERSION}"
           git push
+
+  update-scoop:
+    name: Update Scoop bucket
+    needs: [release, build-windows-x86]
+    if: needs.release.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout bucket via SSH deploy key
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: Mearman/scoop-cascade
+          ssh-key: ${{ secrets.SCOOP_DEPLOY_KEY }}
+      - name: Download checksum
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          TAG_URL="https://github.com/Mearman/cascade/releases/download/${VERSION}"
+          curl -sL "${TAG_URL}/cascade-x86_64-windows.zip.sha256" | awk '{print $1}' > sha-windows-x86
+      - name: Generate manifest
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          VERSION_NUM="${VERSION#v}"
+          WINDOWS_X86_SHA=$(cat sha-windows-x86)
+
+          mkdir -p bucket
+          cat > bucket/cascade.json <<EOF
+          {
+              "version": "${VERSION_NUM}",
+              "description": "Cross-platform cloud storage filesystem client",
+              "homepage": "https://github.com/Mearman/cascade",
+              "license": "MIT",
+              "architecture": {
+                  "64bit": {
+                      "url": "https://github.com/Mearman/cascade/releases/download/${VERSION}/cascade-x86_64-windows.zip",
+                      "hash": "${WINDOWS_X86_SHA}"
+                  }
+              },
+              "bin": "cascade.exe",
+              "checkver": {
+                  "github": "https://github.com/Mearman/cascade"
+              },
+              "autoupdate": {
+                  "architecture": {
+                      "64bit": {
+                          "url": "https://github.com/Mearman/cascade/releases/download/v\$version/cascade-x86_64-windows.zip"
+                      }
+                  }
+              }
+          }
+          EOF
+      - name: Commit and push
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add bucket/cascade.json
+          git diff --cached --quiet || git commit -m "chore: update manifest to ${VERSION}"
+          git push
