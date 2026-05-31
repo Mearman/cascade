@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 /// One row in the folder index.
 #[derive(Debug, Clone)]
@@ -58,14 +58,27 @@ impl FolderIndex {
     /// New databases get every column from the start. Older databases —
     /// created before the version-vector schema — are migrated in
     /// place: the `version_blob` column is added with an empty default.
+    ///
+    /// Schema initialisation runs inside a single `BEGIN EXCLUSIVE`
+    /// transaction so that two processes opening the same `SQLite` file
+    /// concurrently serialise on the migration rather than racing on
+    /// `PRAGMA table_info` and `ALTER TABLE`. `PRAGMA user_version`
+    /// records the highest applied migration so already-migrated
+    /// databases skip the column check on subsequent opens.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        let conn =
+        let mut conn =
             Connection::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-        conn.execute_batch(
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Exclusive)
+            .context("begin schema transaction")?;
+
+        // Step 1: base schema. Idempotent — `IF NOT EXISTS` everywhere,
+        // so this is a no-op on a database that already has the schema.
+        tx.execute_batch(
             r"
             CREATE TABLE IF NOT EXISTS files (
                 path TEXT PRIMARY KEY NOT NULL,
@@ -85,7 +98,38 @@ impl FolderIndex {
             ",
         )
         .context("init schema")?;
-        ensure_version_blob_column(&conn).context("migrating files.version_blob")?;
+
+        // Step 2: migrations. `PRAGMA user_version` is the schema
+        // version sentinel — each bump represents a one-time migration.
+        let current_version: i64 = tx
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .context("read user_version")?;
+
+        if current_version < 1 {
+            // Migration 1: add `version_blob` to pre-v0.1.20 databases
+            // that were created before the column existed. New
+            // databases get the column from the `CREATE TABLE` above
+            // and skip the `ALTER`. We still have to check, because
+            // `user_version` is 0 in both cases.
+            let has_version_blob: bool = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('files') WHERE name = 'version_blob'",
+                    [],
+                    |r| r.get::<_, i64>(0).map(|n| n > 0),
+                )
+                .context("probe files.version_blob")?;
+            if !has_version_blob {
+                tx.execute(
+                    "ALTER TABLE files ADD COLUMN version_blob BLOB NOT NULL DEFAULT (x'')",
+                    [],
+                )
+                .context("add files.version_blob")?;
+            }
+            tx.execute_batch("PRAGMA user_version = 1")
+                .context("bump user_version")?;
+        }
+
+        tx.commit().context("commit schema transaction")?;
         Ok(Self {
             conn: Mutex::new(conn),
             db_path: path.to_path_buf(),
@@ -229,30 +273,6 @@ impl FolderIndex {
             version,
         })
     }
-}
-
-/// Ensure the `version_blob` column exists on the `files` table. New
-/// databases get it via the `CREATE TABLE` above; pre-existing ones
-/// (created before this commit) need an explicit `ALTER TABLE`.
-///
-/// `SQLite` has no `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, so we
-/// inspect `PRAGMA table_info` and only run the alter if the column is
-/// missing.
-fn ensure_version_blob_column(conn: &Connection) -> Result<()> {
-    let has_column = {
-        let mut stmt = conn.prepare("PRAGMA table_info(files)")?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<Result<Vec<_>, _>>()?;
-        rows.iter().any(|name| name == "version_blob")
-    };
-    if !has_column {
-        conn.execute(
-            "ALTER TABLE files ADD COLUMN version_blob BLOB NOT NULL DEFAULT (x'')",
-            [],
-        )?;
-    }
-    Ok(())
 }
 
 /// Encode a version vector as a flat blob: pairs of 8-byte big-endian
