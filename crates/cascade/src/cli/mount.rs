@@ -172,7 +172,24 @@ pub async fn start(
 
     #[cfg(target_os = "windows")]
     {
-        // Windows: WebDAV server + mount via WebClient (`net use`).
+        // Attempt 1: ProjFS (native, no admin required, scaffold only).
+        //
+        // ProjFS self-mounts via the Win32 ProjectedFileSystem API and
+        // cannot be used without mounting, so it is skipped when
+        // --no-mount is set.
+        if !no_mount {
+            let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
+            tracing::info!(strategy = "projfs", "attempting ProjFS mount");
+            match try_projfs(ctx, &mount_path, backends, enable_p2p).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    tracing::warn!(error = %e, "ProjFS mount failed, falling back to WebDAV");
+                    drop(e);
+                }
+            }
+        }
+
+        // Attempt 2: WebDAV via the built-in WebClient service.
         let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
         tracing::info!(strategy = "webdav", "attempting WebDAV mount");
         try_webdav(ctx, &mount_path, backends, no_mount, enable_p2p).await
@@ -263,6 +280,91 @@ async fn try_fskit(
     unmount_path(mount_path)?;
     if let Err(e) = presenter.stop().await {
         tracing::warn!(error = %e, "FSKit presenter stop returned an error");
+    }
+    resources.shutdown();
+
+    let _ = std::fs::remove_file(&ctx.pid_path);
+
+    tracing::info!("Cascade stopped.");
+    Ok(())
+}
+
+/// Try to mount via the `ProjFS` presenter (Windows only).
+///
+/// `ProjFS` (Projected File System) is the native Windows equivalent of
+/// `FSKit` on macOS and FUSE on Linux. The presenter self-mounts via
+/// `PrjStartVirtualizing` — there is no separate OS mount command — so
+/// this function does not need a `no_mount` parameter and is skipped at
+/// the dispatch level when `--no-mount` is set.
+///
+/// Same shutdown guarantees as the other presenter functions: on any
+/// failure during engine, presenter, or mount setup, every started
+/// resource is stopped before the error is returned.
+#[cfg(target_os = "windows")]
+async fn try_projfs(
+    ctx: &CliContext,
+    mount_path: &Path,
+    backends: Vec<Arc<dyn cascade_engine::backend::Backend>>,
+    enable_p2p: bool,
+) -> Result<()> {
+    let engine_config = EngineConfig {
+        db_path: ctx.db_path.clone(),
+        mount_point: mount_path.to_path_buf(),
+        backends,
+        cache_dir: None,
+        enable_p2p,
+        p2p_data_dir: None,
+    };
+    let engine = Engine::new(engine_config)?;
+
+    let presenter =
+        Arc::new(cascade_presenter_projfs::ProjFsPresenter::new(mount_path).with_mount_point(mount_path));
+
+    let sync_runner = engine.create_sync_runner(presenter.clone());
+    let sync_handle = tokio::spawn(async move {
+        if let Err(e) = sync_runner.run().await {
+            tracing::error!(error = %e, "sync runner exited with error");
+        }
+    });
+
+    let engine_handle = engine.start()?;
+
+    let resources = PresenterResources {
+        engine,
+        engine_handle,
+        sync_handle,
+    };
+
+    if let Err(e) = presenter.start(mount_path).await {
+        resources.shutdown();
+        return Err(e).with_context(|| {
+            format!(
+                "failed to start ProjFS presenter at {}",
+                mount_path.display()
+            )
+        });
+    }
+
+    // ProjFS self-mounts via PrjStartVirtualizing; no separate OS mount
+    // command is needed.
+
+    if let Err(e) = write_pid_file(&ctx.pid_path) {
+        resources.shutdown();
+        return Err(e);
+    }
+
+    println!("Cascade started (ProjFS).");
+    println!("  Mount point: {}", mount_path.display());
+    println!("  PID: {}", std::process::id());
+    println!();
+    println!("Press Ctrl+C to stop.");
+
+    tokio::signal::ctrl_c().await?;
+
+    tracing::info!("Shutting down...");
+
+    if let Err(e) = presenter.stop().await {
+        tracing::warn!(error = %e, "ProjFS presenter stop returned an error");
     }
     resources.shutdown();
 

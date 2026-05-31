@@ -20,6 +20,7 @@ cascade-presenter-nfs = { path = "../presenter-nfs" }
 cascade-presenter-webdav = { path = "../presenter-webdav" }
 cascade-presenter-fskit = { path = "../presenter-fskit" }
 cascade-presenter-fuse = { path = "../presenter-fuse" }
+cascade-presenter-projfs = { path = "../presenter-projfs" }
 clap.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
