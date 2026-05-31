@@ -711,4 +711,50 @@ mod tests {
         let backends = db.list_backends().unwrap();
         assert!(backends.is_empty());
     }
+
+    // ── backend_add (p2p) ──
+
+    /// The TOML table the p2p arm of `backend_add` builds for a representative
+    /// input must round-trip through `cascade_backend_p2p::create_backend`.
+    /// This is the public contract between the CLI wizard and the backend
+    /// factory — if the wizard ever produces a key the factory does not
+    /// recognise (or omits one it requires), this test fails.
+    #[tokio::test]
+    async fn p2p_backend_add_produces_loadable_config() {
+        let dir = TempDir::new().unwrap();
+
+        let mut peer = toml::Table::new();
+        peer.insert(
+            "device_id".to_string(),
+            toml::Value::String("PEER-DEVICE-ID".to_string()),
+        );
+        peer.insert(
+            "address".to_string(),
+            toml::Value::String("192.0.2.1:22000".to_string()),
+        );
+
+        let mut config = toml::Table::new();
+        config.insert("type".to_string(), toml::Value::String("p2p".to_string()));
+        config.insert(
+            "name".to_string(),
+            toml::Value::String("shared".to_string()),
+        );
+        config.insert(
+            "listen_addr".to_string(),
+            toml::Value::String("0.0.0.0:22000".to_string()),
+        );
+        config.insert(
+            "data_dir".to_string(),
+            toml::Value::String(dir.path().to_string_lossy().into_owned()),
+        );
+        config.insert(
+            "peers".to_string(),
+            toml::Value::Array(vec![toml::Value::Table(peer)]),
+        );
+
+        let value = toml::Value::Table(config);
+        if let Err(err) = cascade_backend_p2p::create_backend(&value) {
+            panic!("create_backend rejected wizard output: {err:#}");
+        }
+    }
 }
