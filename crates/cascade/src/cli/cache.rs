@@ -243,17 +243,38 @@ pub fn backend_add(
         "p2p" => {
             println!("\nP2P configuration:");
 
-            let listen_addr = read_input("Listen address (host:port, blank to disable)")?;
+            let initial_listen_addr = read_input("Listen address (host:port, blank to disable)")?;
             let display_name = read_input("Display name (blank for backend name)")?;
             let data_dir =
                 read_input("Data directory (blank for default ~/.config/cascade/p2p-<name>)")?;
             let enable_discovery_raw = read_input("Enable LAN discovery? (y/N)")?;
-            let enable_discovery = matches!(
+            let initial_enable_discovery = matches!(
                 enable_discovery_raw.to_ascii_lowercase().as_str(),
                 "y" | "yes"
             );
 
-            let mut peers: Vec<toml::Value> = Vec::new();
+            // Discovery is inert without a listen address. Re-prompt the user
+            // before silently disabling so the config matches their intent.
+            let follow_up_listen_addr =
+                if initial_enable_discovery && initial_listen_addr.is_empty() {
+                    eprintln!(
+                        "LAN discovery requires a listen address — the BEP listener is what \
+                         responds to multicast announcements."
+                    );
+                    read_input("Set listen_addr now? (host:port, blank to disable discovery)")?
+                } else {
+                    String::new()
+                };
+            let (listen_addr, enable_discovery) = reconcile_discovery(
+                &initial_listen_addr,
+                initial_enable_discovery,
+                &follow_up_listen_addr,
+            );
+            if initial_enable_discovery && !enable_discovery {
+                eprintln!("Discovery disabled (no listen address provided).");
+            }
+
+            let mut peers: Vec<(String, String)> = Vec::new();
             loop {
                 let add_peer = read_input("Add a peer? (y/N)")?;
                 if !matches!(add_peer.to_ascii_lowercase().as_str(), "y" | "yes") {
@@ -275,10 +296,7 @@ pub fn backend_add(
                     }
                     break addr;
                 };
-                let mut peer = toml::Table::new();
-                peer.insert("device_id".to_string(), toml::Value::String(device_id));
-                peer.insert("address".to_string(), toml::Value::String(address));
-                peers.push(toml::Value::Table(peer));
+                peers.push((device_id, address));
             }
 
             let mut full_config = toml::Table::new();
@@ -308,10 +326,7 @@ pub fn backend_add(
             if enable_discovery {
                 full_config.insert("enable_discovery".to_string(), toml::Value::Boolean(true));
             }
-            if !peers.is_empty() {
-                full_config.insert("peers".to_string(), toml::Value::Array(peers));
-            }
-            let config_str = toml::to_string_pretty(&full_config)?;
+            let config_str = render_p2p_config(&full_config, &peers)?;
             std::fs::write(&config_path, &config_str)?;
         }
         "gdrive" => {
@@ -446,6 +461,67 @@ fn read_input(prompt: &str) -> Result<String> {
     let mut input = String::new();
     std::io::stdin().read_line(&mut input)?;
     Ok(input.trim().to_string())
+}
+
+/// Resolve the listen address and discovery flag for the p2p wizard.
+///
+/// `enable_discovery && listen_addr.is_some()` is the contract `P2pBackend`
+/// enforces — discovery without a listen address is silently inert. This
+/// function reconciles the initial wizard inputs with the follow-up prompt
+/// shown when the user asked for discovery without a listen address:
+///
+/// - Discovery disabled, or listen address already set: pass through.
+/// - Discovery requested with blank listen address and a non-empty follow-up:
+///   adopt the follow-up address and keep discovery on.
+/// - Discovery requested with blank listen address and a blank follow-up:
+///   disable discovery.
+fn reconcile_discovery(
+    initial_listen_addr: &str,
+    enable_discovery: bool,
+    follow_up_listen_addr: &str,
+) -> (String, bool) {
+    if !enable_discovery || !initial_listen_addr.is_empty() {
+        return (initial_listen_addr.to_string(), enable_discovery);
+    }
+    if follow_up_listen_addr.is_empty() {
+        (String::new(), false)
+    } else {
+        (follow_up_listen_addr.to_string(), true)
+    }
+}
+
+/// Render the p2p backend config with peers as a proper `[[peers]]`
+/// array-of-tables.
+///
+/// `toml::to_string_pretty` serialises an array of tables as a flat inline
+/// array (`peers = [{...}]`). The parser accepts both forms but the
+/// documented hand-written form uses array-of-tables, so the wizard's
+/// output should match for visual parity with the e2e fixtures and the
+/// docs. The scalar config is serialised through `toml::to_string_pretty`
+/// (which handles string escaping correctly); each peer is then appended
+/// as its own `[[peers]]` table, with the per-peer body serialised through
+/// `toml::to_string` so string values are escaped according to the TOML
+/// grammar.
+fn render_p2p_config(scalar_config: &toml::Table, peers: &[(String, String)]) -> Result<String> {
+    let mut out = toml::to_string_pretty(scalar_config)?;
+    for (device_id, address) in peers {
+        if !out.ends_with("\n\n") {
+            if out.ends_with('\n') {
+                out.push('\n');
+            } else {
+                out.push_str("\n\n");
+            }
+        }
+        out.push_str("[[peers]]\n");
+        let mut peer = toml::Table::new();
+        peer.insert(
+            "device_id".to_string(),
+            toml::Value::String(device_id.clone()),
+        );
+        peer.insert("address".to_string(), toml::Value::String(address.clone()));
+        out.push_str(&toml::to_string(&peer)?);
+    }
+    Ok(out)
 }
 
 /// Remove a backend configuration.
@@ -714,24 +790,18 @@ mod tests {
 
     // ── backend_add (p2p) ──
 
-    /// The TOML table the p2p arm of `backend_add` builds for a representative
+    /// The TOML the p2p arm of `backend_add` writes for a representative
     /// input must round-trip through `cascade_backend_p2p::create_backend`.
     /// This is the public contract between the CLI wizard and the backend
     /// factory — if the wizard ever produces a key the factory does not
     /// recognise (or omits one it requires), this test fails.
+    ///
+    /// The wizard now emits peers as `[[peers]]` array-of-tables (matching
+    /// the documented hand-written form), so this test also asserts the
+    /// serialised text contains that marker.
     #[tokio::test]
     async fn p2p_backend_add_produces_loadable_config() {
         let dir = TempDir::new().unwrap();
-
-        let mut peer = toml::Table::new();
-        peer.insert(
-            "device_id".to_string(),
-            toml::Value::String("PEER-DEVICE-ID".to_string()),
-        );
-        peer.insert(
-            "address".to_string(),
-            toml::Value::String("192.0.2.1:22000".to_string()),
-        );
 
         let mut config = toml::Table::new();
         config.insert("type".to_string(), toml::Value::String("p2p".to_string()));
@@ -747,14 +817,100 @@ mod tests {
             "data_dir".to_string(),
             toml::Value::String(dir.path().to_string_lossy().into_owned()),
         );
-        config.insert(
-            "peers".to_string(),
-            toml::Value::Array(vec![toml::Value::Table(peer)]),
+
+        let peers = vec![("PEER-DEVICE-ID".to_string(), "192.0.2.1:22000".to_string())];
+        let rendered = render_p2p_config(&config, &peers).unwrap();
+
+        assert!(
+            rendered.contains("[[peers]]"),
+            "wizard output must use array-of-tables for peers, got:\n{rendered}",
         );
 
-        let value = toml::Value::Table(config);
-        if let Err(err) = cascade_backend_p2p::create_backend(&value) {
-            panic!("create_backend rejected wizard output: {err:#}");
+        let parsed: toml::Value = toml::from_str(&rendered).unwrap();
+        if let Err(err) = cascade_backend_p2p::create_backend(&parsed) {
+            panic!("create_backend rejected wizard output: {err:#}\nrendered:\n{rendered}");
         }
+    }
+
+    /// `render_p2p_config` with no peers must emit nothing peer-related — no
+    /// stray `[[peers]]` headers, no empty `peers = []` array.
+    #[test]
+    fn render_p2p_config_with_no_peers_omits_peers_section() {
+        let mut config = toml::Table::new();
+        config.insert("type".to_string(), toml::Value::String("p2p".to_string()));
+        config.insert("name".to_string(), toml::Value::String("solo".to_string()));
+
+        let rendered = render_p2p_config(&config, &[]).unwrap();
+        assert!(
+            !rendered.contains("peers"),
+            "unexpected peers content: {rendered}"
+        );
+    }
+
+    /// Strings containing TOML metacharacters must be escaped properly when
+    /// rendered as part of the `[[peers]]` block — `toml::to_string` handles
+    /// this, this test guards against accidental hand-formatting that would
+    /// break round-tripping.
+    #[test]
+    fn render_p2p_config_escapes_peer_strings() {
+        let mut config = toml::Table::new();
+        config.insert("type".to_string(), toml::Value::String("p2p".to_string()));
+
+        let peers = vec![(
+            "dev with \"quotes\" and \\backslash".to_string(),
+            "[::1]:22000".to_string(),
+        )];
+        let rendered = render_p2p_config(&config, &peers).unwrap();
+        let parsed: toml::Value = toml::from_str(&rendered).unwrap();
+        let peers_value = parsed.get("peers").unwrap().as_array().unwrap();
+        assert_eq!(peers_value.len(), 1);
+        let peer = peers_value[0].as_table().unwrap();
+        assert_eq!(
+            peer.get("device_id").unwrap().as_str().unwrap(),
+            "dev with \"quotes\" and \\backslash",
+        );
+        assert_eq!(
+            peer.get("address").unwrap().as_str().unwrap(),
+            "[::1]:22000"
+        );
+    }
+
+    // ── reconcile_discovery ──
+
+    /// Discovery off: `listen_addr` passes through unchanged, discovery stays off.
+    #[test]
+    fn reconcile_discovery_off_is_passthrough() {
+        assert_eq!(reconcile_discovery("", false, ""), (String::new(), false),);
+        assert_eq!(
+            reconcile_discovery("0.0.0.0:22000", false, ""),
+            ("0.0.0.0:22000".to_string(), false),
+        );
+    }
+
+    /// Discovery on with a `listen_addr` already set: pass through.
+    #[test]
+    fn reconcile_discovery_on_with_listen_addr_is_passthrough() {
+        assert_eq!(
+            reconcile_discovery("0.0.0.0:22000", true, ""),
+            ("0.0.0.0:22000".to_string(), true),
+        );
+    }
+
+    /// Discovery requested without a `listen_addr` and the user provides one
+    /// via the follow-up prompt: adopt the follow-up address.
+    #[test]
+    fn discovery_without_listen_addr_is_corrected() {
+        assert_eq!(
+            reconcile_discovery("", true, "0.0.0.0:22000"),
+            ("0.0.0.0:22000".to_string(), true),
+        );
+    }
+
+    /// Discovery requested without a `listen_addr` and the user leaves the
+    /// follow-up prompt blank: discovery is disabled rather than written as
+    /// silently-inert config.
+    #[test]
+    fn discovery_without_listen_addr_disables_when_followup_blank() {
+        assert_eq!(reconcile_discovery("", true, ""), (String::new(), false),);
     }
 }
