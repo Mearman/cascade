@@ -12,7 +12,7 @@
 //!    timestamps; take the newer row).
 //! 3. Local writes (`upload`, `update`) broadcast an `IndexUpdate` frame
 //!    with the new row to every connected peer.
-//! 4. When a [`Backend::download`] call discovers blocks missing from
+//! 4. When a `Backend::download` call discovers blocks missing from
 //!    the local [`BlockStore`], each connected peer is asked in turn
 //!    via [`BepMessage::Request`] and the first matching block is kept.
 //!
