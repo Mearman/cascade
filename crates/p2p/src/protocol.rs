@@ -17,6 +17,19 @@ const MSG_REQUEST: u32 = 3;
 const MSG_RESPONSE: u32 = 4;
 const MSG_PING: u32 = 5;
 const MSG_CLOSE: u32 = 6;
+const MSG_GOSSIP: u32 = 7;
+
+/// Maximum number of peers carried in a single `Gossip` frame. Caps the
+/// receiver's memory cost when a malicious or buggy peer sends a huge
+/// peer list. Well above the realistic peer-book size for a personal
+/// mesh while still bounded.
+const MAX_GOSSIP_PEERS: u32 = 10_000;
+
+/// Maximum number of addresses per `GossipPeer`. A peer with more than
+/// a small handful of reachable endpoints almost certainly indicates
+/// either misconfiguration or an attempt to amplify the wire frame, so
+/// the cap stays conservative.
+const MAX_GOSSIP_ADDRESSES_PER_PEER: u32 = 32;
 
 // ── XDR primitives ──
 
@@ -239,6 +252,28 @@ pub struct FileInfo {
     pub block_hashes: Vec<[u8; 32]>,
 }
 
+/// A peer entry as it appears on the wire inside a [`BepMessage::Gossip`] frame.
+///
+/// Deliberately wire-typed (string addresses, explicit `last_seen`
+/// field) so the on-disk [`crate::wan::PeerBook`] storage can evolve
+/// without churning the BEP layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GossipPeer {
+    /// Device ID (base32-encoded SHA-256 of the peer's TLS certificate).
+    pub device_id: String,
+    /// Known socket-addressable endpoints for this peer, serialised as
+    /// `host:port` strings. Receivers parse each entry and silently
+    /// drop ones they cannot resolve — DNS-style host names that are
+    /// not yet routable from the receiver's network can show up here.
+    pub addresses: Vec<String>,
+    /// Broadcaster's Unix-seconds timestamp for the last time this
+    /// peer was confirmed reachable. Receivers can use this to prefer
+    /// fresher entries when merging concurrent gossip from multiple
+    /// introducers (not implemented yet — the field is recorded as
+    /// metadata for future work).
+    pub last_seen_unix_seconds: i64,
+}
+
 /// BEP message types.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BepMessage {
@@ -278,6 +313,12 @@ pub enum BepMessage {
     Ping,
     /// Graceful connection teardown.
     Close { reason: String },
+    /// Snapshot of the broadcaster's known peers, sent periodically to
+    /// every connected peer so the receiver can learn about devices it
+    /// is not directly configured for. Receivers merge the peers into
+    /// their local peer book; unresolved address entries are silently
+    /// dropped.
+    Gossip { peers: Vec<GossipPeer> },
 }
 
 impl BepMessage {
@@ -290,6 +331,7 @@ impl BepMessage {
             Self::Response { .. } => MSG_RESPONSE,
             Self::Ping => MSG_PING,
             Self::Close { .. } => MSG_CLOSE,
+            Self::Gossip { .. } => MSG_GOSSIP,
         }
     }
 }
@@ -344,6 +386,21 @@ pub fn encode_message(msg: &BepMessage) -> Result<Vec<u8>> {
         BepMessage::Ping => {}
         BepMessage::Close { reason } => {
             encode_string(&mut body, reason)?;
+        }
+        BepMessage::Gossip { peers } => {
+            let peer_count = u32::try_from(peers.len())
+                .map_err(|_| anyhow::anyhow!("too many gossip peers"))?;
+            encode_u32(&mut body, peer_count);
+            for peer in peers {
+                encode_string(&mut body, &peer.device_id)?;
+                let addr_count = u32::try_from(peer.addresses.len())
+                    .map_err(|_| anyhow::anyhow!("too many addresses per gossip peer"))?;
+                encode_u32(&mut body, addr_count);
+                for addr in &peer.addresses {
+                    encode_string(&mut body, addr)?;
+                }
+                encode_i64(&mut body, peer.last_seen_unix_seconds);
+            }
         }
     }
 
@@ -423,6 +480,7 @@ pub fn decode_message(frame: &[u8]) -> Result<BepMessage> {
         MSG_RESPONSE => decode_response(rest),
         MSG_PING => Ok(BepMessage::Ping),
         MSG_CLOSE => decode_close(rest),
+        MSG_GOSSIP => decode_gossip(rest),
         _ => anyhow::bail!("unknown message type: {msg_type}"),
     }
 }
@@ -485,6 +543,40 @@ fn decode_response(data: &[u8]) -> Result<BepMessage> {
 fn decode_close(data: &[u8]) -> Result<BepMessage> {
     let (reason, _) = decode_string(data)?;
     Ok(BepMessage::Close { reason })
+}
+
+fn decode_gossip(data: &[u8]) -> Result<BepMessage> {
+    let (count, mut rest) = decode_u32(data)?;
+    if count > MAX_GOSSIP_PEERS {
+        anyhow::bail!(
+            "gossip peer count {count} exceeds maximum {MAX_GOSSIP_PEERS}",
+        );
+    }
+    let mut peers = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let (device_id, after_id) = decode_string(rest)?;
+        let (addr_count, after_addr_count) = decode_u32(after_id)?;
+        if addr_count > MAX_GOSSIP_ADDRESSES_PER_PEER {
+            anyhow::bail!(
+                "gossip peer `{device_id}` has {addr_count} addresses, exceeding maximum {MAX_GOSSIP_ADDRESSES_PER_PEER}",
+            );
+        }
+        let mut addresses = Vec::with_capacity(addr_count as usize);
+        let mut cursor = after_addr_count;
+        for _ in 0..addr_count {
+            let (addr, next) = decode_string(cursor)?;
+            addresses.push(addr);
+            cursor = next;
+        }
+        let (last_seen_unix_seconds, after_last_seen) = decode_i64(cursor)?;
+        peers.push(GossipPeer {
+            device_id,
+            addresses,
+            last_seen_unix_seconds,
+        });
+        rest = after_last_seen;
+    }
+    Ok(BepMessage::Gossip { peers })
 }
 
 fn decode_file_infos(data: &[u8]) -> Result<(Vec<FileInfo>, &[u8])> {
@@ -749,6 +841,82 @@ mod tests {
         round_trip(BepMessage::Close {
             reason: "shutdown".into(),
         });
+    }
+
+    #[test]
+    fn encode_decode_gossip() {
+        round_trip(BepMessage::Gossip {
+            peers: vec![
+                GossipPeer {
+                    device_id: "AAAA".to_string(),
+                    addresses: vec!["1.2.3.4:5000".to_string()],
+                    last_seen_unix_seconds: 1_700_000_000,
+                },
+                GossipPeer {
+                    device_id: "BBBB".to_string(),
+                    addresses: vec![
+                        "10.0.0.1:22000".to_string(),
+                        "[fe80::1]:22000".to_string(),
+                    ],
+                    last_seen_unix_seconds: 1_700_000_100,
+                },
+            ],
+        });
+    }
+
+    #[test]
+    fn encode_decode_gossip_empty() {
+        round_trip(BepMessage::Gossip { peers: vec![] });
+    }
+
+    #[test]
+    fn decode_gossip_rejects_excessive_peer_count() {
+        // Hand-build a frame whose declared peer count exceeds the cap.
+        // The body length prefix is honest (matches the trailing body
+        // bytes) but the inner gossip count tries to make the receiver
+        // allocate a 20k-entry vector — exactly the kind of frame the
+        // bound is there to reject.
+        let mut body = Vec::new();
+        encode_u32(&mut body, MSG_GOSSIP);
+        encode_u32(&mut body, 20_000);
+        let mut frame = Vec::new();
+        let body_len = u32::try_from(body.len()).unwrap_or(0);
+        encode_u32(&mut frame, body_len);
+        frame.extend_from_slice(&body);
+        let result = decode_message(&frame);
+        assert!(result.is_err(), "excessive peer count must fail");
+        assert!(
+            result
+                .err()
+                .map(|e| e.to_string())
+                .is_some_and(|msg| msg.contains("exceeds maximum")),
+            "error should mention the cap",
+        );
+    }
+
+    #[test]
+    fn decode_gossip_rejects_excessive_address_count() {
+        let mut body = Vec::new();
+        encode_u32(&mut body, MSG_GOSSIP);
+        encode_u32(&mut body, 1);
+        // String encoding is infallible for short inputs; ignore the
+        // Result to avoid an unwrap that clippy would flag at test
+        // build time.
+        let _ = encode_string(&mut body, "PEER-A");
+        encode_u32(&mut body, 100); // > MAX_GOSSIP_ADDRESSES_PER_PEER
+        let mut frame = Vec::new();
+        let body_len = u32::try_from(body.len()).unwrap_or(0);
+        encode_u32(&mut frame, body_len);
+        frame.extend_from_slice(&body);
+        let result = decode_message(&frame);
+        assert!(result.is_err(), "excessive address count must fail");
+        assert!(
+            result
+                .err()
+                .map(|e| e.to_string())
+                .is_some_and(|msg| msg.contains("exceeding maximum")),
+            "error should mention the cap",
+        );
     }
 
     #[test]
