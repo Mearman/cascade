@@ -15,8 +15,8 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
-  compile:
-    name: Compile (${{ matrix.target }})
+  check:
+    name: Check (${{ matrix.target }})
     strategy:
       fail-fast: false
       matrix:
@@ -38,51 +38,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Install system dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
-      - name: Build workspace
-        run: cargo build --workspace --all-targets
-      - name: Save compilation for downstream jobs
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: compile-${{ matrix.target }}-${{ github.run_id }}
-
-  check:
-    name: Check (${{ matrix.target }})
-    needs: compile
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          - os: macos-13
-            target: x86_64-apple-darwin
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-        with:
-          components: rustfmt, clippy
-      - name: Restore compilation
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: compile-${{ matrix.target }}-${{ github.run_id }}
+          key: check-${{ matrix.target }}
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
@@ -90,8 +47,6 @@ jobs:
         run: cargo fmt --check
       - name: Clippy
         run: cargo clippy --workspace
-      - name: Check
-        run: cargo check --workspace
       - name: Docs
         run: cargo doc --workspace --no-deps --document-private-items
         env:
@@ -99,7 +54,6 @@ jobs:
 
   test:
     name: Test (${{ matrix.target }})
-    needs: compile
     strategy:
       fail-fast: false
       matrix:
@@ -118,14 +72,9 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - name: Restore compilation
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: compile-${{ matrix.target }}-${{ github.run_id }}
+          key: test-${{ matrix.target }}
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
@@ -343,6 +292,42 @@ jobs:
         with:
           tag_name: ${{ needs.release.outputs.version }}
           files: dist/cascade-aarch64-linux.tar.gz*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-windows-x86:
+    name: Build Windows x86_64
+    needs: release
+    if: needs.release.outputs.released == 'true'
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.release.outputs.version }}
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Build
+        run: cargo build --release --target x86_64-pc-windows-msvc -p cascade
+        env:
+          CASCADE_GDRIVE_CLIENT_ID: ${{ secrets.CASCADE_GDRIVE_CLIENT_ID }}
+          CASCADE_GDRIVE_CLIENT_SECRET: ${{ secrets.CASCADE_GDRIVE_CLIENT_SECRET }}
+      - name: Package archive
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/cascade.exe dist/cascade.exe
+          Compress-Archive -Path dist/cascade.exe -DestinationPath dist/cascade-x86_64-windows.zip
+          $hash = (Get-FileHash -Algorithm SHA256 dist/cascade-x86_64-windows.zip).Hash.ToLower()
+          $hash | Out-File -Encoding ascii -NoNewline dist/cascade-x86_64-windows.zip.sha256
+      - name: Upload to release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ needs.release.outputs.version }}
+          files: dist/cascade-x86_64-windows.zip*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
