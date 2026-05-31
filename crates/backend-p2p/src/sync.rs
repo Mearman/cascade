@@ -791,6 +791,73 @@ mod tests {
         assert_eq!(fetched, data);
     }
 
+    /// Two concurrent block requests against the same peer must each
+    /// get a distinct `request_id` and must each receive the right
+    /// payload — no Response can be misrouted by FIFO order.
+    #[tokio::test]
+    async fn request_block_uses_distinct_request_ids_concurrently() {
+        let (_dir_a, engine_a) = make_engine("shared").await;
+        let (_dir_b, engine_b) = make_engine("shared").await;
+
+        engine_a.trust(engine_b.device_id().to_string()).await;
+        engine_b.trust(engine_a.device_id().to_string()).await;
+
+        // Two distinct blocks on A's store.
+        let data_x = vec![0xAAu8; 4096];
+        let data_y = vec![0xBBu8; 4096];
+        let hash_x = BlockHash::from_data(&data_x);
+        let hash_y = BlockHash::from_data(&data_y);
+        engine_a.blocks.store_block(&hash_x, &data_x).await.unwrap();
+        engine_a.blocks.store_block(&hash_y, &data_y).await.unwrap();
+
+        let (_cancel_tx_a, cancel_rx_a) = tokio::sync::watch::channel(false);
+        let (addr_a, _a_task) = engine_a
+            .start_listener("127.0.0.1:0".parse().unwrap(), cancel_rx_a)
+            .await
+            .unwrap();
+        engine_b
+            .connect_to(Peer {
+                device_id: engine_a.device_id().to_string(),
+                address: addr_a,
+            })
+            .await
+            .unwrap();
+
+        // Wait for the peer handle to be registered.
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let peers = engine_b.peers.lock().await;
+            if peers.contains_key(engine_a.device_id()) {
+                break;
+            }
+        }
+
+        // Fire both requests concurrently and assert both succeed with
+        // the right bytes.
+        let size = u32::try_from(data_x.len()).unwrap();
+        let engine_b_x = engine_b.clone();
+        let engine_b_y = engine_b.clone();
+        let fut_x = tokio::spawn(async move {
+            engine_b_x.fetch_block("x.bin", 0, size, hash_x.0).await
+        });
+        let fut_y = tokio::spawn(async move {
+            engine_b_y.fetch_block("y.bin", 0, size, hash_y.0).await
+        });
+
+        let got_x = fut_x.await.unwrap().expect("expected X block");
+        let got_y = fut_y.await.unwrap().expect("expected Y block");
+        assert_eq!(got_x, data_x);
+        assert_eq!(got_y, data_y);
+
+        // The peer's id allocator must have advanced by at least two.
+        let peers = engine_b.peers.lock().await;
+        let handle = peers.get(engine_a.device_id()).unwrap();
+        assert!(
+            handle.next_request_id.load(Ordering::Relaxed) >= 3,
+            "expected at least two ids consumed",
+        );
+    }
+
     #[tokio::test]
     async fn merge_files_skips_when_local_dominates() {
         let (_dir, engine) = make_engine("f").await;

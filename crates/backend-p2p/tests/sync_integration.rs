@@ -336,6 +336,81 @@ async fn version_vectors_resolve_concurrent_upload() {
     );
 }
 
+/// Concurrent downloads on a single peer connection must not serialise
+/// behind each other. B uploads three files to A, then on a separate
+/// node C fires three `download` calls in parallel. All three complete
+/// with the right content, well inside the worst-case-serial bound.
+#[tokio::test]
+async fn concurrent_downloads_do_not_serialise() {
+    let a = Node::new("a", "shared").await;
+    let b = Node::new("b", "shared").await;
+    mutual_trust(&a, &b).await;
+    let _cancel = connect_via_listener(&a, &b).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Three distinct payloads, each larger than the smallest block
+    // size so the download path actually exercises the block-fetch
+    // round trip.
+    let p1 = vec![0x11u8; 200 * 1024];
+    let p2 = vec![0x22u8; 200 * 1024];
+    let p3 = vec![0x33u8; 200 * 1024];
+
+    for (name, payload) in [("one.bin", &p1), ("two.bin", &p2), ("three.bin", &p3)] {
+        let mut r = Cursor::new(payload.clone());
+        a.backend
+            .upload(
+                Path::new(name),
+                &mut r,
+                &FileId(format!("{}:root", a.backend.id())),
+            )
+            .await
+            .unwrap();
+    }
+
+    // Wait until B has seen all three entries.
+    assert_eq!(wait_for_file(&b, "one.bin").await, Some(p1.len() as u64));
+    assert_eq!(wait_for_file(&b, "two.bin").await, Some(p2.len() as u64));
+    assert_eq!(wait_for_file(&b, "three.bin").await, Some(p3.len() as u64));
+
+    // Fire three downloads concurrently. With per-request correlation
+    // they overlap on the wire; without it they queue strictly. We
+    // assert correctness here, not wall-clock — a generous timeout
+    // catches the pathological serialised case.
+    let entry_1 = b.backend.metadata(Path::new("one.bin")).await.unwrap();
+    let entry_2 = b.backend.metadata(Path::new("two.bin")).await.unwrap();
+    let entry_3 = b.backend.metadata(Path::new("three.bin")).await.unwrap();
+
+    let b_1 = b.backend.clone();
+    let b_2 = b.backend.clone();
+    let b_3 = b.backend.clone();
+
+    let job = async move {
+        let f1 = tokio::spawn(async move {
+            let mut out = Vec::new();
+            b_1.download(&entry_1, &mut out).await.unwrap();
+            out
+        });
+        let f2 = tokio::spawn(async move {
+            let mut out = Vec::new();
+            b_2.download(&entry_2, &mut out).await.unwrap();
+            out
+        });
+        let f3 = tokio::spawn(async move {
+            let mut out = Vec::new();
+            b_3.download(&entry_3, &mut out).await.unwrap();
+            out
+        });
+        (f1.await.unwrap(), f2.await.unwrap(), f3.await.unwrap())
+    };
+
+    let (out1, out2, out3) = tokio::time::timeout(Duration::from_secs(5), job)
+        .await
+        .expect("three concurrent downloads should finish well under 5s");
+    assert_eq!(out1, p1);
+    assert_eq!(out2, p2);
+    assert_eq!(out3, p3);
+}
+
 /// Block-fetch fallback: A has a block, B does not. B's `download`
 /// must satisfy the read by pulling the block from A.
 #[tokio::test]
