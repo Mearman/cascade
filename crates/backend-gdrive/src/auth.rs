@@ -620,9 +620,9 @@ mod tests {
     // in CI without waiting for a Linux runner.
     // -----------------------------------------------------------------------
 
-    use super::file_store::{load_tokens_in, sanitise_account, save_tokens_in};
     #[cfg(unix)]
     use super::file_store::tokens_path_in;
+    use super::file_store::{load_tokens_in, sanitise_account, save_tokens_in};
 
     fn sample_tokens() -> AuthTokens {
         AuthTokens {
