@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.20](https://github.com/Mearman/cascade/compare/v0.1.19...v0.1.20) - 2026-05-31
+
+### Added
+
+- *(p2p)* unit + integration + Docker Compose e2e for the P2P backend
+
 ## [0.1.19](https://github.com/Mearman/cascade/compare/v0.1.18...v0.1.19) - 2026-05-31
 
 ### Other
