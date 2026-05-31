@@ -164,25 +164,31 @@ impl P2pBackend {
             // `listen_addr` uses port 0 — peers receiving a port-0
             // announcement would be unable to connect back).
             let bound_port = match cfg_listen_addr {
-                Some(addr) => match sync_for_listener.start_listener(addr).await {
-                    Ok((bound, _handle)) => {
-                        tracing::info!(
-                            target: "cascade::backend::p2p",
-                            "P2P backend `{}` listening on {bound} as device {}",
-                            cfg_instance_id,
-                            sync_for_listener.device_id(),
-                        );
-                        Some(bound.port())
+                Some(addr) => {
+                    let listener_cancel = cancel_for_children.subscribe();
+                    match sync_for_listener
+                        .start_listener(addr, listener_cancel)
+                        .await
+                    {
+                        Ok((bound, _handle)) => {
+                            tracing::info!(
+                                target: "cascade::backend::p2p",
+                                "P2P backend `{}` listening on {bound} as device {}",
+                                cfg_instance_id,
+                                sync_for_listener.device_id(),
+                            );
+                            Some(bound.port())
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                target: "cascade::backend::p2p",
+                                "P2P backend `{}` failed to listen on {addr}: {e:#}",
+                                cfg_instance_id,
+                            );
+                            None
+                        }
                     }
-                    Err(e) => {
-                        tracing::error!(
-                            target: "cascade::backend::p2p",
-                            "P2P backend `{}` failed to listen on {addr}: {e:#}",
-                            cfg_instance_id,
-                        );
-                        None
-                    }
-                },
+                }
                 None => None,
             };
 
@@ -610,34 +616,49 @@ async fn discovery_announce_loop(
 /// `spawn_blocking` with a 15 s timeout. Errors are logged and the loop
 /// continues.
 ///
-/// Exits as soon as `cancel` flips to `true`. Cancellation is checked
-/// at the top of each iteration; an in-flight 15 s `listen` call may
-/// still need to finish before the loop notices, so callers should
-/// expect a bounded delay on shutdown.
-async fn discovery_listen_loop(sync: SyncEngine, cancel: tokio::sync::watch::Receiver<bool>) {
+/// Exits as soon as `cancel` flips to `true`. The outer task races
+/// `cancel.changed()` against the in-flight `listen` future, so
+/// shutdown is observed immediately rather than waiting up to the 15 s
+/// blocking timeout. The detached `spawn_blocking` thread will finish
+/// on its own when the std-net call times out, but the async task no
+/// longer blocks on it.
+async fn discovery_listen_loop(sync: SyncEngine, mut cancel: tokio::sync::watch::Receiver<bool>) {
     loop {
         if *cancel.borrow() {
             return;
         }
-        let result = tokio::task::spawn_blocking(|| {
+        let listen_fut = tokio::task::spawn_blocking(|| {
             cascade_p2p::discovery::listen(std::time::Duration::from_secs(15))
-        })
-        .await;
-        let peers = match result {
-            Ok(Ok(peers)) => peers,
-            Ok(Err(e)) => {
-                tracing::debug!(
-                    target: "cascade::backend::p2p",
-                    "LAN discovery listen failed: {e:#}",
-                );
-                Vec::new()
+        });
+        let peers = tokio::select! {
+            res = cancel.changed() => {
+                if res.is_err() || *cancel.borrow() {
+                    tracing::debug!(
+                        target: "cascade::backend::p2p",
+                        "discovery listen loop cancelled",
+                    );
+                    return;
+                }
+                continue;
             }
-            Err(e) => {
-                tracing::debug!(
-                    target: "cascade::backend::p2p",
-                    "LAN discovery listen task panicked: {e:#}",
-                );
-                Vec::new()
+            result = listen_fut => {
+                match result {
+                    Ok(Ok(peers)) => peers,
+                    Ok(Err(e)) => {
+                        tracing::debug!(
+                            target: "cascade::backend::p2p",
+                            "LAN discovery listen failed: {e:#}",
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            target: "cascade::backend::p2p",
+                            "LAN discovery listen task panicked: {e:#}",
+                        );
+                        continue;
+                    }
+                }
             }
         };
         for peer in peers {
@@ -897,9 +918,10 @@ mod tests {
             .trust(backend_a.sync().device_id().to_string())
             .await;
 
+        let (_cancel_tx_a, cancel_rx_a) = tokio::sync::watch::channel(false);
         let (addr_a, _a_task) = backend_a
             .sync()
-            .start_listener("127.0.0.1:0".parse().unwrap())
+            .start_listener("127.0.0.1:0".parse().unwrap(), cancel_rx_a)
             .await
             .unwrap();
         backend_b

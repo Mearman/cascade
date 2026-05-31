@@ -171,9 +171,16 @@ impl SyncEngine {
     ///
     /// Returns the bound `SocketAddr` (useful when binding to port 0)
     /// and a `JoinHandle` for the listener task.
+    ///
+    /// The `cancel` receiver lets the caller break the accept loop when
+    /// the owning backend is dropped. Without it, dropping the
+    /// `JoinHandle` would detach the task rather than abort it, leaving
+    /// the accept loop alive forever and keeping `Arc<FolderIndex>` and
+    /// `Arc<BlockStore>` pinned through the engine clone.
     pub async fn start_listener(
         &self,
         addr: SocketAddr,
+        mut cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
         let listener = TcpListener::bind(addr)
             .await
@@ -184,19 +191,34 @@ impl SyncEngine {
         let engine = self.clone();
         let handle = tokio::spawn(async move {
             loop {
-                let (stream, peer_addr) = match listener.accept().await {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        warn!("P2P listener accept failed: {e}");
-                        continue;
+                tokio::select! {
+                    res = cancel.changed() => {
+                        if res.is_err() || *cancel.borrow() {
+                            debug!(
+                                target: "cascade::backend::p2p",
+                                "listener task cancelled",
+                            );
+                            break;
+                        }
                     }
-                };
-                let engine = engine.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = engine.handle_inbound(stream, peer_addr).await {
-                        debug!("inbound peer {peer_addr} disconnected: {e:#}");
+                    accept_result = listener.accept() => {
+                        match accept_result {
+                            Ok((stream, peer_addr)) => {
+                                let engine = engine.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = engine.handle_inbound(stream, peer_addr).await {
+                                        debug!(
+                                            "inbound peer {peer_addr} disconnected: {e:#}",
+                                        );
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                warn!("P2P listener accept failed: {e}");
+                            }
+                        }
                     }
-                });
+                }
             }
         });
         Ok((bound, handle))
@@ -576,8 +598,9 @@ mod tests {
         engine_a.trust(engine_b.device_id().to_string()).await;
         engine_b.trust(engine_a.device_id().to_string()).await;
 
+        let (_cancel_tx_b, cancel_rx_b) = tokio::sync::watch::channel(false);
         let (addr_b, _b_task) = engine_b
-            .start_listener("127.0.0.1:0".parse().unwrap())
+            .start_listener("127.0.0.1:0".parse().unwrap(), cancel_rx_b)
             .await
             .unwrap();
         engine_a
@@ -628,8 +651,9 @@ mod tests {
         let hash = BlockHash::from_data(&data);
         engine_a.blocks.store_block(&hash, &data).await.unwrap();
 
+        let (_cancel_tx_a, cancel_rx_a) = tokio::sync::watch::channel(false);
         let (addr_a, _a_task) = engine_a
-            .start_listener("127.0.0.1:0".parse().unwrap())
+            .start_listener("127.0.0.1:0".parse().unwrap(), cancel_rx_a)
             .await
             .unwrap();
         engine_b
@@ -878,5 +902,25 @@ mod tests {
         };
         let err = entry_to_file_info(&entry).unwrap_err();
         assert!(err.to_string().contains("partial hash"));
+    }
+
+    /// The accept loop must observe the `cancel` watch and exit. Without
+    /// this, dropping the `JoinHandle` would detach the task and leave
+    /// the loop running forever, pinning the cloned engine (and its
+    /// `Arc<FolderIndex>` / `Arc<BlockStore>`) past the backend's
+    /// lifetime.
+    #[tokio::test]
+    async fn start_listener_exits_on_cancel() {
+        let (_dir, engine) = make_engine("f").await;
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let (_bound, handle) = engine
+            .start_listener("127.0.0.1:0".parse().unwrap(), cancel_rx)
+            .await
+            .unwrap();
+        cancel_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("listener should exit within 2s of cancel")
+            .expect("listener task should not panic");
     }
 }

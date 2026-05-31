@@ -55,10 +55,11 @@ async fn mutual_trust(a: &Node, b: &Node) {
 
 /// Start a listener on `node` and connect `peer` to it.
 async fn connect_via_listener(server: &Node, client: &Node) {
+    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     let (addr, _) = server
         .backend
         .sync()
-        .start_listener("127.0.0.1:0".parse().unwrap())
+        .start_listener("127.0.0.1:0".parse().unwrap(), cancel_rx)
         .await
         .unwrap();
     client
@@ -103,10 +104,11 @@ async fn three_peer_index_propagation() {
     mutual_trust(&a, &c).await;
 
     // A listens; B and C dial in.
+    let (_cancel_tx_a, cancel_rx_a) = tokio::sync::watch::channel(false);
     let (addr_a, _task) = a
         .backend
         .sync()
-        .start_listener("127.0.0.1:0".parse().unwrap())
+        .start_listener("127.0.0.1:0".parse().unwrap(), cancel_rx_a)
         .await
         .unwrap();
     b.backend
