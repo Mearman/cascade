@@ -470,3 +470,83 @@ jobs:
           git add bucket/cascade.json
           git diff --cached --quiet || git commit -m "chore: update manifest to ${VERSION}"
           git push
+
+  verify-brew-macos:
+    name: Verify Homebrew install (macOS)
+    needs: [release, update-tap]
+    if: needs.release.outputs.released == 'true'
+    runs-on: macos-latest
+    steps:
+      - name: Install via Homebrew tap
+        run: |
+          brew tap Mearman/cascade
+          brew install Mearman/cascade/cascade
+      - name: Run cascade --version
+        run: |
+          cascade --version
+          # Verify the installed version matches the release tag.
+          INSTALLED=$(cascade --version | awk '{print $2}')
+          EXPECTED="${VERSION#v}"
+          if [ "$INSTALLED" != "$EXPECTED" ]; then
+            echo "version mismatch: installed=$INSTALLED expected=$EXPECTED"
+            exit 1
+          fi
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+
+  verify-brew-linux:
+    name: Verify Homebrew install (Linux)
+    needs: [release, update-tap]
+    if: needs.release.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Homebrew on Linux
+        run: |
+          /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" </dev/null
+          echo "/home/linuxbrew/.linuxbrew/bin" >> $GITHUB_PATH
+      - name: Install via Homebrew tap
+        run: |
+          brew tap Mearman/cascade
+          brew install Mearman/cascade/cascade
+      - name: Run cascade --version
+        run: |
+          cascade --version
+          INSTALLED=$(cascade --version | awk '{print $2}')
+          EXPECTED="${VERSION#v}"
+          if [ "$INSTALLED" != "$EXPECTED" ]; then
+            echo "version mismatch: installed=$INSTALLED expected=$EXPECTED"
+            exit 1
+          fi
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+
+  verify-scoop:
+    name: Verify Scoop install (Windows)
+    needs: [release, update-scoop]
+    if: needs.release.outputs.released == 'true'
+    runs-on: windows-latest
+    steps:
+      - name: Install Scoop
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+          Invoke-RestMethod -Uri https://get.scoop.sh | Invoke-Expression
+          Add-Content $env:GITHUB_PATH "$env:USERPROFILE\scoop\shims"
+      - name: Add bucket and install cascade
+        shell: pwsh
+        run: |
+          scoop bucket add cascade https://github.com/Mearman/scoop-cascade
+          scoop install cascade
+      - name: Run cascade --version
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          $output = cascade --version
+          Write-Host $output
+          $installed = ($output -split '\s+')[1]
+          $expected = $env:VERSION -replace '^v',''
+          if ($installed -ne $expected) {
+            Write-Host "version mismatch: installed=$installed expected=$expected"
+            exit 1
+          }
