@@ -388,8 +388,8 @@ pub fn encode_message(msg: &BepMessage) -> Result<Vec<u8>> {
             encode_string(&mut body, reason)?;
         }
         BepMessage::Gossip { peers } => {
-            let peer_count = u32::try_from(peers.len())
-                .map_err(|_| anyhow::anyhow!("too many gossip peers"))?;
+            let peer_count =
+                u32::try_from(peers.len()).map_err(|_| anyhow::anyhow!("too many gossip peers"))?;
             encode_u32(&mut body, peer_count);
             for peer in peers {
                 encode_string(&mut body, &peer.device_id)?;
@@ -548,9 +548,7 @@ fn decode_close(data: &[u8]) -> Result<BepMessage> {
 fn decode_gossip(data: &[u8]) -> Result<BepMessage> {
     let (count, mut rest) = decode_u32(data)?;
     if count > MAX_GOSSIP_PEERS {
-        anyhow::bail!(
-            "gossip peer count {count} exceeds maximum {MAX_GOSSIP_PEERS}",
-        );
+        anyhow::bail!("gossip peer count {count} exceeds maximum {MAX_GOSSIP_PEERS}",);
     }
     let mut peers = Vec::with_capacity(count as usize);
     for _ in 0..count {
@@ -854,10 +852,7 @@ mod tests {
                 },
                 GossipPeer {
                     device_id: "BBBB".to_string(),
-                    addresses: vec![
-                        "10.0.0.1:22000".to_string(),
-                        "[fe80::1]:22000".to_string(),
-                    ],
+                    addresses: vec!["10.0.0.1:22000".to_string(), "[fe80::1]:22000".to_string()],
                     last_seen_unix_seconds: 1_700_000_100,
                 },
             ],
