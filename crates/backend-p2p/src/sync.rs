@@ -14,11 +14,15 @@
 //!    ignored. If the incoming version dominates the local row, the
 //!    incoming row wins. If neither dominates (concurrent edit on
 //!    disconnected peers), the local row's content is preserved as a
-//!    conflict copy at a sibling `<stem>.conflict-<short-id>-<ts>.<ext>`
+//!    conflict copy at a sibling `<stem>.conflict-<id>-<ts>.<ext>`
 //!    path, then the incoming row overwrites the original with the
 //!    merged version vector so subsequent comparisons see both
-//!    histories. A row with `FileInfo.deleted` set marks the local
-//!    entry as a tombstone instead of overwriting its blocks.
+//!    histories. The conflict-copy `<id>` is the friendly name
+//!    configured for the LOCAL device when one is set, sanitised for
+//!    filesystem use; otherwise it falls back to the first eight
+//!    characters of the device id. A row with `FileInfo.deleted` set
+//!    marks the local entry as a tombstone instead of overwriting its
+//!    blocks.
 //! 3. Local writes (`upload`, `update`, `delete`) bump the local
 //!    device's counter in the row's version vector, then broadcast an
 //!    `IndexUpdate` frame with the new row — tombstones included — to
@@ -686,15 +690,26 @@ impl SyncEngine {
     /// state — same content, same modified time, same version vector —
     /// but at a unique path so it does not collide on any peer.
     ///
+    /// The path identifier comes from the friendly name configured for
+    /// the LOCAL device when one is set (sanitised for filesystem use);
+    /// otherwise it falls back to the first eight characters of the
+    /// device id. An empty sanitised name also triggers the fallback
+    /// so the resulting path is never `<stem>.conflict--<ts>.<ext>`.
+    ///
     /// A row whose content is empty (zero size, no block hashes) is
     /// skipped — there's nothing meaningful to preserve.
     fn persist_conflict_copy(&self, original_path: &str, local: &IndexEntry) -> Result<()> {
         if local.size == 0 && local.block_hashes.is_empty() {
             return Ok(());
         }
-        let short_id = local_short_device_id(self.device_id());
+        let identifier = self
+            .local_device_name
+            .as_deref()
+            .map(sanitise_for_path)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| local_short_device_id(self.device_id()));
         let timestamp = unix_timestamp_seconds();
-        let conflict_path = conflict_copy_path(original_path, &short_id, timestamp);
+        let conflict_path = conflict_copy_path(original_path, &identifier, timestamp);
         let conflict_entry = IndexEntry {
             path: conflict_path.clone(),
             is_dir: false,
@@ -785,26 +800,67 @@ impl SyncEngine {
 /// Build the path at which to persist a conflict copy of a row whose
 /// content is about to be overwritten by an incoming concurrent write.
 ///
-/// The format is `<stem>.conflict-<short_device_id>-<timestamp>.<ext>`
+/// The format is `<stem>.conflict-<device_identifier>-<timestamp>.<ext>`
 /// where the stem and extension are split on the LAST `.` in the
 /// filename. A leading dot is treated as a hidden-file marker rather
 /// than an extension separator, so `.gitignore` becomes
 /// `.gitignore.conflict-<id>-<ts>` with no trailing extension.
-fn conflict_copy_path(original: &str, short_device_id: &str, timestamp: i64) -> String {
+///
+/// `device_identifier` is the friendly device name when one is
+/// configured, otherwise the first eight characters of the device id.
+/// Callers are responsible for sanitising it via `sanitise_for_path`
+/// before passing it in.
+fn conflict_copy_path(original: &str, device_identifier: &str, timestamp: i64) -> String {
     let (parent, filename) = match original.rsplit_once('/') {
         Some((p, f)) => (Some(p), f),
         None => (None, original),
     };
     let (stem, ext) = split_filename(filename);
     let suffixed = if ext.is_empty() {
-        format!("{stem}.conflict-{short_device_id}-{timestamp}")
+        format!("{stem}.conflict-{device_identifier}-{timestamp}")
     } else {
-        format!("{stem}.conflict-{short_device_id}-{timestamp}.{ext}")
+        format!("{stem}.conflict-{device_identifier}-{timestamp}.{ext}")
     };
     match parent {
         Some(p) => format!("{p}/{suffixed}"),
         None => suffixed,
     }
+}
+
+/// Sanitise a string for use as a filename component in a conflict-copy
+/// path. Replaces any character that is unsafe or noisy in a filename
+/// with a single `-` and lowercases the result. Forward slash,
+/// backslash, dot, and whitespace are always replaced; a handful of
+/// shell-significant characters and any remaining control character
+/// are also normalised.
+///
+/// Replacement is one-for-one — runs of replaced characters become runs
+/// of dashes — so `..` becomes `--` and `home/server` becomes
+/// `home-server`. Collapsing would alias distinct inputs (`a..b` vs
+/// `a-b`) which is undesirable when the identifier is meant to be
+/// distinguishing.
+///
+/// An empty input produces an empty output — the caller is expected to
+/// fall back to the short device id when this happens.
+fn sanitise_for_path(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        let replaced = match ch {
+            // Filesystem path separators and the extension separator.
+            '/' | '\\' | '.'
+            // Whitespace — keeps filenames terminal-friendly.
+            | ' ' | '\t' | '\n' | '\r'
+            // Shell metacharacters and control bytes get normalised too;
+            // these would otherwise need quoting at every use site.
+            | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0' => '-',
+            // Any other control character is replaced as well so the
+            // result is safe to embed in shell output and filenames.
+            other if other.is_control() => '-',
+            other => other,
+        };
+        out.push(replaced);
+    }
+    out.to_lowercase()
 }
 
 /// Split a filename into `(stem, extension)` on the LAST `.`. A leading
