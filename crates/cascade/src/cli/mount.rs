@@ -585,6 +585,7 @@ fn resolve_mount_path(path: &str) -> PathBuf {
 }
 
 /// Resolve the mount path from config.toml, falling back to ~/Cloud.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn resolve_mount_path_from_config(config_dir: &Path) -> PathBuf {
     let main_config = load_main_config(config_dir).ok();
     let configured = main_config.as_ref().and_then(|c| {
