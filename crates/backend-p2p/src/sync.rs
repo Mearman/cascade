@@ -13,11 +13,12 @@
 //!    local row dominates the incoming version, the incoming row is
 //!    ignored. If the incoming version dominates the local row, the
 //!    incoming row wins. If neither dominates (concurrent edit on
-//!    disconnected peers), a `tracing::warn!` records the conflict and
-//!    the incoming row is accepted — the persisted-conflict-copy
-//!    behaviour is a follow-up. A row with `FileInfo.deleted` set
-//!    marks the local entry as a tombstone instead of overwriting
-//!    its blocks.
+//!    disconnected peers), the local row's content is preserved as a
+//!    conflict copy at a sibling `<stem>.conflict-<short-id>-<ts>.<ext>`
+//!    path, then the incoming row overwrites the original with the
+//!    merged version vector so subsequent comparisons see both
+//!    histories. A row with `FileInfo.deleted` set marks the local
+//!    entry as a tombstone instead of overwriting its blocks.
 //! 3. Local writes (`upload`, `update`, `delete`) bump the local
 //!    device's counter in the row's version vector, then broadcast an
 //!    `IndexUpdate` frame with the new row — tombstones included — to
@@ -1114,6 +1115,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn conflict_copy_path_splits_on_last_dot() {
+        // Compound extensions like `.tar.gz` split on the LAST dot:
+        // stem = `archive.tar`, ext = `gz`. The conflict marker lands
+        // between them. Two-component restoration (`gunzip` then
+        // `tar -xf`) still recognises the file shape.
+        assert_eq!(
+            conflict_copy_path("archive.tar.gz", "7BHJ62FL", 1_700_000_000),
+            "archive.tar.conflict-7BHJ62FL-1700000000.gz",
+        );
+    }
+
     #[tokio::test]
     async fn merge_files_concurrent_edit_accepts_incoming() {
         let (_dir, engine) = make_engine("f").await;
@@ -1147,9 +1160,12 @@ mod tests {
             }])
             .unwrap();
         let after = engine.index.get("doc.txt").unwrap().unwrap();
-        // Conflict-copy persistence is a follow-up; for now incoming
-        // content wins, but the version vector must merge both counters so
-        // a third peer sees the full history.
+        // The incoming row overwrites the original (matching the
+        // ordering chosen by merge_files on the concurrent branch);
+        // the version vector must merge both counters so a third peer
+        // sees the full history. Separately, the conflict-copy path
+        // covered by `merge_files_persists_conflict_copy` ensures the
+        // displaced local content is preserved at a sibling path.
         assert_eq!(after.size, 99);
         assert!(
             after.version.iter().any(|(id, _)| *id == 1),
