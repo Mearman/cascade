@@ -240,6 +240,80 @@ pub fn backend_add(
             let config_str = toml::to_string_pretty(&full_config)?;
             std::fs::write(&config_path, &config_str)?;
         }
+        "p2p" => {
+            println!("\nP2P configuration:");
+
+            let listen_addr = read_input("Listen address (host:port, blank to disable)")?;
+            let display_name = read_input("Display name (blank for backend name)")?;
+            let data_dir =
+                read_input("Data directory (blank for default ~/.config/cascade/p2p-<name>)")?;
+            let enable_discovery_raw = read_input("Enable LAN discovery? (y/N)")?;
+            let enable_discovery = matches!(
+                enable_discovery_raw.to_ascii_lowercase().as_str(),
+                "y" | "yes"
+            );
+
+            let mut peers: Vec<toml::Value> = Vec::new();
+            loop {
+                let add_peer = read_input("Add a peer? (y/N)")?;
+                if !matches!(add_peer.to_ascii_lowercase().as_str(), "y" | "yes") {
+                    break;
+                }
+                let device_id = loop {
+                    let id = read_input("  Peer device_id")?;
+                    if id.is_empty() {
+                        eprintln!("  device_id must not be empty");
+                        continue;
+                    }
+                    break id;
+                };
+                let address = loop {
+                    let addr = read_input("  Peer address (host:port)")?;
+                    if addr.is_empty() {
+                        eprintln!("  address must not be empty");
+                        continue;
+                    }
+                    break addr;
+                };
+                let mut peer = toml::Table::new();
+                peer.insert("device_id".to_string(), toml::Value::String(device_id));
+                peer.insert("address".to_string(), toml::Value::String(address));
+                peers.push(toml::Value::Table(peer));
+            }
+
+            let mut full_config = toml::Table::new();
+            full_config.insert("type".to_string(), toml::Value::String("p2p".to_string()));
+            full_config.insert(
+                "name".to_string(),
+                toml::Value::String(backend_name.to_string()),
+            );
+            if let Some(mp) = mount_path {
+                full_config.insert(
+                    "mount_path".to_string(),
+                    toml::Value::String(mp.to_string()),
+                );
+            }
+            if !display_name.is_empty() {
+                full_config.insert(
+                    "display_name".to_string(),
+                    toml::Value::String(display_name),
+                );
+            }
+            if !data_dir.is_empty() {
+                full_config.insert("data_dir".to_string(), toml::Value::String(data_dir));
+            }
+            if !listen_addr.is_empty() {
+                full_config.insert("listen_addr".to_string(), toml::Value::String(listen_addr));
+            }
+            if enable_discovery {
+                full_config.insert("enable_discovery".to_string(), toml::Value::Boolean(true));
+            }
+            if !peers.is_empty() {
+                full_config.insert("peers".to_string(), toml::Value::Array(peers));
+            }
+            let config_str = toml::to_string_pretty(&full_config)?;
+            std::fs::write(&config_path, &config_str)?;
+        }
         "gdrive" => {
             // Use CLI flags if provided, otherwise prompt interactively.
             let client_id = if let Some(cid) = cli_client_id {
@@ -411,6 +485,7 @@ fn backend_type_display(backend_type: &str) -> &str {
     match backend_type {
         "gdrive" => "Google Drive",
         "s3" => "S3 Compatible",
+        "p2p" => "P2P",
         _ => backend_type,
     }
 }

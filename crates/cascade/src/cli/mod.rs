@@ -226,7 +226,7 @@ pub enum Commands {
     /// Add a backend
     #[command(name = "backend-add")]
     BackendAdd {
-        /// Backend type (gdrive, s3)
+        /// Backend type (gdrive, s3, p2p)
         backend_type: String,
 
         /// Name for this backend instance
