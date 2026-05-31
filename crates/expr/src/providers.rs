@@ -140,7 +140,7 @@ impl DiskProvider {
     }
 
     /// Collect disk stats for the filesystem containing the given path.
-    #[allow(unsafe_code)]
+    #[allow(unsafe_code, clippy::missing_const_for_fn)]
     #[must_use]
     pub fn collect_for_path(path: &str) -> DiskContext {
         #[cfg(unix)]
