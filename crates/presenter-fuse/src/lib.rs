@@ -186,8 +186,13 @@ impl VfsPresenter for FusePresenter {
                 crate::ops::FuseOps::new_with_vfs(self.root_id.clone(), Arc::clone(&self.vfs));
             let mp = mount_point.to_path_buf();
 
-            // Spawn the FUSE session in a background task.
-            // fuser::spawn_mount2 blocks, so we run it in a dedicated thread.
+            // Spawn the FUSE session in a background thread. fuser::mount2
+            // is the *blocking* form — it returns only when the filesystem
+            // is unmounted from the outside (umount(8) / Ctrl-C / Drop).
+            // Using fuser::spawn_mount2 here would have returned a
+            // BackgroundSession that we'd need to keep alive; dropping it
+            // tears the mount down immediately, which is what produced the
+            // "FUSE session ended" log line one tick after start in CI.
             std::thread::spawn(move || {
                 let mut config = fuser::Config::default();
                 config.mount_options = vec![
@@ -195,13 +200,10 @@ impl VfsPresenter for FusePresenter {
                     fuser::MountOption::FSName("cascade".to_string()),
                     fuser::MountOption::DefaultPermissions,
                 ];
-                match fuser::spawn_mount2(ops, &mp, &config) {
-                    Ok(_session) => {
-                        tracing::info!("FUSE session ended");
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "FUSE mount failed");
-                    }
+                if let Err(e) = fuser::mount2(ops, &mp, &config) {
+                    tracing::error!(error = %e, "FUSE mount failed");
+                } else {
+                    tracing::info!("FUSE session ended");
                 }
             });
 
