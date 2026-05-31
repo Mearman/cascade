@@ -776,6 +776,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn merge_files_creates_tombstone_for_unknown_path() {
+        let (_dir, engine) = make_engine("f").await;
+        // No prior upsert for "gone.txt".
+        engine
+            .merge_files(&[FileInfo {
+                name: "gone.txt".into(),
+                file_type: FILE_TYPE_FILE,
+                size: 0,
+                modified: 1_700_000_000,
+                block_size: 128 * 1024,
+                block_hashes: vec![],
+                deleted: true,
+            }])
+            .unwrap();
+        let row = engine
+            .index
+            .get("gone.txt")
+            .unwrap()
+            .expect("tombstone row should exist");
+        assert!(row.deleted);
+        assert_eq!(row.modified, 1_700_000_000);
+    }
+
+    #[tokio::test]
+    async fn merge_files_tombstone_wins_on_tied_modified() {
+        let (_dir, engine) = make_engine("f").await;
+        let ts = 1_700_000_000;
+        engine
+            .index
+            .upsert(&IndexEntry {
+                path: "doc.txt".into(),
+                is_dir: false,
+                size: 10,
+                modified: ts,
+                block_hashes: vec![0u8; 32],
+                deleted: false,
+                version: 0,
+            })
+            .unwrap();
+        engine
+            .merge_files(&[FileInfo {
+                name: "doc.txt".into(),
+                file_type: FILE_TYPE_FILE,
+                size: 0,
+                modified: ts, // same timestamp
+                block_size: 128 * 1024,
+                block_hashes: vec![],
+                deleted: true,
+            }])
+            .unwrap();
+        let row = engine.index.get("doc.txt").unwrap().unwrap();
+        assert!(row.deleted, "delete should win on tied modified");
+    }
+
+    #[tokio::test]
     async fn merge_files_skips_unknown_file_type() {
         let (_dir, engine) = make_engine("f").await;
         engine
