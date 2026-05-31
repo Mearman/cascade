@@ -1064,6 +1064,10 @@ mod tests {
 
     // --- Stop ---
 
+    // `stop` is only implemented on unix; the non-unix stub bails so
+    // these tests would always fail there. Gate to unix.
+
+    #[cfg(unix)]
     #[test]
     fn stop_succeeds_when_no_pid_file() {
         let dir = TempDir::new().unwrap();
@@ -1073,6 +1077,7 @@ mod tests {
         stop(&ctx).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn stop_cleans_up_stale_pid_file() {
         let dir = TempDir::new().unwrap();
