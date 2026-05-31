@@ -440,7 +440,10 @@ async fn try_fuse(
 /// Try to mount via the NFS presenter.
 ///
 /// Works on all platforms (Linux/macOS).  Same shutdown guarantees as
-/// the macOS presenter functions.
+/// the macOS presenter functions. On Windows the chain doesn't fall
+/// back to NFS (no built-in NFS client we can talk to from cascade),
+/// so this function would be unused there — silence the lint.
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 async fn try_nfs(
     ctx: &CliContext,
     mount_path: &Path,
@@ -1063,13 +1066,13 @@ fn is_mounted(path: &Path) -> bool {
 }
 
 #[cfg(not(target_os = "macos"))]
-#[allow(clippy::missing_const_for_fn, clippy::unused_self)]
+#[allow(clippy::missing_const_for_fn, clippy::unused_self, dead_code)]
 fn mount_nfs(_mount_point: &Path, _port: u16) -> Result<()> {
     anyhow::bail!("NFS mounting is not supported on this platform yet");
 }
 
-/// Mount the WebDAV server as a network drive on Windows via the
-/// built-in WebClient service (`net use`).
+/// Mount the `WebDAV` server as a network drive on Windows via the
+/// built-in `WebClient` service (`net use`).
 ///
 /// `mount_point` is used as a display string; the actual mount target
 /// is whichever drive letter Windows assigns when `*` is passed. The
@@ -1086,11 +1089,7 @@ fn mount_webdav(mount_point: &Path, port: u16) -> Result<()> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
-        anyhow::bail!(
-            "net use failed (is the WebClient service running?): {}{}",
-            stdout,
-            stderr
-        );
+        anyhow::bail!("net use failed (is the WebClient service running?): {stdout}{stderr}");
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1102,7 +1101,7 @@ fn mount_webdav(mount_point: &Path, port: u16) -> Result<()> {
     Ok(())
 }
 
-/// Unmount the most recently assigned WebDAV drive on Windows.
+/// Unmount the most recently assigned `WebDAV` drive on Windows.
 ///
 /// `net use <url> /delete` removes by URL rather than by drive letter,
 /// which matches how we created the mount with `*`.
