@@ -205,7 +205,7 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
 name = "cascade"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -238,7 +238,7 @@ dependencies = [
 
 [[package]]
 name = "cascade-backend-gdrive"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -260,7 +260,7 @@ dependencies = [
 
 [[package]]
 name = "cascade-backend-local"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -280,7 +280,7 @@ dependencies = [
 
 [[package]]
 name = "cascade-backend-p2p"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -301,7 +301,7 @@ dependencies = [
 
 [[package]]
 name = "cascade-backend-s3"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -319,7 +319,7 @@ dependencies = [
 
 [[package]]
 name = "cascade-config"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "anyhow",
  "serde",
@@ -332,7 +332,7 @@ dependencies = [
 
 [[package]]
 name = "cascade-engine"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -351,7 +351,7 @@ dependencies = [
 
 [[package]]
 name = "cascade-expr"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "anyhow",
  "chrono",
@@ -364,7 +364,7 @@ dependencies = [
 
 [[package]]
 name = "cascade-p2p"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -387,7 +387,7 @@ dependencies = [
 
 [[package]]
 name = "cascade-presenter-fileprovider"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -403,7 +403,7 @@ dependencies = [
 
 [[package]]
 name = "cascade-presenter-fskit"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -419,7 +419,7 @@ dependencies = [
 
 [[package]]
 name = "cascade-presenter-fuse"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -435,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "cascade-presenter-nfs"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -452,7 +452,7 @@ dependencies = [
 
 [[package]]
 name = "cascade-presenter-webdav"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "anyhow",
  "async-trait",

@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.21](https://github.com/Mearman/cascade/compare/v0.1.20...v0.1.21) - 2026-05-31
+
+### Added
+
+- *(p2p)* add request_id field to BEP Request/Response
+- *(p2p)* add Version vector type and FileInfo field
+- *(p2p)* add FileInfo.deleted flag to BEP wire protocol
+- *(cli)* support p2p backend in backend-add wizard
+
+### Fixed
+
+- *(cli)* tighten p2p backend-add wizard output and discovery handling
+
+### Other
+
+- *(cli)* cover p2p backend-add config round-trip
+
 ## [0.1.20](https://github.com/Mearman/cascade/compare/v0.1.19...v0.1.20) - 2026-05-31
 
 ### Added
