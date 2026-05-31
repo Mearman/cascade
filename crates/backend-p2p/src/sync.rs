@@ -1399,18 +1399,24 @@ mod tests {
             .unwrap();
         // Concurrent incoming write — neither vector dominates.
         engine
-            .merge_files(&[FileInfo {
-                name: "doc.txt".into(),
-                file_type: FILE_TYPE_FILE,
-                size: 99,
-                modified: 2_000_000_000,
-                block_size: 128 * 1024,
-                deleted: false,
-                version: Version {
-                    counters: vec![(2, 1)],
-                },
-                block_hashes: vec![[1u8; 32]],
-            }])
+            .merge_files(
+                "peer-test",
+                &[FileInfo {
+                    name: "doc.txt".into(),
+                    file_type: FILE_TYPE_FILE,
+                    size: 99,
+                    modified: 2_000_000_000,
+                    sequence: 0,
+                    block_size: 128 * 1024,
+                    deleted: false,
+                    invalid: false,
+                    no_permissions: false,
+                    version: Version {
+                        counters: vec![(2, 1)],
+                    },
+                    block_hashes: vec![[1u8; 32]],
+                }],
+            )
             .unwrap();
         // The displaced local row should be persisted at a sibling
         // path stamped with the sanitised friendly name, not the
@@ -1459,18 +1465,24 @@ mod tests {
             })
             .unwrap();
         engine
-            .merge_files(&[FileInfo {
-                name: "doc.txt".into(),
-                file_type: FILE_TYPE_FILE,
-                size: 99,
-                modified: 2_000_000_000,
-                block_size: 128 * 1024,
-                deleted: false,
-                version: Version {
-                    counters: vec![(2, 1)],
-                },
-                block_hashes: vec![[1u8; 32]],
-            }])
+            .merge_files(
+                "peer-test",
+                &[FileInfo {
+                    name: "doc.txt".into(),
+                    file_type: FILE_TYPE_FILE,
+                    size: 99,
+                    modified: 2_000_000_000,
+                    sequence: 0,
+                    block_size: 128 * 1024,
+                    deleted: false,
+                    invalid: false,
+                    no_permissions: false,
+                    version: Version {
+                        counters: vec![(2, 1)],
+                    },
+                    block_hashes: vec![[1u8; 32]],
+                }],
+            )
             .unwrap();
         let conflict_row = engine
             .index
@@ -1513,18 +1525,24 @@ mod tests {
             })
             .unwrap();
         engine
-            .merge_files(&[FileInfo {
-                name: "doc.txt".into(),
-                file_type: FILE_TYPE_FILE,
-                size: 99,
-                modified: 2_000_000_000,
-                block_size: 128 * 1024,
-                deleted: false,
-                version: Version {
-                    counters: vec![(2, 1)],
-                },
-                block_hashes: vec![[1u8; 32]],
-            }])
+            .merge_files(
+                "peer-test",
+                &[FileInfo {
+                    name: "doc.txt".into(),
+                    file_type: FILE_TYPE_FILE,
+                    size: 99,
+                    modified: 2_000_000_000,
+                    sequence: 0,
+                    block_size: 128 * 1024,
+                    deleted: false,
+                    invalid: false,
+                    no_permissions: false,
+                    version: Version {
+                        counters: vec![(2, 1)],
+                    },
+                    block_hashes: vec![[1u8; 32]],
+                }],
+            )
             .unwrap();
         let conflict_row = engine
             .index
@@ -1818,8 +1836,9 @@ mod tests {
         engine_a.trust(engine_b.device_id().to_string()).await;
         engine_b.trust(engine_a.device_id().to_string()).await;
 
+        let (_cancel_tx_b, cancel_rx_b) = tokio::sync::watch::channel(false);
         let (addr_b, _b_task) = engine_b
-            .start_listener("127.0.0.1:0".parse().unwrap())
+            .start_listener("127.0.0.1:0".parse().unwrap(), cancel_rx_b)
             .await
             .unwrap();
         engine_a
@@ -1850,8 +1869,9 @@ mod tests {
         engine_a.trust(engine_b.device_id().to_string()).await;
         engine_b.trust(engine_a.device_id().to_string()).await;
 
+        let (_cancel_tx_b, cancel_rx_b) = tokio::sync::watch::channel(false);
         let (addr_b, _b_task) = engine_b
-            .start_listener("127.0.0.1:0".parse().unwrap())
+            .start_listener("127.0.0.1:0".parse().unwrap(), cancel_rx_b)
             .await
             .unwrap();
         engine_a
