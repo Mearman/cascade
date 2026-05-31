@@ -53,9 +53,12 @@ async fn mutual_trust(a: &Node, b: &Node) {
     b.backend.sync().trust(a.device_id()).await;
 }
 
-/// Start a listener on `node` and connect `peer` to it.
-async fn connect_via_listener(server: &Node, client: &Node) {
-    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+/// Start a listener on `server` and connect `client` to it. The returned
+/// `Sender` must be held by the caller for the lifetime of the test so
+/// the listener task doesn't observe its watch as cancelled when the
+/// helper returns.
+async fn connect_via_listener(server: &Node, client: &Node) -> tokio::sync::watch::Sender<bool> {
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
     let (addr, _) = server
         .backend
         .sync()
@@ -71,6 +74,7 @@ async fn connect_via_listener(server: &Node, client: &Node) {
         })
         .await
         .unwrap();
+    cancel_tx
 }
 
 /// Spin until the given index has an entry for `name` or the deadline
@@ -174,7 +178,7 @@ async fn last_write_wins_conflict() {
     let a = Node::new("a", "shared").await;
     let b = Node::new("b", "shared").await;
     mutual_trust(&a, &b).await;
-    connect_via_listener(&a, &b).await;
+    let _cancel = connect_via_listener(&a, &b).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     // A uploads first.
@@ -230,7 +234,7 @@ async fn deletes_propagate_to_peers() {
     let a = Node::new("a", "shared").await;
     let b = Node::new("b", "shared").await;
     mutual_trust(&a, &b).await;
-    connect_via_listener(&a, &b).await;
+    let _cancel = connect_via_listener(&a, &b).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     let payload = b"to be deleted".to_vec();
@@ -281,7 +285,7 @@ async fn download_pulls_missing_blocks_from_peer() {
     let a = Node::new("a", "shared").await;
     let b = Node::new("b", "shared").await;
     mutual_trust(&a, &b).await;
-    connect_via_listener(&a, &b).await;
+    let _cancel = connect_via_listener(&a, &b).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let payload = vec![0xCDu8; 200 * 1024]; // > one 128KB block
