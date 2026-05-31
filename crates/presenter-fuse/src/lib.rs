@@ -67,6 +67,14 @@ impl FusePresenter {
         self
     }
 
+    /// Override the cache directory. Mainly used by tests so each test
+    /// gets a unique tempdir and they don't race on the shared system
+    /// cache path (which the running daemon also writes to).
+    pub fn with_cache_dir(mut self, path: impl Into<PathBuf>) -> Self {
+        self.cache_dir = path.into();
+        self
+    }
+
     /// Get a reference to the inode map (for testing).
     #[must_use]
     pub const fn inode_map(&self) -> &Arc<std::sync::Mutex<InodeMap>> {
@@ -370,8 +378,9 @@ mod tests {
 
     #[tokio::test]
     async fn evict_removes_cached_file() {
+        let tmp = tempfile::tempdir().unwrap();
         let root = ItemId::new("gdrive", "root");
-        let presenter = FusePresenter::new(root);
+        let presenter = FusePresenter::new(root).with_cache_dir(tmp.path());
         let id = ItemId::new("test", "file1");
         let cache_path = presenter.cache_path_for(&id);
 
@@ -389,8 +398,9 @@ mod tests {
     async fn fetch_contents_caches_file() {
         // fetch_contents with a NullBackend will fail (no files),
         // but we can test the caching path by pre-placing a file.
+        let tmp = tempfile::tempdir().unwrap();
         let root = ItemId::new("gdrive", "root");
-        let presenter = FusePresenter::new(root);
+        let presenter = FusePresenter::new(root).with_cache_dir(tmp.path());
         let id = ItemId::new("test", "cached");
         let cache_path = presenter.cache_path_for(&id);
 
