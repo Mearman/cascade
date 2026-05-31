@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8](https://github.com/Mearman/cascade/compare/v0.1.7...v0.1.8) - 2026-05-31
+
+### Added
+
+- *(mount)* wire FUSE on Linux and net-use WebDAV on Windows
+
+### Fixed
+
+- *(mount)* doc link only resolves on macOS; describe behaviour inline instead
+- *(mount)* silence Windows clippy on unused try_nfs/mount_nfs and doc backticks
+- *(mount)* include Windows in VfsPresenter import for try_webdav
+- *(mount)* bring VfsPresenter into scope on Linux and WebDavPresenter on Windows
+- *(cli)* allow non-const fn on is_process_alive (unix branch isn't const)
+- *(mount)* silence dead_code on Windows for unix-only stop helper
+
+### Other
+
+- *(expr)* gate DISK.free assertion to unix where statfs is implemented
+- cargo fmt
+- *(mount)* silence dead_code on Windows for make_ctx (only used by gated tests)
+- *(mount)* gate stop tests to unix where stop is actually implemented
+
 ## [0.1.7](https://github.com/Mearman/cascade/compare/v0.1.6...v0.1.7) - 2026-05-30
 
 ### Added
