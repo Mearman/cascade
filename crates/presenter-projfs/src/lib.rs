@@ -2,10 +2,72 @@
 //! Projected File System mount.
 //!
 //! Implements the engine's [`VfsPresenter`] trait. On Windows, the mount
-//! is served via the Projected File System API exposed through the
-//! `windows` crate's `Win32_Storage_ProjectedFileSystem` module. On
-//! other platforms, every operation that actually touches the OS
-//! returns an error — the crate compiles but does not mount.
+//! is served via the [Projected File System][projfs] API exposed through
+//! the `windows` crate's `Win32_Storage_ProjectedFileSystem` module.
+//! On other platforms, every operation that actually touches the OS
+//! returns an error — the crate compiles but does not mount, which keeps
+//! the workspace buildable from macOS and Linux while the real callbacks
+//! are filled in.
+//!
+//! # Scaffold status
+//!
+//! This is the v8 roadmap scaffold. The crate exposes a [`ProjFsPresenter`]
+//! that implements [`VfsPresenter`], but most of the methods that talk to
+//! the OS are stubs:
+//!
+//! - [`ProjFsPresenter::upsert_item`] and [`ProjFsPresenter::delete_item`]
+//!   are real — they update an in-memory `HashMap<String, VfsItem>`
+//!   exactly like the other presenters.
+//! - [`ProjFsPresenter::update_state`] is a no-op log line; `ProjFS` has
+//!   no equivalent of `FSKit`'s `update_state` push hook.
+//! - [`ProjFsPresenter::evict_item`] logs and returns `Ok(())`; `ProjFS`
+//!   manages projection cache eviction at the OS layer.
+//! - [`ProjFsPresenter::fetch_contents`] returns an "not yet
+//!   implemented" error. In the full implementation, on-demand reads are
+//!   driven by the `GetFileDataCallback` rather than by direct calls
+//!   into this method.
+//! - [`ProjFsPresenter::start`] registers the virtualisation root and
+//!   begins virtualising via `PrjMarkDirectoryAsPlaceholder` and
+//!   `PrjStartVirtualizing`, but every callback in the table immediately
+//!   returns `S_OK` with empty results (or
+//!   `HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)` where empty is not a
+//!   legal answer). The mount appears as an empty directory until the
+//!   callbacks are filled in.
+//! - [`ProjFsPresenter::stop`] calls `PrjStopVirtualizing` against the
+//!   stored namespace handle.
+//!
+//! On non-Windows targets, [`ProjFsPresenter::start`] returns
+//! `Err("ProjFS presenter is only supported on Windows")` and
+//! [`ProjFsPresenter::stop`] is a no-op.
+//!
+//! # Follow-up work
+//!
+//! The eight `ProjFS` callbacks that need real implementations are:
+//!
+//! 1. `StartDirectoryEnumerationCallback` — open a directory iterator
+//!    keyed by enumeration `GUID`, backed by the engine `VfsTree`.
+//! 2. `EndDirectoryEnumerationCallback` — release the iterator.
+//! 3. `GetDirectoryEnumerationCallback` — yield the next batch of
+//!    entries into the `PRJ_DIR_ENTRY_BUFFER_HANDLE` honouring the
+//!    `PCWSTR` search expression.
+//! 4. `GetPlaceholderInfoCallback` — translate a path to
+//!    `PRJ_PLACEHOLDER_INFO`, populating `FileBasicInfo` from the
+//!    matching `VfsItem`.
+//! 5. `GetFileDataCallback` — stream file bytes from the backend via
+//!    `PrjWriteFileData`, respecting the requested offset and length.
+//! 6. `QueryFileNameCallback` — case-insensitive existence check used
+//!    by `ProjFS` to decide whether to descend into the projection.
+//! 7. `NotificationCallback` — react to user-driven changes
+//!    (open/close/rename/delete) and forward them back into the engine.
+//! 8. `CancelCommandCallback` — abort the in-flight Tokio task for a
+//!    given `PRJ_CALLBACK_DATA.CommandId`.
+//!
+//! Each requires translating between `ProjFS`'s enumeration session model
+//! (keyed by `GUID`s) and the engine's `VfsTree`/`Backend` API. See the
+//! [Projected File System Win32 documentation][projfs] for the full
+//! callback contract.
+//!
+//! [projfs]: https://learn.microsoft.com/en-us/windows/win32/projfs/projected-file-system
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

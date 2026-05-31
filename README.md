@@ -35,7 +35,7 @@ The bet is that one filesystem client that works the same on every laptop is mor
     - **rustup (recommended)** — the project pins its Rust toolchain in `rust-toolchain.toml`. Install rustup from <https://rustup.rs/> so local builds, the pre-push hook, and CI all use the same compiler.
 - macOS: Xcode Command Line Tools (for Swift File Provider and FSKit extensions). FSKit requires macOS 15.4+ (Sequoia).
 - Linux: `libfuse3` runtime libraries for the FUSE presenter (`apt install libfuse3-dev` on Debian/Ubuntu, `yum install fuse3-devel` on RHEL/Fedora). NFS fallback additionally needs root to bind a privileged port.
-- Windows: the built-in `WebClient` service for the WebDAV mount. It ships with Windows but is often set to manual start — `sc config WebClient start= auto` (in an elevated shell) makes it come up automatically. WinFSP/ProjFS presenter is still planned, not implemented.
+- Windows: the built-in `WebClient` service for the WebDAV mount. It ships with Windows but is often set to manual start — `sc config WebClient start= auto` (in an elevated shell) makes it come up automatically. A native ProjFS presenter (`presenter-projfs`) is scaffolded and tried first by `cascade start`, but its callback table is still stubbed so the mount appears empty and the daemon falls back to WebDAV in practice.
 
 ### Install
 
@@ -122,7 +122,7 @@ The design is documented in full at [`docs/design.md`](docs/design.md). This sec
 │  macOS:   FSKit (15.4+) · WebDAV · NFS                   │
 │  (File Provider planned — see roadmap)                   │
 │  Linux:   FUSE · NFS (root)                              │
-│  Windows: WebDAV via WebClient (WinFSP/ProjFS planned)   │
+│  Windows: ProjFS (scaffolded) · WebDAV via WebClient     │
 │  Universal fallback: NFS server · WebDAV server          │
 └────────────────────┬─────────────────────────────────────┘
                      │ VfsPresenter trait
@@ -133,7 +133,7 @@ The design is documented in full at [`docs/design.md`](docs/design.md). This sec
 └──────────────────────────────────────────────────────────┘
 ```
 
-`cascade start` tries the platform-preferred presenters in order and falls back as each one fails: on macOS that's FSKit → WebDAV → NFS; on Linux it's FUSE → NFS; on Windows it's WebDAV (mounted via `net use *` against the built-in `WebClient` service).
+`cascade start` tries the platform-preferred presenters in order and falls back as each one fails: on macOS that's FSKit → WebDAV → NFS; on Linux it's FUSE → NFS; on Windows it's ProjFS → WebDAV (mounted via `net use *` against the built-in `WebClient` service). The Windows ProjFS presenter is currently a scaffold — the callback table is stubbed, so the mount appears empty and the daemon falls back to WebDAV in practice. See `crates/presenter-projfs/` for the follow-up callback list.
 
 Communication between the platform layer and the engine uses a Unix domain socket with a length-prefixed JSON protocol, shared by the CLI, the macOS File Provider and FSKit extensions, and any future GUI.
 
@@ -153,6 +153,7 @@ crates/
   presenter-webdav/       WebDAV server presenter (cross-platform)
   presenter-fileprovider/ macOS File Provider bridge (Rust side)
   presenter-fskit/        macOS FSKit bridge (Rust side, macOS 15.4+)
+  presenter-projfs/       Windows ProjFS presenter (scaffold — callbacks stubbed)
   cascade/                Binary crate (CLI entry point and daemon)
 swift/
   CascadeFileProvider/    macOS File Provider extension
@@ -165,7 +166,7 @@ Integration tests live inside each crate's `tests/` directory rather than at wor
 
 - **`Backend` trait** — every cloud provider and the local filesystem implement this. The engine never sees provider-specific APIs. Each backend crate exposes `create_backend(config) -> Result<Box<dyn Backend>>`.
 - **`VfsTree`** — composes multiple backends into a single tree, routed by longest-prefix match. Cross-backend moves trigger download + upload + delete.
-- **`VfsPresenter` trait** — platform-agnostic interface for presenting the VFS to the OS. Compile-time selection: FSKit on macOS (with WebDAV and NFS fallbacks), FUSE on Linux (with NFS fallback), WebDAV via WebClient on Windows, NFS as universal fallback.
+- **`VfsPresenter` trait** — platform-agnostic interface for presenting the VFS to the OS. Compile-time selection: FSKit on macOS (with WebDAV and NFS fallbacks), FUSE on Linux (with NFS fallback), ProjFS on Windows with WebDAV via WebClient as fallback, NFS as universal fallback.
 - **`.cascade` config walk** — like `.gitignore`: files in each directory layer with child-overrides-parent precedence. Four formats (gitignore-style, TOML, YAML, JSON) all deserialise to `CascadeConfig`.
 - **Expression language** — PEG grammar evaluated against `EvalContext` (file, device, disk, network, power, time, peer). Used for conditional rules in `.cascade` files.
 - **P2P engine** — based on Syncthing's BEP v1. Sits between VFS and cache as an optimisation layer, not as a backend. Cloud remains the authority for cloud-backed folders.
