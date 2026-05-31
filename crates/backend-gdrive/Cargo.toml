@@ -17,6 +17,7 @@ chrono.workspace = true
 reqwest.workspace = true
 urlencoding.workspace = true
 futures-core.workspace = true
+dirs = "6"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

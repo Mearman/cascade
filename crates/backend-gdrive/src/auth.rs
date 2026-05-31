@@ -11,9 +11,11 @@
 //! and `CASCADE_GDRIVE_CLIENT_SECRET` environment variables. If not set, the
 //! credentials are read from the backend config file at runtime.
 //!
-//! Tokens are stored in the macOS Keychain via the `security` command.
-//! Token persistence (`save_tokens` / `load_tokens`) is only available on
-//! macOS. On other platforms both functions return an error immediately.
+//! Token persistence (`save_tokens` / `load_tokens`) uses the macOS Keychain on
+//! macOS via the `security` command. On other platforms tokens are persisted to
+//! a JSON file under the user's config directory
+//! (`${CONFIG_DIR}/cascade/gdrive-tokens/${account}.json`), with `0o600`
+//! permissions on Unix systems.
 
 #[cfg(target_os = "macos")]
 use std::process::Command;
@@ -393,12 +395,13 @@ pub async fn refresh_access_token(
 }
 
 // ---------------------------------------------------------------------------
-// Token persistence (macOS Keychain)
+// Token persistence
 // ---------------------------------------------------------------------------
+//
+// macOS uses the system Keychain via the `security` command. Other platforms
+// fall back to a JSON file under the user's config directory.
 
 /// Save tokens to the macOS Keychain.
-///
-/// Only available on macOS. Returns an error on other platforms.
 #[cfg(target_os = "macos")]
 pub fn save_tokens(account: &str, tokens: &AuthTokens) -> anyhow::Result<()> {
     let json = serde_json::to_string(tokens)?;
@@ -433,14 +436,7 @@ pub fn save_tokens(account: &str, tokens: &AuthTokens) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
-pub fn save_tokens(_account: &str, _tokens: &AuthTokens) -> anyhow::Result<()> {
-    anyhow::bail!("token storage via Keychain is only supported on macOS")
-}
-
 /// Load tokens from the macOS Keychain.
-///
-/// Only available on macOS. Returns an error on other platforms.
 #[cfg(target_os = "macos")]
 pub fn load_tokens(account: &str) -> anyhow::Result<Option<AuthTokens>> {
     let output = Command::new("security")
@@ -464,9 +460,89 @@ pub fn load_tokens(account: &str) -> anyhow::Result<Option<AuthTokens>> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// File-based persistence
+// ---------------------------------------------------------------------------
+//
+// Used by the public `save_tokens`/`load_tokens` on non-macOS targets. macOS
+// continues to use the Keychain implementation above for the public API.
+
 #[cfg(not(target_os = "macos"))]
-pub fn load_tokens(_account: &str) -> anyhow::Result<Option<AuthTokens>> {
-    anyhow::bail!("token storage via Keychain is only supported on macOS")
+mod file_store {
+    use super::AuthTokens;
+    use std::path::{Path, PathBuf};
+
+    /// Sub-path under the config directory where token files live.
+    #[cfg(not(target_os = "macos"))]
+    const TOKEN_SUBDIR: &str = "cascade/gdrive-tokens";
+
+    /// Resolve the default token storage directory under the user's config dir.
+    #[cfg(not(target_os = "macos"))]
+    pub(super) fn default_tokens_dir() -> anyhow::Result<PathBuf> {
+        Ok(dirs::config_dir()
+            .ok_or_else(|| anyhow::anyhow!("could not determine user config directory"))?
+            .join(TOKEN_SUBDIR))
+    }
+
+    /// Replace path-unsafe characters in an account name with underscores.
+    pub(super) fn sanitise_account(account: &str) -> String {
+        account.replace(['/', '\\', ':', '\0'], "_")
+    }
+
+    /// Compose the on-disk path for the given account's tokens under `base`.
+    pub(super) fn tokens_path_in(base: &Path, account: &str) -> PathBuf {
+        base.join(format!("{}.json", sanitise_account(account)))
+    }
+
+    /// Save tokens as JSON under the given directory.
+    ///
+    /// On Unix the file is created with `0o600` permissions (owner read+write
+    /// only). On Windows the file inherits NTFS ACLs from its parent dir.
+    pub(super) fn save_tokens_in(
+        base: &Path,
+        account: &str,
+        tokens: &AuthTokens,
+    ) -> anyhow::Result<()> {
+        std::fs::create_dir_all(base)?;
+
+        let path = tokens_path_in(base, account);
+        let json = serde_json::to_string(tokens)?;
+        std::fs::write(&path, json.as_bytes())?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            std::fs::set_permissions(&path, perms)?;
+        }
+
+        Ok(())
+    }
+
+    /// Load tokens from the per-account JSON file under `base`, if it exists.
+    pub(super) fn load_tokens_in(base: &Path, account: &str) -> anyhow::Result<Option<AuthTokens>> {
+        let path = tokens_path_in(base, account);
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                let tokens: AuthTokens = serde_json::from_slice(&bytes)?;
+                Ok(Some(tokens))
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+}
+
+/// Save tokens to a JSON file under the user's config directory.
+#[cfg(not(target_os = "macos"))]
+pub fn save_tokens(account: &str, tokens: &AuthTokens) -> anyhow::Result<()> {
+    file_store::save_tokens_in(&file_store::default_tokens_dir()?, account, tokens)
+}
+
+/// Load tokens from the per-account JSON file under the user's config dir.
+#[cfg(not(target_os = "macos"))]
+pub fn load_tokens(account: &str) -> anyhow::Result<Option<AuthTokens>> {
+    file_store::load_tokens_in(&file_store::default_tokens_dir()?, account)
 }
 
 #[cfg(test)]

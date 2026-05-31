@@ -242,6 +242,7 @@ dependencies = [
  "async-trait",
  "cascade-engine",
  "chrono",
+ "dirs",
  "futures-core",
  "reqwest",
  "serde",
