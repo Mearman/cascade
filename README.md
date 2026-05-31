@@ -10,8 +10,38 @@ Rust (edition 2024) · Swift (macOS File Provider extension) · SQLite state · 
 
 - Rust toolchain pinned in [`rust-toolchain.toml`](rust-toolchain.toml) (currently 1.96.0, edition 2024). `rustup` installs it automatically on first build.
 - macOS: Xcode Command Line Tools (for Swift File Provider and FSKit extensions). FSKit requires macOS 15.4+ (Sequoia).
-- Linux: `libfuse3-dev` (for FUSE).
-- Windows: not yet supported (WinFSP/ProjFS presenter is planned, not implemented).
+- Linux: `libfuse3` runtime libraries for the FUSE presenter (`apt install libfuse3-dev` on Debian/Ubuntu, `yum install fuse3-devel` on RHEL/Fedora). NFS fallback additionally needs root to bind a privileged port.
+- Windows: the built-in `WebClient` service for the WebDAV mount. It ships with Windows but is often set to manual start — `sc config WebClient start= auto` (in an elevated shell) makes it come up automatically. WinFSP/ProjFS presenter is still planned, not implemented.
+
+### Install
+
+Pre-built binaries are published on each release from [GitHub Releases](https://github.com/Mearman/cascade/releases).
+
+- **macOS and Linux (Homebrew)**:
+
+  ```bash
+  brew install Mearman/cascade/cascade
+  ```
+
+  The [`Formula/cascade.rb`](Formula/cascade.rb) bottle covers both `aarch64` and `x86_64` on macOS and Linux.
+
+- **Linux (direct download)**: grab `cascade-aarch64-linux.tar.gz` or `cascade-x86_64-linux.tar.gz` from the release, extract, and place `cascade` on your `PATH`:
+
+  ```bash
+  curl -L https://github.com/Mearman/cascade/releases/latest/download/cascade-x86_64-linux.tar.gz | tar -xz
+  install -m 0755 cascade ~/.local/bin/
+  ```
+
+- **Windows (Scoop)**:
+
+  ```powershell
+  scoop bucket add cascade https://github.com/Mearman/scoop-cascade
+  scoop install cascade
+  ```
+
+- **Windows (direct download)**: grab `cascade-x86_64-windows.zip` from the release, extract, and place `cascade.exe` on your `PATH`.
+
+- **From source (any platform)**: see [Build](#build) below.
 
 ### Build
 
@@ -65,8 +95,9 @@ The design is documented in full at [`docs/design.md`](docs/design.md). This sec
 ```
 ┌──────────────────────────────────────────────────────────┐
 │  Platform Layer (per-OS)                                 │
-│  macOS: File Provider · FSKit (15.4+) · Linux: FUSE      │
-│  Windows: WinFSP/ProjFS (planned)                        │
+│  macOS:   FSKit (15.4+) · File Provider · WebDAV · NFS   │
+│  Linux:   FUSE · WebDAV · NFS (root)                     │
+│  Windows: WebDAV via WebClient (WinFSP/ProjFS planned)   │
 │  Universal fallback: NFS server · WebDAV server          │
 └────────────────────┬─────────────────────────────────────┘
                      │ VfsPresenter trait
@@ -76,6 +107,8 @@ The design is documented in full at [`docs/design.md`](docs/design.md). This sec
 │  Backend trait · Expression Evaluator · P2P Engine (BEP) │
 └──────────────────────────────────────────────────────────┘
 ```
+
+`cascade start` tries the platform-preferred presenters in order and falls back as each one fails: on macOS that's FSKit → File Provider → WebDAV → NFS; on Linux it's FUSE → WebDAV → NFS; on Windows it's WebDAV (mounted via `net use *` against the built-in `WebClient` service).
 
 Communication between the platform layer and the engine uses a Unix domain socket with a length-prefixed JSON protocol, shared by the CLI, the macOS File Provider and FSKit extensions, and any future GUI.
 
@@ -128,6 +161,9 @@ SQLite at `~/.config/cascade/state.db`. Tables: `files`, `backends`, `pin_rules`
 
 ## Gotchas and quirks
 
+- **Linux FUSE runs without root.** The FUSE presenter mounts as the calling user via `fusermount3`. NFS fallback is different — binding a privileged port for NFS still needs `sudo`, so if FUSE is unavailable (missing `libfuse3`, no `/dev/fuse`) and you don't want to escalate, the daemon will fail rather than silently downgrade.
+- **Windows mounts go via WebDAV and the WebClient service.** `cascade start` runs `net use * \\localhost@<port>\DavWWWRoot\...` which lets the OS pick the next free drive letter. If `WebClient` isn't running the mount fails immediately; start it once with `sc start WebClient` or set it to auto-start (see Prerequisites).
+- **Google Drive auth tokens are stored per platform.** macOS and Linux: `$XDG_CONFIG_HOME/cascade/gdrive-tokens/<account>.json`, falling back to `~/.config/cascade/...`. Windows: `%APPDATA%\cascade\gdrive-tokens\<account>.json`, with the default NTFS ACLs restricting access to the current user.
 - **NFS cache mode** controls write support. `off` is read-only. `minimal` (default) enables writes with minimal disk usage. `full` caches everything eagerly.
 - **Google Drive rate limits** — ~10,000 requests per 100 seconds per user. The backend uses a token-bucket rate limiter and batch requests where possible.
 - **Cross-backend moves** are not atomic — they download from source, upload to destination, then delete the original. A failure partway through can leave duplicates.
@@ -148,7 +184,7 @@ SQLite at `~/.config/cascade/state.db`. Tables: `files`, `backends`, `pin_rules`
 | v5 | macOS File Provider presenter (Swift extension) |
 | v6 | Adopt existing directories (local backend, adopt-and-sync, adopt-in-place) |
 | v7 | P2P block sharing (LAN) |
-| v8 | Linux FUSE presenter + Windows WinFSP presenter |
+| v8 | Windows WinFSP/ProjFS presenter (Linux FUSE delivered earlier) |
 | v9 | Full P2P (WAN discovery, NAT traversal) |
 
 Full timeline estimates, dependency list, and reference implementations in [`docs/design.md`](docs/design.md).
