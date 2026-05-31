@@ -464,10 +464,12 @@ pub fn load_tokens(account: &str) -> anyhow::Result<Option<AuthTokens>> {
 // File-based persistence
 // ---------------------------------------------------------------------------
 //
-// Used by the public `save_tokens`/`load_tokens` on non-macOS targets. macOS
-// continues to use the Keychain implementation above for the public API.
+// Used by the public `save_tokens`/`load_tokens` on non-macOS targets. The
+// module is also compiled in `cfg(test)` so the round trip can be exercised
+// from the test suite on every host, while macOS continues to use the
+// Keychain implementation above for the public API.
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(any(test, not(target_os = "macos")))]
 mod file_store {
     use super::AuthTokens;
     use std::path::{Path, PathBuf};
@@ -581,5 +583,73 @@ mod tests {
         // If no baked-in creds and no config values, should error.
         let result = resolve_credentials(None, None);
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // File-fallback tests
+    //
+    // These exercise the JSON-file persistence path used by the public
+    // `save_tokens`/`load_tokens` on Linux and Windows. The helpers are
+    // compiled under `cfg(any(test, not(target_os = "macos")))`, so the same
+    // round trip also runs on macOS hosts — useful for catching regressions
+    // in CI without waiting for a Linux runner.
+    // -----------------------------------------------------------------------
+
+    use super::file_store::{load_tokens_in, sanitise_account, save_tokens_in, tokens_path_in};
+
+    fn sample_tokens() -> AuthTokens {
+        AuthTokens {
+            access_token: "access-123".to_string(),
+            refresh_token: "refresh-456".to_string(),
+            expires_at: chrono::DateTime::from_timestamp(1_700_000_000, 0)
+                .unwrap_or_else(chrono::Utc::now),
+        }
+    }
+
+    #[test]
+    fn file_fallback_round_trips_tokens() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let tokens = sample_tokens();
+
+        save_tokens_in(dir.path(), "primary", &tokens)?;
+        let loaded = load_tokens_in(dir.path(), "primary")?
+            .ok_or_else(|| anyhow::anyhow!("expected tokens to be present after save"))?;
+
+        assert_eq!(loaded.access_token, tokens.access_token);
+        assert_eq!(loaded.refresh_token, tokens.refresh_token);
+        assert_eq!(loaded.expires_at, tokens.expires_at);
+        Ok(())
+    }
+
+    #[test]
+    fn file_fallback_returns_none_when_missing() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let loaded = load_tokens_in(dir.path(), "never-saved")?;
+        assert!(loaded.is_none());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_fallback_sets_owner_only_permissions() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir()?;
+        save_tokens_in(dir.path(), "perms", &sample_tokens())?;
+
+        let path = tokens_path_in(dir.path(), "perms");
+        let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "expected file mode 0o600, found {mode:o}");
+        Ok(())
+    }
+
+    #[test]
+    fn file_fallback_sanitises_account_names() {
+        // Slashes and colons must not escape the storage directory.
+        let dirty = "dir/with:bad\\chars";
+        let cleaned = sanitise_account(dirty);
+        assert!(!cleaned.contains('/'));
+        assert!(!cleaned.contains('\\'));
+        assert!(!cleaned.contains(':'));
     }
 }
