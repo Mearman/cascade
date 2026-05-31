@@ -58,6 +58,10 @@ impl FolderIndex {
     /// New databases get every column from the start. Older databases —
     /// created before the version-vector schema — are migrated in
     /// place: the `version_blob` column is added with an empty default.
+    /// A `peer_sequences` table is also created (or added on migration)
+    /// so the sync engine can record the highest [`FileInfo::sequence`]
+    /// it has seen from each peer and request only the delta on
+    /// reconnect.
     ///
     /// Schema initialisation runs inside a single `BEGIN EXCLUSIVE`
     /// transaction so that two processes opening the same `SQLite` file
@@ -94,6 +98,10 @@ impl FolderIndex {
                 key TEXT PRIMARY KEY NOT NULL,
                 value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS peer_sequences (
+                peer_device_id TEXT PRIMARY KEY NOT NULL,
+                max_sequence INTEGER NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS files_version ON files(version);
             ",
         )
@@ -127,6 +135,22 @@ impl FolderIndex {
             }
             tx.execute_batch("PRAGMA user_version = 1")
                 .context("bump user_version")?;
+        }
+
+        if current_version < 2 {
+            // Migration 2: add `peer_sequences` for delta-sync tracking.
+            // New databases already created the table via the base
+            // schema above; the `IF NOT EXISTS` makes the re-create a
+            // no-op there. Existing v1 databases pick the table up here.
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS peer_sequences (
+                    peer_device_id TEXT PRIMARY KEY NOT NULL,
+                    max_sequence INTEGER NOT NULL
+                )",
+            )
+            .context("create peer_sequences table")?;
+            tx.execute_batch("PRAGMA user_version = 2")
+                .context("bump user_version to 2")?;
         }
 
         tx.commit().context("commit schema transaction")?;
@@ -251,6 +275,44 @@ impl FolderIndex {
             .optional()?
             .flatten();
         Ok(v.unwrap_or(0))
+    }
+
+    /// Return the highest [`FileInfo::sequence`](cascade_p2p::protocol::FileInfo::sequence)
+    /// we have ever received from `peer_device_id`, or `0` if we have
+    /// never recorded anything for that peer.
+    ///
+    /// The sync engine consults this on reconnect to send only entries
+    /// whose `row_version` exceeds the value, avoiding a full Index
+    /// re-enumeration on every session.
+    pub fn get_peer_max_sequence(&self, peer_device_id: &str) -> Result<u64> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let value: Option<i64> = conn
+            .query_row(
+                "SELECT max_sequence FROM peer_sequences WHERE peer_device_id = ?1",
+                params![peer_device_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(value.map(|v| u64::try_from(v).unwrap_or(0)).unwrap_or(0))
+    }
+
+    /// Record the highest [`FileInfo::sequence`](cascade_p2p::protocol::FileInfo::sequence)
+    /// we have received from `peer_device_id`.
+    ///
+    /// Always overwrites the stored value with `max_sequence`; the
+    /// caller is responsible for combining successive observations with
+    /// the previous value (e.g. by taking `max(prev, observed)`) before
+    /// calling.
+    pub fn set_peer_max_sequence(&self, peer_device_id: &str, max_sequence: u64) -> Result<()> {
+        let stored = i64::try_from(max_sequence).unwrap_or(i64::MAX);
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        conn.execute(
+            "INSERT INTO peer_sequences (peer_device_id, max_sequence)
+             VALUES (?1, ?2)
+             ON CONFLICT(peer_device_id) DO UPDATE SET max_sequence = excluded.max_sequence",
+            params![peer_device_id, stored],
+        )?;
+        Ok(())
     }
 
     fn next_row_version(&self) -> Result<i64> {
@@ -423,13 +485,14 @@ mod tests {
         // First open — migration runs.
         drop(FolderIndex::open(&path).unwrap());
 
-        // Inspect the database directly: `user_version` must be 1 and
-        // `version_blob` must exist.
+        // Inspect the database directly: `user_version` must reflect
+        // the latest applied migration (currently 2 — peer_sequences)
+        // and `version_blob` must exist.
         let probe = Connection::open(&path).unwrap();
         let user_version: i64 = probe
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(user_version, 1, "migration should bump user_version");
+        assert_eq!(user_version, 2, "migration should bump user_version");
         let has_column: i64 = probe
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('files') WHERE name = 'version_blob'",
@@ -495,5 +558,69 @@ mod tests {
         let since_two = idx.entries_since(2).unwrap();
         assert_eq!(since_two.len(), 1);
         assert_eq!(since_two[0].path, "c");
+    }
+
+    #[test]
+    fn peer_max_sequence_defaults_to_zero_for_unknown_peer() {
+        let dir = tempdir().unwrap();
+        let idx = FolderIndex::open(&dir.path().join("seq.db")).unwrap();
+        assert_eq!(idx.get_peer_max_sequence("unknown-device").unwrap(), 0);
+    }
+
+    #[test]
+    fn peer_max_sequence_round_trip() {
+        let dir = tempdir().unwrap();
+        let idx = FolderIndex::open(&dir.path().join("seq.db")).unwrap();
+        idx.set_peer_max_sequence("peer-a", 17).unwrap();
+        idx.set_peer_max_sequence("peer-b", 42).unwrap();
+        assert_eq!(idx.get_peer_max_sequence("peer-a").unwrap(), 17);
+        assert_eq!(idx.get_peer_max_sequence("peer-b").unwrap(), 42);
+    }
+
+    #[test]
+    fn peer_max_sequence_overwrites_previous_value() {
+        let dir = tempdir().unwrap();
+        let idx = FolderIndex::open(&dir.path().join("seq.db")).unwrap();
+        idx.set_peer_max_sequence("peer-a", 5).unwrap();
+        idx.set_peer_max_sequence("peer-a", 9).unwrap();
+        assert_eq!(idx.get_peer_max_sequence("peer-a").unwrap(), 9);
+    }
+
+    #[test]
+    fn migration_two_creates_peer_sequences_on_legacy_database() {
+        // A database that completed migration 1 (version_blob present,
+        // user_version = 1) but predates migration 2 should pick up the
+        // `peer_sequences` table on the next open.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy_v1.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE files (
+                    path TEXT PRIMARY KEY NOT NULL,
+                    is_dir INTEGER NOT NULL,
+                    size INTEGER NOT NULL DEFAULT 0,
+                    modified INTEGER NOT NULL DEFAULT 0,
+                    block_hashes BLOB NOT NULL DEFAULT (x''),
+                    deleted INTEGER NOT NULL DEFAULT 0,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    version_blob BLOB NOT NULL DEFAULT (x'')
+                );
+                PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        }
+
+        let idx = FolderIndex::open(&path).unwrap();
+        // The table must now exist and be usable.
+        idx.set_peer_max_sequence("peer-a", 11).unwrap();
+        assert_eq!(idx.get_peer_max_sequence("peer-a").unwrap(), 11);
+
+        // user_version should have advanced to 2.
+        let probe = Connection::open(&path).unwrap();
+        let user_version: i64 = probe
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(user_version, 2);
     }
 }
