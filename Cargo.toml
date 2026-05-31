@@ -68,15 +68,22 @@ hex = "0.4"
 nix = { version = "0.29", features = ["signal", "process"] }
 
 [workspace.lints.rust]
+# Denied at workspace level. Per-site #[allow] requires explicit justification
+# (a comment naming the legitimate cross-platform or FFI need).
+#
+# These cannot be raised to `forbid` because macro expansions emit internal
+# `#[allow]` attributes for hygiene — tracing emits #[allow(unused_imports,
+# unused_must_use)], pest_derive emits #[allow(unused_variables)], and so on.
+# Forbidding any of those would break every macro call site.
 unsafe_code = "deny"
 unused_imports = "deny"
 dead_code = "deny"
+unused_variables = "deny"
+unused_must_use = "deny"
 missing_debug_implementations = "deny"
 missing_copy_implementations = "deny"
 trivial_casts = "deny"
 trivial_numeric_casts = "deny"
-unused_must_use = "deny"
-unused_variables = "deny"
 unreachable_patterns = "deny"
 
 [workspace.lints.clippy]
@@ -100,8 +107,19 @@ default_trait_access = "allow"
 needless_pass_by_value = "allow"
 return_self_not_must_use = "allow"
 
-# Correctness lints — deny outright.
+# Correctness lints — deny outright. Per-site #[allow] requires justification.
 unwrap_used = "deny"
 expect_used = "deny"
 indexing_slicing = "deny"
 string_slice = "deny"
+
+# Forbid #[allow] escapes for the cross-platform const-fn pattern: if a
+# function is naturally const on one target and not on another, split it into
+# two cfg-gated definitions rather than allowing the lint. See
+# crates/expr/src/providers.rs DiskProvider::collect_for_path and
+# crates/presenter-fuse/src/ops.rs FileAttr::{directory,file} for the pattern.
+#
+# NOTE: not raised to `forbid` because pre-existing #[allow] sites in
+# backend-gdrive and mount.rs (owned by a parallel agent) would break. Once
+# those are migrated to the cfg-split pattern, this can become `forbid`.
+missing_const_for_fn = "deny"
