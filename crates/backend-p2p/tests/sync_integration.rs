@@ -278,6 +278,64 @@ async fn deletes_propagate_to_peers() {
     );
 }
 
+/// Two nodes that have never communicated each upload a different
+/// payload to the same path while disconnected. When they finally
+/// connect, version-vector dominance must not panic and both sides
+/// must end up holding a non-empty payload — naïve LWW on `modified`
+/// could otherwise drop one side's row entirely if the timestamps
+/// collided. Persistent conflict-copy resolution is tracked
+/// separately, so this test does not require that both sides converge
+/// on the *same* payload — only that neither side regresses to an
+/// empty / missing row.
+#[tokio::test]
+async fn version_vectors_resolve_concurrent_upload() {
+    let a = Node::new("a", "shared").await;
+    let b = Node::new("b", "shared").await;
+    mutual_trust(&a, &b).await;
+
+    // Disconnected uploads — each node bumps its own short_id only.
+    let payload_a = b"alpha payload".repeat(8);
+    let payload_b = b"beta payload longer than alpha".repeat(4);
+    let mut ra = Cursor::new(payload_a.clone());
+    a.backend
+        .upload(
+            Path::new("doc.txt"),
+            &mut ra,
+            &FileId(format!("{}:root", a.backend.id())),
+        )
+        .await
+        .unwrap();
+    let mut rb = Cursor::new(payload_b.clone());
+    b.backend
+        .upload(
+            Path::new("doc.txt"),
+            &mut rb,
+            &FileId(format!("{}:root", b.backend.id())),
+        )
+        .await
+        .unwrap();
+
+    // Connect after both writes happened — this is the concurrent edit.
+    let _cancel = connect_via_listener(&a, &b).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // After Index frames have flowed both ways, each side must still
+    // hold a non-empty doc.txt — version-vector dominance must not
+    // erase a row that has no causal predecessor on the other side.
+    let on_a = a.backend.metadata(Path::new("doc.txt")).await.unwrap();
+    let on_b = b.backend.metadata(Path::new("doc.txt")).await.unwrap();
+    let size_a = on_a.size.unwrap_or(0);
+    let size_b = on_b.size.unwrap_or(0);
+    assert!(
+        size_a == payload_a.len() as u64 || size_a == payload_b.len() as u64,
+        "A's size {size_a} matches neither payload",
+    );
+    assert!(
+        size_b == payload_a.len() as u64 || size_b == payload_b.len() as u64,
+        "B's size {size_b} matches neither payload",
+    );
+}
+
 /// Block-fetch fallback: A has a block, B does not. B's `download`
 /// must satisfy the read by pulling the block from A.
 #[tokio::test]

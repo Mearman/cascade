@@ -700,4 +700,90 @@ mod tests {
         let result = decode_message(&frame);
         assert!(result.is_err());
     }
+
+    // ── Version vector semantics ──
+
+    #[test]
+    fn version_dominates_self_is_false_for_equal() {
+        let a = Version {
+            counters: vec![(1, 2), (2, 3)],
+        };
+        let b = a.clone();
+        assert!(!a.dominates(&b), "equal vectors do not dominate");
+        assert!(!b.dominates(&a));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn version_dominates_strictly_greater() {
+        let a = Version {
+            counters: vec![(1, 5)],
+        };
+        let b = Version {
+            counters: vec![(1, 2)],
+        };
+        assert!(a.dominates(&b));
+        assert!(!b.dominates(&a));
+    }
+
+    #[test]
+    fn version_dominates_with_extra_device() {
+        // a has an entry b does not — a covers strictly more history.
+        let a = Version {
+            counters: vec![(1, 1), (2, 4)],
+        };
+        let b = Version {
+            counters: vec![(2, 4)],
+        };
+        assert!(a.dominates(&b));
+        assert!(!b.dominates(&a));
+    }
+
+    #[test]
+    fn version_dominates_concurrent_returns_false_both_ways() {
+        // Device 1 advanced only in a; device 2 advanced only in b.
+        let a = Version {
+            counters: vec![(1, 1)],
+        };
+        let b = Version {
+            counters: vec![(2, 1)],
+        };
+        assert!(!a.dominates(&b));
+        assert!(!b.dominates(&a));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn version_merge_takes_per_device_max() {
+        let mut a = Version {
+            counters: vec![(1, 5), (2, 3)],
+        };
+        let b = Version {
+            counters: vec![(1, 2), (3, 9)],
+        };
+        a.merge(&b);
+        assert_eq!(a.counters, vec![(1, 5), (2, 3), (3, 9)]);
+    }
+
+    #[test]
+    fn version_bump_appends_or_increments() {
+        let mut v = Version::default();
+        v.bump(42);
+        assert_eq!(v.counters, vec![(42, 1)]);
+        v.bump(42);
+        assert_eq!(v.counters, vec![(42, 2)]);
+        v.bump(7);
+        // Sorted ascending by device id.
+        assert_eq!(v.counters, vec![(7, 1), (42, 2)]);
+    }
+
+    #[test]
+    fn version_bump_keeps_counters_sorted() {
+        let mut v = Version::default();
+        v.bump(100);
+        v.bump(5);
+        v.bump(50);
+        let ids: Vec<u64> = v.counters.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![5, 50, 100]);
+    }
 }
