@@ -364,7 +364,15 @@ impl SyncEngine {
             }],
         })
         .ok();
-        let snapshot = self.snapshot_for_peer()?;
+        // Delta sync: only send rows whose row_version exceeds the
+        // highest sequence we have previously sent to this peer (which
+        // we approximate by the highest sequence the peer has reported
+        // back to us — they are equal once the previous session
+        // completed cleanly, and a conservative lower bound otherwise).
+        // First connect to a peer sees `0` and falls through to a full
+        // enumeration.
+        let last_seen = self.index.get_peer_max_sequence(&device_id).unwrap_or(0);
+        let snapshot = self.snapshot_since(last_seen)?;
         tx.send(BepMessage::Index {
             folder: self.folder_id.clone(),
             files: snapshot,
@@ -378,7 +386,7 @@ impl SyncEngine {
                 Ok(None) => break Ok(()),
                 Err(e) => break Err(e),
             };
-            if let Err(e) = self.handle_message(msg, &tx, &pending).await {
+            if let Err(e) = self.handle_message(&device_id, msg, &tx, &pending).await {
                 break Err(e);
             }
         };
@@ -393,11 +401,18 @@ impl SyncEngine {
         result
     }
 
-    /// Build a [`Vec<FileInfo>`] describing every row in the index,
-    /// including tombstones. Directory rows are skipped — BEP carries
+    /// Build a [`Vec<FileInfo>`] describing every row whose
+    /// `row_version` exceeds `since`, including tombstones. Pass `0`
+    /// for a full snapshot. Directory rows are skipped — BEP carries
     /// them implicitly via the parent path of each file.
-    fn snapshot_for_peer(&self) -> Result<Vec<FileInfo>> {
-        let entries = self.index.entries_since(0)?;
+    ///
+    /// The sender's `row_version` is encoded as
+    /// [`FileInfo::sequence`](cascade_p2p::protocol::FileInfo::sequence)
+    /// in the emitted entries; the receiving peer uses the maximum
+    /// sequence it observes to bound its next request.
+    fn snapshot_since(&self, since: u64) -> Result<Vec<FileInfo>> {
+        let since_i64 = i64::try_from(since).unwrap_or(i64::MAX);
+        let entries = self.index.entries_since(since_i64)?;
         let mut files = Vec::with_capacity(entries.len());
         for entry in entries {
             if entry.is_dir {
@@ -411,6 +426,7 @@ impl SyncEngine {
     /// Dispatch one incoming message.
     async fn handle_message(
         &self,
+        peer_device_id: &str,
         msg: BepMessage,
         outbound: &mpsc::UnboundedSender<BepMessage>,
         pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<u8>>>>>,
@@ -422,7 +438,7 @@ impl SyncEngine {
                     debug!("ignoring frame for unknown folder {folder}");
                     return Ok(());
                 }
-                self.merge_files(&files)?;
+                self.merge_files(peer_device_id, &files)?;
                 Ok(())
             }
             BepMessage::Request {
@@ -502,7 +518,14 @@ impl SyncEngine {
     ///
     /// A peer row with `FileInfo.deleted` set marks the local entry
     /// as a tombstone rather than overwriting its blocks.
-    fn merge_files(&self, files: &[FileInfo]) -> Result<()> {
+    ///
+    /// After processing the batch, the highest [`FileInfo::sequence`]
+    /// observed is persisted via
+    /// [`FolderIndex::set_peer_max_sequence`] for `peer_device_id`, so
+    /// the next reconnect can request only the delta beyond what we
+    /// have already seen. The stored value is `max(prior, observed)` —
+    /// frames arriving out of order never regress the cursor.
+    fn merge_files(&self, peer_device_id: &str, files: &[FileInfo]) -> Result<()> {
         for file in files {
             if file.file_type == FILE_TYPE_DIR {
                 continue;
@@ -573,6 +596,20 @@ impl SyncEngine {
                 version: persisted_version.counters,
             };
             self.index.upsert(&entry)?;
+        }
+        // Persist the highest sequence observed for this peer so the
+        // next reconnect can ask only for the delta beyond it. Empty
+        // batches are no-ops. The stored value is `max(prior, observed)`
+        // — out-of-order delivery never regresses the cursor.
+        if let Some(max_seq) = files.iter().map(|f| f.sequence).max() {
+            let prior = self
+                .index
+                .get_peer_max_sequence(peer_device_id)
+                .unwrap_or(0);
+            let updated = prior.max(max_seq);
+            if updated != prior {
+                self.index.set_peer_max_sequence(peer_device_id, updated)?;
+            }
         }
         Ok(())
     }
@@ -1004,19 +1041,22 @@ mod tests {
 
         // Older-by-vector incoming row (`(1, 2)` < `(1, 5)`) must be ignored.
         engine
-            .merge_files(&[FileInfo {
-                name: "doc.txt".into(),
-                file_type: FILE_TYPE_FILE,
-                size: 99,
-                modified: 1_000_000_000,
-                sequence: 0,
-                block_size: 128 * 1024,
-                deleted: false,
-                version: Version {
-                    counters: vec![(1, 2)],
-                },
-                block_hashes: vec![[1u8; 32]],
-            }])
+            .merge_files(
+                "peer-test",
+                &[FileInfo {
+                    name: "doc.txt".into(),
+                    file_type: FILE_TYPE_FILE,
+                    size: 99,
+                    modified: 1_000_000_000,
+                    sequence: 0,
+                    block_size: 128 * 1024,
+                    deleted: false,
+                    version: Version {
+                        counters: vec![(1, 2)],
+                    },
+                    block_hashes: vec![[1u8; 32]],
+                }],
+            )
             .unwrap();
         let after = engine.index.get("doc.txt").unwrap().unwrap();
         assert_eq!(after.size, 10);
@@ -1041,19 +1081,22 @@ mod tests {
             .unwrap();
         // Incoming dominates: `(1, 1)` is strictly less than `(1, 3)`.
         engine
-            .merge_files(&[FileInfo {
-                name: "doc.txt".into(),
-                file_type: FILE_TYPE_FILE,
-                size: 99,
-                modified: 2_000_000_000,
-                sequence: 0,
-                block_size: 128 * 1024,
-                deleted: false,
-                version: Version {
-                    counters: vec![(1, 3)],
-                },
-                block_hashes: vec![[1u8; 32]],
-            }])
+            .merge_files(
+                "peer-test",
+                &[FileInfo {
+                    name: "doc.txt".into(),
+                    file_type: FILE_TYPE_FILE,
+                    size: 99,
+                    modified: 2_000_000_000,
+                    sequence: 0,
+                    block_size: 128 * 1024,
+                    deleted: false,
+                    version: Version {
+                        counters: vec![(1, 3)],
+                    },
+                    block_hashes: vec![[1u8; 32]],
+                }],
+            )
             .unwrap();
         let after = engine.index.get("doc.txt").unwrap().unwrap();
         assert_eq!(after.size, 99);
@@ -1079,19 +1122,22 @@ mod tests {
             })
             .unwrap();
         engine
-            .merge_files(&[FileInfo {
-                name: "doc.txt".into(),
-                file_type: FILE_TYPE_FILE,
-                size: 99, // would be different content, but vector equals — skip
-                modified: 2_000_000_000,
-                sequence: 0,
-                block_size: 128 * 1024,
-                deleted: false,
-                version: Version {
-                    counters: vec![(1, 1), (2, 2)],
-                },
-                block_hashes: vec![[1u8; 32]],
-            }])
+            .merge_files(
+                "peer-test",
+                &[FileInfo {
+                    name: "doc.txt".into(),
+                    file_type: FILE_TYPE_FILE,
+                    size: 99, // would be different content, but vector equals — skip
+                    modified: 2_000_000_000,
+                    sequence: 0,
+                    block_size: 128 * 1024,
+                    deleted: false,
+                    version: Version {
+                        counters: vec![(1, 1), (2, 2)],
+                    },
+                    block_hashes: vec![[1u8; 32]],
+                }],
+            )
             .unwrap();
         let after = engine.index.get("doc.txt").unwrap().unwrap();
         assert_eq!(after.size, 10, "equal vectors are no-ops");
@@ -1155,19 +1201,22 @@ mod tests {
             })
             .unwrap();
         engine
-            .merge_files(&[FileInfo {
-                name: "doc.txt".into(),
-                file_type: FILE_TYPE_FILE,
-                size: 99,
-                modified: 2_000_000_000,
-                sequence: 0,
-                block_size: 128 * 1024,
-                deleted: false,
-                version: Version {
-                    counters: vec![(2, 1)],
-                },
-                block_hashes: vec![[1u8; 32]],
-            }])
+            .merge_files(
+                "peer-test",
+                &[FileInfo {
+                    name: "doc.txt".into(),
+                    file_type: FILE_TYPE_FILE,
+                    size: 99,
+                    modified: 2_000_000_000,
+                    sequence: 0,
+                    block_size: 128 * 1024,
+                    deleted: false,
+                    version: Version {
+                        counters: vec![(2, 1)],
+                    },
+                    block_hashes: vec![[1u8; 32]],
+                }],
+            )
             .unwrap();
         let after = engine.index.get("doc.txt").unwrap().unwrap();
         // The incoming row overwrites the original (matching the
@@ -1206,19 +1255,22 @@ mod tests {
             .unwrap();
         // Receive incoming with concurrent VV: [(2, 1)] — neither dominates.
         engine
-            .merge_files(&[FileInfo {
-                name: "doc.txt".into(),
-                file_type: FILE_TYPE_FILE,
-                size: 99,
-                modified: 100,
-                sequence: 0,
-                block_size: 128 * 1024,
-                deleted: false,
-                version: Version {
-                    counters: vec![(2, 1)],
-                },
-                block_hashes: vec![[1u8; 32]],
-            }])
+            .merge_files(
+                "peer-test",
+                &[FileInfo {
+                    name: "doc.txt".into(),
+                    file_type: FILE_TYPE_FILE,
+                    size: 99,
+                    modified: 100,
+                    sequence: 0,
+                    block_size: 128 * 1024,
+                    deleted: false,
+                    version: Version {
+                        counters: vec![(2, 1)],
+                    },
+                    block_hashes: vec![[1u8; 32]],
+                }],
+            )
             .unwrap();
         // After merge, the row must contain BOTH counters.
         let row = engine.index.get("doc.txt").unwrap().unwrap();
@@ -1236,17 +1288,20 @@ mod tests {
     async fn merge_files_ignores_directory_entries() {
         let (_dir, engine) = make_engine("f").await;
         engine
-            .merge_files(&[FileInfo {
-                name: "subdir".into(),
-                file_type: FILE_TYPE_DIR,
-                size: 0,
-                modified: 1_000_000_000,
-                sequence: 0,
-                block_size: 128 * 1024,
-                deleted: false,
-                version: Version::default(),
-                block_hashes: vec![],
-            }])
+            .merge_files(
+                "peer-test",
+                &[FileInfo {
+                    name: "subdir".into(),
+                    file_type: FILE_TYPE_DIR,
+                    size: 0,
+                    modified: 1_000_000_000,
+                    sequence: 0,
+                    block_size: 128 * 1024,
+                    deleted: false,
+                    version: Version::default(),
+                    block_hashes: vec![],
+                }],
+            )
             .unwrap();
         assert!(engine.index.get("subdir").unwrap().is_none());
     }
@@ -1270,19 +1325,22 @@ mod tests {
             .unwrap();
         // Incoming tombstone dominates with `(1, 2)`.
         engine
-            .merge_files(&[FileInfo {
-                name: "doc.txt".into(),
-                file_type: FILE_TYPE_FILE,
-                size: 0,
-                modified: 2_000_000_000,
-                sequence: 0,
-                block_size: 128 * 1024,
-                deleted: true,
-                version: Version {
-                    counters: vec![(1, 2)],
-                },
-                block_hashes: vec![],
-            }])
+            .merge_files(
+                "peer-test",
+                &[FileInfo {
+                    name: "doc.txt".into(),
+                    file_type: FILE_TYPE_FILE,
+                    size: 0,
+                    modified: 2_000_000_000,
+                    sequence: 0,
+                    block_size: 128 * 1024,
+                    deleted: true,
+                    version: Version {
+                        counters: vec![(1, 2)],
+                    },
+                    block_hashes: vec![],
+                }],
+            )
             .unwrap();
         let after = engine.index.get("doc.txt").unwrap().unwrap();
         assert!(after.deleted, "row should be marked deleted");
@@ -1294,19 +1352,22 @@ mod tests {
         let (_dir, engine) = make_engine("f").await;
         // No prior upsert for "gone.txt".
         engine
-            .merge_files(&[FileInfo {
-                name: "gone.txt".into(),
-                file_type: FILE_TYPE_FILE,
-                size: 0,
-                modified: 1_700_000_000,
-                sequence: 0,
-                block_size: 128 * 1024,
-                block_hashes: vec![],
-                deleted: true,
-                version: Version {
-                    counters: vec![(7, 1)],
-                },
-            }])
+            .merge_files(
+                "peer-test",
+                &[FileInfo {
+                    name: "gone.txt".into(),
+                    file_type: FILE_TYPE_FILE,
+                    size: 0,
+                    modified: 1_700_000_000,
+                    sequence: 0,
+                    block_size: 128 * 1024,
+                    block_hashes: vec![],
+                    deleted: true,
+                    version: Version {
+                        counters: vec![(7, 1)],
+                    },
+                }],
+            )
             .unwrap();
         let row = engine
             .index
@@ -1322,17 +1383,20 @@ mod tests {
     async fn merge_files_skips_unknown_file_type() {
         let (_dir, engine) = make_engine("f").await;
         engine
-            .merge_files(&[FileInfo {
-                name: "weird".into(),
-                file_type: 99,
-                size: 1,
-                modified: 1_000_000_000,
-                sequence: 0,
-                block_size: 128 * 1024,
-                deleted: false,
-                version: Version::default(),
-                block_hashes: vec![[0u8; 32]],
-            }])
+            .merge_files(
+                "peer-test",
+                &[FileInfo {
+                    name: "weird".into(),
+                    file_type: 99,
+                    size: 1,
+                    modified: 1_000_000_000,
+                    sequence: 0,
+                    block_size: 128 * 1024,
+                    deleted: false,
+                    version: Version::default(),
+                    block_hashes: vec![[0u8; 32]],
+                }],
+            )
             .unwrap();
         assert!(engine.index.get("weird").unwrap().is_none());
     }
@@ -1370,6 +1434,104 @@ mod tests {
         };
         let err = entry_to_file_info(&entry).unwrap_err();
         assert!(err.to_string().contains("partial hash"));
+    }
+
+    #[tokio::test]
+    async fn merge_files_advances_peer_max_sequence() {
+        let (_dir, engine) = make_engine("f").await;
+        engine
+            .merge_files(
+                "peer-x",
+                &[
+                    FileInfo {
+                        name: "a.txt".into(),
+                        file_type: FILE_TYPE_FILE,
+                        size: 1,
+                        modified: 0,
+                        sequence: 7,
+                        block_size: 128 * 1024,
+                        deleted: false,
+                        version: Version {
+                            counters: vec![(1, 1)],
+                        },
+                        block_hashes: vec![[0u8; 32]],
+                    },
+                    FileInfo {
+                        name: "b.txt".into(),
+                        file_type: FILE_TYPE_FILE,
+                        size: 1,
+                        modified: 0,
+                        sequence: 15,
+                        block_size: 128 * 1024,
+                        deleted: false,
+                        version: Version {
+                            counters: vec![(1, 1)],
+                        },
+                        block_hashes: vec![[0u8; 32]],
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(engine.index.get_peer_max_sequence("peer-x").unwrap(), 15);
+    }
+
+    #[tokio::test]
+    async fn merge_files_does_not_regress_peer_max_sequence() {
+        let (_dir, engine) = make_engine("f").await;
+        // Seed: peer reports a high watermark first.
+        engine.index.set_peer_max_sequence("peer-x", 100).unwrap();
+        // A later batch with a lower max sequence must NOT overwrite
+        // the prior value — frame reordering should never regress
+        // the cursor.
+        engine
+            .merge_files(
+                "peer-x",
+                &[FileInfo {
+                    name: "late.txt".into(),
+                    file_type: FILE_TYPE_FILE,
+                    size: 1,
+                    modified: 0,
+                    sequence: 4,
+                    block_size: 128 * 1024,
+                    deleted: false,
+                    version: Version {
+                        counters: vec![(1, 1)],
+                    },
+                    block_hashes: vec![[0u8; 32]],
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            engine.index.get_peer_max_sequence("peer-x").unwrap(),
+            100,
+            "out-of-order frames must not regress the cursor",
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_since_filters_by_row_version() {
+        // Three rows seeded into the index; entries_since(2) yields
+        // only the third. Snapshot_since must mirror that.
+        let (_dir, engine) = make_engine("f").await;
+        for path in ["one.txt", "two.txt", "three.txt"] {
+            engine
+                .index
+                .upsert(&IndexEntry {
+                    path: path.into(),
+                    is_dir: false,
+                    size: 1,
+                    modified: 0,
+                    block_hashes: vec![0u8; 32],
+                    deleted: false,
+                    row_version: 0,
+                    version: vec![(1, 1)],
+                })
+                .unwrap();
+        }
+        let delta = engine.snapshot_since(2).unwrap();
+        assert_eq!(delta.len(), 1);
+        assert_eq!(delta[0].name, "three.txt");
+        assert_eq!(delta[0].sequence, 3);
     }
 
     /// The accept loop must observe the `cancel` watch and exit. Without

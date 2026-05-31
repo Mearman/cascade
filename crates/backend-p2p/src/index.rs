@@ -293,7 +293,7 @@ impl FolderIndex {
                 |r| r.get(0),
             )
             .optional()?;
-        Ok(value.map(|v| u64::try_from(v).unwrap_or(0)).unwrap_or(0))
+        Ok(value.map_or(0, |v| u64::try_from(v).unwrap_or(0)))
     }
 
     /// Record the highest [`FileInfo::sequence`](cascade_p2p::protocol::FileInfo::sequence)
