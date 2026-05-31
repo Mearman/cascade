@@ -513,6 +513,14 @@ impl SyncEngine {
             }
             let local = self.index.get(&file.name)?;
             let incoming_version = file.version.clone();
+            // The version vector to persist alongside the incoming row.
+            // When there's no local row, or when the incoming row strictly
+            // dominates, the incoming counters are correct as-is. On a
+            // concurrent edit we must merge the two vectors so that a third
+            // peer later receiving this row sees the union of history —
+            // otherwise the local device's counter is silently dropped and
+            // a subsequent dominance check against that peer regresses.
+            let mut persisted_version = incoming_version.clone();
             if let Some(local_entry) = &local {
                 let local_version = Version {
                     counters: local_entry.version.clone(),
@@ -526,11 +534,11 @@ impl SyncEngine {
                     continue;
                 }
                 if !incoming_version.dominates(&local_version) {
-                    // Neither dominates — concurrent edit. Persisting
-                    // a conflict copy is tracked as a follow-up; for
-                    // this commit we log and fall through to accept
-                    // the incoming row so we don't regress relative to
-                    // the previous LWW tie-break behaviour.
+                    // Neither dominates — concurrent edit. The content
+                    // resolution (conflict-copy persistence) remains a
+                    // follow-up, but the version vector itself must merge:
+                    // dropping the local counters would let a third peer
+                    // make wrong dominance decisions against this row.
                     //
                     // TODO(cascade#conflict-copies): write the losing
                     // local row to a conflict-suffixed path before
@@ -540,8 +548,9 @@ impl SyncEngine {
                     tracing::warn!(
                         target: "cascade::backend::p2p",
                         path = %file.name,
-                        "version conflict — neither local nor remote dominates; accepting remote (conflict-copy persistence is a follow-up)",
+                        "version conflict — neither local nor remote dominates; accepting remote content and merging version vectors (conflict-copy persistence is a follow-up)",
                     );
+                    persisted_version.merge(&local_version);
                 }
             }
             if file.deleted {
@@ -553,7 +562,7 @@ impl SyncEngine {
                     block_hashes: vec![],
                     deleted: true,
                     row_version: 0,
-                    version: incoming_version.counters,
+                    version: persisted_version.counters,
                 };
                 self.index.upsert(&entry)?;
                 continue;
@@ -570,7 +579,7 @@ impl SyncEngine {
                 block_hashes: hash_blob,
                 deleted: false,
                 row_version: 0,
-                version: incoming_version.counters,
+                version: persisted_version.counters,
             };
             self.index.upsert(&entry)?;
         }
@@ -1015,9 +1024,62 @@ mod tests {
             }])
             .unwrap();
         let after = engine.index.get("doc.txt").unwrap().unwrap();
-        // Conflict-copy persistence is a follow-up; for now incoming wins.
+        // Conflict-copy persistence is a follow-up; for now incoming
+        // content wins, but the version vector must merge both counters so
+        // a third peer sees the full history.
         assert_eq!(after.size, 99);
-        assert_eq!(after.version, vec![(2, 1)]);
+        assert!(
+            after.version.iter().any(|(id, _)| *id == 1),
+            "local device counter must survive the merge"
+        );
+        assert!(
+            after.version.iter().any(|(id, _)| *id == 2),
+            "remote device counter must be present after the merge"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_files_merges_version_vectors_on_conflict() {
+        let (_dir, engine) = make_engine("f").await;
+        // Seed local: version = [(1, 1)]
+        engine
+            .index
+            .upsert(&IndexEntry {
+                path: "doc.txt".into(),
+                is_dir: false,
+                size: 10,
+                modified: 100,
+                block_hashes: vec![0u8; 32],
+                deleted: false,
+                row_version: 0,
+                version: vec![(1, 1)],
+            })
+            .unwrap();
+        // Receive incoming with concurrent VV: [(2, 1)] — neither dominates.
+        engine
+            .merge_files(&[FileInfo {
+                name: "doc.txt".into(),
+                file_type: FILE_TYPE_FILE,
+                size: 99,
+                modified: 100,
+                block_size: 128 * 1024,
+                deleted: false,
+                version: Version {
+                    counters: vec![(2, 1)],
+                },
+                block_hashes: vec![[1u8; 32]],
+            }])
+            .unwrap();
+        // After merge, the row must contain BOTH counters.
+        let row = engine.index.get("doc.txt").unwrap().unwrap();
+        assert!(
+            row.version.iter().any(|(id, _)| *id == 1),
+            "local device counter dropped"
+        );
+        assert!(
+            row.version.iter().any(|(id, _)| *id == 2),
+            "remote device counter missing"
+        );
     }
 
     #[tokio::test]
