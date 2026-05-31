@@ -28,6 +28,10 @@ fn encode_u64(buf: &mut Vec<u8>, val: u64) {
     buf.extend_from_slice(&val.to_be_bytes());
 }
 
+fn encode_i64(buf: &mut Vec<u8>, val: i64) {
+    buf.extend_from_slice(&val.to_be_bytes());
+}
+
 fn encode_opaque(buf: &mut Vec<u8>, data: &[u8]) -> Result<()> {
     let len = u32::try_from(data.len())
         .map_err(|_| anyhow::anyhow!("opaque data length {} exceeds u32", data.len()))?;
@@ -54,6 +58,13 @@ fn decode_u64(data: &[u8]) -> io::Result<(u64, &[u8])> {
         .split_first_chunk::<8>()
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "need 8 bytes for uint64"))?;
     Ok((u64::from_be_bytes(*bytes), rest))
+}
+
+fn decode_i64(data: &[u8]) -> io::Result<(i64, &[u8])> {
+    let (bytes, rest) = data
+        .split_first_chunk::<8>()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "need 8 bytes for int64"))?;
+    Ok((i64::from_be_bytes(*bytes), rest))
 }
 
 fn decode_opaque(data: &[u8]) -> io::Result<(&[u8], &[u8])> {
@@ -218,11 +229,7 @@ fn encode_file_infos(buf: &mut Vec<u8>, files: &[FileInfo]) -> Result<()> {
         encode_string(buf, &fi.name)?;
         encode_u32(buf, fi.file_type);
         encode_u64(buf, fi.size);
-        encode_u64(
-            buf,
-            u64::try_from(fi.modified)
-                .map_err(|_| anyhow::anyhow!("file modified timestamp is negative"))?,
-        );
+        encode_i64(buf, fi.modified);
         encode_u32(buf, fi.block_size);
         encode_u32(buf, u32::from(fi.deleted));
         encode_u32(
@@ -333,7 +340,7 @@ fn decode_file_infos(data: &[u8]) -> Result<(Vec<FileInfo>, &[u8])> {
         let (name, rest) = decode_string(data)?;
         let (file_type, rest) = decode_u32(rest)?;
         let (size, rest) = decode_u64(rest)?;
-        let (modified, rest) = decode_u64(rest)?;
+        let (modified, rest) = decode_i64(rest)?;
         let (block_size, rest) = decode_u32(rest)?;
         let (deleted_flag, rest) = decode_u32(rest)?;
         let (hash_count, mut rest) = decode_u32(rest)?;
@@ -352,8 +359,7 @@ fn decode_file_infos(data: &[u8]) -> Result<(Vec<FileInfo>, &[u8])> {
             name,
             file_type,
             size,
-            modified: i64::try_from(modified)
-                .map_err(|_| anyhow::anyhow!("modified timestamp overflows i64"))?,
+            modified,
             block_size,
             deleted: deleted_flag != 0,
             block_hashes,
@@ -465,6 +471,22 @@ mod tests {
                 block_size: 128 * 1024,
                 deleted: true,
                 block_hashes: vec![],
+            }],
+        });
+    }
+
+    #[test]
+    fn encode_decode_index_negative_modified() {
+        round_trip(BepMessage::IndexUpdate {
+            folder: "folder-1".into(),
+            files: vec![FileInfo {
+                name: "ancient.txt".into(),
+                file_type: 0,
+                size: 42,
+                modified: -1_000_000,
+                block_size: 128 * 1024,
+                deleted: false,
+                block_hashes: vec![[0x77; 32]],
             }],
         });
     }
