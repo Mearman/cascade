@@ -1,0 +1,25 @@
+[package]
+name = "cascade-presenter-projfs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cascade-engine = { path = "../engine" }
+async-trait.workspace = true
+anyhow.workspace = true
+tokio = { workspace = true, features = ["sync", "rt", "macros"] }
+tracing.workspace = true
+
+# The windows crate ships ProjFS bindings under the
+# `Win32_Storage_ProjectedFileSystem` feature. Only pull it in on
+# Windows targets so the crate compiles cross-platform.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_Storage_ProjectedFileSystem",
+] }
+
+[lints]
+workspace = true

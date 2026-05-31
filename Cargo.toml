@@ -15,6 +15,7 @@ members = [
     "crates/cascade",
     "crates/p2p",
     "crates/presenter-webdav",
+    "crates/presenter-projfs",
 ]
 
 [workspace.package]
