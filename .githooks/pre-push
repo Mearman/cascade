@@ -43,23 +43,49 @@ else
         exit 1
     fi
 
-    # Detect rustup by checking if `rustup` exists and resolves cargo.
+    # Only semantic versions (X.Y.Z) have a checkable cargo --version string.
+    # Symbolic channels (stable, beta, nightly, nightly-YYYY-MM-DD) get an
+    # info line and skip the exact-version check.
+    is_semantic_channel=false
+    if [[ "$PINNED_CHANNEL" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        is_semantic_channel=true
+    fi
+
+    rustup_handled=false
     if command -v rustup >/dev/null 2>&1; then
-        # rustup is installed — it respects rust-toolchain.toml automatically.
-        CARGO_VERSION=$(cargo --version 2>&1)
-        if ! echo "$CARGO_VERSION" | grep -qF "${PINNED_CHANNEL%%-*}"; then
-            echo "warning: cargo version does not contain pinned channel ${PINNED_CHANNEL}"
-            echo "         got: $CARGO_VERSION"
-            echo "         continuing — rustup should auto-install on first invocation"
+        # Query rustup's installed-toolchain list directly. This is the
+        # truth source — `cargo --version` lags rustup until the first
+        # invocation in the directory, which makes it misleading on a
+        # fresh box where the pinned channel hasn't yet been installed.
+        if RUSTUP_LIST=$(rustup toolchain list --verbose 2>/dev/null); then
+            rustup_handled=true
+            if ! echo "$RUSTUP_LIST" | grep -qF "$PINNED_CHANNEL"; then
+                echo "rustup: pinned channel ${PINNED_CHANNEL} is not installed; installing now"
+                if ! rustup install "$PINNED_CHANNEL"; then
+                    echo "error: rustup failed to install ${PINNED_CHANNEL}" >&2
+                    exit 1
+                fi
+            fi
         fi
-    else
-        # No rustup. The cargo on PATH is whatever the system installed.
-        CARGO_VERSION=$(cargo --version 2>&1)
-        if ! echo "$CARGO_VERSION" | grep -qF "${PINNED_CHANNEL%%-*}"; then
-            cat >&2 <<EOF
+    fi
+
+    if [[ "$rustup_handled" == false ]]; then
+        # No working rustup. The cargo on PATH is whatever the system installed,
+        # and rust-toolchain.toml is not auto-respected.
+        if [[ "$is_semantic_channel" == false ]]; then
+            echo "channel ${PINNED_CHANNEL} selected — toolchain version not verified"
+        else
+            CARGO_VERSION_STRING=$(cargo --version 2>&1)
+            # Anchor the match at the start of the version output: the
+            # output is reliably `cargo X.Y.Z (...)`. Escaping the dots
+            # in the channel keeps the regex precise — without escaping,
+            # `1.96.0` would also match `1x96x0`-like strings.
+            ESCAPED_CHANNEL=$(echo "$PINNED_CHANNEL" | sed 's/\./\\./g')
+            if ! echo "$CARGO_VERSION_STRING" | grep -qE "^cargo ${ESCAPED_CHANNEL} \("; then
+                cat >&2 <<EOF
 error: local toolchain does not match the pinned channel.
        pinned (rust-toolchain.toml): ${PINNED_CHANNEL}
-       actual (cargo on PATH):       ${CARGO_VERSION}
+       actual (cargo on PATH):       ${CARGO_VERSION_STRING}
 
        Without rustup, this hook runs gates against a different toolchain
        than CI. To fix:
@@ -67,7 +93,8 @@ error: local toolchain does not match the pinned channel.
            2. The pinned toolchain installs automatically on next cargo invocation.
            3. Optionally remove the Homebrew/system rust to avoid PATH ambiguity.
 EOF
-            exit 1
+                exit 1
+            fi
         fi
     fi
 fi
