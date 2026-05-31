@@ -224,6 +224,11 @@ pub enum BepMessage {
     },
     /// Request a specific block from a peer.
     Request {
+        /// Monotonic per-peer correlation id chosen by the requester.
+        /// The peer must echo this id in its [`BepMessage::Response`] so
+        /// the requester can route the payload to the right waiter,
+        /// allowing many concurrent requests on one connection.
+        request_id: u64,
         folder: String,
         name: String,
         block_offset: u64,
@@ -231,7 +236,12 @@ pub enum BepMessage {
         block_hash: [u8; 32],
     },
     /// Send block data.
-    Response { data: Vec<u8> },
+    Response {
+        /// Echoes the `request_id` of the [`BepMessage::Request`] this
+        /// response satisfies.
+        request_id: u64,
+        data: Vec<u8>,
+    },
     /// Keepalive.
     Ping,
     /// Graceful connection teardown.
@@ -281,19 +291,22 @@ pub fn encode_message(msg: &BepMessage) -> Result<Vec<u8>> {
             encode_file_infos(&mut body, files)?;
         }
         BepMessage::Request {
+            request_id,
             folder,
             name,
             block_offset,
             block_size,
             block_hash,
         } => {
+            encode_u64(&mut body, *request_id);
             encode_string(&mut body, folder)?;
             encode_string(&mut body, name)?;
             encode_u64(&mut body, *block_offset);
             encode_u32(&mut body, *block_size);
             encode_opaque(&mut body, block_hash)?;
         }
-        BepMessage::Response { data } => {
+        BepMessage::Response { request_id, data } => {
+            encode_u64(&mut body, *request_id);
             encode_opaque(&mut body, data)?;
         }
         BepMessage::Ping => {}
@@ -404,6 +417,7 @@ fn decode_index_update(data: &[u8]) -> Result<BepMessage> {
 }
 
 fn decode_request(data: &[u8]) -> Result<BepMessage> {
+    let (request_id, data) = decode_u64(data)?;
     let (folder, data) = decode_string(data)?;
     let (name, data) = decode_string(data)?;
     let (block_offset, data) = decode_u64(data)?;
@@ -415,6 +429,7 @@ fn decode_request(data: &[u8]) -> Result<BepMessage> {
     let mut block_hash = [0u8; 32];
     block_hash.copy_from_slice(hash_bytes);
     Ok(BepMessage::Request {
+        request_id,
         folder,
         name,
         block_offset,
@@ -424,8 +439,12 @@ fn decode_request(data: &[u8]) -> Result<BepMessage> {
 }
 
 fn decode_response(data: &[u8]) -> Result<BepMessage> {
+    let (request_id, data) = decode_u64(data)?;
     let (raw, _) = decode_opaque(data)?;
-    Ok(BepMessage::Response { data: raw.to_vec() })
+    Ok(BepMessage::Response {
+        request_id,
+        data: raw.to_vec(),
+    })
 }
 
 fn decode_close(data: &[u8]) -> Result<BepMessage> {
@@ -633,6 +652,7 @@ mod tests {
     #[test]
     fn encode_decode_request() {
         round_trip(BepMessage::Request {
+            request_id: 42,
             folder: "folder-1".into(),
             name: "bigfile.iso".into(),
             block_offset: 524288,
@@ -644,13 +664,17 @@ mod tests {
     #[test]
     fn encode_decode_response() {
         round_trip(BepMessage::Response {
+            request_id: 42,
             data: vec![0xDE, 0xAD, 0xBE, 0xEF],
         });
     }
 
     #[test]
     fn encode_decode_response_empty() {
-        round_trip(BepMessage::Response { data: vec![] });
+        round_trip(BepMessage::Response {
+            request_id: 1,
+            data: vec![],
+        });
     }
 
     #[test]

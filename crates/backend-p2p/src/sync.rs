@@ -92,6 +92,7 @@ impl PeerHandle {
         }
         self.outbound
             .send(BepMessage::Request {
+                request_id: 0,
                 folder,
                 name,
                 block_offset: offset,
@@ -403,6 +404,7 @@ impl SyncEngine {
                 Ok(())
             }
             BepMessage::Request {
+                request_id,
                 folder,
                 name: _,
                 block_offset: _,
@@ -411,7 +413,10 @@ impl SyncEngine {
             } => {
                 if folder != self.folder_id {
                     outbound
-                        .send(BepMessage::Response { data: Vec::new() })
+                        .send(BepMessage::Response {
+                            request_id,
+                            data: Vec::new(),
+                        })
                         .ok();
                     return Ok(());
                 }
@@ -422,10 +427,12 @@ impl SyncEngine {
                     .await
                     .unwrap_or(None)
                     .unwrap_or_default();
-                outbound.send(BepMessage::Response { data }).ok();
+                outbound
+                    .send(BepMessage::Response { request_id, data })
+                    .ok();
                 Ok(())
             }
-            BepMessage::Response { data } => {
+            BepMessage::Response { request_id: _, data } => {
                 let waiter = {
                     let mut pending = pending.lock().await;
                     pending.pop_front()

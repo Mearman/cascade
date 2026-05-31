@@ -150,13 +150,15 @@ fn bep_message_strategy() -> impl Strategy<Value = BepMessage> {
         .prop_map(|(folder, files)| BepMessage::IndexUpdate { folder, files });
 
     let request = (
+        any::<u64>(),
         ".{0,20}",
         ".{0,20}",
         0u64..1_000_000,
         prop::array::uniform32(any::<u8>()),
     )
         .prop_map(
-            |(folder, name, block_offset, block_hash)| BepMessage::Request {
+            |(request_id, folder, name, block_offset, block_hash)| BepMessage::Request {
+                request_id,
                 folder,
                 name,
                 block_offset,
@@ -165,8 +167,8 @@ fn bep_message_strategy() -> impl Strategy<Value = BepMessage> {
             },
         );
 
-    let response =
-        prop::collection::vec(any::<u8>(), 0..100).prop_map(|data| BepMessage::Response { data });
+    let response = (any::<u64>(), prop::collection::vec(any::<u8>(), 0..100))
+        .prop_map(|(request_id, data)| BepMessage::Response { request_id, data });
 
     let close = ".{0,50}".prop_map(|reason| BepMessage::Close { reason });
 
