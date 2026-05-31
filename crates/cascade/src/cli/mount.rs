@@ -1162,6 +1162,9 @@ fn osascript_mount_command(mount_point: &Path, port: u16) -> std::process::Comma
 /// than propagated — shutdown should not block on an already-detached
 /// mount.
 #[cfg(target_os = "linux")]
+#[allow(clippy::unnecessary_wraps)]
+// Returns `Result<()>` to share the signature with the macOS/Windows impls;
+// shutdown is best-effort and never propagates errors on Linux.
 fn unmount_path(mount_point: &Path) -> Result<()> {
     tracing::info!(path = %mount_point.display(), "unmounting NFS");
 
