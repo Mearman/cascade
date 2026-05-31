@@ -498,8 +498,13 @@ mod file_store {
 
     /// Save tokens as JSON under the given directory.
     ///
-    /// On Unix the file is created with `0o600` permissions (owner read+write
-    /// only). On Windows the file inherits NTFS ACLs from its parent dir.
+    /// On Unix the file is created atomically with `0o600` permissions
+    /// (owner read+write only) — the file never exists on disk with
+    /// permissive bits. Any pre-existing file is removed first so that
+    /// `create_new` always creates a fresh inode at the restrictive mode,
+    /// avoiding the TOCTOU window that an `open(write|truncate)` followed
+    /// by a separate `set_permissions` call would leave behind.
+    /// On Windows the file inherits NTFS ACLs from its parent dir.
     pub(super) fn save_tokens_in(
         base: &Path,
         account: &str,
@@ -509,13 +514,33 @@ mod file_store {
 
         let path = tokens_path_in(base, account);
         let json = serde_json::to_string(tokens)?;
-        std::fs::write(&path, json.as_bytes())?;
 
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            std::fs::set_permissions(&path, perms)?;
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+
+            // Remove any existing file so `create_new` always allocates a
+            // fresh inode with the requested mode. Without this, a pre-existing
+            // file with permissive bits would keep those bits after the write
+            // (the `mode` argument to `OpenOptions` only applies on creation).
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)?;
+            file.write_all(json.as_bytes())?;
+            file.sync_all()?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&path, json.as_bytes())?;
         }
 
         Ok(())
@@ -638,6 +663,34 @@ mod tests {
         save_tokens_in(dir.path(), "perms", &sample_tokens())?;
 
         let path = tokens_path_in(dir.path(), "perms");
+        let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "expected file mode 0o600, found {mode:o}");
+        Ok(())
+    }
+
+    /// Regression test for the TOCTOU permission window: when a pre-existing
+    /// token file has permissive bits (e.g. left behind by an older build that
+    /// wrote at the umask before tightening), the next save must end with
+    /// `0o600` and no intermediate state visible to other local users.
+    /// Implementation-wise this means the existing file is unlinked and
+    /// replaced rather than overwritten in place.
+    #[cfg(unix)]
+    #[test]
+    fn file_fallback_tightens_permissive_existing_file() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir()?;
+        let path = tokens_path_in(dir.path(), "stale");
+
+        // Seed a pre-existing token file with world-readable permissions, as
+        // would happen on a host where an older binary wrote at the umask.
+        std::fs::write(&path, b"stale")?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+        let stale_mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
+        assert_eq!(stale_mode, 0o644, "seed file should start at 0o644");
+
+        save_tokens_in(dir.path(), "stale", &sample_tokens())?;
+
         let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "expected file mode 0o600, found {mode:o}");
         Ok(())
