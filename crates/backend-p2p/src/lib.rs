@@ -179,6 +179,7 @@ impl P2pBackend {
         let cfg_instance_id = cfg.instance_id.clone();
         let cfg_peers = cfg.peers.clone();
         let cfg_enable_discovery = cfg.enable_discovery;
+        let cfg_stun_servers = cfg.stun_servers.clone();
         let bootstrap_cancel = cancel.subscribe();
         let cancel_for_children = cancel.clone();
         tokio::spawn(async move {
@@ -196,6 +197,13 @@ impl P2pBackend {
             if !name_entries.is_empty() {
                 sync_for_listener.seed_peer_names(name_entries).await;
             }
+
+            // NAT detection runs before the listener so the operator sees
+            // the diagnostic next to the listen log. Logged for diagnostics
+            // only today — future work could pick relay vs direct based on
+            // the detected type, but the current SyncEngine does not expose
+            // a hook to influence connection behaviour from this signal.
+            detect_nat_with_logging(&cfg_instance_id, &cfg_stun_servers).await;
 
             // Bind the listener first so subsequent announce loops can
             // advertise the actual bound port (important when
@@ -664,6 +672,40 @@ async fn keep_peer_connected(
                 if res.is_err() || *cancel.borrow() {
                     return;
                 }
+            }
+        }
+    }
+}
+
+/// Walk the configured STUN servers and log the first successfully
+/// detected NAT type. Failures fall through to the next server; if no
+/// server responds, the function returns without logging at info level
+/// — the per-server debug logs are sufficient for diagnostics.
+///
+/// Today this is purely informational. Future work could route this
+/// signal into connection-strategy decisions (e.g. prefer relay when
+/// `Symmetric` is detected) but the current `SyncEngine` does not
+/// expose a hook for that.
+async fn detect_nat_with_logging(instance_id: &str, stun_servers: &[String]) {
+    for stun in stun_servers {
+        match cascade_p2p::nat::NatTraversal::detect_nat_type(stun).await {
+            Ok(nat_type) => {
+                tracing::info!(
+                    target: "cascade::backend::p2p",
+                    instance = %instance_id,
+                    stun = %stun,
+                    nat = ?nat_type,
+                    "NAT type detected",
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::debug!(
+                    target: "cascade::backend::p2p",
+                    stun = %stun,
+                    error = %e,
+                    "NAT detection failed; trying next server",
+                );
             }
         }
     }
