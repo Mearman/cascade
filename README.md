@@ -1,9 +1,9 @@
 # Cascade
 
-[![GitHub](https://img.shields.io/badge/GitHub-181717?logo=github&logoColor=white)](https://github.com/Mearman/cascade)
 [![CI](https://img.shields.io/github/actions/workflow/status/Mearman/cascade/ci.yml?branch=main&label=CI)](https://github.com/Mearman/cascade/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/Mearman/cascade?sort=semver)](https://github.com/Mearman/cascade/releases/latest)
 [![License](https://img.shields.io/github/license/Mearman/cascade)](LICENSE)
+[![GitHub](https://img.shields.io/badge/GitHub-181717?logo=github&logoColor=white)](https://github.com/Mearman/cascade)
 [![Homebrew](https://img.shields.io/badge/Homebrew-FBB040?logo=homebrew&logoColor=white)](https://github.com/Mearman/homebrew-cascade)
 [![Scoop](https://img.shields.io/badge/Scoop-205081?logo=data:image/svg%2Bxml%3Bbase64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZD0iTTExIDJoMnY5aC0yek0xMiAyMmE3IDcgMCAwIDAgNy03SDVhNyA3IDAgMCAwIDcgN3oiIGZpbGw9IiNmZmYiLz48L3N2Zz4K&logoColor=white)](https://github.com/Mearman/scoop-cascade)
 
