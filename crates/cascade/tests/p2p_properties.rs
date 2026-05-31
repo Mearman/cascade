@@ -133,6 +133,7 @@ fn bep_message_strategy() -> impl Strategy<Value = BepMessage> {
             size,
             modified,
             block_size: 128 * 1024,
+            deleted: false,
             block_hashes: vec![hash],
         });
 

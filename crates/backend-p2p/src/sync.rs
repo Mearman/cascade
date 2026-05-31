@@ -504,6 +504,7 @@ fn entry_to_file_info(entry: &IndexEntry) -> Result<FileInfo> {
         size: entry.size,
         modified: entry.modified,
         block_size,
+        deleted: entry.deleted,
         block_hashes: hashes,
     })
 }
@@ -650,6 +651,7 @@ mod tests {
                 size: 99,
                 modified: 1_000_000_000,
                 block_size: 128 * 1024,
+                deleted: false,
                 block_hashes: vec![[1u8; 32]],
             }])
             .unwrap();
@@ -680,6 +682,7 @@ mod tests {
                 size: 99,
                 modified: 2_000_000_000,
                 block_size: 128 * 1024,
+                deleted: false,
                 block_hashes: vec![[1u8; 32]],
             }])
             .unwrap();
@@ -699,6 +702,7 @@ mod tests {
                 size: 0,
                 modified: 1_000_000_000,
                 block_size: 128 * 1024,
+                deleted: false,
                 block_hashes: vec![],
             }])
             .unwrap();
@@ -715,6 +719,7 @@ mod tests {
                 size: 1,
                 modified: 1_000_000_000,
                 block_size: 128 * 1024,
+                deleted: false,
                 block_hashes: vec![[0u8; 32]],
             }])
             .unwrap();

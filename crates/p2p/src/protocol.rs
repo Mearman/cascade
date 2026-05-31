@@ -102,6 +102,10 @@ pub struct FileInfo {
     pub modified: i64,
     /// Block size used for this file.
     pub block_size: u32,
+    /// Tombstone flag. When `true`, the row records a delete event:
+    /// the peer should mark its local copy deleted (subject to the
+    /// last-write-wins comparison on `modified`).
+    pub deleted: bool,
     /// SHA-256 hashes of each block, in order.
     pub block_hashes: Vec<[u8; 32]>,
 }
@@ -220,6 +224,7 @@ fn encode_file_infos(buf: &mut Vec<u8>, files: &[FileInfo]) -> Result<()> {
                 .map_err(|_| anyhow::anyhow!("file modified timestamp is negative"))?,
         );
         encode_u32(buf, fi.block_size);
+        encode_u32(buf, u32::from(fi.deleted));
         encode_u32(
             buf,
             u32::try_from(fi.block_hashes.len())
@@ -330,6 +335,7 @@ fn decode_file_infos(data: &[u8]) -> Result<(Vec<FileInfo>, &[u8])> {
         let (size, rest) = decode_u64(rest)?;
         let (modified, rest) = decode_u64(rest)?;
         let (block_size, rest) = decode_u32(rest)?;
+        let (deleted_flag, rest) = decode_u32(rest)?;
         let (hash_count, mut rest) = decode_u32(rest)?;
         let mut block_hashes = Vec::with_capacity(hash_count as usize);
         for _ in 0..hash_count {
@@ -349,6 +355,7 @@ fn decode_file_infos(data: &[u8]) -> Result<(Vec<FileInfo>, &[u8])> {
             modified: i64::try_from(modified)
                 .map_err(|_| anyhow::anyhow!("modified timestamp overflows i64"))?,
             block_size,
+            deleted: deleted_flag != 0,
             block_hashes,
         });
         data = rest;
@@ -397,6 +404,7 @@ mod tests {
                 size: 1024,
                 modified: 1700000000,
                 block_size: 128 * 1024,
+                deleted: false,
                 block_hashes: vec![[0xAB; 32]],
             }],
         });
@@ -413,6 +421,7 @@ mod tests {
                     size: 500,
                     modified: 100,
                     block_size: 128 * 1024,
+                    deleted: false,
                     block_hashes: vec![[1u8; 32]],
                 },
                 FileInfo {
@@ -421,6 +430,7 @@ mod tests {
                     size: 200000,
                     modified: 200,
                     block_size: 128 * 1024,
+                    deleted: false,
                     block_hashes: vec![[2u8; 32], [3u8; 32]],
                 },
             ],
@@ -437,7 +447,24 @@ mod tests {
                 size: 999999,
                 modified: 1700000001,
                 block_size: 512 * 1024,
+                deleted: false,
                 block_hashes: vec![[0xFF; 32], [0xEE; 32]],
+            }],
+        });
+    }
+
+    #[test]
+    fn encode_decode_index_tombstone_round_trip() {
+        round_trip(BepMessage::IndexUpdate {
+            folder: "folder-1".into(),
+            files: vec![FileInfo {
+                name: "gone.txt".into(),
+                file_type: 0,
+                size: 0,
+                modified: 1700000002,
+                block_size: 128 * 1024,
+                deleted: true,
+                block_hashes: vec![],
             }],
         });
     }
