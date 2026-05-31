@@ -29,6 +29,7 @@
 pub mod block;
 pub mod connection;
 pub mod discovery;
+pub mod framed;
 pub mod identity;
 pub mod nat;
 pub mod protocol;

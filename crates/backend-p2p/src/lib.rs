@@ -12,6 +12,7 @@
 //! `cascade_p2p::BepMessage` machinery onto this index.
 
 pub mod index;
+pub mod sync;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -21,10 +22,12 @@ use async_trait::async_trait;
 use cascade_engine::backend::Backend;
 use cascade_engine::types::{Change, Cursor, FileEntry, FileId, ItemId, Quota};
 use cascade_p2p::block::{BlockHash, split_data};
+use cascade_p2p::identity::DeviceIdentity;
 use cascade_p2p::store::BlockStore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::index::{FolderIndex, IndexEntry};
+use crate::sync::SyncEngine;
 
 /// Configuration for a P2P backend instance.
 #[derive(Debug)]
@@ -33,6 +36,10 @@ pub struct P2pBackendConfig {
     pub display_name: String,
     pub index_path: PathBuf,
     pub block_store_root: PathBuf,
+    /// Directory used for the device identity certificate.
+    pub identity_dir: PathBuf,
+    /// Folder ID exchanged with peers. Defaults to `instance_id`.
+    pub folder_id: String,
 }
 
 /// A P2P backend instance.
@@ -40,6 +47,7 @@ pub struct P2pBackend {
     cfg: P2pBackendConfig,
     index: Arc<FolderIndex>,
     blocks: Arc<BlockStore>,
+    sync: SyncEngine,
 }
 
 impl std::fmt::Debug for P2pBackend {
@@ -54,15 +62,32 @@ impl std::fmt::Debug for P2pBackend {
 impl P2pBackend {
     /// Open or create a P2P backend at the given index + block store paths.
     pub async fn open(cfg: P2pBackendConfig) -> Result<Self> {
-        let index = FolderIndex::open(&cfg.index_path)?;
-        let blocks = BlockStore::new(&cfg.block_store_root)
-            .await
-            .context("open block store")?;
+        let index = Arc::new(FolderIndex::open(&cfg.index_path)?);
+        let blocks = Arc::new(
+            BlockStore::new(&cfg.block_store_root)
+                .await
+                .context("open block store")?,
+        );
+        let identity = DeviceIdentity::load_or_generate(&cfg.identity_dir)
+            .context("loading P2P backend identity")?;
+        let sync = SyncEngine::new(
+            cfg.folder_id.clone(),
+            index.clone(),
+            blocks.clone(),
+            identity,
+        );
         Ok(Self {
             cfg,
-            index: Arc::new(index),
-            blocks: Arc::new(blocks),
+            index,
+            blocks,
+            sync,
         })
+    }
+
+    /// Access the sync engine — used to start a listener and add peers.
+    #[must_use]
+    pub const fn sync(&self) -> &SyncEngine {
+        &self.sync
     }
 
     /// Convert a `FolderIndex` row into a `FileEntry` keyed under this
@@ -157,13 +182,27 @@ impl Backend for P2pBackend {
             .index
             .get(native)?
             .ok_or_else(|| anyhow::anyhow!("not in index: {native}"))?;
+        let block_size = cascade_p2p::block::block_size_for_file(entry.size);
         // Block hashes are stored as concatenated 32-byte values.
-        for chunk in entry.block_hashes.chunks(32) {
+        for (idx, chunk) in entry.block_hashes.chunks(32).enumerate() {
             let mut h = [0u8; 32];
             h.copy_from_slice(chunk);
-            let data = self.blocks.get_block(&BlockHash(h)).await?.ok_or_else(|| {
-                anyhow::anyhow!("block missing locally; peer fetch not yet wired")
-            })?;
+            let hash = BlockHash(h);
+            let data = if let Some(data) = self.blocks.get_block(&hash).await? {
+                data
+            } else {
+                let fetched = self
+                    .sync
+                    .fetch_block(native, idx, block_size, h)
+                    .await
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("block {hash} missing and no peer had it")
+                    })?;
+                // Cache the fetched block locally so future reads hit
+                // the store without round-tripping the network.
+                self.blocks.store_block(&hash, &fetched).await?;
+                fetched
+            };
             writer.write_all(&data).await?;
         }
         writer.flush().await?;
@@ -213,6 +252,7 @@ impl Backend for P2pBackend {
             version: 0,
         };
         self.index.upsert(&entry)?;
+        self.sync.broadcast_update(&entry).await;
         Ok(self.entry_to_file(&entry))
     }
 
@@ -323,11 +363,14 @@ pub fn create_backend(config: &toml::Value) -> Result<Box<dyn Backend>> {
         .and_then(|v| v.as_str())
         .map_or_else(|| default_data_dir(&name), PathBuf::from);
 
+    let instance_id = format!("p2p-{name}");
     let cfg = P2pBackendConfig {
-        instance_id: format!("p2p-{name}"),
+        folder_id: instance_id.clone(),
+        instance_id,
         display_name,
         index_path: data_dir.join("index.db"),
         block_store_root: data_dir.join("blocks"),
+        identity_dir: data_dir.join("identity"),
     };
 
     // Open is async — block on a runtime handle. The CLI is already in a
@@ -355,9 +398,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let cfg = P2pBackendConfig {
             instance_id: "p2p-test".to_string(),
+            folder_id: "p2p-test".to_string(),
             display_name: "Test".to_string(),
             index_path: dir.path().join("index.db"),
             block_store_root: dir.path().join("blocks"),
+            identity_dir: dir.path().join("identity"),
         };
         let backend = P2pBackend::open(cfg).await.unwrap();
         (dir, backend)
@@ -447,5 +492,91 @@ mod tests {
         backend.delete(&entry).await.unwrap();
         let kids = backend.list_children("root").await.unwrap();
         assert!(kids.is_empty());
+    }
+
+    /// End-to-end: A uploads through the Backend trait, B connects, and
+    /// B's `download()` succeeds even though B's local block store is
+    /// empty — the missing blocks must be fetched from A over the wire.
+    #[tokio::test]
+    async fn cross_backend_download_via_peer_fetch() {
+        async fn open_with_folder(dir: &std::path::Path, name: &str) -> P2pBackend {
+            let cfg = P2pBackendConfig {
+                instance_id: format!("p2p-{name}"),
+                folder_id: "shared".to_string(),
+                display_name: name.to_string(),
+                index_path: dir.join("index.db"),
+                block_store_root: dir.join("blocks"),
+                identity_dir: dir.join("identity"),
+            };
+            P2pBackend::open(cfg).await.unwrap()
+        }
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let backend_a = open_with_folder(dir_a.path(), "a").await;
+        let backend_b = open_with_folder(dir_b.path(), "b").await;
+
+        backend_a
+            .sync()
+            .trust(backend_b.sync().device_id().to_string())
+            .await;
+        backend_b
+            .sync()
+            .trust(backend_a.sync().device_id().to_string())
+            .await;
+
+        let (addr_a, _a_task) = backend_a
+            .sync()
+            .start_listener("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        backend_b
+            .sync()
+            .connect_to(crate::sync::Peer {
+                device_id: backend_a.sync().device_id().to_string(),
+                address: addr_a,
+            })
+            .await
+            .unwrap();
+
+        let payload = b"peer-to-peer round trip".repeat(50);
+        let mut reader = IoCursor::new(payload.clone());
+        let entry_a = backend_a
+            .upload(
+                Path::new("shared.bin"),
+                &mut reader,
+                &FileId(format!("{}:root", backend_a.id())),
+            )
+            .await
+            .unwrap();
+
+        // Let the IndexUpdate broadcast and the handshake Index reach B.
+        let mut found = None;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            if let Some(local) = backend_b.index.get("shared.bin").unwrap() {
+                found = Some(local);
+                break;
+            }
+        }
+        let local_b = found.expect("B never received index update");
+        assert_eq!(local_b.size, entry_a.size.unwrap());
+        // B's block store is empty — download must hit the peer.
+        for chunk in local_b.block_hashes.chunks(32) {
+            let mut h = [0u8; 32];
+            h.copy_from_slice(chunk);
+            assert!(
+                backend_b
+                    .blocks
+                    .get_block(&BlockHash(h))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        let entry_b = backend_b.metadata(Path::new("shared.bin")).await.unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        backend_b.download(&entry_b, &mut out).await.unwrap();
+        assert_eq!(out, payload);
     }
 }

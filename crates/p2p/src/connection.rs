@@ -132,7 +132,7 @@ impl ConnectionManager {
             .await
             .with_context(|| format!("TCP connect to {address}"))?;
 
-        let connector = Self::build_client_connector();
+        let connector = self.build_client_connector()?;
         let server_name = ServerName::try_from("cascade-device")
             .map_err(|e| anyhow::anyhow!("invalid server name: {e}"))?;
 
@@ -158,27 +158,30 @@ impl ConnectionManager {
         Ok(TlsStream::Client(tls_stream))
     }
 
-    /// Build a TLS client connector that accepts any self-signed cert
-    /// (we verify the fingerprint ourselves after handshake).
-    fn build_client_connector() -> TlsConnector {
+    /// Build a TLS client connector that presents our identity certificate
+    /// and accepts any self-signed server cert (we verify the fingerprint
+    /// ourselves after handshake).
+    fn build_client_connector(&self) -> Result<TlsConnector> {
         ensure_crypto_provider();
-        // Dangerous cert verifier — we accept any certificate and
-        // verify the fingerprint post-handshake instead.
+        let certs = load_certs(&self.identity.cert_pem)?;
+        let key = load_key(&self.identity.key_pem)?;
         let config = ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoVerifier))
-            .with_no_client_auth();
-        TlsConnector::from(Arc::new(config))
+            .with_client_auth_cert(certs, key)
+            .map_err(|e| anyhow::anyhow!("building TLS client config: {e}"))?;
+        Ok(TlsConnector::from(Arc::new(config)))
     }
 
-    /// Build a TLS server acceptor using our identity certificate.
+    /// Build a TLS server acceptor that requires a client certificate
+    /// (the fingerprint is checked post-handshake to identify the peer).
     fn build_server_acceptor(&self) -> Result<TlsAcceptor> {
         ensure_crypto_provider();
         let certs = load_certs(&self.identity.cert_pem)?;
         let key = load_key(&self.identity.key_pem)?;
 
         let config = ServerConfig::builder()
-            .with_no_client_auth()
+            .with_client_cert_verifier(Arc::new(NoClientCertVerifier))
             .with_single_cert(certs, key)
             .map_err(|e| anyhow::anyhow!("building TLS server config: {e}"))?;
 
@@ -186,7 +189,67 @@ impl ConnectionManager {
     }
 }
 
-/// Certificate verifier that accepts any certificate.
+/// Client cert verifier that accepts any client certificate.
+/// We derive the device ID from the cert fingerprint post-handshake
+/// and reject the connection there if the device is not trusted.
+#[derive(Debug)]
+struct NoClientCertVerifier;
+
+impl tokio_rustls::rustls::server::danger::ClientCertVerifier for NoClientCertVerifier {
+    fn root_hint_subjects(&self) -> &[tokio_rustls::rustls::DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: tokio_rustls::rustls::pki_types::UnixTime,
+    ) -> std::result::Result<
+        tokio_rustls::rustls::server::danger::ClientCertVerified,
+        tokio_rustls::rustls::Error,
+    > {
+        Ok(tokio_rustls::rustls::server::danger::ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &tokio_rustls::rustls::DigitallySignedStruct,
+    ) -> std::result::Result<
+        tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
+        tokio_rustls::rustls::Error,
+    > {
+        Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &tokio_rustls::rustls::DigitallySignedStruct,
+    ) -> std::result::Result<
+        tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
+        tokio_rustls::rustls::Error,
+    > {
+        Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<tokio_rustls::rustls::SignatureScheme> {
+        vec![
+            tokio_rustls::rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            tokio_rustls::rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            tokio_rustls::rustls::SignatureScheme::ED25519,
+            tokio_rustls::rustls::SignatureScheme::RSA_PSS_SHA256,
+            tokio_rustls::rustls::SignatureScheme::RSA_PSS_SHA384,
+            tokio_rustls::rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            tokio_rustls::rustls::SignatureScheme::RSA_PKCS1_SHA384,
+        ]
+    }
+}
+
+/// Server cert verifier that accepts any server certificate.
 /// We verify the device ID fingerprint post-handshake instead.
 #[derive(Debug)]
 struct NoVerifier;
@@ -316,7 +379,9 @@ mod tests {
 
     #[test]
     fn connection_manager_builds_client_connector() {
-        let _connector = ConnectionManager::build_client_connector();
+        let identity = DeviceIdentity::generate().unwrap();
+        let manager = ConnectionManager::new(identity, vec![], vec![]);
+        let _connector = manager.build_client_connector().unwrap();
     }
 
     #[test]

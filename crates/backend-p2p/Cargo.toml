@@ -10,7 +10,7 @@ cascade-p2p = { path = "../p2p" }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["net", "rt", "macros", "io-util", "sync", "time"] }
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
