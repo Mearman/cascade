@@ -53,6 +53,7 @@ use cascade_p2p::framed::FramedPeer;
 use cascade_p2p::identity::DeviceIdentity;
 use cascade_p2p::protocol::{BepMessage, FileInfo, Folder, Version};
 use cascade_p2p::store::BlockStore;
+use cascade_p2p::wan::PeerBook;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tracing::{debug, info, warn};
@@ -161,6 +162,10 @@ pub struct SyncEngine {
     /// Device IDs we are willing to talk to.
     trusted: Arc<Mutex<Vec<String>>>,
     peers: Arc<Mutex<HashMap<String, PeerHandle>>>,
+    /// Record of every peer we have successfully connected to (either
+    /// direction), keyed by device ID. Populated as a local artefact for
+    /// future gossip work; the transport itself is not wired yet.
+    peer_book: Arc<RwLock<PeerBook>>,
 }
 
 impl SyncEngine {
@@ -182,6 +187,7 @@ impl SyncEngine {
             peer_names: Arc::new(RwLock::new(HashMap::new())),
             trusted: Arc::new(Mutex::new(Vec::new())),
             peers: Arc::new(Mutex::new(HashMap::new())),
+            peer_book: Arc::new(RwLock::new(PeerBook::new())),
         }
     }
 
@@ -234,6 +240,13 @@ impl SyncEngine {
     #[must_use]
     pub const fn device_short_id(&self) -> u64 {
         self.device_short_id
+    }
+
+    /// Read-only access to the peer book. Used by tests and future
+    /// gossip work.
+    #[must_use]
+    pub const fn peer_book(&self) -> &Arc<RwLock<PeerBook>> {
+        &self.peer_book
     }
 
     /// Add a trusted device ID. Future inbound connections from this
@@ -352,6 +365,7 @@ impl SyncEngine {
             .with_context(|| {
                 format!("connecting to peer {} at {}", peer.device_id, peer.address)
             })?;
+        self.record_peer(&peer.device_id, peer.address).await;
         let framed = FramedPeer::from_connection(conn)?;
         let engine = self.clone();
         let device_id = peer.device_id.clone();
@@ -376,8 +390,18 @@ impl SyncEngine {
             .await
             .with_context(|| format!("accepting inbound from {peer_addr}"))?;
         info!("inbound P2P connection accepted from device {device_id}");
+        self.record_peer(&device_id, peer_addr).await;
         let framed = FramedPeer::from_tls(tls);
         self.run_session(device_id, framed).await
+    }
+
+    /// Record a successful peer contact in the local `PeerBook`. A
+    /// repeat call for the same device ID overwrites the recorded
+    /// address with the latest one — that matches the realistic case
+    /// of a peer reconnecting from a new IP.
+    async fn record_peer(&self, device_id: &str, address: SocketAddr) {
+        let mut book = self.peer_book.write().await;
+        book.add_peer(device_id.to_string(), vec![address]);
     }
 
     /// Drive a peer session: send our handshake, then read frames and
@@ -1783,6 +1807,74 @@ mod tests {
             version: Vec::new(),
         };
         engine.broadcast_update(&dir).await;
+    }
+
+    /// `connect_to` should record the dialled peer in our `PeerBook`.
+    #[tokio::test]
+    async fn peer_book_records_outbound_connections() {
+        let (_dir_a, engine_a) = make_engine("shared").await;
+        let (_dir_b, engine_b) = make_engine("shared").await;
+
+        engine_a.trust(engine_b.device_id().to_string()).await;
+        engine_b.trust(engine_a.device_id().to_string()).await;
+
+        let (addr_b, _b_task) = engine_b
+            .start_listener("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        engine_a
+            .connect_to(Peer {
+                device_id: engine_b.device_id().to_string(),
+                address: addr_b,
+            })
+            .await
+            .unwrap();
+
+        let book = engine_a.peer_book().read().await;
+        let recorded = book
+            .get(engine_b.device_id())
+            .expect("B should be recorded in A's peer book");
+        assert_eq!(recorded.addresses, vec![addr_b]);
+        assert!(
+            recorded.introduced_by.is_empty(),
+            "manual contact should record no introducer"
+        );
+    }
+
+    /// `handle_inbound` should record the accepted peer in our `PeerBook`.
+    #[tokio::test]
+    async fn peer_book_records_inbound_connections() {
+        let (_dir_a, engine_a) = make_engine("shared").await;
+        let (_dir_b, engine_b) = make_engine("shared").await;
+
+        engine_a.trust(engine_b.device_id().to_string()).await;
+        engine_b.trust(engine_a.device_id().to_string()).await;
+
+        let (addr_b, _b_task) = engine_b
+            .start_listener("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        engine_a
+            .connect_to(Peer {
+                device_id: engine_b.device_id().to_string(),
+                address: addr_b,
+            })
+            .await
+            .unwrap();
+
+        // The inbound handler records the peer asynchronously inside the
+        // listener task; poll the peer book until A appears (or fail).
+        let mut found = false;
+        for _ in 0..40 {
+            let book = engine_b.peer_book().read().await;
+            if book.get(engine_a.device_id()).is_some() {
+                found = true;
+                break;
+            }
+            drop(book);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(found, "A should be recorded in B's peer book");
     }
 
     #[tokio::test]
