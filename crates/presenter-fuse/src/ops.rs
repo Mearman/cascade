@@ -24,7 +24,6 @@ pub struct FileAttr {
 
 impl FileAttr {
     /// Build attributes for a directory.
-    #[allow(unsafe_code)]
     #[must_use]
     pub fn directory(inode: u64) -> Self {
         Self {
@@ -33,13 +32,12 @@ impl FileAttr {
             is_dir: true,
             mode: 0o755,
             nlink: 2,
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
+            uid: current_uid(),
+            gid: current_gid(),
         }
     }
 
     /// Build attributes for a regular file.
-    #[allow(unsafe_code)]
     #[must_use]
     pub fn file(inode: u64, size: u64) -> Self {
         Self {
@@ -48,10 +46,35 @@ impl FileAttr {
             is_dir: false,
             mode: 0o644,
             nlink: 1,
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
+            uid: current_uid(),
+            gid: current_gid(),
         }
     }
+}
+
+/// Resolve the calling process's effective UID. On Windows there is no
+/// equivalent concept so the crate (which is a no-op outside Linux)
+/// reports 0.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn current_uid() -> u32 {
+    unsafe { libc::getuid() }
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn current_gid() -> u32 {
+    unsafe { libc::getgid() }
+}
+
+#[cfg(not(unix))]
+const fn current_uid() -> u32 {
+    0
+}
+
+#[cfg(not(unix))]
+const fn current_gid() -> u32 {
+    0
 }
 
 /// Convert a `VfsItem` to `FileAttr` using the inode from the map.
