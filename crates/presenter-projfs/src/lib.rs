@@ -404,3 +404,105 @@ mod windows_impl {
         Ok(())
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// Upserting an item exposes it via `items()`, and deleting it
+    /// removes it. Platform-independent because the underlying
+    /// `HashMap` is the same on every target.
+    #[tokio::test]
+    async fn upsert_and_delete_round_trip() {
+        let presenter = ProjFsPresenter::new(PathBuf::from("/tmp/cascade-projfs-test"));
+        let id = ItemId::new("backend", "file");
+        let item = VfsItem {
+            id: id.clone(),
+            parent_id: ItemId::new("backend", "root"),
+            name: "test.txt".to_string(),
+            is_dir: false,
+            size: Some(0),
+            mod_time: None,
+            cache_state: CacheState::Online,
+            mime_type: None,
+        };
+
+        presenter.upsert_item(item).await.unwrap();
+        {
+            let items = presenter.items().read().await;
+            assert!(items.contains_key(&id.0));
+        }
+
+        presenter.delete_item(&id).await.unwrap();
+        {
+            let items = presenter.items().read().await;
+            assert!(!items.contains_key(&id.0));
+        }
+    }
+
+    /// The builder API mirrors the other presenters: `new` sets a
+    /// default mount point and `with_mount_point` overrides it.
+    #[test]
+    fn mount_point_round_trips() {
+        let presenter = ProjFsPresenter::new(PathBuf::from("C:/cascade"));
+        assert_eq!(presenter.mount_point(), Path::new("C:/cascade"));
+
+        let moved = presenter.with_mount_point("D:/cascade");
+        assert_eq!(moved.mount_point(), Path::new("D:/cascade"));
+    }
+
+    /// On non-Windows platforms `start` must fail loudly so the CLI
+    /// dispatch can move on to the next fallback presenter.
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn start_fails_on_non_windows() {
+        let presenter = ProjFsPresenter::new(PathBuf::from("/tmp/cascade-projfs-test"));
+        let err = presenter
+            .start(Path::new("/tmp/cascade-projfs-test"))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("only supported on Windows"),
+            "expected Windows-only error, got: {msg}"
+        );
+    }
+
+    /// On non-Windows platforms `stop` is a no-op so the CLI shutdown
+    /// path can call it unconditionally.
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn stop_is_noop_on_non_windows() {
+        let presenter = ProjFsPresenter::new(PathBuf::from("/tmp/cascade-projfs-test"));
+        presenter.stop().await.unwrap();
+    }
+
+    /// `fetch_contents` is documented as unimplemented — the real work
+    /// will live in the `GetFileData` callback.
+    #[tokio::test]
+    async fn fetch_contents_returns_unimplemented_error() {
+        let presenter = ProjFsPresenter::new(PathBuf::from("/tmp/cascade-projfs-test"));
+        let id = ItemId::new("backend", "file");
+        let err = presenter.fetch_contents(&id).await.unwrap_err();
+        assert!(err.to_string().contains("not yet implemented"));
+    }
+
+    /// `update_state` and `evict_item` are intentional no-ops on
+    /// `ProjFS`; verify both succeed for an arbitrary id without
+    /// touching disk or the OS.
+    #[tokio::test]
+    async fn update_state_and_evict_are_ok() {
+        let presenter = ProjFsPresenter::new(PathBuf::from("/tmp/cascade-projfs-test"));
+        let id = ItemId::new("backend", "file");
+        presenter
+            .update_state(&id, CacheState::Cached)
+            .await
+            .unwrap();
+        presenter.evict_item(&id).await.unwrap();
+    }
+}
