@@ -4,8 +4,8 @@
 [![CI](https://img.shields.io/github/actions/workflow/status/Mearman/cascade/ci.yml?branch=main&label=CI)](https://github.com/Mearman/cascade/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/Mearman/cascade?sort=semver)](https://github.com/Mearman/cascade/releases/latest)
 [![License](https://img.shields.io/github/license/Mearman/cascade)](LICENSE)
-[![Homebrew](https://img.shields.io/badge/Homebrew-install-FBB040?logo=homebrew&logoColor=white)](https://github.com/Mearman/homebrew-cascade)
-[![Scoop](https://img.shields.io/badge/Scoop-install-205081)](https://github.com/Mearman/scoop-cascade)
+[![Homebrew](https://img.shields.io/badge/Homebrew-FBB040?logo=homebrew&logoColor=white)](https://github.com/Mearman/homebrew-cascade)
+[![Scoop](https://img.shields.io/badge/Scoop-205081)](https://github.com/Mearman/scoop-cascade)
 
 > Cross-platform cloud storage filesystem client built in Rust. On-demand file access, nested `.cascade` config with directory-walk precedence, offline pinning, policy-driven lifecycle management, P2P block sync, and multi-backend support. Uses native platform APIs (File Provider on macOS, ProjFS on Windows, FUSE on Linux) with NFS fallback — no kernel extensions required.
 
