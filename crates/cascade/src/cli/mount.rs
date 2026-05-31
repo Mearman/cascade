@@ -617,6 +617,11 @@ pub fn stop(ctx: &CliContext) -> anyhow::Result<()> {
 ///
 /// Windows ships `taskkill` in `System32` so it is always on `PATH`; we
 /// shell out rather than pulling in `windows-sys` for a single API call.
+///
+/// A stale PID file (process already gone) is treated as success — both
+/// `is_process_alive` on Windows always reporting "alive" (lacking a
+/// cheap liveness check) and `taskkill`'s "process not found" stderr
+/// route through this success path so `cascade stop` is idempotent.
 #[cfg(windows)]
 pub fn stop(ctx: &CliContext) -> anyhow::Result<()> {
     if !ctx.pid_path.exists() {
@@ -642,7 +647,8 @@ pub fn stop(ctx: &CliContext) -> anyhow::Result<()> {
 
     // Graceful first: `taskkill` without `/F` posts WM_CLOSE which Cascade
     // can react to like a Ctrl+C. Ignore non-zero exit — the process may
-    // have died between our liveness check and this call.
+    // have died between our liveness check and this call, or the OS may
+    // report "not found".
     let _ = std::process::Command::new("taskkill")
         .args(["/PID", &pid.to_string()])
         .output();
@@ -658,19 +664,28 @@ pub fn stop(ctx: &CliContext) -> anyhow::Result<()> {
     }
 
     if !exited {
-        // Force-kill: `taskkill /F` issues `TerminateProcess`. This always
-        // wins unless the PID is somehow unkillable, which would surface
-        // as a non-zero exit we propagate.
+        // Force-kill: `taskkill /F` issues `TerminateProcess`. This wins
+        // unless the PID is somehow unkillable. "Process not found"
+        // stderr is treated as success because the goal — process gone —
+        // is already met.
         let output = std::process::Command::new("taskkill")
             .args(["/F", "/PID", &pid.to_string()])
             .output()
             .with_context(|| format!("failed to force-kill PID {pid} via taskkill"))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow::anyhow!(
-                "taskkill /F /PID {pid} failed: {}",
-                stderr.trim()
-            ));
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let combined = format!("{stdout}{stderr}");
+            if !is_windows_process_not_found(&combined) {
+                return Err(anyhow::anyhow!(
+                    "taskkill /F /PID {pid} failed: {}",
+                    combined.trim()
+                ));
+            }
+            tracing::debug!(
+                pid,
+                "taskkill reported process not found; treating as already exited"
+            );
         }
     }
 
@@ -684,6 +699,18 @@ pub fn stop(ctx: &CliContext) -> anyhow::Result<()> {
 
     println!("Cascade stopped.");
     Ok(())
+}
+
+/// Detect whether `taskkill` output indicates the target PID no longer
+/// exists. `taskkill` writes localised messages but the English token
+/// "not found" (with various surrounding text) is consistent enough to
+/// match against, and matches the format documented by Microsoft.
+#[cfg(windows)]
+fn is_windows_process_not_found(output: &str) -> bool {
+    let lower = output.to_lowercase();
+    lower.contains("not found")
+        || lower.contains("no running instance")
+        || lower.contains("no tasks running")
 }
 
 /// Stop the Cascade daemon on platforms that genuinely lack an implementation.
@@ -1362,7 +1389,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg_attr(not(any(unix, windows)), allow(dead_code))]
     fn make_ctx(dir: &TempDir) -> CliContext {
         let config_dir: PathBuf = dir.path().to_path_buf();
         CliContext {
@@ -1441,8 +1468,10 @@ mod tests {
 
     // --- Stop ---
 
-    // `stop` is only implemented on unix; the non-unix stub bails so
-    // these tests would always fail there. Gate to unix.
+    // `stop` is implemented on unix and windows; other platforms bail.
+    // The same behavioural contract holds on both unix and windows:
+    // a missing PID file is "not running" (Ok), and a stale PID file
+    // (process that no longer exists) is cleaned up.
 
     #[cfg(unix)]
     #[test]
@@ -1467,6 +1496,49 @@ mod tests {
 
         // The stale PID file should have been removed.
         assert!(!ctx.pid_path.exists());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_stop_succeeds_when_no_pid_file() {
+        let dir = TempDir::new().unwrap();
+        let ctx = make_ctx(&dir);
+
+        // No PID file exists — should print "not running" and succeed.
+        stop(&ctx).unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_stop_cleans_up_stale_pid_file() {
+        let dir = TempDir::new().unwrap();
+        let ctx = make_ctx(&dir);
+
+        // PID 999999999 is not a real process. `is_process_alive`
+        // returns true on Windows (no cheap liveness check), so
+        // `stop` will call `taskkill /F` against a missing PID;
+        // we detect taskkill's "process not found" output and treat
+        // it as success so `cascade stop` stays idempotent.
+        std::fs::write(&ctx.pid_path, "999999999").unwrap();
+
+        stop(&ctx).unwrap();
+
+        assert!(!ctx.pid_path.exists());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn is_windows_process_not_found_matches_taskkill_messages() {
+        assert!(is_windows_process_not_found(
+            "ERROR: The process \"999999999\" not found."
+        ));
+        assert!(is_windows_process_not_found(
+            "INFO: No tasks running with the specified criteria."
+        ));
+        assert!(!is_windows_process_not_found("SUCCESS: terminated"));
+        assert!(!is_windows_process_not_found(
+            "ERROR: Access is denied for PID 1234."
+        ));
     }
 
     // -- Permission escalation (macOS only) ---
@@ -1531,6 +1603,78 @@ mod tests {
         assert_eq!(args[1], mount_point.to_str().unwrap());
     }
 
+    // --- Linux NFS mount command construction ---
+
+    /// Verify the Linux `mount -t nfs` command is built with the right
+    /// options for the cascade NFS server (v3 over TCP, port pinned to
+    /// the server's bound port for both NFS and mountd traffic).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_nfs_mount_command_constructs_correctly() {
+        let dir = TempDir::new().unwrap();
+        let mount_point = dir.path().join("Cloud");
+        let cmd = linux_nfs_mount_command(&mount_point, 52431);
+
+        assert_eq!(cmd.get_program(), "mount");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(std::ffi::OsStr::to_string_lossy)
+            .map(std::borrow::Cow::into_owned)
+            .collect();
+        assert_eq!(args[0], "-t");
+        assert_eq!(args[1], "nfs");
+        assert_eq!(args[2], "-o");
+        let options = &args[3];
+        assert!(options.contains("port=52431"));
+        assert!(options.contains("mountport=52431"));
+        assert!(options.contains("proto=tcp"));
+        assert!(options.contains("vers=3"));
+        assert_eq!(args[4], "127.0.0.1:/");
+        assert_eq!(args[5], mount_point.to_str().unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn is_linux_permission_error_detects_root_messages() {
+        assert!(is_linux_permission_error(
+            "mount: only root can do that",
+            Some(1)
+        ));
+        assert!(is_linux_permission_error(
+            "mount: permission denied",
+            Some(1)
+        ));
+        assert!(is_linux_permission_error(
+            "mount: you must be root to use mount",
+            Some(1)
+        ));
+        assert!(is_linux_permission_error(
+            "mount: operation not permitted",
+            Some(1)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn is_linux_permission_error_detects_exit_32() {
+        // util-linux exit code 32 = mount failure; commonly permission.
+        assert!(is_linux_permission_error("", Some(32)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn is_linux_permission_error_rejects_other_failures() {
+        assert!(!is_linux_permission_error(
+            "mount: no such file or directory",
+            Some(1)
+        ));
+        assert!(!is_linux_permission_error(
+            "mount: connection refused",
+            Some(1)
+        ));
+        assert!(!is_linux_permission_error("", None));
+    }
+
     // --- Fallback ordering ---
 
     /// Verifies the macOS strategy order by checking that each
@@ -1566,7 +1710,7 @@ mod tests {
 
     // --- PresenterResources cleanup ---
 
-    /// Verify that PresenterResources::shutdown does not panic when called
+    /// Verify that `PresenterResources::shutdown` does not panic when called
     /// on handles that have already completed (simulating a failed attempt).
     #[tokio::test]
     async fn presenter_resources_shutdown_is_idempotent() {
