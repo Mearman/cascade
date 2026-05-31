@@ -1126,9 +1126,66 @@ fn osascript_mount_command(mount_point: &Path, port: u16) -> std::process::Comma
 // Non-macOS stubs
 // ---------------------------------------------------------------------------
 
-/// Unmount the NFS filesystem (kept for compatibility with platforms
-/// that don't have a real implementation of `unmount_path`).
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+/// Unmount the NFS filesystem on Linux using `umount`.
+///
+/// Tries the plain `umount <path>` first; if the kernel reports the
+/// device as busy we retry with `-l` (lazy detach) so the daemon can
+/// always exit cleanly even when a shell still has the mount as `cwd`.
+/// Permission and "not mounted" failures are logged at debug rather
+/// than propagated — shutdown should not block on an already-detached
+/// mount.
+#[cfg(target_os = "linux")]
+fn unmount_path(mount_point: &Path) -> Result<()> {
+    tracing::info!(path = %mount_point.display(), "unmounting NFS");
+
+    let output = std::process::Command::new("umount")
+        .arg(mount_point)
+        .output();
+
+    match output {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            if stderr.contains("not mounted") || stderr.contains("not found") {
+                tracing::debug!(path = %mount_point.display(), "not mounted, skipping unmount");
+                return Ok(());
+            }
+            // Try a lazy unmount on busy/permission failures so the
+            // daemon doesn't get stuck waiting for shells to leave.
+            let lazy = std::process::Command::new("umount")
+                .arg("-l")
+                .arg(mount_point)
+                .output();
+            match lazy {
+                Ok(l) if l.status.success() => {
+                    tracing::info!(path = %mount_point.display(), "NFS lazily unmounted");
+                    Ok(())
+                }
+                Ok(l) => {
+                    let lazy_err = String::from_utf8_lossy(&l.stderr);
+                    tracing::warn!(
+                        error = %stderr.trim(),
+                        lazy_error = %lazy_err.trim(),
+                        "umount failed (will be cleaned up on exit)"
+                    );
+                    Ok(())
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "lazy umount failed to spawn");
+                    Ok(())
+                }
+            }
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "umount failed to spawn (may already be unmounted)");
+            Ok(())
+        }
+    }
+}
+
+/// Unmount stub for platforms with neither macOS, Linux, nor Windows
+/// implementations.
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 #[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
 fn unmount_path(_mount_point: &Path) -> Result<()> {
     Ok(())
@@ -1146,7 +1203,81 @@ fn is_mounted(path: &Path) -> bool {
     mounts.contains(&*path.to_string_lossy())
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Mount the cascade NFS server on Linux using `mount -t nfs`.
+///
+/// The cascade NFS server speaks `NFSv3`, so we always request v3 and
+/// connect over TCP. `mount(8)` on Linux requires root for NFS mounts;
+/// when we hit `EACCES` or a "must be root" / "permission denied" stderr
+/// we surface a clear hint to retry with `sudo` rather than letting the
+/// raw `mount` error reach the user.
+#[cfg(target_os = "linux")]
+fn mount_nfs(mount_point: &Path, port: u16) -> Result<()> {
+    ensure_directory(mount_point, "NFS mount point")?;
+
+    let mut cmd = linux_nfs_mount_command(mount_point, port);
+    tracing::info!(
+        mount = %mount_point.display(),
+        port,
+        "mounting NFS (Linux, v3 over TCP)"
+    );
+
+    let output = cmd
+        .output()
+        .context("failed to invoke /bin/mount (is it installed?)")?;
+
+    if output.status.success() {
+        tracing::info!(path = %mount_point.display(), "NFS mounted");
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if is_linux_permission_error(&stderr, output.status.code()) {
+        anyhow::bail!(
+            "mount: NFS mounts on Linux require root. Re-run with sudo (e.g. `sudo cascade start`) or grant CAP_SYS_ADMIN. Original error: {}",
+            stderr.trim()
+        );
+    }
+    anyhow::bail!("mount -t nfs failed: {}", stderr.trim());
+}
+
+/// Build the Linux `mount -t nfs` command for the cascade server.
+///
+/// Extracted from `mount_nfs` so tests can assert argument construction
+/// without invoking the kernel (which would need root and a live server).
+#[cfg(target_os = "linux")]
+fn linux_nfs_mount_command(mount_point: &Path, port: u16) -> std::process::Command {
+    let options = format!("port={port},mountport={port},proto=tcp,vers=3");
+    let mut cmd = std::process::Command::new("mount");
+    cmd.arg("-t")
+        .arg("nfs")
+        .arg("-o")
+        .arg(&options)
+        .arg("127.0.0.1:/")
+        .arg(mount_point);
+    cmd
+}
+
+/// Detect whether a Linux `mount` invocation failed because we lacked
+/// root. Linux `mount` writes "must be root", "permission denied", or
+/// "only root" depending on distro and version; we check all three plus
+/// the EACCES exit code (32 on util-linux ≥ 2.34).
+#[cfg(target_os = "linux")]
+fn is_linux_permission_error(stderr: &str, exit_code: Option<i32>) -> bool {
+    let lower = stderr.to_lowercase();
+    if lower.contains("must be root")
+        || lower.contains("permission denied")
+        || lower.contains("only root")
+        || lower.contains("operation not permitted")
+    {
+        return true;
+    }
+    // util-linux convention: exit code 32 means "mount failure" with
+    // permission as the most common cause when running unprivileged.
+    matches!(exit_code, Some(32))
+}
+
+/// NFS mount stub for platforms with neither macOS nor Linux support.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 #[allow(clippy::missing_const_for_fn, clippy::unused_self, dead_code)]
 fn mount_nfs(_mount_point: &Path, _port: u16) -> Result<()> {
     anyhow::bail!("NFS mounting is not supported on this platform yet");
