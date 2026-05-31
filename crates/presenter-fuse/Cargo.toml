@@ -10,7 +10,7 @@ tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 libc = "0.2"
-dirs = "6"
+dirs.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 fuser = "0.17"

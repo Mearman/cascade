@@ -67,6 +67,9 @@ hex = "0.4"
 # OS process management (Unix-only)
 nix = { version = "0.29", features = ["signal", "process"] }
 
+# Platform config / cache paths
+dirs = "6"
+
 [workspace.lints.rust]
 # Denied at workspace level. Per-site #[allow] requires explicit justification
 # (a comment naming the legitimate cross-platform or FFI need).
@@ -119,7 +122,10 @@ string_slice = "deny"
 # crates/expr/src/providers.rs DiskProvider::collect_for_path and
 # crates/presenter-fuse/src/ops.rs FileAttr::{directory,file} for the pattern.
 #
-# NOTE: not raised to `forbid` because pre-existing #[allow] sites in
-# backend-gdrive and mount.rs (owned by a parallel agent) would break. Once
-# those are migrated to the cfg-split pattern, this can become `forbid`.
+# missing_const_for_fn is a nursery lint already denied at the group level.
+# It cannot be raised to `forbid` workspace-wide while legitimate `#[allow]`
+# sites exist for it in macro-generated code (e.g. `tracing!` expansions) and
+# in cfg-gated stubs that genuinely vary between targets. Promote to `forbid`
+# only after every existing `#[allow(clippy::missing_const_for_fn)]` site has
+# been migrated to a proper cfg-split impl.
 missing_const_for_fn = "deny"
