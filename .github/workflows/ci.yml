@@ -516,14 +516,16 @@ jobs:
     if: needs.release.outputs.released == 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: Cache Linuxbrew install
+      - name: Cache Linuxbrew downloads
+        # Only cache the bottle download dir — caching the full prefix
+        # would restore an older cascade binary across versions and
+        # `brew install` would no-op, causing the version check below
+        # to fail with the previous release's version.
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          path: |
-            /home/linuxbrew/.linuxbrew
-            ~/.cache/Homebrew/downloads
-          key: linuxbrew-${{ needs.release.outputs.version }}
-          restore-keys: linuxbrew-
+          path: ~/.cache/Homebrew/downloads
+          key: linuxbrew-downloads-${{ needs.release.outputs.version }}
+          restore-keys: linuxbrew-downloads-
       - name: Install Homebrew on Linux
         run: |
           if ! command -v brew >/dev/null 2>&1 && ! [ -x /home/linuxbrew/.linuxbrew/bin/brew ]; then
@@ -552,12 +554,15 @@ jobs:
     if: needs.release.outputs.released == 'true'
     runs-on: windows-latest
     steps:
-      - name: Cache Scoop install + downloads
+      - name: Cache Scoop downloads
+        # Caching the full ~/scoop dir restores an older cascade across
+        # releases, so `scoop install` becomes a no-op and the version
+        # check fails. Cache only the bottle download dir.
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          path: ~\scoop
-          key: scoop-${{ needs.release.outputs.version }}
-          restore-keys: scoop-
+          path: ~\scoop\cache
+          key: scoop-downloads-${{ needs.release.outputs.version }}
+          restore-keys: scoop-downloads-
       - name: Install Scoop
         shell: pwsh
         run: |
@@ -668,14 +673,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y fuse3 libfuse3-3
-      - name: Cache Linuxbrew install
+      - name: Cache Linuxbrew downloads
+        # See verify-brew-linux above: caching the prefix breaks the
+        # per-release install.
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          path: |
-            /home/linuxbrew/.linuxbrew
-            ~/.cache/Homebrew/downloads
-          key: linuxbrew-${{ needs.release.outputs.version }}
-          restore-keys: linuxbrew-
+          path: ~/.cache/Homebrew/downloads
+          key: linuxbrew-downloads-${{ needs.release.outputs.version }}
+          restore-keys: linuxbrew-downloads-
       - name: Install Homebrew on Linux
         run: |
           if ! command -v brew >/dev/null 2>&1 && ! [ -x /home/linuxbrew/.linuxbrew/bin/brew ]; then
@@ -745,12 +750,15 @@ jobs:
     if: needs.release.outputs.released == 'true'
     runs-on: windows-latest
     steps:
-      - name: Cache Scoop install + downloads
+      - name: Cache Scoop downloads
+        # Caching the full ~/scoop dir restores an older cascade across
+        # releases, so `scoop install` becomes a no-op and the version
+        # check fails. Cache only the bottle download dir.
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          path: ~\scoop
-          key: scoop-${{ needs.release.outputs.version }}
-          restore-keys: scoop-
+          path: ~\scoop\cache
+          key: scoop-downloads-${{ needs.release.outputs.version }}
+          restore-keys: scoop-downloads-
       - name: Install Scoop
         shell: pwsh
         run: |
