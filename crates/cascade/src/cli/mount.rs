@@ -247,11 +247,13 @@ async fn try_fskit(
 
 /// Try to mount via the `WebDAV` presenter.
 ///
-/// Same shutdown guarantees as [`try_fskit`]. The `WebDAV` server runs
-/// on every platform; only the OS-level mount command varies. macOS uses
-/// `mount_webdav`, Windows uses `net use` against the built-in
-/// `WebClient` service, and Linux falls through to FUSE/NFS rather than
-/// using `mount.davfs` (which requires root).
+/// Same shutdown guarantees as the FSKit/FUSE presenter functions: on
+/// any failure during engine, presenter, or mount setup, every started
+/// resource is stopped before the error is returned. The `WebDAV`
+/// server runs on every platform; only the OS-level mount command
+/// varies. macOS uses `mount_webdav`, Windows uses `net use` against
+/// the built-in `WebClient` service, and Linux falls through to
+/// FUSE/NFS rather than using `mount.davfs` (which requires root).
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 async fn try_webdav(
     ctx: &CliContext,
