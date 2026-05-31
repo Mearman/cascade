@@ -64,28 +64,26 @@ impl CliContext {
 /// On Unix, sends signal 0 (no-op) via `kill(2)` — returns `true` if the call
 /// succeeds (process exists and we have permission to signal it), `false` if
 /// `ESRCH` is returned (no such process), and `false` for any other error.
+#[cfg(unix)]
+pub fn is_process_alive(pid: u32) -> bool {
+    let Ok(pid_signed) = i32::try_from(pid) else {
+        return false;
+    };
+    let nix_pid = nix::unistd::Pid::from_raw(pid_signed);
+    match nix::sys::signal::kill(nix_pid, None) {
+        Ok(()) => true,
+        Err(_) => false,
+    }
+}
+
+/// Check whether the process with the given PID is alive.
 ///
 /// On non-Unix platforms, a reliable cross-process liveness check is not
 /// available without an OS-specific crate, so the presence of the PID file is
 /// treated as sufficient and this function always returns `true`.
-#[allow(clippy::missing_const_for_fn)] // unix branch is not const
-pub fn is_process_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        let Ok(pid_signed) = i32::try_from(pid) else {
-            return false;
-        };
-        let nix_pid = nix::unistd::Pid::from_raw(pid_signed);
-        match nix::sys::signal::kill(nix_pid, None) {
-            Ok(()) => true,
-            Err(_) => false,
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        true
-    }
+#[cfg(not(unix))]
+pub const fn is_process_alive(_pid: u32) -> bool {
+    true
 }
 
 // ---------------------------------------------------------------------------
