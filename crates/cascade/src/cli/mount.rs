@@ -1088,7 +1088,8 @@ fn mount_webdav(mount_point: &Path, port: u16) -> Result<()> {
         let stdout = String::from_utf8_lossy(&output.stdout);
         anyhow::bail!(
             "net use failed (is the WebClient service running?): {}{}",
-            stdout, stderr
+            stdout,
+            stderr
         );
     }
 
