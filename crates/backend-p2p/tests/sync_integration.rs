@@ -220,12 +220,11 @@ async fn last_write_wins_conflict() {
     assert_eq!(on_b.size, Some(late.len() as u64));
 }
 
-/// Documented behaviour: a delete on one device is not propagated to
-/// peers in this phase (BEP v1 has no tombstone field). The deleted
-/// row stays as an "invisible" tombstone locally; the remote peer
-/// still sees the file.
+/// A delete on one device propagates to peers via a tombstone row in
+/// an `IndexUpdate` frame. After the delete, B should see the file
+/// disappear from both `metadata` and `list_children`.
 #[tokio::test]
-async fn deletes_do_not_propagate() {
+async fn deletes_propagate_to_peers() {
     let a = Node::new("a", "shared").await;
     let b = Node::new("b", "shared").await;
     mutual_trust(&a, &b).await;
@@ -245,18 +244,31 @@ async fn deletes_do_not_propagate() {
         .unwrap();
     assert!(wait_for_file(&b, "ephemeral.txt").await.is_some());
 
+    // Bump the wall clock so the tombstone's `modified` is strictly
+    // newer than the upload row's `modified` (both measured in Unix
+    // seconds), making the LWW comparison on B unambiguous.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
     a.backend.delete(&entry).await.unwrap();
 
     // A's local listing should hide it.
     let kids_a = a.backend.list_children("root").await.unwrap();
     assert!(!kids_a.iter().any(|e| e.name == "ephemeral.txt"));
 
-    // B should still see it — tombstones don't cross the wire (yet).
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let on_b = b.backend.metadata(Path::new("ephemeral.txt")).await;
+    // B should observe the tombstone — metadata reports not found and
+    // the file no longer appears in root.
+    let mut tombstoned = false;
+    for _ in 0..60 {
+        let metadata = b.backend.metadata(Path::new("ephemeral.txt")).await;
+        let kids = b.backend.list_children("root").await.unwrap();
+        if metadata.is_err() && !kids.iter().any(|e| e.name == "ephemeral.txt") {
+            tombstoned = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     assert!(
-        on_b.is_ok(),
-        "B should still see the file (deletes don't propagate in phase 3)",
+        tombstoned,
+        "B never observed the tombstone for ephemeral.txt",
     );
 }
 
