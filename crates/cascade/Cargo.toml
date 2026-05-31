@@ -16,6 +16,7 @@ cascade-backend-s3 = { path = "../backend-s3" }
 cascade-presenter-nfs = { path = "../presenter-nfs" }
 cascade-presenter-webdav = { path = "../presenter-webdav" }
 cascade-presenter-fskit = { path = "../presenter-fskit" }
+cascade-presenter-fuse = { path = "../presenter-fuse" }
 clap.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
@@ -33,7 +34,6 @@ nix = { workspace = true }
 
 [dev-dependencies]
 cascade-p2p = { path = "../p2p" }
-cascade-presenter-fuse = { path = "../presenter-fuse" }
 tempfile = "3"
 proptest = "1"
 async-trait = "0.1"

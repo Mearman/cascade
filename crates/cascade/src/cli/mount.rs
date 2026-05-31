@@ -127,7 +127,32 @@ pub async fn start(ctx: &CliContext, mount_point: Option<&str>, no_mount: bool) 
         try_nfs(ctx, &mount_path, backends, no_mount).await
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        // FUSE first (native, runs as the calling user), NFS fallback.
+        let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
+        tracing::info!(strategy = "fuse", "attempting FUSE mount");
+        match try_fuse(ctx, &mount_path, backends).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                tracing::warn!(error = %e, "FUSE mount failed, falling back to NFS");
+                drop(e);
+            }
+        }
+
+        let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
+        try_nfs(ctx, &mount_path, backends, no_mount).await
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Windows: WebDAV server + mount via WebClient (`net use`).
+        let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
+        tracing::info!(strategy = "webdav", "attempting WebDAV mount");
+        try_webdav(ctx, &mount_path, backends, no_mount).await
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
         try_nfs(ctx, &mount_path, backends, no_mount).await
@@ -222,8 +247,12 @@ async fn try_fskit(
 
 /// Try to mount via the `WebDAV` presenter.
 ///
-/// Same shutdown guarantees as [`try_fskit`].
-#[cfg(target_os = "macos")]
+/// Same shutdown guarantees as [`try_fskit`]. The `WebDAV` server runs
+/// on every platform; only the OS-level mount command varies. macOS uses
+/// `mount_webdav`, Windows uses `net use` against the built-in
+/// `WebClient` service, and Linux falls through to FUSE/NFS rather than
+/// using `mount.davfs` (which requires root).
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 async fn try_webdav(
     ctx: &CliContext,
     mount_path: &Path,
@@ -326,6 +355,80 @@ async fn try_webdav(
         tracing::warn!(error = %e, "WebDAV presenter stop returned an error");
     }
     drop(items);
+    resources.shutdown();
+
+    let _ = std::fs::remove_file(&ctx.pid_path);
+
+    tracing::info!("Cascade stopped.");
+    Ok(())
+}
+
+/// Try to mount via the FUSE presenter (Linux only).
+///
+/// Same shutdown guarantees as the macOS presenter functions: on any
+/// failure during engine, presenter, or mount setup, every started
+/// resource is stopped before the error is returned.
+#[cfg(target_os = "linux")]
+async fn try_fuse(
+    ctx: &CliContext,
+    mount_path: &Path,
+    backends: Vec<Arc<dyn cascade_engine::backend::Backend>>,
+) -> Result<()> {
+    let engine_config = EngineConfig {
+        db_path: ctx.db_path.clone(),
+        mount_point: mount_path.to_path_buf(),
+        backends,
+        cache_dir: None,
+        enable_p2p: false,
+        p2p_data_dir: None,
+    };
+    let engine = Engine::new(engine_config).await?;
+
+    let root_id = cascade_engine::types::ItemId::new("vfs", "root");
+    let presenter = Arc::new(
+        cascade_presenter_fuse::FusePresenter::with_vfs(root_id, engine.vfs().clone())
+            .with_mount_point(mount_path),
+    );
+
+    let sync_runner = engine.create_sync_runner(presenter.clone());
+    let sync_handle = tokio::spawn(async move {
+        if let Err(e) = sync_runner.run().await {
+            tracing::error!(error = %e, "sync runner exited with error");
+        }
+    });
+
+    let engine_handle = engine.start()?;
+    let resources = PresenterResources {
+        engine,
+        engine_handle,
+        sync_handle,
+    };
+
+    if let Err(e) = presenter.start(mount_path).await {
+        resources.shutdown();
+        return Err(e).with_context(|| {
+            format!("failed to start FUSE presenter at {}", mount_path.display())
+        });
+    }
+
+    if let Err(e) = write_pid_file(&ctx.pid_path) {
+        resources.shutdown();
+        return Err(e);
+    }
+
+    println!("Cascade started (FUSE).");
+    println!("  Mount point: {}", mount_path.display());
+    println!("  PID: {}", std::process::id());
+    println!();
+    println!("Press Ctrl+C to stop.");
+
+    tokio::signal::ctrl_c().await?;
+
+    tracing::info!("Shutting down...");
+
+    if let Err(e) = presenter.stop().await {
+        tracing::warn!(error = %e, "FUSE presenter stop returned an error");
+    }
     resources.shutdown();
 
     let _ = std::fs::remove_file(&ctx.pid_path);
@@ -939,8 +1042,9 @@ fn osascript_mount_command(mount_point: &Path, port: u16) -> std::process::Comma
 // Non-macOS stubs
 // ---------------------------------------------------------------------------
 
-/// Unmount the NFS filesystem (kept for compatibility with non-macOS code paths).
-#[cfg(not(target_os = "macos"))]
+/// Unmount the NFS filesystem (kept for compatibility with platforms
+/// that don't have a real implementation of `unmount_path`).
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
 fn unmount_path(_mount_point: &Path) -> Result<()> {
     Ok(())
@@ -964,7 +1068,67 @@ fn mount_nfs(_mount_point: &Path, _port: u16) -> Result<()> {
     anyhow::bail!("NFS mounting is not supported on this platform yet");
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Mount the WebDAV server as a network drive on Windows via the
+/// built-in WebClient service (`net use`).
+///
+/// `mount_point` is used as a display string; the actual mount target
+/// is whichever drive letter Windows assigns when `*` is passed. The
+/// drive letter is reported in the log.
+#[cfg(target_os = "windows")]
+fn mount_webdav(mount_point: &Path, port: u16) -> Result<()> {
+    let url = format!("http://localhost:{port}/");
+    tracing::info!(url = %url, "mounting WebDAV via `net use`");
+
+    let output = std::process::Command::new("net")
+        .args(["use", "*", &url])
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        anyhow::bail!(
+            "net use failed (is the WebClient service running?): {}{}",
+            stdout, stderr
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    tracing::info!(
+        path = %mount_point.display(),
+        output = %stdout.trim(),
+        "WebDAV mounted on Windows"
+    );
+    Ok(())
+}
+
+/// Unmount the most recently assigned WebDAV drive on Windows.
+///
+/// `net use <url> /delete` removes by URL rather than by drive letter,
+/// which matches how we created the mount with `*`.
+#[cfg(target_os = "windows")]
+fn unmount_path(_mount_point: &Path) -> Result<()> {
+    // Best-effort: enumerate all drives mapped to a localhost WebDAV URL
+    // and detach each. The mount point passed here is the cascade-logical
+    // path, not the assigned drive letter, so we can't address it directly.
+    let output = std::process::Command::new("net").arg("use").output()?;
+    if !output.status.success() {
+        return Ok(());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if line.contains("http://localhost:") || line.contains("http://127.0.0.1:") {
+            // Extract the URL (last whitespace-separated token).
+            if let Some(url) = line.split_whitespace().last() {
+                let _ = std::process::Command::new("net")
+                    .args(["use", url, "/delete", "/y"])
+                    .output();
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[allow(clippy::missing_const_for_fn, clippy::unnecessary_wraps, dead_code)]
 fn mount_webdav(_mount_point: &Path, _port: u16) -> Result<()> {
     anyhow::bail!("WebDAV mounting is not supported on this platform yet");
