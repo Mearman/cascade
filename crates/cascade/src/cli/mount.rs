@@ -317,9 +317,7 @@ async fn try_projfs(
     };
     let engine = Engine::new(engine_config)?;
 
-    let presenter = Arc::new(
-        cascade_presenter_projfs::ProjFsPresenter::new(mount_path).with_mount_point(mount_path),
-    );
+    let presenter = Arc::new(cascade_presenter_projfs::ProjFsPresenter::new(mount_path));
 
     let sync_runner = engine.create_sync_runner(presenter.clone());
     let sync_handle = tokio::spawn(async move {

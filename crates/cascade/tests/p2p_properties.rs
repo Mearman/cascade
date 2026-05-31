@@ -71,10 +71,10 @@ fn gossip_merge_idempotent() {
         let mut book = PeerBook::new();
         let gossip = GossipMessage { peers };
 
-        book.merge_gossip("INTRO", &gossip);
+        book.merge_gossip("INTRO", "SELF", &gossip);
         let len_after_first = book.len();
 
-        book.merge_gossip("INTRO", &gossip);
+        book.merge_gossip("INTRO", "SELF", &gossip);
         assert_eq!(book.len(), len_after_first);
     });
 }
@@ -89,13 +89,13 @@ fn gossip_merge_commutative() {
 
         // Order 1: A then B.
         let mut book1 = PeerBook::new();
-        book1.merge_gossip("X", &gossip_a);
-        book1.merge_gossip("Y", &gossip_b);
+        book1.merge_gossip("X", "SELF", &gossip_a);
+        book1.merge_gossip("Y", "SELF", &gossip_b);
 
         // Order 2: B then A.
         let mut book2 = PeerBook::new();
-        book2.merge_gossip("Y", &gossip_b);
-        book2.merge_gossip("X", &gossip_a);
+        book2.merge_gossip("Y", "SELF", &gossip_b);
+        book2.merge_gossip("X", "SELF", &gossip_a);
 
         // Both should have the same set of device IDs.
         let mut ids1: Vec<_> = book1.peers().keys().collect();
@@ -190,10 +190,10 @@ fn bep_message_strategy() -> impl Strategy<Value = BepMessage> {
         any::<i64>(),
     )
         .prop_map(
-            |(device_id, addresses, last_seen_unix_seconds)| WireGossipPeer {
+            |(device_id, addresses, snapshot_unix_seconds)| WireGossipPeer {
                 device_id,
                 addresses,
-                last_seen_unix_seconds,
+                snapshot_unix_seconds,
             },
         );
     let gossip =

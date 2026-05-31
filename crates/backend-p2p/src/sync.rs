@@ -612,40 +612,44 @@ impl SyncEngine {
     /// any newly-learned peer so it can be propagated correctly by
     /// the next outbound gossip frame.
     async fn merge_gossip(&self, introducer_id: &str, peers: Vec<GossipPeer>) {
-        // Skip self-references — a peer's gossip frame may include us.
+        // PeerBook::merge_gossip enforces the self-exclusion guard, so
+        // we just have to turn the wire-shape GossipPeer into the
+        // PeerBook-shape (parse string addresses to SocketAddr,
+        // dropping any that don't parse). Empty parsed-address lists
+        // mean the peer is unreachable via the addresses they
+        // advertised — skip them rather than recording an empty entry.
         let self_id = self.identity.device_id.clone();
-        let mut book = self.peer_book.write().await;
-        for peer in peers {
-            if peer.device_id == self_id {
-                continue;
-            }
-            let parsed: Vec<SocketAddr> = peer
-                .addresses
-                .iter()
-                .filter_map(|a| a.parse().ok())
-                .collect();
-            if parsed.is_empty() {
-                continue;
-            }
-            // Use merge_gossip on a single-peer GossipMessage so the
-            // introducer-tracking semantics match the rest of the
-            // peer-book API (existing peers keep their introducer
-            // list; new peers record `introducer_id`).
-            let single = cascade_p2p::wan::GossipMessage {
-                peers: vec![cascade_p2p::wan::GossipPeer {
-                    device_id: peer.device_id,
-                    addresses: parsed,
-                }],
-            };
-            book.merge_gossip(introducer_id, &single);
+        let wire_peers: Vec<cascade_p2p::wan::GossipPeer> = peers
+            .into_iter()
+            .filter_map(|peer| {
+                let parsed: Vec<SocketAddr> = peer
+                    .addresses
+                    .iter()
+                    .filter_map(|a| a.parse().ok())
+                    .collect();
+                if parsed.is_empty() {
+                    None
+                } else {
+                    Some(cascade_p2p::wan::GossipPeer {
+                        device_id: peer.device_id,
+                        addresses: parsed,
+                    })
+                }
+            })
+            .collect();
+        if wire_peers.is_empty() {
+            return;
         }
+        let message = cascade_p2p::wan::GossipMessage { peers: wire_peers };
+        let mut book = self.peer_book.write().await;
+        book.merge_gossip(introducer_id, &self_id, &message);
     }
 
     /// Build a [`BepMessage::Gossip`] frame from the current peer book
     /// and send it to every connected peer.
     ///
     /// Excludes the local device id from the snapshot — peers do not
-    /// need us to tell them about ourselves. The `last_seen_unix_seconds`
+    /// need us to tell them about ourselves. The `snapshot_unix_seconds`
     /// field is stamped with the broadcast time because the
     /// [`PeerBook`] does not track per-peer last-contact yet; future
     /// work can thread a precise timestamp through `record_peer`
@@ -664,7 +668,7 @@ impl SyncEngine {
                 .map(|p| GossipPeer {
                     device_id: p.device_id.clone(),
                     addresses: p.addresses.iter().map(ToString::to_string).collect(),
-                    last_seen_unix_seconds: now,
+                    snapshot_unix_seconds: now,
                 })
                 .collect()
         };

@@ -266,12 +266,16 @@ pub struct GossipPeer {
     /// drop ones they cannot resolve — DNS-style host names that are
     /// not yet routable from the receiver's network can show up here.
     pub addresses: Vec<String>,
-    /// Broadcaster's Unix-seconds timestamp for the last time this
-    /// peer was confirmed reachable. Receivers can use this to prefer
-    /// fresher entries when merging concurrent gossip from multiple
-    /// introducers (not implemented yet — the field is recorded as
-    /// metadata for future work).
-    pub last_seen_unix_seconds: i64,
+    /// Unix-seconds timestamp at which the broadcaster *took the
+    /// snapshot* — not necessarily when the peer was last actually
+    /// reachable. `PeerBook` does not yet record per-peer
+    /// last-contact time, so the broadcaster stamps every entry with
+    /// `now` at send-time. A receiver should treat this as a
+    /// monotone tie-breaker for concurrent gossip from multiple
+    /// introducers, NOT as proof that the peer was live at this
+    /// instant. When `PeerBook` grows a real last-seen field, this
+    /// can be tightened to the per-peer observed timestamp.
+    pub snapshot_unix_seconds: i64,
 }
 
 /// BEP message types.
@@ -399,7 +403,7 @@ pub fn encode_message(msg: &BepMessage) -> Result<Vec<u8>> {
                 for addr in &peer.addresses {
                     encode_string(&mut body, addr)?;
                 }
-                encode_i64(&mut body, peer.last_seen_unix_seconds);
+                encode_i64(&mut body, peer.snapshot_unix_seconds);
             }
         }
     }
@@ -566,11 +570,11 @@ fn decode_gossip(data: &[u8]) -> Result<BepMessage> {
             addresses.push(addr);
             cursor = next;
         }
-        let (last_seen_unix_seconds, after_last_seen) = decode_i64(cursor)?;
+        let (snapshot_unix_seconds, after_last_seen) = decode_i64(cursor)?;
         peers.push(GossipPeer {
             device_id,
             addresses,
-            last_seen_unix_seconds,
+            snapshot_unix_seconds,
         });
         rest = after_last_seen;
     }
@@ -848,12 +852,12 @@ mod tests {
                 GossipPeer {
                     device_id: "AAAA".to_string(),
                     addresses: vec!["1.2.3.4:5000".to_string()],
-                    last_seen_unix_seconds: 1_700_000_000,
+                    snapshot_unix_seconds: 1_700_000_000,
                 },
                 GossipPeer {
                     device_id: "BBBB".to_string(),
                     addresses: vec!["10.0.0.1:22000".to_string(), "[fe80::1]:22000".to_string()],
-                    last_seen_unix_seconds: 1_700_000_100,
+                    snapshot_unix_seconds: 1_700_000_100,
                 },
             ],
         });

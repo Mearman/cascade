@@ -74,9 +74,21 @@ impl PeerBook {
     /// auto-added with the introducer recorded. Existing peers are
     /// updated with any new addresses but their introducer list is
     /// preserved.
-    pub fn merge_gossip(&mut self, introducer_id: &str, gossip: &GossipMessage) {
+    pub fn merge_gossip(
+        &mut self,
+        introducer_id: &str,
+        self_device_id: &str,
+        gossip: &GossipMessage,
+    ) {
         for gossip_peer in &gossip.peers {
-            // Never add self.
+            // Never add self — a malicious or buggy peer that gossips
+            // our own device ID back to us must not poison our own
+            // record (we'd otherwise insert addresses for ourselves and
+            // every future `KnownPeer` lookup for our own ID would
+            // succeed with attacker-controlled data).
+            if gossip_peer.device_id == self_device_id {
+                continue;
+            }
             if let Some(existing) = self.peers.get_mut(&gossip_peer.device_id) {
                 // Merge addresses.
                 for addr in &gossip_peer.addresses {
@@ -197,7 +209,7 @@ mod tests {
             ],
         };
 
-        book.merge_gossip("INTRODUCER", &gossip);
+        book.merge_gossip("INTRODUCER", "SELF", &gossip);
 
         let peer_b = book.get("DEVICE-B").unwrap();
         assert_eq!(peer_b.introduced_by, vec!["INTRODUCER"]);
@@ -218,7 +230,7 @@ mod tests {
             }],
         };
 
-        book.merge_gossip("INTRODUCER", &gossip);
+        book.merge_gossip("INTRODUCER", "SELF", &gossip);
 
         let peer = book.get("DEVICE-B").unwrap();
         assert_eq!(peer.addresses, vec![addr(22001), addr(22003)]);
@@ -237,7 +249,7 @@ mod tests {
                 addresses: vec![addr(22001)],
             }],
         };
-        book.merge_gossip("INTRODUCER", &gossip);
+        book.merge_gossip("INTRODUCER", "SELF", &gossip);
         assert_eq!(book.len(), 2);
 
         book.remove_introduced_by("INTRODUCER");
@@ -306,7 +318,7 @@ mod tests {
             }],
         };
 
-        book.merge_gossip("INTRODUCER", &gossip);
+        book.merge_gossip("INTRODUCER", "SELF", &gossip);
         assert_eq!(book.len(), 1);
     }
 
