@@ -93,14 +93,18 @@ pub struct P2pBackendConfig {
     /// rather than the opaque first eight characters of the device id.
     /// `None` falls back to the short device id.
     pub device_name: Option<String>,
-    /// Enable WAN peer gossip. When enabled (and a `listen_addr` is set),
+    /// Reserved for future WAN peer gossip. The intended behaviour:
     /// the backend periodically gossips its known peer list with every
     /// connected peer, learning about new peers through transitive
-    /// introductions. Independent of `enable_discovery` (LAN multicast).
+    /// introductions.
     ///
-    /// Today the gossip transport is not yet implemented — turning this
-    /// on enables the local `PeerBook` maintenance that future work will
-    /// wire to a BEP extension.
+    /// **Today this flag is inert.** The local [`SyncEngine`] maintains
+    /// a `PeerBook` of connected peers unconditionally — useful for
+    /// future relay-candidate selection and NAT-traversal hints — but
+    /// no gossip transport exists yet (it needs a BEP extension).
+    /// Setting this to `true` produces an `info!` log at startup
+    /// pointing future implementers at the gap; it does not change
+    /// runtime behaviour.
     pub enable_wan_gossip: bool,
     /// STUN servers used for NAT type detection at startup. Empty means
     /// no NAT detection runs. Each entry is a `host:port` string; the
@@ -179,6 +183,7 @@ impl P2pBackend {
         let cfg_instance_id = cfg.instance_id.clone();
         let cfg_peers = cfg.peers.clone();
         let cfg_enable_discovery = cfg.enable_discovery;
+        let cfg_enable_wan_gossip = cfg.enable_wan_gossip;
         let cfg_stun_servers = cfg.stun_servers.clone();
         let bootstrap_cancel = cancel.subscribe();
         let cancel_for_children = cancel.clone();
@@ -196,6 +201,21 @@ impl P2pBackend {
                 .collect();
             if !name_entries.is_empty() {
                 sync_for_listener.seed_peer_names(name_entries).await;
+            }
+
+            // Honest log: the operator opted into WAN gossip but no
+            // transport exists yet. The PeerBook in SyncEngine is
+            // maintained regardless; what's missing is the BEP frame to
+            // exchange it with peers. Surface this once at startup so
+            // it's visible without grepping the config.
+            if cfg_enable_wan_gossip {
+                tracing::info!(
+                    target: "cascade::backend::p2p",
+                    instance = %cfg_instance_id,
+                    "enable_wan_gossip = true is reserved for future use; \
+                     the gossip transport (BEP extension) is not yet wired. \
+                     PeerBook is still maintained unconditionally."
+                );
             }
 
             // NAT detection runs before the listener so the operator sees

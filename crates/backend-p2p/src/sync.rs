@@ -495,7 +495,12 @@ impl SyncEngine {
     /// in the emitted entries; the receiving peer uses the maximum
     /// sequence it observes to bound its next request.
     fn snapshot_since(&self, since: u64) -> Result<Vec<FileInfo>> {
-        let since_i64 = i64::try_from(since).unwrap_or(i64::MAX);
+        // The SQLite index stores `row_version` as i64. A `since` value
+        // above `i64::MAX` indicates either a wrap-around bug or
+        // corrupted state — silently saturating would send an empty
+        // Index, hiding the underlying problem. Fail loudly instead.
+        let since_i64 = i64::try_from(since)
+            .with_context(|| format!("peer max sequence {since} exceeds i64::MAX"))?;
         let entries = self.index.entries_since(since_i64)?;
         let mut files = Vec::with_capacity(entries.len());
         for entry in entries {
