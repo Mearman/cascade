@@ -163,6 +163,8 @@ jobs:
         with:
           targets: aarch64-apple-darwin
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: build-aarch64-apple-darwin
       - name: Build
         run: cargo build --release --target aarch64-apple-darwin -p cascade
         env:
@@ -199,6 +201,8 @@ jobs:
           targets: x86_64-apple-darwin
       - run: rustup target add x86_64-apple-darwin
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: build-x86_64-apple-darwin
       - name: Build
         run: cargo build --release --target x86_64-apple-darwin -p cascade
         env:
@@ -232,6 +236,8 @@ jobs:
           ref: ${{ needs.release.outputs.version }}
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: build-x86_64-unknown-linux-gnu
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
       - name: Build
@@ -270,6 +276,8 @@ jobs:
           targets: aarch64-unknown-linux-gnu
       - run: rustup target add aarch64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: build-aarch64-unknown-linux-gnu
       - name: Install cross-compilation toolchain
         run: |
           sudo apt-get update
@@ -310,6 +318,8 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: build-x86_64-pc-windows-msvc
       - name: Build
         run: cargo build --release --target x86_64-pc-windows-msvc -p cascade
         env:
@@ -477,6 +487,12 @@ jobs:
     if: needs.release.outputs.released == 'true'
     runs-on: macos-latest
     steps:
+      - name: Cache Homebrew downloads
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/Library/Caches/Homebrew/downloads
+          key: brew-cache-macos-${{ needs.release.outputs.version }}
+          restore-keys: brew-cache-macos-
       - name: Install via Homebrew tap
         run: |
           brew tap Mearman/cascade
@@ -500,9 +516,19 @@ jobs:
     if: needs.release.outputs.released == 'true'
     runs-on: ubuntu-latest
     steps:
+      - name: Cache Linuxbrew install
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            /home/linuxbrew/.linuxbrew
+            ~/.cache/Homebrew/downloads
+          key: linuxbrew-${{ needs.release.outputs.version }}
+          restore-keys: linuxbrew-
       - name: Install Homebrew on Linux
         run: |
-          /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" </dev/null
+          if ! command -v brew >/dev/null 2>&1 && ! [ -x /home/linuxbrew/.linuxbrew/bin/brew ]; then
+            /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" </dev/null
+          fi
           echo "/home/linuxbrew/.linuxbrew/bin" >> $GITHUB_PATH
       - name: Install via Homebrew tap
         run: |
@@ -526,16 +552,26 @@ jobs:
     if: needs.release.outputs.released == 'true'
     runs-on: windows-latest
     steps:
+      - name: Cache Scoop install + downloads
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~\scoop
+          key: scoop-${{ needs.release.outputs.version }}
+          restore-keys: scoop-
       - name: Install Scoop
         shell: pwsh
         run: |
-          Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
-          Invoke-RestMethod -Uri https://get.scoop.sh | Invoke-Expression
+          if (-not (Test-Path "$env:USERPROFILE\scoop\shims\scoop.ps1")) {
+            Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+            Invoke-RestMethod -Uri https://get.scoop.sh | Invoke-Expression
+          }
           Add-Content $env:GITHUB_PATH "$env:USERPROFILE\scoop\shims"
       - name: Add bucket and install cascade
         shell: pwsh
         run: |
-          scoop bucket add cascade https://github.com/Mearman/scoop-cascade
+          if (-not (scoop bucket list | Select-String -Quiet '^cascade')) {
+            scoop bucket add cascade https://github.com/Mearman/scoop-cascade
+          }
           scoop install cascade
       - name: Run cascade --version
         shell: pwsh
@@ -557,6 +593,12 @@ jobs:
     if: needs.release.outputs.released == 'true'
     runs-on: macos-latest
     steps:
+      - name: Cache Homebrew downloads
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/Library/Caches/Homebrew/downloads
+          key: brew-cache-macos-${{ needs.release.outputs.version }}
+          restore-keys: brew-cache-macos-
       - name: Install via Homebrew tap
         run: |
           brew tap Mearman/cascade
@@ -626,9 +668,19 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y fuse3 libfuse3-3
+      - name: Cache Linuxbrew install
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            /home/linuxbrew/.linuxbrew
+            ~/.cache/Homebrew/downloads
+          key: linuxbrew-${{ needs.release.outputs.version }}
+          restore-keys: linuxbrew-
       - name: Install Homebrew on Linux
         run: |
-          /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" </dev/null
+          if ! command -v brew >/dev/null 2>&1 && ! [ -x /home/linuxbrew/.linuxbrew/bin/brew ]; then
+            /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" </dev/null
+          fi
           echo "/home/linuxbrew/.linuxbrew/bin" >> "$GITHUB_PATH"
       - name: Install via Homebrew tap
         run: |
@@ -693,16 +745,26 @@ jobs:
     if: needs.release.outputs.released == 'true'
     runs-on: windows-latest
     steps:
+      - name: Cache Scoop install + downloads
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~\scoop
+          key: scoop-${{ needs.release.outputs.version }}
+          restore-keys: scoop-
       - name: Install Scoop
         shell: pwsh
         run: |
-          Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
-          Invoke-RestMethod -Uri https://get.scoop.sh | Invoke-Expression
+          if (-not (Test-Path "$env:USERPROFILE\scoop\shims\scoop.ps1")) {
+            Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+            Invoke-RestMethod -Uri https://get.scoop.sh | Invoke-Expression
+          }
           Add-Content $env:GITHUB_PATH "$env:USERPROFILE\scoop\shims"
       - name: Add bucket and install cascade
         shell: pwsh
         run: |
-          scoop bucket add cascade https://github.com/Mearman/scoop-cascade
+          if (-not (scoop bucket list | Select-String -Quiet '^cascade')) {
+            scoop bucket add cascade https://github.com/Mearman/scoop-cascade
+          }
           scoop install cascade
       - name: Note WebClient service availability
         shell: pwsh
