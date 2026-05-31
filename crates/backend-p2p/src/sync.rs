@@ -152,6 +152,12 @@ impl SyncEngine {
         &self.identity.device_id
     }
 
+    /// `true` if a session to `device_id` is currently active.
+    pub async fn has_peer(&self, device_id: &str) -> bool {
+        let peers = self.peers.lock().await;
+        peers.contains_key(device_id)
+    }
+
     /// Start accepting incoming TLS connections on `addr`.
     ///
     /// Returns the bound `SocketAddr` (useful when binding to port 0)
@@ -510,7 +516,7 @@ mod tests {
     async fn make_engine(folder_id: &str) -> (tempfile::TempDir, SyncEngine) {
         let dir = tempdir().unwrap();
         let index = Arc::new(FolderIndex::open(&dir.path().join("idx.db")).unwrap());
-        let blocks = Arc::new(BlockStore::new(&dir.path().join("blocks")).await.unwrap());
+        let blocks = Arc::new(BlockStore::new(&dir.path().join("blocks")).unwrap());
         let identity = DeviceIdentity::generate().unwrap();
         let engine = SyncEngine::new(folder_id.to_string(), index, blocks, identity);
         (dir, engine)
@@ -609,5 +615,142 @@ mod tests {
             .await
             .expect("expected to fetch block from peer");
         assert_eq!(fetched, data);
+    }
+
+    #[tokio::test]
+    async fn merge_files_skips_older_local() {
+        let (_dir, engine) = make_engine("f").await;
+        engine
+            .index
+            .upsert(&IndexEntry {
+                path: "doc.txt".into(),
+                is_dir: false,
+                size: 10,
+                modified: 2_000_000_000,
+                block_hashes: vec![0u8; 32],
+                deleted: false,
+                version: 0,
+            })
+            .unwrap();
+
+        // Older incoming row should not displace the local one.
+        engine
+            .merge_files(&[FileInfo {
+                name: "doc.txt".into(),
+                file_type: FILE_TYPE_FILE,
+                size: 99,
+                modified: 1_000_000_000,
+                block_size: 128 * 1024,
+                block_hashes: vec![[1u8; 32]],
+            }])
+            .unwrap();
+        let after = engine.index.get("doc.txt").unwrap().unwrap();
+        assert_eq!(after.size, 10);
+        assert_eq!(after.modified, 2_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn merge_files_takes_newer_peer() {
+        let (_dir, engine) = make_engine("f").await;
+        engine
+            .index
+            .upsert(&IndexEntry {
+                path: "doc.txt".into(),
+                is_dir: false,
+                size: 10,
+                modified: 1_000_000_000,
+                block_hashes: vec![0u8; 32],
+                deleted: false,
+                version: 0,
+            })
+            .unwrap();
+        engine
+            .merge_files(&[FileInfo {
+                name: "doc.txt".into(),
+                file_type: FILE_TYPE_FILE,
+                size: 99,
+                modified: 2_000_000_000,
+                block_size: 128 * 1024,
+                block_hashes: vec![[1u8; 32]],
+            }])
+            .unwrap();
+        let after = engine.index.get("doc.txt").unwrap().unwrap();
+        assert_eq!(after.size, 99);
+        assert_eq!(after.modified, 2_000_000_000);
+        assert_eq!(after.block_hashes, vec![1u8; 32]);
+    }
+
+    #[tokio::test]
+    async fn merge_files_ignores_directory_entries() {
+        let (_dir, engine) = make_engine("f").await;
+        engine
+            .merge_files(&[FileInfo {
+                name: "subdir".into(),
+                file_type: FILE_TYPE_DIR,
+                size: 0,
+                modified: 1_000_000_000,
+                block_size: 128 * 1024,
+                block_hashes: vec![],
+            }])
+            .unwrap();
+        assert!(engine.index.get("subdir").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn merge_files_skips_unknown_file_type() {
+        let (_dir, engine) = make_engine("f").await;
+        engine
+            .merge_files(&[FileInfo {
+                name: "weird".into(),
+                file_type: 99,
+                size: 1,
+                modified: 1_000_000_000,
+                block_size: 128 * 1024,
+                block_hashes: vec![[0u8; 32]],
+            }])
+            .unwrap();
+        assert!(engine.index.get("weird").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn broadcast_update_skips_tombstones() {
+        let (_dir, engine) = make_engine("f").await;
+        // No peers connected; broadcast should be a quiet no-op for
+        // tombstones and dir entries (we just confirm no panic).
+        let tombstone = IndexEntry {
+            path: "gone.txt".into(),
+            is_dir: false,
+            size: 0,
+            modified: 0,
+            block_hashes: vec![],
+            deleted: true,
+            version: 0,
+        };
+        engine.broadcast_update(&tombstone).await;
+        let dir = IndexEntry {
+            path: "subdir".into(),
+            is_dir: true,
+            size: 0,
+            modified: 0,
+            block_hashes: vec![],
+            deleted: false,
+            version: 0,
+        };
+        engine.broadcast_update(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn entry_to_file_info_rejects_partial_hash() {
+        let entry = IndexEntry {
+            path: "bad.txt".into(),
+            is_dir: false,
+            size: 1,
+            modified: 0,
+            block_hashes: vec![0u8; 31], // not a multiple of 32
+            deleted: false,
+            version: 0,
+        };
+        let err = entry_to_file_info(&entry).unwrap_err();
+        assert!(err.to_string().contains("partial hash"));
     }
 }

@@ -7,7 +7,6 @@ use cascade_engine::engine::{Engine, EngineConfig};
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 use cascade_engine::presenter::VfsPresenter;
 use cascade_presenter_nfs::nfs::server::{NfsServer, NfsServerConfig};
-#[cfg(any(target_os = "macos", target_os = "windows"))]
 use cascade_presenter_webdav::WebDavPresenter;
 
 use super::init::{BackendConfig, CascadeConfig};
@@ -105,6 +104,18 @@ pub async fn start(
 
     ensure_directory(&mount_path, "mount point")?;
 
+    // Override knob for containers and tests: CASCADE_PRESENTER=webdav
+    // forces the WebDAV presenter on any platform. Useful for Linux
+    // containers where /dev/fuse may be unavailable and NFS needs root.
+    if std::env::var("CASCADE_PRESENTER").as_deref() == Ok("webdav") {
+        let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
+        tracing::info!(
+            strategy = "webdav-forced",
+            "honouring CASCADE_PRESENTER=webdav"
+        );
+        return try_webdav(ctx, &mount_path, backends, no_mount, enable_p2p).await;
+    }
+
     // On macOS: FSKit first (native, kext-free, POSIX), then WebDAV (no
     // root needed), then NFSv4/v3 fallback.  NFS already has the v4 → v3 →
     // escalation chain inside mount_nfs().
@@ -199,7 +210,7 @@ async fn try_fskit(
         enable_p2p,
         p2p_data_dir: None,
     };
-    let engine = Engine::new(engine_config).await?;
+    let engine = Engine::new(engine_config)?;
 
     let presenter = Arc::new(
         cascade_presenter_fskit::FSKitPresenter::from_default_socket()?
@@ -270,7 +281,6 @@ async fn try_fskit(
 /// varies. macOS uses `mount_webdav`, Windows uses `net use` against
 /// the built-in `WebClient` service, and Linux falls through to
 /// FUSE/NFS rather than using `mount.davfs` (which requires root).
-#[cfg(any(target_os = "macos", target_os = "windows"))]
 async fn try_webdav(
     ctx: &CliContext,
     mount_path: &Path,
@@ -286,9 +296,12 @@ async fn try_webdav(
         enable_p2p,
         p2p_data_dir: None,
     };
-    let engine = Engine::new(engine_config).await?;
+    let engine = Engine::new(engine_config)?;
 
     let mut presenter = WebDavPresenter::new(mount_path);
+    if let Ok(bind) = std::env::var("CASCADE_WEBDAV_BIND") {
+        presenter = presenter.with_bind_addr(bind);
+    }
 
     // Pass backends and DB for on-demand directory expansion.
     let all_backends: Vec<Arc<dyn cascade_engine::backend::Backend>> = {
@@ -402,7 +415,7 @@ async fn try_fuse(
         enable_p2p,
         p2p_data_dir: None,
     };
-    let engine = Engine::new(engine_config).await?;
+    let engine = Engine::new(engine_config)?;
 
     let root_id = cascade_engine::types::ItemId::new("vfs", "root");
     let presenter = Arc::new(
@@ -479,7 +492,7 @@ async fn try_nfs(
         enable_p2p,
         p2p_data_dir: None,
     };
-    let engine = Engine::new(engine_config).await?;
+    let engine = Engine::new(engine_config)?;
 
     let presenter = Arc::new(cascade_presenter_nfs::NfsPresenter::with_vfs(
         mount_path,

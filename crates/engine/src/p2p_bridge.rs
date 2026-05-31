@@ -167,7 +167,7 @@ mod tests {
     #[tokio::test]
     async fn test_index_and_has_blocks() {
         let dir = tempfile::tempdir().unwrap();
-        let engine = P2pEngine::new(dir.path()).await.unwrap();
+        let engine = P2pEngine::new(dir.path()).unwrap();
         let db = Arc::new(StateDb::open_in_memory().unwrap());
         let bridge = P2pBridge::new(engine, db);
 
@@ -183,7 +183,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_fetch_returns_none_when_no_index() {
         let dir = tempfile::tempdir().unwrap();
-        let engine = P2pEngine::new(dir.path()).await.unwrap();
+        let engine = P2pEngine::new(dir.path()).unwrap();
         let db = Arc::new(StateDb::open_in_memory().unwrap());
         let bridge = P2pBridge::new(engine, db);
 
@@ -200,7 +200,7 @@ mod tests {
     #[tokio::test]
     async fn test_device_id_non_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let engine = P2pEngine::new(dir.path()).await.unwrap();
+        let engine = P2pEngine::new(dir.path()).unwrap();
         let db = Arc::new(StateDb::open_in_memory().unwrap());
         let bridge = P2pBridge::new(engine, db);
 
@@ -211,7 +211,7 @@ mod tests {
     #[tokio::test]
     async fn test_index_and_fetch_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let engine = P2pEngine::new(dir.path()).await.unwrap();
+        let engine = P2pEngine::new(dir.path()).unwrap();
         let db = Arc::new(StateDb::open_in_memory().unwrap());
         let bridge = P2pBridge::new(engine, db.clone());
 

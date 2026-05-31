@@ -19,7 +19,7 @@ const BLOCK_128KB: usize = 128 * 1024;
 #[tokio::test]
 async fn bridge_index_and_lookup() {
     let dir = tempfile::tempdir().unwrap();
-    let engine = P2pEngine::new(dir.path()).await.unwrap();
+    let engine = P2pEngine::new(dir.path()).unwrap();
     let db = Arc::new(StateDb::open_in_memory().unwrap());
     let bridge = P2pBridge::new(engine, db);
 
@@ -44,7 +44,7 @@ async fn cross_engine_block_sharing_via_shared_store() {
     let dir = tempfile::tempdir().unwrap();
 
     // Engine A indexes data.
-    let engine_a = P2pEngine::new(dir.path()).await.unwrap();
+    let engine_a = P2pEngine::new(dir.path()).unwrap();
     let db_a = Arc::new(StateDb::open_in_memory().unwrap());
     let bridge_a = P2pBridge::new(engine_a, db_a);
 
@@ -52,7 +52,7 @@ async fn cross_engine_block_sharing_via_shared_store() {
     let blocks = bridge_a.index_file("shared.bin", &data).await.unwrap();
 
     // Engine B reads from the same block store directory.
-    let engine_b = P2pEngine::new(dir.path()).await.unwrap();
+    let engine_b = P2pEngine::new(dir.path()).unwrap();
     let db_b = Arc::new(StateDb::open_in_memory().unwrap());
 
     // Register the backend so we can create a file entry.
@@ -88,7 +88,7 @@ async fn sync_runner_with_p2p_bridge() {
         .unwrap();
 
     let p2p_dir = tempfile::tempdir().unwrap();
-    let p2p_engine = P2pEngine::new(p2p_dir.path()).await.unwrap();
+    let p2p_engine = P2pEngine::new(p2p_dir.path()).unwrap();
     let bridge = P2pBridge::new(p2p_engine, db.clone());
 
     // Verify the bridge works before attaching.
@@ -117,7 +117,7 @@ async fn cache_manager_with_p2p() {
         .unwrap();
 
     let p2p_dir = tempfile::tempdir().unwrap();
-    let p2p_engine = P2pEngine::new(p2p_dir.path()).await.unwrap();
+    let p2p_engine = P2pEngine::new(p2p_dir.path()).unwrap();
     let bridge = Arc::new(P2pBridge::new(p2p_engine, db.clone()));
 
     let cache = CacheManager::new(db.clone(), CacheManagerConfig::default()).with_p2p(bridge);

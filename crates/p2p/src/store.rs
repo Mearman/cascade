@@ -26,11 +26,12 @@ pub struct BlockStore {
 impl BlockStore {
     /// Create a new block store rooted at the given directory.
     ///
-    /// The directory is created if it does not exist.
-    pub async fn new(root: &Path) -> Result<Self> {
+    /// The directory is created if it does not exist. This is a
+    /// synchronous one-off — the per-block read/write paths remain
+    /// async and unaffected.
+    pub fn new(root: &Path) -> Result<Self> {
         let blocks_dir = root.join(BLOCKS_DIR_NAME);
-        tokio::fs::create_dir_all(&blocks_dir)
-            .await
+        std::fs::create_dir_all(&blocks_dir)
             .with_context(|| format!("creating blocks directory {}", blocks_dir.display()))?;
         Ok(Self { root: blocks_dir })
     }
@@ -158,7 +159,7 @@ mod tests {
     #[tokio::test]
     async fn store_and_retrieve_block() {
         let dir = tempfile::tempdir().unwrap();
-        let store = BlockStore::new(dir.path()).await.unwrap();
+        let store = BlockStore::new(dir.path()).unwrap();
 
         let data = b"hello block store";
         let hash = BlockHash::from_data(data);
@@ -171,7 +172,7 @@ mod tests {
     #[tokio::test]
     async fn duplicate_store_is_noop() {
         let dir = tempfile::tempdir().unwrap();
-        let store = BlockStore::new(dir.path()).await.unwrap();
+        let store = BlockStore::new(dir.path()).unwrap();
 
         let data = b"duplicate";
         let hash = BlockHash::from_data(data);
@@ -186,7 +187,7 @@ mod tests {
     #[tokio::test]
     async fn missing_block_returns_none() {
         let dir = tempfile::tempdir().unwrap();
-        let store = BlockStore::new(dir.path()).await.unwrap();
+        let store = BlockStore::new(dir.path()).unwrap();
 
         let hash = BlockHash::from_data(b"nonexistent");
         let result = store.get_block(&hash).await.unwrap();
@@ -196,7 +197,7 @@ mod tests {
     #[tokio::test]
     async fn has_block_check() {
         let dir = tempfile::tempdir().unwrap();
-        let store = BlockStore::new(dir.path()).await.unwrap();
+        let store = BlockStore::new(dir.path()).unwrap();
 
         let data = b"check me";
         let hash = BlockHash::from_data(data);
@@ -209,7 +210,7 @@ mod tests {
     #[tokio::test]
     async fn index_and_reassemble_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let store = BlockStore::new(dir.path()).await.unwrap();
+        let store = BlockStore::new(dir.path()).unwrap();
 
         // Create data spanning multiple blocks.
         let original = vec![0xAA; 128 * 1024 * 3 + 512];
@@ -225,7 +226,7 @@ mod tests {
     #[tokio::test]
     async fn block_path_sharding() {
         let dir = tempfile::tempdir().unwrap();
-        let store = BlockStore::new(dir.path()).await.unwrap();
+        let store = BlockStore::new(dir.path()).unwrap();
 
         let data = b"shard test";
         let hash = BlockHash::from_data(data);
@@ -244,7 +245,7 @@ mod tests {
     #[tokio::test]
     async fn remove_block() {
         let dir = tempfile::tempdir().unwrap();
-        let store = BlockStore::new(dir.path()).await.unwrap();
+        let store = BlockStore::new(dir.path()).unwrap();
 
         let data = b"to be removed";
         let hash = BlockHash::from_data(data);

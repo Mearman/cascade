@@ -36,6 +36,10 @@ pub struct WebDavPresenter {
     mount_point: PathBuf,
     /// Base directory for cached files (defaults to ~/.config/cascade/cache).
     cache_dir: PathBuf,
+    /// Address the HTTP server binds to. Defaults to `127.0.0.1:0`
+    /// (loopback, random port). Set to e.g. `0.0.0.0:8080` for
+    /// container / multi-host scenarios.
+    bind_addr: String,
     /// In-memory item store keyed by `ItemId`.
     items: Arc<RwLock<HashMap<String, VfsItem>>>,
     /// Running server handle (set after start).
@@ -61,11 +65,18 @@ impl WebDavPresenter {
         Self {
             mount_point: mount_point.into(),
             cache_dir: dirs_cache_dir(),
+            bind_addr: "127.0.0.1:0".to_string(),
             items: Arc::new(RwLock::new(HashMap::new())),
             server: Arc::new(tokio::sync::Mutex::new(None)),
             backends: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             db: None,
         }
+    }
+
+    /// Override the bind address (e.g. `0.0.0.0:8080` for containers).
+    pub fn with_bind_addr(mut self, bind_addr: impl Into<String>) -> Self {
+        self.bind_addr = bind_addr.into();
+        self
     }
 
     /// Create with default mount point.
@@ -173,7 +184,7 @@ impl VfsPresenter for WebDavPresenter {
             "starting WebDAV presenter"
         );
         let server = WebDavServer::start(
-            "127.0.0.1:0",
+            &self.bind_addr,
             self.items.clone(),
             self.cache_dir.clone(),
             self.backends.clone(),

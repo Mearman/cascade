@@ -81,6 +81,24 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
+  e2e-p2p:
+    name: E2E (P2P mesh in Docker Compose)
+    needs: [check, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Verify Docker Compose
+        run: docker compose version
+      - name: Run P2P e2e harness
+        run: test/e2e/p2p/run.sh
+        env:
+          # Larger build context fits comfortably in 7 GB-class runners.
+          DOCKER_BUILDKIT: "1"
+      - name: Dump compose logs on failure
+        if: failure()
+        working-directory: test/e2e/p2p
+        run: docker compose logs --tail=200 || true
+
   release:
     name: Release
     needs: [check, test]

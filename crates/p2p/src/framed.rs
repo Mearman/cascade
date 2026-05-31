@@ -179,4 +179,42 @@ mod tests {
         let got = sr.recv().await.unwrap();
         assert!(got.is_none());
     }
+
+    /// A peer that announces a frame body larger than the allowed cap
+    /// must be rejected by `recv` before any allocation happens.
+    #[tokio::test]
+    async fn recv_rejects_oversized_frame_header() {
+        use tokio::io::AsyncWriteExt;
+        let (client, server) = paired_framed().await;
+        let (mut sr, _sw) = server.split();
+        let (_cr, mut cw) = client.split();
+        // Hand-craft a frame whose declared body is one byte over the cap.
+        let bogus_len = u32::try_from(MAX_FRAME_BODY + 1).unwrap();
+        cw.inner.write_all(&bogus_len.to_be_bytes()).await.unwrap();
+        cw.inner.flush().await.unwrap();
+        let err = sr.recv().await.unwrap_err();
+        assert!(err.to_string().contains("exceeds limit"));
+    }
+
+    /// Truncated mid-body must surface as a read error, not silently as
+    /// EOF — otherwise a hostile peer could elicit a misparse by closing
+    /// after the length prefix.
+    #[tokio::test]
+    async fn recv_errors_on_partial_body() {
+        use tokio::io::AsyncWriteExt;
+        let (client, server) = paired_framed().await;
+        let (mut sr, _sw) = server.split();
+        let (_cr, mut cw) = client.split();
+        // Claim 16 bytes of body, send 4, then close.
+        cw.inner.write_all(&16u32.to_be_bytes()).await.unwrap();
+        cw.inner.write_all(&[0, 0, 0, 0]).await.unwrap();
+        cw.shutdown().await.unwrap();
+        let err = sr.recv().await.unwrap_err();
+        assert!(
+            err.to_string().contains("frame body")
+                || err.to_string().contains("UnexpectedEof")
+                || err.to_string().contains("eof"),
+            "unexpected error: {err}"
+        );
+    }
 }

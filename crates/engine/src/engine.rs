@@ -79,7 +79,7 @@ impl Engine {
     ///
     /// Opens the state database, creates the VFS tree, registers backends,
     /// and wires up the cache manager and optional P2P bridge.
-    pub async fn new(config: EngineConfig) -> Result<Self> {
+    pub fn new(config: EngineConfig) -> Result<Self> {
         let backends = config.backends;
         if backends.is_empty() {
             anyhow::bail!("at least one backend is required");
@@ -121,7 +121,7 @@ impl Engine {
                     .unwrap_or_else(|| Path::new("."))
                     .join("p2p")
             });
-            let p2p_engine = cascade_p2p::P2pEngine::new(&p2p_dir).await?;
+            let p2p_engine = cascade_p2p::P2pEngine::new(&p2p_dir)?;
             info!(device_id = %p2p_engine.device_id(), "P2P engine initialised");
             Some(P2pBridge::new(p2p_engine, db.clone()))
         } else {
@@ -320,7 +320,6 @@ mod tests {
             enable_p2p: false,
             p2p_data_dir: None,
         })
-        .await
         .unwrap()
     }
 
@@ -409,8 +408,7 @@ mod tests {
             cache_dir: None,
             enable_p2p: false,
             p2p_data_dir: None,
-        })
-        .await;
+        });
 
         assert!(result.is_err());
     }
@@ -429,7 +427,6 @@ mod tests {
             enable_p2p: false,
             p2p_data_dir: None,
         })
-        .await
         .unwrap();
 
         let tree = engine.vfs().read().unwrap();

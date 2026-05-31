@@ -253,6 +253,17 @@ pub enum Commands {
         name: String,
     },
 
+    /// Print (or generate) the P2P backend's device identity for a data dir.
+    ///
+    /// Used to bootstrap multi-node P2P clusters: read each node's device
+    /// ID once, then write peer configs that reference them.
+    #[command(name = "p2p-identity")]
+    P2pIdentity {
+        /// Directory holding the P2P identity files. Created if missing.
+        #[arg(long)]
+        data_dir: PathBuf,
+    },
+
     /// Authenticate a backend (runs `OAuth2` flow)
     #[command(name = "backend-auth")]
     BackendAuth {
@@ -378,6 +389,14 @@ impl Cli {
                 client_secret.as_deref(),
             ),
             Commands::BackendRemove { name } => cache::backend_remove(ctx, &name),
+            Commands::P2pIdentity { data_dir } => {
+                let identity_dir = data_dir.join("identity");
+                let identity =
+                    cascade_p2p::identity::DeviceIdentity::load_or_generate(&identity_dir)
+                        .context("loading P2P identity")?;
+                println!("{}", identity.device_id);
+                Ok(())
+            }
             Commands::BackendAuth {
                 name,
                 client_id,

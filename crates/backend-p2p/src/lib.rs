@@ -29,14 +29,28 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::index::{FolderIndex, IndexEntry};
 use crate::sync::SyncEngine;
 
-/// Poll interval reported to the engine when no peer push has arrived
-/// recently. Long enough to avoid wasted work but short enough that
-/// queued peer changes surface quickly through `changes()`.
-#[allow(clippy::duration_suboptimal_units)]
-const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Poll interval reported to the engine.
+///
+/// The P2P backend receives updates via `IndexUpdate` push, but the sync
+/// runner only surfaces new entries into the presenter on its next
+/// poll. We keep the interval short (1 s) so peer-pushed files appear
+/// in WebDAV/FUSE listings without user-visible lag.
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Statically-configured peer entry.
+///
+/// The address is stored as a `host:port` string and re-resolved on
+/// every reconnect attempt. This is what we want for container DNS:
+/// the peer may not be resolvable at startup (it hasn't booted yet)
+/// but becomes resolvable seconds later.
+#[derive(Debug, Clone)]
+pub struct ConfiguredPeer {
+    pub device_id: String,
+    pub address: String,
+}
 
 /// Configuration for a P2P backend instance.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct P2pBackendConfig {
     pub instance_id: String,
     pub display_name: String,
@@ -46,6 +60,12 @@ pub struct P2pBackendConfig {
     pub identity_dir: PathBuf,
     /// Folder ID exchanged with peers. Defaults to `instance_id`.
     pub folder_id: String,
+    /// If set, the backend starts a BEP listener on this address when
+    /// opened. `None` disables the listener (the backend can still
+    /// dial out to known peers).
+    pub listen_addr: Option<std::net::SocketAddr>,
+    /// Static peer list — connection attempts run in the background.
+    pub peers: Vec<ConfiguredPeer>,
 }
 
 /// A P2P backend instance.
@@ -66,14 +86,15 @@ impl std::fmt::Debug for P2pBackend {
 }
 
 impl P2pBackend {
-    /// Open or create a P2P backend at the given index + block store paths.
-    pub async fn open(cfg: P2pBackendConfig) -> Result<Self> {
+    /// Open or create a P2P backend at the given index + block store
+    /// paths. Synchronous: filesystem setup happens up-front so this
+    /// is callable from within a tokio runtime worker thread without
+    /// nested-runtime panics. If `cfg.listen_addr` is set, a BEP
+    /// listener is spawned (via `tokio::spawn`); every configured peer
+    /// gets a background reconnect task.
+    pub fn open(cfg: P2pBackendConfig) -> Result<Self> {
         let index = Arc::new(FolderIndex::open(&cfg.index_path)?);
-        let blocks = Arc::new(
-            BlockStore::new(&cfg.block_store_root)
-                .await
-                .context("open block store")?,
-        );
+        let blocks = Arc::new(BlockStore::new(&cfg.block_store_root).context("open block store")?);
         let identity = DeviceIdentity::load_or_generate(&cfg.identity_dir)
             .context("loading P2P backend identity")?;
         let sync = SyncEngine::new(
@@ -82,6 +103,40 @@ impl P2pBackend {
             blocks.clone(),
             identity,
         );
+
+        // Trust + reconnect tasks need a runtime — spawn them on the
+        // current handle. The caller must be inside a tokio context.
+        let sync_for_listener = sync.clone();
+        let cfg_listen_addr = cfg.listen_addr;
+        let cfg_instance_id = cfg.instance_id.clone();
+        let cfg_peers = cfg.peers.clone();
+        tokio::spawn(async move {
+            for peer in &cfg_peers {
+                sync_for_listener.trust(peer.device_id.clone()).await;
+            }
+            if let Some(addr) = cfg_listen_addr {
+                match sync_for_listener.start_listener(addr).await {
+                    Ok(_) => tracing::info!(
+                        target: "cascade::backend::p2p",
+                        "P2P backend `{}` listening on {addr} as device {}",
+                        cfg_instance_id,
+                        sync_for_listener.device_id(),
+                    ),
+                    Err(e) => tracing::error!(
+                        target: "cascade::backend::p2p",
+                        "P2P backend `{}` failed to listen on {addr}: {e:#}",
+                        cfg_instance_id,
+                    ),
+                }
+            }
+            for peer in cfg_peers {
+                let sync_clone = sync_for_listener.clone();
+                tokio::spawn(async move {
+                    keep_peer_connected(sync_clone, peer).await;
+                });
+            }
+        });
+
         Ok(Self {
             cfg,
             index,
@@ -344,6 +399,66 @@ impl Backend for P2pBackend {
     }
 }
 
+/// Retry loop: try to keep an outbound BEP connection to `peer` up.
+///
+/// `connect_to` returns immediately after spawning the session; if the
+/// session ends (e.g. the peer crashed or the network blipped), our
+/// peer table loses the entry and we should try again. The 5s back-off
+/// is enough to avoid busy-looping on a sustained outage and short
+/// enough to recover quickly from a transient one.
+///
+/// DNS resolution happens here, not at config-parse time, so a peer
+/// hostname that isn't yet routable at startup (the typical Docker
+/// case) becomes routable on the next tick.
+async fn keep_peer_connected(sync: SyncEngine, peer: ConfiguredPeer) {
+    let peer_id = peer.device_id.clone();
+    let peer_addr_raw = peer.address.clone();
+    loop {
+        let already = sync.has_peer(&peer_id).await;
+        if !already {
+            match resolve_first(&peer_addr_raw).await {
+                Ok(addr) => {
+                    if let Err(e) = sync
+                        .connect_to(crate::sync::Peer {
+                            device_id: peer.device_id.clone(),
+                            address: addr,
+                        })
+                        .await
+                    {
+                        tracing::debug!(
+                            target: "cascade::backend::p2p",
+                            "peer {peer_id} not reachable at {addr}: {e:#}; retrying",
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        target: "cascade::backend::p2p",
+                        "peer {peer_id} address `{peer_addr_raw}` did not resolve: {e:#}; retrying",
+                    );
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+}
+
+/// Resolve `host:port` (or `addr:port`) to a single `SocketAddr`,
+/// off-thread so we don't block the tokio runtime.
+async fn resolve_first(raw: &str) -> Result<std::net::SocketAddr> {
+    let owned = raw.to_string();
+    let addrs = tokio::task::spawn_blocking(move || {
+        std::net::ToSocketAddrs::to_socket_addrs(&owned).map(Iterator::collect::<Vec<_>>)
+    })
+    .await
+    .context("DNS resolve task panicked")?
+    .with_context(|| format!("resolving `{raw}`"))?;
+    addrs
+        .into_iter()
+        .next()
+        .with_context(|| format!("`{raw}` resolved to no records"))
+}
+
 /// CLI entry point — construct a backend from a TOML config table.
 ///
 /// Expected keys:
@@ -351,6 +466,8 @@ impl Backend for P2pBackend {
 /// - `display_name` (optional) — human-readable label
 /// - `data_dir` (optional) — base dir for index + block store;
 ///   defaults to `${HOME}/.config/cascade/p2p-{name}`
+/// - `listen_addr` (optional) — `"host:port"` for the BEP listener
+/// - `peers` (optional) — array of `{ device_id = "...", address = "host:port" }`
 pub fn create_backend(config: &toml::Value) -> Result<Box<dyn Backend>> {
     let name = config
         .get("name")
@@ -366,6 +483,15 @@ pub fn create_backend(config: &toml::Value) -> Result<Box<dyn Backend>> {
         .get("data_dir")
         .and_then(|v| v.as_str())
         .map_or_else(|| default_data_dir(&name), PathBuf::from);
+    let listen_addr = config
+        .get("listen_addr")
+        .and_then(|v| v.as_str())
+        .map(|s| {
+            s.parse::<std::net::SocketAddr>()
+                .with_context(|| format!("invalid listen_addr `{s}`"))
+        })
+        .transpose()?;
+    let peers = parse_peers(config.get("peers"))?;
 
     let instance_id = format!("p2p-{name}");
     let cfg = P2pBackendConfig {
@@ -375,13 +501,36 @@ pub fn create_backend(config: &toml::Value) -> Result<Box<dyn Backend>> {
         index_path: data_dir.join("index.db"),
         block_store_root: data_dir.join("blocks"),
         identity_dir: data_dir.join("identity"),
+        listen_addr,
+        peers,
     };
 
-    // Open is async — block on a runtime handle. The CLI is already in a
-    // tokio context when this is called.
-    let rt = tokio::runtime::Handle::current();
-    let backend = rt.block_on(P2pBackend::open(cfg))?;
+    let backend = P2pBackend::open(cfg)?;
     Ok(Box::new(backend))
+}
+
+fn parse_peers(value: Option<&toml::Value>) -> Result<Vec<ConfiguredPeer>> {
+    let Some(arr) = value.and_then(|v| v.as_array()) else {
+        return Ok(Vec::new());
+    };
+    let mut peers = Vec::with_capacity(arr.len());
+    for (idx, item) in arr.iter().enumerate() {
+        let table = item
+            .as_table()
+            .ok_or_else(|| anyhow::anyhow!("peers[{idx}] must be a table"))?;
+        let device_id = table
+            .get("device_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("peers[{idx}].device_id required"))?
+            .to_string();
+        let address = table
+            .get("address")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("peers[{idx}].address required"))?
+            .to_string();
+        peers.push(ConfiguredPeer { device_id, address });
+    }
+    Ok(peers)
 }
 
 fn default_data_dir(name: &str) -> PathBuf {
@@ -407,8 +556,9 @@ mod tests {
             index_path: dir.path().join("index.db"),
             block_store_root: dir.path().join("blocks"),
             identity_dir: dir.path().join("identity"),
+            ..Default::default()
         };
-        let backend = P2pBackend::open(cfg).await.unwrap();
+        let backend = P2pBackend::open(cfg).unwrap();
         (dir, backend)
     }
 
@@ -511,8 +661,9 @@ mod tests {
                 index_path: dir.join("index.db"),
                 block_store_root: dir.join("blocks"),
                 identity_dir: dir.join("identity"),
+                ..Default::default()
             };
-            P2pBackend::open(cfg).await.unwrap()
+            P2pBackend::open(cfg).unwrap()
         }
         let dir_a = tempdir().unwrap();
         let dir_b = tempdir().unwrap();

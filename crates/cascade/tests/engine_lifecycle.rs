@@ -19,7 +19,6 @@ async fn make_engine_with_backends(
         enable_p2p: false,
         p2p_data_dir: None,
     })
-    .await
     .unwrap()
 }
 

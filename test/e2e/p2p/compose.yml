@@ -1,0 +1,47 @@
+name: cascade-p2p-e2e
+
+services:
+  node-a:
+    build:
+      context: ../../..
+      dockerfile: test/e2e/p2p/Dockerfile
+    image: cascade-p2p-e2e:local
+    hostname: node-a
+    networks:
+      cascade-net:
+    environment:
+      CASCADE_WEBDAV_BIND: 0.0.0.0:8080
+      CASCADE_PRESENTER: webdav
+      RUST_LOG: cascade=info,cascade_presenter_webdav=debug,cascade_backend_p2p=debug,cascade_engine=debug
+    volumes:
+      - data-a:/data
+      - ./configs/node-a:/config:rw
+    command: ["--config", "/config", "start", "--no-mount"]
+    ports:
+      - "18080:8080"
+
+  node-b:
+    image: cascade-p2p-e2e:local
+    depends_on:
+      - node-a
+    hostname: node-b
+    networks:
+      cascade-net:
+    environment:
+      CASCADE_WEBDAV_BIND: 0.0.0.0:8080
+      CASCADE_PRESENTER: webdav
+      RUST_LOG: cascade=info,cascade_presenter_webdav=debug,cascade_backend_p2p=debug,cascade_engine=debug
+    volumes:
+      - data-b:/data
+      - ./configs/node-b:/config:rw
+    command: ["--config", "/config", "start", "--no-mount"]
+    ports:
+      - "18081:8080"
+
+networks:
+  cascade-net:
+    driver: bridge
+
+volumes:
+  data-a:
+  data-b:

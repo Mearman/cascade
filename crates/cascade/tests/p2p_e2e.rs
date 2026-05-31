@@ -24,8 +24,8 @@ async fn e2e_p2p_data_path() {
     let dir_a = tempfile::tempdir().unwrap();
     let dir_b = tempfile::tempdir().unwrap();
 
-    let engine_a = P2pEngine::new(dir_a.path()).await.unwrap();
-    let engine_b = P2pEngine::new(dir_b.path()).await.unwrap();
+    let engine_a = P2pEngine::new(dir_a.path()).unwrap();
+    let engine_b = P2pEngine::new(dir_b.path()).unwrap();
 
     let db_a = Arc::new(StateDb::open_in_memory().unwrap());
     let db_b = Arc::new(StateDb::open_in_memory().unwrap());
@@ -100,7 +100,7 @@ async fn e2e_p2p_data_path() {
 #[tokio::test]
 async fn e2e_empty_file() {
     let dir = tempfile::tempdir().unwrap();
-    let engine = P2pEngine::new(dir.path()).await.unwrap();
+    let engine = P2pEngine::new(dir.path()).unwrap();
     let db = Arc::new(StateDb::open_in_memory().unwrap());
     db.register_backend("p2p", "p2p", "P2P", None, None)
         .unwrap();
@@ -117,7 +117,7 @@ async fn e2e_empty_file() {
 #[tokio::test]
 async fn e2e_multiple_files_independent_blocks() {
     let dir = tempfile::tempdir().unwrap();
-    let engine = P2pEngine::new(dir.path()).await.unwrap();
+    let engine = P2pEngine::new(dir.path()).unwrap();
     let db = Arc::new(StateDb::open_in_memory().unwrap());
     db.register_backend("p2p", "p2p", "P2P", None, None)
         .unwrap();

@@ -1,0 +1,49 @@
+# Keep the build context small. The P2P e2e Dockerfile only needs
+# Cargo.toml, Cargo.lock, rust-toolchain.toml, and the workspace
+# `crates/` directory — everything else is either build output, IDE
+# state, or unrelated tooling.
+
+# Build output
+target/
+**/target/
+
+# Git metadata
+.git/
+.gitignore
+.githooks/
+.git-blame-ignore-revs
+
+# IDE / editor
+.idea/
+.vscode/
+.zed/
+*.iml
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Distribution metadata not needed for the e2e build
+Formula/
+test/
+swift/
+docs/
+
+# CI / agent infrastructure
+.github/
+.cursor/
+.claude/
+.junie/
+.windsurf/
+.tmp/
+
+# Top-level docs and config the build doesn't need
+*.md
+LICENSE
+Makefile
+
+# Keep config files the build *does* need
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!release-plz.toml

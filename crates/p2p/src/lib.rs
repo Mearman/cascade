@@ -70,13 +70,11 @@ impl P2pEngine {
     /// Create a new P2P engine rooted at the Cascade config directory.
     ///
     /// Initialises the block store and loads or generates a device identity.
-    pub async fn new(config_dir: &Path) -> Result<Self> {
+    pub fn new(config_dir: &Path) -> Result<Self> {
         let p2p_dir = config_dir.join(P2P_DIR);
         let identity = DeviceIdentity::load_or_generate(&p2p_dir.join("identity"))
             .context("initialising device identity")?;
-        let block_store = BlockStore::new(&p2p_dir)
-            .await
-            .context("initialising block store")?;
+        let block_store = BlockStore::new(&p2p_dir).context("initialising block store")?;
 
         Ok(Self {
             identity,
@@ -217,7 +215,7 @@ mod tests {
     #[tokio::test]
     async fn engine_creation() {
         let dir = tempfile::tempdir().unwrap();
-        let engine = P2pEngine::new(dir.path()).await.unwrap();
+        let engine = P2pEngine::new(dir.path()).unwrap();
         assert!(!engine.device_id().is_empty());
         assert_eq!(engine.listen_port(), DEFAULT_LISTEN_PORT);
     }
@@ -225,7 +223,7 @@ mod tests {
     #[tokio::test]
     async fn engine_index_and_reassemble() {
         let dir = tempfile::tempdir().unwrap();
-        let engine = P2pEngine::new(dir.path()).await.unwrap();
+        let engine = P2pEngine::new(dir.path()).unwrap();
 
         let data = vec![0xCC; BLOCK_128KB as usize * 2 + 512];
         let blocks = engine.index_data(&data).await.unwrap();
@@ -240,10 +238,10 @@ mod tests {
     #[tokio::test]
     async fn engine_persistent_identity() {
         let dir = tempfile::tempdir().unwrap();
-        let engine1 = P2pEngine::new(dir.path()).await.unwrap();
+        let engine1 = P2pEngine::new(dir.path()).unwrap();
         let id1 = engine1.device_id().to_string();
 
-        let engine2 = P2pEngine::new(dir.path()).await.unwrap();
+        let engine2 = P2pEngine::new(dir.path()).unwrap();
         let id2 = engine2.device_id().to_string();
 
         // Same config dir should produce the same identity.
