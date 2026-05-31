@@ -11,6 +11,22 @@
 
 Rust (edition 2024) · Swift (macOS File Provider extension) · SQLite state · Tokio async runtime
 
+## Why
+
+Every cloud provider ships their own desktop client. They all share the same shape — pick a folder, sync it, hope your disk is bigger than the data. Google Drive for Desktop has a stream mode that loads files on demand, but it's macOS- and Windows-only, leaves you guessing what's actually local, and behaves badly offline. Dropbox, OneDrive, iCloud — same story, each with their own client, their own quirks, their own opinions about your filesystem layout.
+
+[rclone](https://github.com/rclone/rclone) solves the cross-cloud unification well, but its mount story is per-OS fiddly: each platform needs its own filesystem driver, sometimes root, sometimes a separate install. The config is global; if you want different rules for `Work/` than `Personal/` you reach for a wrapper script.
+
+Cascade is what happens when you want a single tool, with a single config language, that:
+
+- Presents every backend — Google Drive, S3, the local filesystem — as one virtual tree under one mount point, mounted with the same shape on macOS, Linux, and Windows.
+- Streams file content on demand. Directory listings work without downloading anything; only `open()` triggers a fetch.
+- Uses the OS's native filesystem APIs — FSKit on macOS (15.4+), FUSE on Linux, WebDAV via the built-in `WebClient` on Windows — with no kernel extension, no admin escalation, no third-party driver.
+- Takes its rules from `.cascade` files scattered through the tree (gitignore-style precedence), so behaviour can vary per directory without restarting anything.
+- Mirrors the actual Drive web UI — `My Drive`, `Shared drives`, `Shared with me`, `Bin` — instead of pretending every account is one flat folder.
+
+The bet is that one filesystem client that works the same on every laptop is more useful than five vendor clients plus a folder full of rclone scripts.
+
 ## Getting started
 
 ### Prerequisites
