@@ -8,6 +8,7 @@ members = [
     "crates/backend-s3",
     "crates/presenter-nfs",
     "crates/backend-local",
+    "crates/backend-p2p",
     "crates/presenter-fuse",
     "crates/presenter-fileprovider",
     "crates/presenter-fskit",

@@ -14,6 +14,7 @@ cascade-expr = { path = "../expr" }
 cascade-backend-gdrive = { path = "../backend-gdrive" }
 cascade-backend-s3 = { path = "../backend-s3" }
 cascade-backend-local = { path = "../backend-local" }
+cascade-backend-p2p = { path = "../backend-p2p" }
 cascade-presenter-nfs = { path = "../presenter-nfs" }
 cascade-presenter-webdav = { path = "../presenter-webdav" }
 cascade-presenter-fskit = { path = "../presenter-fskit" }

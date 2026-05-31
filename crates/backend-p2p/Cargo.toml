@@ -1,0 +1,28 @@
+[package]
+name = "cascade-backend-p2p"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cascade-engine = { path = "../engine" }
+cascade-p2p = { path = "../p2p" }
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+toml.workspace = true
+rusqlite = { version = "0.35", features = ["bundled"] }
+sha2 = "0.10"
+dirs.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+tempfile = "3"
+
+[lints]
+workspace = true

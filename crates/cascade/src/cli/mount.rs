@@ -755,6 +755,8 @@ fn create_backend(
             .with_context(|| format!("failed to create s3 backend `{name}`")),
         "local" => cascade_backend_local::create_backend(config)
             .with_context(|| format!("failed to create local backend `{name}`")),
+        "p2p" => cascade_backend_p2p::create_backend(config)
+            .with_context(|| format!("failed to create p2p backend `{name}`")),
         other => anyhow::bail!("unsupported backend type: {other}"),
     }
 }

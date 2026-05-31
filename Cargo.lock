@@ -211,6 +211,7 @@ dependencies = [
  "async-trait",
  "cascade-backend-gdrive",
  "cascade-backend-local",
+ "cascade-backend-p2p",
  "cascade-backend-s3",
  "cascade-config",
  "cascade-engine",
@@ -275,6 +276,27 @@ dependencies = [
  "toml",
  "tracing",
  "walkdir",
+]
+
+[[package]]
+name = "cascade-backend-p2p"
+version = "0.1.15"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cascade-engine",
+ "cascade-p2p",
+ "chrono",
+ "dirs",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
 ]
 
 [[package]]
