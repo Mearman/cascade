@@ -27,6 +27,51 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     fi
 done
 
+echo "Verifying Rust toolchain..."
+
+# Parse the pinned channel from rust-toolchain.toml.
+PINNED_CHANNEL=$(grep -E '^channel = ' rust-toolchain.toml | head -1 | sed -E 's/^channel = "(.+)"/\1/')
+if [[ -z "$PINNED_CHANNEL" ]]; then
+    echo "warning: could not parse channel from rust-toolchain.toml; skipping toolchain check"
+else
+    # rust-toolchain.toml is only auto-respected by rustup. If cargo isn't
+    # rustup-managed, the version on PATH is whatever the developer
+    # installed — typically Homebrew, which drifts from CI.
+    CARGO_PATH=$(command -v cargo)
+    if [[ -z "$CARGO_PATH" ]]; then
+        echo "error: cargo not found on PATH" >&2
+        exit 1
+    fi
+
+    # Detect rustup by checking if `rustup` exists and resolves cargo.
+    if command -v rustup >/dev/null 2>&1; then
+        # rustup is installed — it respects rust-toolchain.toml automatically.
+        CARGO_VERSION=$(cargo --version 2>&1)
+        if ! echo "$CARGO_VERSION" | grep -qF "${PINNED_CHANNEL%%-*}"; then
+            echo "warning: cargo version does not contain pinned channel ${PINNED_CHANNEL}"
+            echo "         got: $CARGO_VERSION"
+            echo "         continuing — rustup should auto-install on first invocation"
+        fi
+    else
+        # No rustup. The cargo on PATH is whatever the system installed.
+        CARGO_VERSION=$(cargo --version 2>&1)
+        if ! echo "$CARGO_VERSION" | grep -qF "${PINNED_CHANNEL%%-*}"; then
+            cat >&2 <<EOF
+error: local toolchain does not match the pinned channel.
+       pinned (rust-toolchain.toml): ${PINNED_CHANNEL}
+       actual (cargo on PATH):       ${CARGO_VERSION}
+
+       Without rustup, this hook runs gates against a different toolchain
+       than CI. To fix:
+           1. Install rustup:   https://rustup.rs/
+           2. The pinned toolchain installs automatically on next cargo invocation.
+           3. Optionally remove the Homebrew/system rust to avoid PATH ambiguity.
+EOF
+            exit 1
+        fi
+    fi
+fi
+
 echo "Checking formatting..."
 if ! cargo fmt --check 2>&1; then
     echo ""

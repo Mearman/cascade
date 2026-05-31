@@ -32,6 +32,7 @@ The bet is that one filesystem client that works the same on every laptop is mor
 ### Prerequisites
 
 - Rust toolchain pinned in [`rust-toolchain.toml`](rust-toolchain.toml) (currently 1.96.0, edition 2024). `rustup` installs it automatically on first build.
+    - **rustup (recommended)** — the project pins its Rust toolchain in `rust-toolchain.toml`. Install rustup from <https://rustup.rs/> so local builds, the pre-push hook, and CI all use the same compiler.
 - macOS: Xcode Command Line Tools (for Swift File Provider and FSKit extensions). FSKit requires macOS 15.4+ (Sequoia).
 - Linux: `libfuse3` runtime libraries for the FUSE presenter (`apt install libfuse3-dev` on Debian/Ubuntu, `yum install fuse3-devel` on RHEL/Fedora). NFS fallback additionally needs root to bind a privileged port.
 - Windows: the built-in `WebClient` service for the WebDAV mount. It ships with Windows but is often set to manual start — `sc config WebClient start= auto` (in an elevated shell) makes it come up automatically. WinFSP/ProjFS presenter is still planned, not implemented.
