@@ -59,7 +59,12 @@ else
         # fresh box where the pinned channel hasn't yet been installed.
         if RUSTUP_LIST=$(rustup toolchain list --verbose 2>/dev/null); then
             rustup_handled=true
-            if ! echo "$RUSTUP_LIST" | grep -qF "$PINNED_CHANNEL"; then
+            # Anchor the match: rustup names a toolchain either "X.Y.Z" or
+            # "X.Y.Z-<host-triple>", so the channel must appear at the start
+            # of a line followed by EOL, hyphen, or whitespace. An
+            # unanchored grep -qF would let "1.9.6" match "1.96.0-...".
+            ESCAPED_CHANNEL=$(echo "$PINNED_CHANNEL" | sed 's/\./\\./g')
+            if ! echo "$RUSTUP_LIST" | grep -qE "^${ESCAPED_CHANNEL}(-|[[:space:]]|$)"; then
                 echo "rustup: pinned channel ${PINNED_CHANNEL} is not installed; installing now"
                 if ! rustup install "$PINNED_CHANNEL"; then
                     echo "error: rustup failed to install ${PINNED_CHANNEL}" >&2
