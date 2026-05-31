@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.9](https://github.com/Mearman/cascade/compare/v0.1.8...v0.1.9) - 2026-05-31
+
+### Added
+
+- *(mount)* implement NFS mount on Linux
+- *(mount)* implement cascade stop on Windows via taskkill
+
+### Fixed
+
+- *(ci)* silence Linux unmount_path clippy lint and gate Windows-unused import
+
+### Other
+
+- *(build)* hoist dirs to workspace deps and fix lint comment
+- *(mount)* cover Windows stop and Linux NFS command construction
+- *(cli)* split is_process_alive by cfg to drop #[allow]
+
 ## [0.1.8](https://github.com/Mearman/cascade/compare/v0.1.7...v0.1.8) - 2026-05-31
 
 ### Added
