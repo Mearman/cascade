@@ -215,6 +215,18 @@ impl SyncEngine {
                             }
                             Err(e) => {
                                 warn!("P2P listener accept failed: {e}");
+                                tokio::select! {
+                                    () = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                                    res = cancel.changed() => {
+                                        if res.is_err() || *cancel.borrow() {
+                                            debug!(
+                                                target: "cascade::backend::p2p",
+                                                "listener task cancelled during back-off",
+                                            );
+                                            return;
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
