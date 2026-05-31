@@ -70,3 +70,7 @@ name = "cascade-presenter-fileprovider"
 release = false
 version_group = "workspace"
 
+[[package]]
+name = "cascade-backend-p2p"
+release = false
+version_group = "workspace"
