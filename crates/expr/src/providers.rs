@@ -137,8 +137,16 @@ pub struct DiskProvider;
 
 impl DiskProvider {
     /// Collect disk stats for the root filesystem.
+    #[cfg(unix)]
     #[must_use]
     pub fn collect_root() -> DiskContext {
+        Self::collect_for_path("/")
+    }
+
+    /// Collect disk stats for the root filesystem (non-unix const stub).
+    #[cfg(not(unix))]
+    #[must_use]
+    pub const fn collect_root() -> DiskContext {
         Self::collect_for_path("/")
     }
 
