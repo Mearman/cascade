@@ -29,6 +29,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::index::{FolderIndex, IndexEntry};
 use crate::sync::SyncEngine;
 
+/// Poll interval reported to the engine when no peer push has arrived
+/// recently. Long enough to avoid wasted work but short enough that
+/// queued peer changes surface quickly through `changes()`.
+#[allow(clippy::duration_suboptimal_units)]
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Configuration for a P2P backend instance.
 #[derive(Debug)]
 pub struct P2pBackendConfig {
@@ -334,7 +340,7 @@ impl Backend for P2pBackend {
         // source to poll (peer sync pushes IndexUpdate messages when
         // wired). 60s is a sensible default so changes() is still called
         // periodically to flush queued peer changes.
-        Some(std::time::Duration::from_secs(60))
+        Some(POLL_INTERVAL)
     }
 }
 
