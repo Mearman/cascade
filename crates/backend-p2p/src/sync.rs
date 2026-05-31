@@ -837,12 +837,10 @@ mod tests {
         let size = u32::try_from(data_x.len()).unwrap();
         let engine_b_x = engine_b.clone();
         let engine_b_y = engine_b.clone();
-        let fut_x = tokio::spawn(async move {
-            engine_b_x.fetch_block("x.bin", 0, size, hash_x.0).await
-        });
-        let fut_y = tokio::spawn(async move {
-            engine_b_y.fetch_block("y.bin", 0, size, hash_y.0).await
-        });
+        let fut_x =
+            tokio::spawn(async move { engine_b_x.fetch_block("x.bin", 0, size, hash_x.0).await });
+        let fut_y =
+            tokio::spawn(async move { engine_b_y.fetch_block("y.bin", 0, size, hash_y.0).await });
 
         let got_x = fut_x.await.unwrap().expect("expected X block");
         let got_y = fut_y.await.unwrap().expect("expected Y block");
