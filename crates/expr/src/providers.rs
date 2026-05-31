@@ -9,9 +9,12 @@
 //!
 //! Usage:
 //! ```
+//! # #[cfg(unix)]
+//! # {
 //! let ctx = cascade_expr::providers::collect_default();
 //! let expr = cascade_expr::eval::parse_expr("DISK.free > 1GB").unwrap();
 //! assert!(cascade_expr::eval::evaluate(&expr, &ctx));
+//! # }
 //! ```
 
 use crate::context::{
