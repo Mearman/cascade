@@ -607,8 +607,87 @@ pub fn stop(ctx: &CliContext) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Stop the Cascade daemon.
-#[cfg(not(unix))]
+/// Stop the Cascade daemon (Windows).
+///
+/// Mirrors the unix implementation: reads the PID file, asks the process
+/// to exit (`taskkill /PID <pid>`), polls for up to 5 seconds, then force
+/// kills (`taskkill /F /PID <pid>`) if it has not exited. The PID file is
+/// removed and any localhost `WebDAV` mounts that match a Cascade pattern
+/// are detached via `unmount_path`.
+///
+/// Windows ships `taskkill` in `System32` so it is always on `PATH`; we
+/// shell out rather than pulling in `windows-sys` for a single API call.
+#[cfg(windows)]
+pub fn stop(ctx: &CliContext) -> anyhow::Result<()> {
+    if !ctx.pid_path.exists() {
+        println!("Cascade is not running.");
+        return Ok(());
+    }
+
+    let raw = read_text_file(&ctx.pid_path, "PID file")?;
+    let pid: u32 = raw.trim().parse().with_context(|| {
+        format!(
+            "invalid PID in {}: {:?}",
+            ctx.pid_path.display(),
+            raw.trim()
+        )
+    })?;
+
+    if !is_process_alive(pid) {
+        // Process already gone — clean up the stale PID file and exit.
+        let _ = std::fs::remove_file(&ctx.pid_path);
+        println!("Cascade is not running.");
+        return Ok(());
+    }
+
+    // Graceful first: `taskkill` without `/F` posts WM_CLOSE which Cascade
+    // can react to like a Ctrl+C. Ignore non-zero exit — the process may
+    // have died between our liveness check and this call.
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string()])
+        .output();
+
+    // Poll for up to 5 seconds for the process to exit (10 × 500 ms).
+    let mut exited = false;
+    for _ in 0..10 {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if !is_process_alive(pid) {
+            exited = true;
+            break;
+        }
+    }
+
+    if !exited {
+        // Force-kill: `taskkill /F` issues `TerminateProcess`. This always
+        // wins unless the PID is somehow unkillable, which would surface
+        // as a non-zero exit we propagate.
+        let output = std::process::Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .output()
+            .with_context(|| format!("failed to force-kill PID {pid} via taskkill"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow::anyhow!(
+                "taskkill /F /PID {pid} failed: {}",
+                stderr.trim()
+            ));
+        }
+    }
+
+    let _ = std::fs::remove_file(&ctx.pid_path);
+
+    // Detach any localhost WebDAV mounts that look like ours.
+    let mount_path = resolve_mount_path_from_config(&ctx.config_dir);
+    if let Err(e) = unmount_path(&mount_path) {
+        tracing::debug!(error = %e, "unmount after stop failed (may already be unmounted)");
+    }
+
+    println!("Cascade stopped.");
+    Ok(())
+}
+
+/// Stop the Cascade daemon on platforms that genuinely lack an implementation.
+#[cfg(not(any(unix, windows)))]
 pub fn stop(_ctx: &CliContext) -> anyhow::Result<()> {
     anyhow::bail!("cascade stop is not supported on this platform yet");
 }
@@ -693,7 +772,7 @@ fn resolve_mount_path(path: &str) -> PathBuf {
 }
 
 /// Resolve the mount path from config.toml, falling back to ~/Cloud.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(not(any(unix, windows)), allow(dead_code))]
 fn resolve_mount_path_from_config(config_dir: &Path) -> PathBuf {
     let main_config = load_main_config(config_dir).ok();
     let configured = main_config.as_ref().and_then(|c| {
