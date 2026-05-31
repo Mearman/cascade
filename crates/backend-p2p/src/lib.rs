@@ -195,9 +195,7 @@ impl Backend for P2pBackend {
                     .sync
                     .fetch_block(native, idx, block_size, h)
                     .await
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("block {hash} missing and no peer had it")
-                    })?;
+                    .ok_or_else(|| anyhow::anyhow!("block {hash} missing and no peer had it"))?;
                 // Cache the fetched block locally so future reads hit
                 // the store without round-tripping the network.
                 self.blocks.store_block(&hash, &fetched).await?;
