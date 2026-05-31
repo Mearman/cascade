@@ -6,12 +6,16 @@
 //!
 //! 1. On a successful connection (in or out), each side sends a
 //!    [`BepMessage::ClusterConfig`] followed by [`BepMessage::Index`]
-//!    enumerating every non-tombstone file with its block hash list.
+//!    enumerating every file row in the index — including tombstones —
+//!    with its block hash list.
 //! 2. Incoming `Index` and `IndexUpdate` frames are merged into the
 //!    local index using a last-write-wins rule (compare `modified`
-//!    timestamps; take the newer row).
-//! 3. Local writes (`upload`, `update`) broadcast an `IndexUpdate` frame
-//!    with the new row to every connected peer.
+//!    timestamps; take the newer row). A row with `FileInfo.deleted`
+//!    set marks the local entry as a tombstone instead of overwriting
+//!    its blocks.
+//! 3. Local writes (`upload`, `update`, `delete`) broadcast an
+//!    `IndexUpdate` frame with the new row — tombstones included — to
+//!    every connected peer.
 //! 4. When a `Backend::download` call discovers blocks missing from
 //!    the local [`BlockStore`], each connected peer is asked in turn
 //!    via [`BepMessage::Request`] and the first matching block is kept.
@@ -20,10 +24,6 @@
 //! single peer connection are serialised — at most one outstanding
 //! [`BepMessage::Request`] per peer at any moment. Multiple peers can
 //! be queried concurrently.
-//!
-//! Deletes are intentionally not propagated in this phase. A future
-//! protocol extension will carry tombstones; until then a deletion on
-//! one device is local-only.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -317,12 +317,14 @@ impl SyncEngine {
         result
     }
 
-    /// Build a [`Vec<FileInfo>`] describing every live file in the index.
+    /// Build a [`Vec<FileInfo>`] describing every row in the index,
+    /// including tombstones. Directory rows are skipped — BEP carries
+    /// them implicitly via the parent path of each file.
     fn snapshot_for_peer(&self) -> Result<Vec<FileInfo>> {
         let entries = self.index.entries_since(0)?;
         let mut files = Vec::with_capacity(entries.len());
         for entry in entries {
-            if entry.deleted || entry.is_dir {
+            if entry.is_dir {
                 continue;
             }
             files.push(entry_to_file_info(&entry)?);
@@ -391,6 +393,8 @@ impl SyncEngine {
 
     /// Merge a peer-provided file list into the local index using LWW
     /// on `modified` timestamps. Newer rows replace local entries.
+    /// Tombstones (`deleted == true`) mark the local row deleted
+    /// instead of overwriting it.
     fn merge_files(&self, files: &[FileInfo]) -> Result<()> {
         for file in files {
             if file.file_type == FILE_TYPE_DIR {
@@ -404,6 +408,10 @@ impl SyncEngine {
             if let Some(local) = &local
                 && local.modified >= file.modified
             {
+                continue;
+            }
+            if file.deleted {
+                self.index.mark_deleted(&file.name)?;
                 continue;
             }
             let mut hash_blob = Vec::with_capacity(file.block_hashes.len() * 32);
@@ -425,8 +433,11 @@ impl SyncEngine {
     }
 
     /// Broadcast an `IndexUpdate` for a single locally-changed entry.
+    /// Tombstones (`entry.deleted`) are sent so peers can mirror the
+    /// delete. Directory rows are still skipped — BEP carries
+    /// directories implicitly via the parent path of each file.
     pub async fn broadcast_update(&self, entry: &IndexEntry) {
-        if entry.deleted || entry.is_dir {
+        if entry.is_dir {
             return;
         }
         let Ok(file_info) = entry_to_file_info(entry) else {
@@ -710,6 +721,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn merge_files_applies_tombstone() {
+        let (_dir, engine) = make_engine("f").await;
+        // Seed an undeleted local row.
+        engine
+            .index
+            .upsert(&IndexEntry {
+                path: "doc.txt".into(),
+                is_dir: false,
+                size: 10,
+                modified: 1_000_000_000,
+                block_hashes: vec![0u8; 32],
+                deleted: false,
+                version: 0,
+            })
+            .unwrap();
+        // Incoming tombstone with a newer timestamp should win.
+        engine
+            .merge_files(&[FileInfo {
+                name: "doc.txt".into(),
+                file_type: FILE_TYPE_FILE,
+                size: 0,
+                modified: 2_000_000_000,
+                block_size: 128 * 1024,
+                deleted: true,
+                block_hashes: vec![],
+            }])
+            .unwrap();
+        let after = engine.index.get("doc.txt").unwrap().unwrap();
+        assert!(after.deleted, "row should be marked deleted");
+    }
+
+    #[tokio::test]
     async fn merge_files_skips_unknown_file_type() {
         let (_dir, engine) = make_engine("f").await;
         engine
@@ -727,20 +770,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn broadcast_update_skips_tombstones() {
+    async fn broadcast_update_skips_directories() {
         let (_dir, engine) = make_engine("f").await;
         // No peers connected; broadcast should be a quiet no-op for
-        // tombstones and dir entries (we just confirm no panic).
-        let tombstone = IndexEntry {
-            path: "gone.txt".into(),
-            is_dir: false,
-            size: 0,
-            modified: 0,
-            block_hashes: vec![],
-            deleted: true,
-            version: 0,
-        };
-        engine.broadcast_update(&tombstone).await;
+        // dir entries (we just confirm no panic). Tombstones are now
+        // broadcast normally and are exercised by the integration test.
         let dir = IndexEntry {
             path: "subdir".into(),
             is_dir: true,

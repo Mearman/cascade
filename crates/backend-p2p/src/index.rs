@@ -103,12 +103,17 @@ impl FolderIndex {
     }
 
     /// Mark an entry as deleted (tombstone). Returns the new version.
+    ///
+    /// The row's `modified` column is bumped to the current wall-clock
+    /// timestamp so the LWW comparison treats the delete as a fresh
+    /// write event when peers compare their copies.
     pub fn mark_deleted(&self, path: &str) -> Result<i64> {
         let next_version = self.next_version()?;
+        let now = chrono::Utc::now().timestamp();
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         conn.execute(
-            "UPDATE files SET deleted = 1, version = ?2 WHERE path = ?1",
-            params![path, next_version],
+            "UPDATE files SET deleted = 1, modified = ?2, version = ?3 WHERE path = ?1",
+            params![path, now, next_version],
         )?;
         Ok(next_version)
     }

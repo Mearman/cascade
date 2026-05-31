@@ -382,6 +382,13 @@ impl Backend for P2pBackend {
     async fn delete(&self, file: &FileEntry) -> Result<()> {
         let native = file.id.native_id();
         self.index.mark_deleted(native)?;
+        // Broadcast the tombstone so peers can mirror the delete.
+        // `mark_deleted` bumps the row's version and updates the
+        // modified timestamp; reading it back gives us the canonical
+        // tombstone row to send.
+        if let Some(row) = self.index.get(native)? {
+            self.sync.broadcast_update(&row).await;
+        }
         Ok(())
     }
 
