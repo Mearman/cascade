@@ -106,9 +106,14 @@ fn file_context_from_entry_builds_correctly() {
 #[test]
 fn evaluate_with_real_context() {
     let ctx = providers::collect_default();
-    // Disk should have free space on a dev machine.
-    let expr = eval::parse_expr("DISK.free > 0").unwrap();
-    assert!(eval::evaluate(&expr, &ctx));
+
+    // Disk should have free space on a dev machine. Gated to unix because
+    // the disk provider stubs to 0/0 on Windows (no statfs).
+    #[cfg(unix)]
+    {
+        let expr = eval::parse_expr("DISK.free > 0").unwrap();
+        assert!(eval::evaluate(&expr, &ctx));
+    }
 
     // Time hour should be 0-23.
     let expr = eval::parse_expr("TIME.hour >= 0").unwrap();
