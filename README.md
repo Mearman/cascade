@@ -95,8 +95,9 @@ The design is documented in full at [`docs/design.md`](docs/design.md). This sec
 ```
 ┌──────────────────────────────────────────────────────────┐
 │  Platform Layer (per-OS)                                 │
-│  macOS:   FSKit (15.4+) · File Provider · WebDAV · NFS   │
-│  Linux:   FUSE · WebDAV · NFS (root)                     │
+│  macOS:   FSKit (15.4+) · WebDAV · NFS                   │
+│  (File Provider planned — see roadmap)                   │
+│  Linux:   FUSE · NFS (root)                              │
 │  Windows: WebDAV via WebClient (WinFSP/ProjFS planned)   │
 │  Universal fallback: NFS server · WebDAV server          │
 └────────────────────┬─────────────────────────────────────┘
@@ -108,7 +109,7 @@ The design is documented in full at [`docs/design.md`](docs/design.md). This sec
 └──────────────────────────────────────────────────────────┘
 ```
 
-`cascade start` tries the platform-preferred presenters in order and falls back as each one fails: on macOS that's FSKit → File Provider → WebDAV → NFS; on Linux it's FUSE → WebDAV → NFS; on Windows it's WebDAV (mounted via `net use *` against the built-in `WebClient` service).
+`cascade start` tries the platform-preferred presenters in order and falls back as each one fails: on macOS that's FSKit → WebDAV → NFS; on Linux it's FUSE → NFS; on Windows it's WebDAV (mounted via `net use *` against the built-in `WebClient` service).
 
 Communication between the platform layer and the engine uses a Unix domain socket with a length-prefixed JSON protocol, shared by the CLI, the macOS File Provider and FSKit extensions, and any future GUI.
 
@@ -162,7 +163,7 @@ SQLite at `~/.config/cascade/state.db`. Tables: `files`, `backends`, `pin_rules`
 ## Gotchas and quirks
 
 - **Linux FUSE runs without root.** The FUSE presenter mounts as the calling user via `fusermount3`. NFS fallback is different — binding a privileged port for NFS still needs `sudo`, so if FUSE is unavailable (missing `libfuse3`, no `/dev/fuse`) and you don't want to escalate, the daemon will fail rather than silently downgrade.
-- **Windows mounts go via WebDAV and the WebClient service.** `cascade start` runs `net use * \\localhost@<port>\DavWWWRoot\...` which lets the OS pick the next free drive letter. If `WebClient` isn't running the mount fails immediately; start it once with `sc start WebClient` or set it to auto-start (see Prerequisites).
+- **Windows mounts go via WebDAV and the WebClient service.** `cascade start` runs `net use * http://localhost:<port>/` which lets the OS pick the next free drive letter. If `WebClient` isn't running the mount fails immediately; start it once with `sc start WebClient` or set it to auto-start (see Prerequisites).
 - **Google Drive auth tokens are stored per platform.** macOS and Linux: `$XDG_CONFIG_HOME/cascade/gdrive-tokens/<account>.json`, falling back to `~/.config/cascade/...`. Windows: `%APPDATA%\cascade\gdrive-tokens\<account>.json`, with the default NTFS ACLs restricting access to the current user.
 - **NFS cache mode** controls write support. `off` is read-only. `minimal` (default) enables writes with minimal disk usage. `full` caches everything eagerly.
 - **Google Drive rate limits** — ~10,000 requests per 100 seconds per user. The backend uses a token-bucket rate limiter and batch requests where possible.
