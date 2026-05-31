@@ -384,6 +384,71 @@ mod tests {
     }
 
     #[test]
+    fn migration_is_idempotent_and_bumps_user_version() {
+        // Hand-craft a database with the pre-v0.1.20 schema (no
+        // `version_blob` column) and confirm:
+        //   1. The first `FolderIndex::open` migrates it and sets
+        //      `PRAGMA user_version` to 1.
+        //   2. A second open is a no-op — it does not attempt the
+        //      `ALTER TABLE` again. (If `user_version` weren't being
+        //      consulted, the column check still saves us, but tracking
+        //      the version is what makes the migration cheap to skip
+        //      and safe under concurrent open contention.)
+        //
+        // This is the regression test for the `BEGIN EXCLUSIVE` +
+        // `PRAGMA user_version` change: under the previous code, a
+        // second concurrent open could race on the `ALTER TABLE` and
+        // fail with `duplicate column name`. We can't easily simulate
+        // process-level contention from a unit test, but we can prove
+        // the migration leaves the database in a state where subsequent
+        // opens skip the alter entirely.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE files (
+                    path TEXT PRIMARY KEY NOT NULL,
+                    is_dir INTEGER NOT NULL,
+                    size INTEGER NOT NULL DEFAULT 0,
+                    modified INTEGER NOT NULL DEFAULT 0,
+                    block_hashes BLOB NOT NULL DEFAULT (x''),
+                    deleted INTEGER NOT NULL DEFAULT 0,
+                    version INTEGER NOT NULL DEFAULT 1
+                );",
+            )
+            .unwrap();
+        }
+
+        // First open — migration runs.
+        drop(FolderIndex::open(&path).unwrap());
+
+        // Inspect the database directly: `user_version` must be 1 and
+        // `version_blob` must exist.
+        let probe = Connection::open(&path).unwrap();
+        let user_version: i64 = probe
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(user_version, 1, "migration should bump user_version");
+        let has_column: i64 = probe
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('files') WHERE name = 'version_blob'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_column, 1, "version_blob column should exist");
+        drop(probe);
+
+        // Second open — must succeed without attempting the ALTER again.
+        // If `BEGIN EXCLUSIVE` weren't wrapping the migration, two
+        // racing processes could both hit `ALTER TABLE ... ADD COLUMN
+        // version_blob` and one would error with `duplicate column
+        // name`. The user_version guard short-circuits that probe.
+        drop(FolderIndex::open(&path).unwrap());
+    }
+
+    #[test]
     fn list_children_one_level_only() {
         let dir = tempdir().unwrap();
         let idx = FolderIndex::open(&dir.path().join("t.db")).unwrap();
