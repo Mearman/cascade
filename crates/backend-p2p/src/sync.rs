@@ -78,8 +78,7 @@ struct PeerHandle {
     /// the matching Response so the entry can be removed and the payload
     /// delivered to the right waiter.
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<u8>>>>>,
-    /// Source of fresh `request_id` values. Starts at 1 because 0 is
-    /// reserved as a sentinel for "no correlation".
+    /// Source of fresh `request_id` values for outbound Request frames.
     next_request_id: Arc<AtomicU64>,
 }
 
@@ -329,7 +328,7 @@ impl SyncEngine {
         let (tx, mut rx) = mpsc::unbounded_channel::<BepMessage>();
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<u8>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let next_request_id = Arc::new(AtomicU64::new(1));
+        let next_request_id = Arc::new(AtomicU64::new(0));
 
         // Register handle.
         {
@@ -973,7 +972,7 @@ mod tests {
         let peers = engine_b.peers.lock().await;
         let handle = peers.get(engine_a.device_id()).unwrap();
         assert!(
-            handle.next_request_id.load(Ordering::Relaxed) >= 3,
+            handle.next_request_id.load(Ordering::Relaxed) >= 2,
             "expected at least two ids consumed",
         );
     }
