@@ -1316,6 +1316,225 @@ mod tests {
         );
     }
 
+    #[test]
+    fn conflict_copy_path_uses_friendly_name() {
+        // A sanitised friendly name is passed positionally where the
+        // short device id used to live — the format is unchanged, only
+        // the source of the identifier differs.
+        assert_eq!(
+            conflict_copy_path("doc.txt", "work-laptop", 1_700_000_000),
+            "doc.conflict-work-laptop-1700000000.txt",
+        );
+    }
+
+    #[test]
+    fn sanitise_for_path_handles_special_chars() {
+        // The three cases called out by the design: whitespace, path
+        // separators, and dots all replace one-for-one and lowercase.
+        assert_eq!(sanitise_for_path("Work Laptop"), "work-laptop");
+        assert_eq!(sanitise_for_path("home/server"), "home-server");
+        assert_eq!(sanitise_for_path(".."), "--");
+    }
+
+    #[test]
+    fn sanitise_for_path_lowercases_and_normalises_metacharacters() {
+        // Mixed-case alphanumerics and apostrophes survive intact
+        // except for the lowercasing pass; shell metacharacters,
+        // colons, and backslashes normalise to single dashes
+        // one-for-one. Replacement is not collapsed, so `C:\` becomes
+        // `c--` (colon + backslash).
+        assert_eq!(sanitise_for_path("Joe's MacBook"), "joe's-macbook");
+        assert_eq!(sanitise_for_path("C:\\users\\joe"), "c--users-joe");
+    }
+
+    #[test]
+    fn sanitise_for_path_empty_input_returns_empty() {
+        // An empty input must produce an empty output so the caller
+        // can detect the case and fall back to the short device id —
+        // returning a placeholder here would defeat the fallback.
+        assert_eq!(sanitise_for_path(""), "");
+    }
+
+    #[tokio::test]
+    async fn persist_conflict_copy_uses_friendly_name_when_set() {
+        let (_dir, engine) = make_engine("f").await;
+        let engine = engine.with_local_device_name(Some("Work Laptop".to_string()));
+        // Seed a local row so `merge_files` has something to displace.
+        engine
+            .index
+            .upsert(&IndexEntry {
+                path: "doc.txt".into(),
+                is_dir: false,
+                size: 10,
+                modified: 1_000_000_000,
+                block_hashes: vec![0u8; 32],
+                deleted: false,
+                row_version: 0,
+                version: vec![(1, 1)],
+            })
+            .unwrap();
+        // Concurrent incoming write — neither vector dominates.
+        engine
+            .merge_files(&[FileInfo {
+                name: "doc.txt".into(),
+                file_type: FILE_TYPE_FILE,
+                size: 99,
+                modified: 2_000_000_000,
+                block_size: 128 * 1024,
+                deleted: false,
+                version: Version {
+                    counters: vec![(2, 1)],
+                },
+                block_hashes: vec![[1u8; 32]],
+            }])
+            .unwrap();
+        // The displaced local row should be persisted at a sibling
+        // path stamped with the sanitised friendly name, not the
+        // opaque short device id.
+        let conflict_row = engine
+            .index
+            .list_children("")
+            .unwrap()
+            .into_iter()
+            .find(|e| e.path.starts_with("doc.conflict-work-laptop-"))
+            .expect("conflict copy should use the friendly name");
+        assert_eq!(
+            std::path::Path::new(&conflict_row.path)
+                .extension()
+                .and_then(std::ffi::OsStr::to_str),
+            Some("txt"),
+            "conflict copy preserves the original extension",
+        );
+        assert_eq!(
+            conflict_row.size, 10,
+            "conflict copy keeps local content size"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_conflict_copy_falls_back_to_short_id_without_name() {
+        let (_dir, engine) = make_engine("f").await;
+        // No friendly name configured — `local_device_name` is `None`
+        // by default — so the short device id must identify the
+        // displaced side.
+        assert!(engine.local_device_name().is_none());
+        let short_id = local_short_device_id(engine.device_id());
+        let conflict_prefix = format!("doc.conflict-{short_id}-");
+
+        engine
+            .index
+            .upsert(&IndexEntry {
+                path: "doc.txt".into(),
+                is_dir: false,
+                size: 10,
+                modified: 1_000_000_000,
+                block_hashes: vec![0u8; 32],
+                deleted: false,
+                row_version: 0,
+                version: vec![(1, 1)],
+            })
+            .unwrap();
+        engine
+            .merge_files(&[FileInfo {
+                name: "doc.txt".into(),
+                file_type: FILE_TYPE_FILE,
+                size: 99,
+                modified: 2_000_000_000,
+                block_size: 128 * 1024,
+                deleted: false,
+                version: Version {
+                    counters: vec![(2, 1)],
+                },
+                block_hashes: vec![[1u8; 32]],
+            }])
+            .unwrap();
+        let conflict_row = engine
+            .index
+            .list_children("")
+            .unwrap()
+            .into_iter()
+            .find(|e| e.path.starts_with(&conflict_prefix))
+            .expect("conflict copy should use the short device id when no friendly name is set");
+        assert_eq!(
+            std::path::Path::new(&conflict_row.path)
+                .extension()
+                .and_then(std::ffi::OsStr::to_str),
+            Some("txt"),
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_conflict_copy_falls_back_when_friendly_name_sanitises_to_empty() {
+        // A friendly name that consists entirely of replaced
+        // characters sanitises to a string of dashes — non-empty —
+        // and is still preferred over the short device id. The
+        // genuine empty-string case (which would otherwise produce a
+        // bare `.conflict--<ts>.` path) is the one we must guard.
+        let (_dir, engine) = make_engine("f").await;
+        let engine = engine.with_local_device_name(Some(String::new()));
+        let short_id = local_short_device_id(engine.device_id());
+        let conflict_prefix = format!("doc.conflict-{short_id}-");
+
+        engine
+            .index
+            .upsert(&IndexEntry {
+                path: "doc.txt".into(),
+                is_dir: false,
+                size: 10,
+                modified: 1_000_000_000,
+                block_hashes: vec![0u8; 32],
+                deleted: false,
+                row_version: 0,
+                version: vec![(1, 1)],
+            })
+            .unwrap();
+        engine
+            .merge_files(&[FileInfo {
+                name: "doc.txt".into(),
+                file_type: FILE_TYPE_FILE,
+                size: 99,
+                modified: 2_000_000_000,
+                block_size: 128 * 1024,
+                deleted: false,
+                version: Version {
+                    counters: vec![(2, 1)],
+                },
+                block_hashes: vec![[1u8; 32]],
+            }])
+            .unwrap();
+        let conflict_row = engine
+            .index
+            .list_children("")
+            .unwrap()
+            .into_iter()
+            .find(|e| e.path.starts_with(&conflict_prefix))
+            .expect("empty friendly name must fall back to the short device id");
+        assert_eq!(
+            std::path::Path::new(&conflict_row.path)
+                .extension()
+                .and_then(std::ffi::OsStr::to_str),
+            Some("txt"),
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_peer_names_round_trips_via_peer_name_lookup() {
+        let (_dir, engine) = make_engine("f").await;
+        engine
+            .seed_peer_names(vec![
+                ("AAAAA".to_string(), "home-laptop".to_string()),
+                // An empty value is ignored — the absence is preserved.
+                ("BBBBB".to_string(), String::new()),
+            ])
+            .await;
+        assert_eq!(
+            engine.peer_name("AAAAA").await.as_deref(),
+            Some("home-laptop"),
+        );
+        assert!(engine.peer_name("BBBBB").await.is_none());
+        assert!(engine.peer_name("CCCCC").await.is_none());
+    }
+
     #[tokio::test]
     async fn merge_files_concurrent_edit_accepts_incoming() {
         let (_dir, engine) = make_engine("f").await;
