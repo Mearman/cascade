@@ -38,7 +38,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use cascade_p2p::block::BlockHash;
@@ -496,9 +496,9 @@ impl SyncEngine {
     /// per-file version vector dominance. The local row wins if it
     /// dominates the incoming version; the incoming row wins if it
     /// dominates the local. Equal vectors are no-ops. When neither
-    /// dominates (concurrent edit on disconnected peers) the conflict
-    /// is logged and the incoming row is accepted — persistent
-    /// conflict copies are tracked separately as future work.
+    /// dominates (concurrent edit on disconnected peers) the local row
+    /// is preserved as a conflict copy at a sibling path before the
+    /// incoming content overwrites it.
     ///
     /// A peer row with `FileInfo.deleted` set marks the local entry
     /// as a tombstone rather than overwriting its blocks.
@@ -534,23 +534,14 @@ impl SyncEngine {
                     continue;
                 }
                 if !incoming_version.dominates(&local_version) {
-                    // Neither dominates — concurrent edit. The content
-                    // resolution (conflict-copy persistence) remains a
-                    // follow-up, but the version vector itself must merge:
-                    // dropping the local counters would let a third peer
-                    // make wrong dominance decisions against this row.
-                    //
-                    // TODO(cascade#conflict-copies): write the losing
-                    // local row to a conflict-suffixed path before
-                    // overwriting it (e.g. "doc.txt (conflict
-                    // <device> <ts>).txt"). See the design note on
-                    // conflict-copy semantics in the project README.
-                    tracing::warn!(
-                        target: "cascade::backend::p2p",
-                        path = %file.name,
-                        "version conflict — neither local nor remote dominates; accepting remote content and merging version vectors (conflict-copy persistence is a follow-up)",
-                    );
+                    // Neither dominates — concurrent edit. The version
+                    // vector itself must merge so a third peer later
+                    // receiving this row sees the union of history.
+                    // Preserve the local row's content as a conflict
+                    // copy at a sibling path before the incoming
+                    // content overwrites the original.
                     persisted_version.merge(&local_version);
+                    self.persist_conflict_copy(&file.name, local_entry)?;
                 }
             }
             if file.deleted {
@@ -583,6 +574,41 @@ impl SyncEngine {
             };
             self.index.upsert(&entry)?;
         }
+        Ok(())
+    }
+
+    /// Persist the local row at `original_path` as a conflict copy at
+    /// a sibling path before the row is overwritten by an incoming
+    /// concurrent write. The conflict copy is a snapshot of the local
+    /// state — same content, same modified time, same version vector —
+    /// but at a unique path so it does not collide on any peer.
+    ///
+    /// A row whose content is empty (zero size, no block hashes) is
+    /// skipped — there's nothing meaningful to preserve.
+    fn persist_conflict_copy(&self, original_path: &str, local: &IndexEntry) -> Result<()> {
+        if local.size == 0 && local.block_hashes.is_empty() {
+            return Ok(());
+        }
+        let short_id = local_short_device_id(self.device_id());
+        let timestamp = unix_timestamp_seconds();
+        let conflict_path = conflict_copy_path(original_path, &short_id, timestamp);
+        let conflict_entry = IndexEntry {
+            path: conflict_path.clone(),
+            is_dir: false,
+            size: local.size,
+            modified: local.modified,
+            block_hashes: local.block_hashes.clone(),
+            deleted: false,
+            row_version: 0,
+            version: local.version.clone(),
+        };
+        self.index.upsert(&conflict_entry)?;
+        info!(
+            target: "cascade::backend::p2p",
+            path = %original_path,
+            conflict_copy = %conflict_path,
+            "preserved local version as conflict copy",
+        );
         Ok(())
     }
 
@@ -653,6 +679,54 @@ impl SyncEngine {
     }
 }
 
+/// Build the path at which to persist a conflict copy of a row whose
+/// content is about to be overwritten by an incoming concurrent write.
+///
+/// The format is `<stem>.conflict-<short_device_id>-<timestamp>.<ext>`
+/// where the stem and extension are split on the LAST `.` in the
+/// filename. A leading dot is treated as a hidden-file marker rather
+/// than an extension separator, so `.gitignore` becomes
+/// `.gitignore.conflict-<id>-<ts>` with no trailing extension.
+fn conflict_copy_path(original: &str, short_device_id: &str, timestamp: i64) -> String {
+    let (parent, filename) = match original.rsplit_once('/') {
+        Some((p, f)) => (Some(p), f),
+        None => (None, original),
+    };
+    let (stem, ext) = split_filename(filename);
+    let suffixed = if ext.is_empty() {
+        format!("{stem}.conflict-{short_device_id}-{timestamp}")
+    } else {
+        format!("{stem}.conflict-{short_device_id}-{timestamp}.{ext}")
+    };
+    match parent {
+        Some(p) => format!("{p}/{suffixed}"),
+        None => suffixed,
+    }
+}
+
+/// Split a filename into `(stem, extension)` on the LAST `.`. A leading
+/// dot is treated as part of the stem (hidden-file convention), not as
+/// an extension separator. An empty extension means there is no
+/// extension to preserve.
+fn split_filename(filename: &str) -> (&str, &str) {
+    // Skip the leading dot for the purposes of finding the extension
+    // separator — `.gitignore` is a stem, not a stem + ext. `split_at`
+    // panics on an out-of-bounds index; the `min(filename.len())` guard
+    // makes the bound trivially in range and avoids the workspace's
+    // `indexing_slicing` lint.
+    let search_start = usize::from(filename.starts_with('.'));
+    let (_, search_slice) = filename.split_at(search_start.min(filename.len()));
+    search_slice.rfind('.').map_or((filename, ""), |rel_idx| {
+        let abs_idx = search_start + rel_idx;
+        let (stem, dot_ext) = filename.split_at(abs_idx);
+        // Strip the leading '.' from the extension half. `dot_ext` is
+        // non-empty (it starts with the `.` we just located via
+        // `rfind`).
+        let (_, ext) = dot_ext.split_at(1);
+        (stem, ext)
+    })
+}
+
 fn entry_to_file_info(entry: &IndexEntry) -> Result<FileInfo> {
     let block_size = cascade_p2p::block::block_size_for_file(entry.size);
     let mut hashes = Vec::with_capacity(entry.block_hashes.len() / 32);
@@ -693,6 +767,29 @@ fn derive_device_short_id(device_id: &str) -> u64 {
     let mut buf = [0u8; 8];
     buf.copy_from_slice(head);
     u64::from_be_bytes(buf)
+}
+
+/// Return the first 8 characters of `device_id` for use as a short,
+/// human-readable identifier in conflict-copy paths. `DeviceIdentity::device_id`
+/// is a base32-encoded SHA-256 (52 chars), so 8 chars is plenty to
+/// distinguish devices in practice without overflowing path budgets.
+fn local_short_device_id(device_id: &str) -> String {
+    let take = device_id.len().min(8);
+    let (head, _) = device_id.split_at(take);
+    head.to_string()
+}
+
+/// Current wall-clock time as seconds since the Unix epoch. Used to
+/// stamp conflict-copy filenames so concurrent edits at the same path
+/// produce distinct sibling paths.
+fn unix_timestamp_seconds() -> i64 {
+    let now = SystemTime::now();
+    let secs = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    // Saturating cast — wall-clock seconds within i64 range for ~292B
+    // years; the only way to hit the ceiling is a malformed clock, in
+    // which case the saturating value is still a valid (if odd) sibling
+    // path stamp.
+    i64::try_from(secs).unwrap_or(i64::MAX)
 }
 
 /// Standard subdirectory under the backend data dir used by the sync
@@ -989,6 +1086,33 @@ mod tests {
             .unwrap();
         let after = engine.index.get("doc.txt").unwrap().unwrap();
         assert_eq!(after.size, 10, "equal vectors are no-ops");
+    }
+
+    #[test]
+    fn conflict_copy_path_preserves_extension() {
+        assert_eq!(
+            conflict_copy_path("docs/report.txt", "7BHJ62FL", 1_700_000_000),
+            "docs/report.conflict-7BHJ62FL-1700000000.txt",
+        );
+    }
+
+    #[test]
+    fn conflict_copy_path_handles_no_extension() {
+        assert_eq!(
+            conflict_copy_path("README", "7BHJ62FL", 1_700_000_000),
+            "README.conflict-7BHJ62FL-1700000000",
+        );
+    }
+
+    #[test]
+    fn conflict_copy_path_handles_dot_prefixed_filename() {
+        // A leading dot is a hidden-file marker, not an extension
+        // separator — the whole `.gitignore` is the stem, so no
+        // extension is preserved.
+        assert_eq!(
+            conflict_copy_path(".gitignore", "7BHJ62FL", 1_700_000_000),
+            ".gitignore.conflict-7BHJ62FL-1700000000",
+        );
     }
 
     #[tokio::test]

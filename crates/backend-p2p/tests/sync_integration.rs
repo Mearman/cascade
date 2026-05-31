@@ -336,6 +336,101 @@ async fn version_vectors_resolve_concurrent_upload() {
     );
 }
 
+/// Two nodes that have never communicated each upload a different
+/// payload to the same path while disconnected. When they finally
+/// connect, the loser's content must be preserved at a sibling
+/// `*.conflict-*.txt` path on the side that overwrites — the original
+/// path holds one payload, and a conflict-copy row holds the other.
+#[tokio::test]
+async fn concurrent_edit_preserves_loser_as_conflict_copy() {
+    let a = Node::new("a", "shared").await;
+    let b = Node::new("b", "shared").await;
+    mutual_trust(&a, &b).await;
+
+    // Disconnected uploads — each node bumps its own short_id only.
+    let payload_a = b"alpha payload".repeat(8);
+    let payload_b = b"beta payload longer than alpha".repeat(4);
+    let mut ra = Cursor::new(payload_a.clone());
+    a.backend
+        .upload(
+            Path::new("doc.txt"),
+            &mut ra,
+            &FileId(format!("{}:root", a.backend.id())),
+        )
+        .await
+        .unwrap();
+    let mut rb = Cursor::new(payload_b.clone());
+    b.backend
+        .upload(
+            Path::new("doc.txt"),
+            &mut rb,
+            &FileId(format!("{}:root", b.backend.id())),
+        )
+        .await
+        .unwrap();
+
+    // Connect after both writes happened — this is the concurrent edit.
+    let _cancel = connect_via_listener(&a, &b).await;
+
+    // Give both sides time to exchange Index frames and persist the
+    // conflict copy. We poll for the conflict-copy row to appear
+    // rather than sleeping a fixed wall-clock duration.
+    let mut found_on_a = false;
+    let mut found_on_b = false;
+    let mut conflict_size_a: u64 = 0;
+    let mut conflict_size_b: u64 = 0;
+    for _ in 0..80 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if !found_on_a {
+            let kids = a.backend.list_children("root").await.unwrap();
+            if let Some(c) = kids
+                .iter()
+                .find(|e| e.name.starts_with("doc.conflict-") && e.name.ends_with(".txt"))
+            {
+                conflict_size_a = c.size.unwrap_or(0);
+                found_on_a = true;
+            }
+        }
+        if !found_on_b {
+            let kids = b.backend.list_children("root").await.unwrap();
+            if let Some(c) = kids
+                .iter()
+                .find(|e| e.name.starts_with("doc.conflict-") && e.name.ends_with(".txt"))
+            {
+                conflict_size_b = c.size.unwrap_or(0);
+                found_on_b = true;
+            }
+        }
+        if found_on_a && found_on_b {
+            break;
+        }
+    }
+    assert!(found_on_a, "A never persisted a conflict copy for doc.txt");
+    assert!(found_on_b, "B never persisted a conflict copy for doc.txt");
+
+    // The conflict copy on each side holds the OTHER payload — the
+    // payload that was discarded as the "loser" of the merge. So the
+    // sizes must match one of the two payloads. With deterministic
+    // dominance the loser is the locally-held content (which is what
+    // gets snapshotted), and the surviving original path holds the
+    // incoming payload.
+    let payload_sizes = [payload_a.len() as u64, payload_b.len() as u64];
+    assert!(
+        payload_sizes.contains(&conflict_size_a),
+        "A's conflict copy size {conflict_size_a} matches neither payload",
+    );
+    assert!(
+        payload_sizes.contains(&conflict_size_b),
+        "B's conflict copy size {conflict_size_b} matches neither payload",
+    );
+
+    // Original path must still hold a valid payload on both sides.
+    let on_a = a.backend.metadata(Path::new("doc.txt")).await.unwrap();
+    let on_b = b.backend.metadata(Path::new("doc.txt")).await.unwrap();
+    assert!(payload_sizes.contains(&on_a.size.unwrap_or(0)));
+    assert!(payload_sizes.contains(&on_b.size.unwrap_or(0)));
+}
+
 /// Concurrent downloads on a single peer connection must not serialise
 /// behind each other. B uploads three files to A, then on a separate
 /// node C fires three `download` calls in parallel. All three complete
