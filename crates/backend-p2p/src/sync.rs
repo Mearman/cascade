@@ -7,13 +7,19 @@
 //! 1. On a successful connection (in or out), each side sends a
 //!    [`BepMessage::ClusterConfig`] followed by [`BepMessage::Index`]
 //!    enumerating every file row in the index — including tombstones —
-//!    with its block hash list.
+//!    with its block hash list and per-file version vector.
 //! 2. Incoming `Index` and `IndexUpdate` frames are merged into the
-//!    local index using a last-write-wins rule (compare `modified`
-//!    timestamps; take the newer row). A row with `FileInfo.deleted`
-//!    set marks the local entry as a tombstone instead of overwriting
+//!    local index using per-file version vector dominance. If the
+//!    local row dominates the incoming version, the incoming row is
+//!    ignored. If the incoming version dominates the local row, the
+//!    incoming row wins. If neither dominates (concurrent edit on
+//!    disconnected peers), a `tracing::warn!` records the conflict and
+//!    the incoming row is accepted — the persisted-conflict-copy
+//!    behaviour is a follow-up. A row with `FileInfo.deleted` set
+//!    marks the local entry as a tombstone instead of overwriting
 //!    its blocks.
-//! 3. Local writes (`upload`, `update`, `delete`) broadcast an
+//! 3. Local writes (`upload`, `update`, `delete`) bump the local
+//!    device's counter in the row's version vector, then broadcast an
 //!    `IndexUpdate` frame with the new row — tombstones included — to
 //!    every connected peer.
 //! 4. When a `Backend::download` call discovers blocks missing from
@@ -113,6 +119,10 @@ pub struct SyncEngine {
     index: Arc<FolderIndex>,
     blocks: Arc<BlockStore>,
     identity: DeviceIdentity,
+    /// 64-bit derivation of the device identity used as this device's
+    /// entry key in version vectors. Stable across restarts because
+    /// it is derived from the persistent `DeviceIdentity::device_id`.
+    device_short_id: u64,
     /// Device IDs we are willing to talk to.
     trusted: Arc<Mutex<Vec<String>>>,
     peers: Arc<Mutex<HashMap<String, PeerHandle>>>,
@@ -126,14 +136,23 @@ impl SyncEngine {
         blocks: Arc<BlockStore>,
         identity: DeviceIdentity,
     ) -> Self {
+        let device_short_id = derive_device_short_id(&identity.device_id);
         Self {
             folder_id,
             index,
             blocks,
             identity,
+            device_short_id,
             trusted: Arc::new(Mutex::new(Vec::new())),
             peers: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// This device's short id, used as the entry key in version
+    /// vectors. Stable across restarts.
+    #[must_use]
+    pub const fn device_short_id(&self) -> u64 {
+        self.device_short_id
     }
 
     /// Add a trusted device ID. Future inbound connections from this
@@ -425,10 +444,16 @@ impl SyncEngine {
         }
     }
 
-    /// Merge a peer-provided file list into the local index using LWW
-    /// on `modified` timestamps. Newer rows replace local entries.
-    /// Tombstones (`deleted == true`) mark the local row deleted
-    /// instead of overwriting it.
+    /// Merge a peer-provided file list into the local index using
+    /// per-file version vector dominance. The local row wins if it
+    /// dominates the incoming version; the incoming row wins if it
+    /// dominates the local. Equal vectors are no-ops. When neither
+    /// dominates (concurrent edit on disconnected peers) the conflict
+    /// is logged and the incoming row is accepted — persistent
+    /// conflict copies are tracked separately as future work.
+    ///
+    /// A peer row with `FileInfo.deleted` set marks the local entry
+    /// as a tombstone rather than overwriting its blocks.
     fn merge_files(&self, files: &[FileInfo]) -> Result<()> {
         for file in files {
             if file.file_type == FILE_TYPE_DIR {
@@ -439,37 +464,50 @@ impl SyncEngine {
                 continue;
             }
             let local = self.index.get(&file.name)?;
-            if let Some(local) = &local {
-                // Delete wins on equal timestamps; otherwise strict
-                // greater-than means the local row is newer and the
-                // incoming one is stale.
-                if file.deleted {
-                    if local.modified > file.modified {
-                        continue;
-                    }
-                } else if local.modified >= file.modified {
+            let incoming_version = file.version.clone();
+            if let Some(local_entry) = &local {
+                let local_version = Version {
+                    counters: local_entry.version.clone(),
+                };
+                if local_version == incoming_version {
+                    // Identical version vectors — nothing to do.
                     continue;
+                }
+                if local_version.dominates(&incoming_version) {
+                    // Local row is strictly newer; ignore incoming.
+                    continue;
+                }
+                if !incoming_version.dominates(&local_version) {
+                    // Neither dominates — concurrent edit. Persisting
+                    // a conflict copy is tracked as a follow-up; for
+                    // this commit we log and fall through to accept
+                    // the incoming row so we don't regress relative to
+                    // the previous LWW tie-break behaviour.
+                    //
+                    // TODO(cascade#conflict-copies): write the losing
+                    // local row to a conflict-suffixed path before
+                    // overwriting it (e.g. "doc.txt (conflict
+                    // <device> <ts>).txt"). See the design note on
+                    // conflict-copy semantics in the project README.
+                    tracing::warn!(
+                        target: "cascade::backend::p2p",
+                        path = %file.name,
+                        "version conflict — neither local nor remote dominates; accepting remote (conflict-copy persistence is a follow-up)",
+                    );
                 }
             }
             if file.deleted {
-                if local.is_some() {
-                    self.index.mark_deleted(&file.name)?;
-                } else {
-                    // Tombstone for a path we have never seen. Insert a
-                    // synthetic deleted row so we can propagate the
-                    // delete to peers that join later.
-                    let entry = IndexEntry {
-                        path: file.name.clone(),
-                        is_dir: false,
-                        size: 0,
-                        modified: file.modified,
-                        block_hashes: vec![],
-                        deleted: true,
-                        row_version: 0,
-                        version: Vec::new(),
-                    };
-                    self.index.upsert(&entry)?;
-                }
+                let entry = IndexEntry {
+                    path: file.name.clone(),
+                    is_dir: false,
+                    size: 0,
+                    modified: file.modified,
+                    block_hashes: vec![],
+                    deleted: true,
+                    row_version: 0,
+                    version: incoming_version.counters,
+                };
+                self.index.upsert(&entry)?;
                 continue;
             }
             let mut hash_blob = Vec::with_capacity(file.block_hashes.len() * 32);
@@ -484,7 +522,7 @@ impl SyncEngine {
                 block_hashes: hash_blob,
                 deleted: false,
                 row_version: 0,
-                version: Vec::new(),
+                version: incoming_version.counters,
             };
             self.index.upsert(&entry)?;
         }
@@ -575,9 +613,28 @@ fn entry_to_file_info(entry: &IndexEntry) -> Result<FileInfo> {
         modified: entry.modified,
         block_size,
         deleted: entry.deleted,
-        version: Version::default(),
+        version: Version {
+            counters: entry.version.clone(),
+        },
         block_hashes: hashes,
     })
+}
+
+/// Derive this device's 64-bit short id from its persistent device id.
+///
+/// `DeviceIdentity::device_id` is a 52-character base32 SHA-256 of the
+/// TLS certificate. Hashing again and folding to 8 bytes gives a
+/// stable per-device u64 to use as the version vector entry key.
+fn derive_device_short_id(device_id: &str) -> u64 {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(device_id.as_bytes());
+    // SHA-256 is always 32 bytes; take the first 8 via `chunks_exact`
+    // so the slice access satisfies the workspace's `indexing_slicing`
+    // lint without requiring an `#[allow]` escape.
+    let (head, _) = digest.as_slice().split_at(8);
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(head);
+    u64::from_be_bytes(buf)
 }
 
 /// Standard subdirectory under the backend data dir used by the sync
@@ -702,8 +759,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn merge_files_skips_older_local() {
+    async fn merge_files_skips_when_local_dominates() {
         let (_dir, engine) = make_engine("f").await;
+        // Local row carries a strictly newer vector for device 1.
         engine
             .index
             .upsert(&IndexEntry {
@@ -714,11 +772,11 @@ mod tests {
                 block_hashes: vec![0u8; 32],
                 deleted: false,
                 row_version: 0,
-                version: Vec::new(),
+                version: vec![(1, 5)],
             })
             .unwrap();
 
-        // Older incoming row should not displace the local one.
+        // Older-by-vector incoming row (`(1, 2)` < `(1, 5)`) must be ignored.
         engine
             .merge_files(&[FileInfo {
                 name: "doc.txt".into(),
@@ -727,17 +785,19 @@ mod tests {
                 modified: 1_000_000_000,
                 block_size: 128 * 1024,
                 deleted: false,
-                version: Version::default(),
+                version: Version {
+                    counters: vec![(1, 2)],
+                },
                 block_hashes: vec![[1u8; 32]],
             }])
             .unwrap();
         let after = engine.index.get("doc.txt").unwrap().unwrap();
         assert_eq!(after.size, 10);
-        assert_eq!(after.modified, 2_000_000_000);
+        assert_eq!(after.version, vec![(1, 5)]);
     }
 
     #[tokio::test]
-    async fn merge_files_takes_newer_peer() {
+    async fn merge_files_takes_dominating_peer() {
         let (_dir, engine) = make_engine("f").await;
         engine
             .index
@@ -749,9 +809,10 @@ mod tests {
                 block_hashes: vec![0u8; 32],
                 deleted: false,
                 row_version: 0,
-                version: Vec::new(),
+                version: vec![(1, 1)],
             })
             .unwrap();
+        // Incoming dominates: `(1, 1)` is strictly less than `(1, 3)`.
         engine
             .merge_files(&[FileInfo {
                 name: "doc.txt".into(),
@@ -760,7 +821,9 @@ mod tests {
                 modified: 2_000_000_000,
                 block_size: 128 * 1024,
                 deleted: false,
-                version: Version::default(),
+                version: Version {
+                    counters: vec![(1, 3)],
+                },
                 block_hashes: vec![[1u8; 32]],
             }])
             .unwrap();
@@ -768,6 +831,79 @@ mod tests {
         assert_eq!(after.size, 99);
         assert_eq!(after.modified, 2_000_000_000);
         assert_eq!(after.block_hashes, vec![1u8; 32]);
+        assert_eq!(after.version, vec![(1, 3)]);
+    }
+
+    #[tokio::test]
+    async fn merge_files_noop_on_equal_vector() {
+        let (_dir, engine) = make_engine("f").await;
+        engine
+            .index
+            .upsert(&IndexEntry {
+                path: "doc.txt".into(),
+                is_dir: false,
+                size: 10,
+                modified: 1_000_000_000,
+                block_hashes: vec![0u8; 32],
+                deleted: false,
+                row_version: 0,
+                version: vec![(1, 1), (2, 2)],
+            })
+            .unwrap();
+        engine
+            .merge_files(&[FileInfo {
+                name: "doc.txt".into(),
+                file_type: FILE_TYPE_FILE,
+                size: 99, // would be different content, but vector equals — skip
+                modified: 2_000_000_000,
+                block_size: 128 * 1024,
+                deleted: false,
+                version: Version {
+                    counters: vec![(1, 1), (2, 2)],
+                },
+                block_hashes: vec![[1u8; 32]],
+            }])
+            .unwrap();
+        let after = engine.index.get("doc.txt").unwrap().unwrap();
+        assert_eq!(after.size, 10, "equal vectors are no-ops");
+    }
+
+    #[tokio::test]
+    async fn merge_files_concurrent_edit_accepts_incoming() {
+        let (_dir, engine) = make_engine("f").await;
+        // Local row bumped by device 1; incoming row bumped by device 2.
+        // Neither dominates — concurrent edit on disconnected peers.
+        engine
+            .index
+            .upsert(&IndexEntry {
+                path: "doc.txt".into(),
+                is_dir: false,
+                size: 10,
+                modified: 1_000_000_000,
+                block_hashes: vec![0u8; 32],
+                deleted: false,
+                row_version: 0,
+                version: vec![(1, 1)],
+            })
+            .unwrap();
+        engine
+            .merge_files(&[FileInfo {
+                name: "doc.txt".into(),
+                file_type: FILE_TYPE_FILE,
+                size: 99,
+                modified: 2_000_000_000,
+                block_size: 128 * 1024,
+                deleted: false,
+                version: Version {
+                    counters: vec![(2, 1)],
+                },
+                block_hashes: vec![[1u8; 32]],
+            }])
+            .unwrap();
+        let after = engine.index.get("doc.txt").unwrap().unwrap();
+        // Conflict-copy persistence is a follow-up; for now incoming wins.
+        assert_eq!(after.size, 99);
+        assert_eq!(after.version, vec![(2, 1)]);
     }
 
     #[tokio::test]
@@ -789,9 +925,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn merge_files_applies_tombstone() {
+    async fn merge_files_applies_dominating_tombstone() {
         let (_dir, engine) = make_engine("f").await;
-        // Seed an undeleted local row.
+        // Seed an undeleted local row with version `(1, 1)`.
         engine
             .index
             .upsert(&IndexEntry {
@@ -802,10 +938,10 @@ mod tests {
                 block_hashes: vec![0u8; 32],
                 deleted: false,
                 row_version: 0,
-                version: Vec::new(),
+                version: vec![(1, 1)],
             })
             .unwrap();
-        // Incoming tombstone with a newer timestamp should win.
+        // Incoming tombstone dominates with `(1, 2)`.
         engine
             .merge_files(&[FileInfo {
                 name: "doc.txt".into(),
@@ -814,12 +950,15 @@ mod tests {
                 modified: 2_000_000_000,
                 block_size: 128 * 1024,
                 deleted: true,
-                version: Version::default(),
+                version: Version {
+                    counters: vec![(1, 2)],
+                },
                 block_hashes: vec![],
             }])
             .unwrap();
         let after = engine.index.get("doc.txt").unwrap().unwrap();
         assert!(after.deleted, "row should be marked deleted");
+        assert_eq!(after.version, vec![(1, 2)]);
     }
 
     #[tokio::test]
@@ -835,7 +974,9 @@ mod tests {
                 block_size: 128 * 1024,
                 block_hashes: vec![],
                 deleted: true,
-                version: Version::default(),
+                version: Version {
+                    counters: vec![(7, 1)],
+                },
             }])
             .unwrap();
         let row = engine
@@ -845,39 +986,7 @@ mod tests {
             .expect("tombstone row should exist");
         assert!(row.deleted);
         assert_eq!(row.modified, 1_700_000_000);
-    }
-
-    #[tokio::test]
-    async fn merge_files_tombstone_wins_on_tied_modified() {
-        let (_dir, engine) = make_engine("f").await;
-        let ts = 1_700_000_000;
-        engine
-            .index
-            .upsert(&IndexEntry {
-                path: "doc.txt".into(),
-                is_dir: false,
-                size: 10,
-                modified: ts,
-                block_hashes: vec![0u8; 32],
-                deleted: false,
-                row_version: 0,
-                version: Vec::new(),
-            })
-            .unwrap();
-        engine
-            .merge_files(&[FileInfo {
-                name: "doc.txt".into(),
-                file_type: FILE_TYPE_FILE,
-                size: 0,
-                modified: ts, // same timestamp
-                block_size: 128 * 1024,
-                block_hashes: vec![],
-                deleted: true,
-                version: Version::default(),
-            }])
-            .unwrap();
-        let row = engine.index.get("doc.txt").unwrap().unwrap();
-        assert!(row.deleted, "delete should win on tied modified");
+        assert_eq!(row.version, vec![(7, 1)]);
     }
 
     #[tokio::test]

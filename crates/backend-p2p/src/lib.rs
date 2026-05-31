@@ -34,6 +34,7 @@ use cascade_engine::backend::Backend;
 use cascade_engine::types::{Change, Cursor, FileEntry, FileId, ItemId, Quota};
 use cascade_p2p::block::{BlockHash, split_data};
 use cascade_p2p::identity::DeviceIdentity;
+use cascade_p2p::protocol::Version;
 use cascade_p2p::store::BlockStore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -384,6 +385,18 @@ impl Backend for P2pBackend {
             hash_blob.extend_from_slice(&hash.0);
         }
 
+        // Bump the local device's version-vector counter so peers can
+        // tell this write apart from any concurrent edit. The existing
+        // counter (if any) is taken from the prior row.
+        let mut version = Version {
+            counters: self
+                .index
+                .get(&path_str)?
+                .map(|e| e.version)
+                .unwrap_or_default(),
+        };
+        version.bump(self.sync.device_short_id());
+
         let entry = IndexEntry {
             path: path_str.clone(),
             is_dir: false,
@@ -392,7 +405,7 @@ impl Backend for P2pBackend {
             block_hashes: hash_blob,
             deleted: false,
             row_version: 0,
-            version: Vec::new(),
+            version: version.counters,
         };
         self.index.upsert(&entry)?;
         self.sync.broadcast_update(&entry).await;
@@ -424,6 +437,17 @@ impl Backend for P2pBackend {
             .ok_or_else(|| anyhow::anyhow!("non-utf8 path"))?
             .trim_start_matches('/')
             .to_string();
+        // Directory rows carry a version vector for symmetry with file
+        // rows even though BEP never propagates directories — peers
+        // infer them from the parent path of each file.
+        let mut version = Version {
+            counters: self
+                .index
+                .get(&path_str)?
+                .map(|e| e.version)
+                .unwrap_or_default(),
+        };
+        version.bump(self.sync.device_short_id());
         let entry = IndexEntry {
             path: path_str,
             is_dir: true,
@@ -432,7 +456,7 @@ impl Backend for P2pBackend {
             block_hashes: Vec::new(),
             deleted: false,
             row_version: 0,
-            version: Vec::new(),
+            version: version.counters,
         };
         self.index.upsert(&entry)?;
         Ok(self.entry_to_file(&entry))
@@ -440,14 +464,31 @@ impl Backend for P2pBackend {
 
     async fn delete(&self, file: &FileEntry) -> Result<()> {
         let native = file.id.native_id();
-        self.index.mark_deleted(native)?;
+        // Bump the local device's counter so peers see this tombstone
+        // as causally newer than whatever they last received for this
+        // path. Reading the existing row gives us the prior vector to
+        // extend rather than overwrite.
+        let existing = self
+            .index
+            .get(native)?
+            .ok_or_else(|| anyhow::anyhow!("not in index: {native}"))?;
+        let mut version = Version {
+            counters: existing.version,
+        };
+        version.bump(self.sync.device_short_id());
+        let tombstone = IndexEntry {
+            path: existing.path,
+            is_dir: existing.is_dir,
+            size: 0,
+            modified: chrono::Utc::now().timestamp(),
+            block_hashes: vec![],
+            deleted: true,
+            row_version: 0,
+            version: version.counters,
+        };
+        self.index.upsert(&tombstone)?;
         // Broadcast the tombstone so peers can mirror the delete.
-        // `mark_deleted` bumps the row's version and updates the
-        // modified timestamp; reading it back gives us the canonical
-        // tombstone row to send.
-        if let Some(row) = self.index.get(native)? {
-            self.sync.broadcast_update(&row).await;
-        }
+        self.sync.broadcast_update(&tombstone).await;
         Ok(())
     }
 
@@ -464,11 +505,51 @@ impl Backend for P2pBackend {
             .index
             .get(src_str)?
             .ok_or_else(|| anyhow::anyhow!("not in index: {src_str}"))?;
-        // Insert at destination, mark source as deleted.
-        let mut new_entry = existing;
-        new_entry.path = dst_str.to_string();
+        let now = chrono::Utc::now().timestamp();
+        let short_id = self.sync.device_short_id();
+
+        // The destination row inherits the source's vector with the
+        // local counter bumped, merged with any prior destination
+        // vector so we don't accidentally regress against a peer.
+        let mut dst_version = Version {
+            counters: existing.version.clone(),
+        };
+        if let Some(existing_dst) = self.index.get(dst_str)? {
+            dst_version.merge(&Version {
+                counters: existing_dst.version,
+            });
+        }
+        dst_version.bump(short_id);
+        let new_entry = IndexEntry {
+            path: dst_str.to_string(),
+            is_dir: existing.is_dir,
+            size: existing.size,
+            modified: now,
+            block_hashes: existing.block_hashes,
+            deleted: false,
+            row_version: 0,
+            version: dst_version.counters,
+        };
         self.index.upsert(&new_entry)?;
-        self.index.mark_deleted(src_str)?;
+
+        // The source row becomes a tombstone with its own counter
+        // bumped so peers see the delete as causally newer than the
+        // row they last received.
+        let mut src_version = Version {
+            counters: existing.version,
+        };
+        src_version.bump(short_id);
+        let tombstone = IndexEntry {
+            path: src_str.to_string(),
+            is_dir: false,
+            size: 0,
+            modified: now,
+            block_hashes: vec![],
+            deleted: true,
+            row_version: 0,
+            version: src_version.counters,
+        };
+        self.index.upsert(&tombstone)?;
         Ok(self.entry_to_file(&new_entry))
     }
 
