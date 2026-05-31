@@ -127,18 +127,22 @@ fn bep_message_strategy() -> impl Strategy<Value = BepMessage> {
         0u32..2,
         0u64..1_000_000,
         0i64..1_000_000,
+        any::<u64>(),
         prop::array::uniform32(any::<u8>()),
     )
-        .prop_map(|(name, file_type, size, modified, hash)| FileInfo {
-            name,
-            file_type,
-            size,
-            modified,
-            block_size: 128 * 1024,
-            deleted: false,
-            version: Version::default(),
-            block_hashes: vec![hash],
-        });
+        .prop_map(
+            |(name, file_type, size, modified, sequence, hash)| FileInfo {
+                name,
+                file_type,
+                size,
+                modified,
+                sequence,
+                block_size: 128 * 1024,
+                deleted: false,
+                version: Version::default(),
+                block_hashes: vec![hash],
+            },
+        );
 
     let cluster_config = prop::collection::vec(folder, 0..3)
         .prop_map(|folders| BepMessage::ClusterConfig { folders });

@@ -743,6 +743,12 @@ fn entry_to_file_info(entry: &IndexEntry) -> Result<FileInfo> {
         file_type: FILE_TYPE_FILE,
         size: entry.size,
         modified: entry.modified,
+        // Sequence space is per-INDEX (one FolderIndex per backend instance)
+        // and the per-row `row_version` is monotonic across upserts and
+        // tombstones, so it is exactly the per-device sequence number BEP
+        // expects. See [`FileInfo::sequence`] for the per-index/per-device
+        // equivalence note.
+        sequence: u64::try_from(entry.row_version).unwrap_or(0),
         block_size,
         deleted: entry.deleted,
         version: Version {
@@ -1003,6 +1009,7 @@ mod tests {
                 file_type: FILE_TYPE_FILE,
                 size: 99,
                 modified: 1_000_000_000,
+                sequence: 0,
                 block_size: 128 * 1024,
                 deleted: false,
                 version: Version {
@@ -1039,6 +1046,7 @@ mod tests {
                 file_type: FILE_TYPE_FILE,
                 size: 99,
                 modified: 2_000_000_000,
+                sequence: 0,
                 block_size: 128 * 1024,
                 deleted: false,
                 version: Version {
@@ -1076,6 +1084,7 @@ mod tests {
                 file_type: FILE_TYPE_FILE,
                 size: 99, // would be different content, but vector equals — skip
                 modified: 2_000_000_000,
+                sequence: 0,
                 block_size: 128 * 1024,
                 deleted: false,
                 version: Version {
@@ -1151,6 +1160,7 @@ mod tests {
                 file_type: FILE_TYPE_FILE,
                 size: 99,
                 modified: 2_000_000_000,
+                sequence: 0,
                 block_size: 128 * 1024,
                 deleted: false,
                 version: Version {
@@ -1201,6 +1211,7 @@ mod tests {
                 file_type: FILE_TYPE_FILE,
                 size: 99,
                 modified: 100,
+                sequence: 0,
                 block_size: 128 * 1024,
                 deleted: false,
                 version: Version {
@@ -1230,6 +1241,7 @@ mod tests {
                 file_type: FILE_TYPE_DIR,
                 size: 0,
                 modified: 1_000_000_000,
+                sequence: 0,
                 block_size: 128 * 1024,
                 deleted: false,
                 version: Version::default(),
@@ -1263,6 +1275,7 @@ mod tests {
                 file_type: FILE_TYPE_FILE,
                 size: 0,
                 modified: 2_000_000_000,
+                sequence: 0,
                 block_size: 128 * 1024,
                 deleted: true,
                 version: Version {
@@ -1286,6 +1299,7 @@ mod tests {
                 file_type: FILE_TYPE_FILE,
                 size: 0,
                 modified: 1_700_000_000,
+                sequence: 0,
                 block_size: 128 * 1024,
                 block_hashes: vec![],
                 deleted: true,
@@ -1313,6 +1327,7 @@ mod tests {
                 file_type: 99,
                 size: 1,
                 modified: 1_000_000_000,
+                sequence: 0,
                 block_size: 128 * 1024,
                 deleted: false,
                 version: Version::default(),

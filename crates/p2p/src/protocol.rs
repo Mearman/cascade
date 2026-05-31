@@ -193,6 +193,18 @@ pub struct FileInfo {
     pub size: u64,
     /// Last modification time (Unix timestamp seconds).
     pub modified: i64,
+    /// Per-row monotonic sequence number assigned by the sending peer's
+    /// folder index. The receiver records the maximum sequence it has
+    /// seen from each peer so that on reconnect only entries with a
+    /// sequence greater than the last-seen value need to be sent — the
+    /// delta-sync optimisation described in BEP.
+    ///
+    /// Sequence space is per-INDEX (i.e. per backend instance) on the
+    /// sender, not strictly per-DEVICE. Since each device runs exactly
+    /// one [`FolderIndex`] in the current implementation, the two are
+    /// equivalent here, but a future multi-folder-per-device design
+    /// would need a per-(device, folder) tracking key.
+    pub sequence: u64,
     /// Block size used for this file.
     pub block_size: u32,
     /// Tombstone flag. When `true`, the row records a delete event:
@@ -329,6 +341,7 @@ fn encode_file_infos(buf: &mut Vec<u8>, files: &[FileInfo]) -> Result<()> {
         encode_u32(buf, fi.file_type);
         encode_u64(buf, fi.size);
         encode_i64(buf, fi.modified);
+        encode_u64(buf, fi.sequence);
         encode_u32(buf, fi.block_size);
         encode_u32(buf, u32::from(fi.deleted));
         encode_version(buf, &fi.version)?;
@@ -460,6 +473,7 @@ fn decode_file_infos(data: &[u8]) -> Result<(Vec<FileInfo>, &[u8])> {
         let (file_type, rest) = decode_u32(rest)?;
         let (size, rest) = decode_u64(rest)?;
         let (modified, rest) = decode_i64(rest)?;
+        let (sequence, rest) = decode_u64(rest)?;
         let (block_size, rest) = decode_u32(rest)?;
         let (deleted_flag, rest) = decode_u32(rest)?;
         let (version, rest) = decode_version(rest)?;
@@ -480,6 +494,7 @@ fn decode_file_infos(data: &[u8]) -> Result<(Vec<FileInfo>, &[u8])> {
             file_type,
             size,
             modified,
+            sequence,
             block_size,
             deleted: deleted_flag != 0,
             version,
@@ -542,6 +557,7 @@ mod tests {
                 file_type: 0,
                 size: 1024,
                 modified: 1700000000,
+                sequence: 0,
                 block_size: 128 * 1024,
                 deleted: false,
                 version: Version::default(),
@@ -560,6 +576,7 @@ mod tests {
                     file_type: 0,
                     size: 500,
                     modified: 100,
+                    sequence: 0,
                     block_size: 128 * 1024,
                     deleted: false,
                     version: Version::default(),
@@ -570,6 +587,7 @@ mod tests {
                     file_type: 0,
                     size: 200000,
                     modified: 200,
+                    sequence: 0,
                     block_size: 128 * 1024,
                     deleted: false,
                     version: Version::default(),
@@ -588,6 +606,7 @@ mod tests {
                 file_type: 0,
                 size: 999999,
                 modified: 1700000001,
+                sequence: 0,
                 block_size: 512 * 1024,
                 deleted: false,
                 version: Version::default(),
@@ -605,6 +624,7 @@ mod tests {
                 file_type: 0,
                 size: 0,
                 modified: 1700000002,
+                sequence: 0,
                 block_size: 128 * 1024,
                 deleted: true,
                 version: Version::default(),
@@ -622,6 +642,7 @@ mod tests {
                 file_type: 0,
                 size: 42,
                 modified: -1_000_000,
+                sequence: 0,
                 block_size: 128 * 1024,
                 deleted: false,
                 version: Version::default(),
@@ -639,6 +660,7 @@ mod tests {
                 file_type: 0,
                 size: 99,
                 modified: 1_700_000_000,
+                sequence: 0,
                 block_size: 128 * 1024,
                 deleted: false,
                 version: Version {
