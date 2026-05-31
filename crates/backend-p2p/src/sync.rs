@@ -37,7 +37,7 @@ use cascade_p2p::connection::ConnectionManager;
 use cascade_p2p::discovery::DiscoveredPeer;
 use cascade_p2p::framed::FramedPeer;
 use cascade_p2p::identity::DeviceIdentity;
-use cascade_p2p::protocol::{BepMessage, FileInfo, Folder};
+use cascade_p2p::protocol::{BepMessage, FileInfo, Folder, Version};
 use cascade_p2p::store::BlockStore;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -573,6 +573,7 @@ fn entry_to_file_info(entry: &IndexEntry) -> Result<FileInfo> {
         modified: entry.modified,
         block_size,
         deleted: entry.deleted,
+        version: Version::default(),
         block_hashes: hashes,
     })
 }
@@ -722,6 +723,7 @@ mod tests {
                 modified: 1_000_000_000,
                 block_size: 128 * 1024,
                 deleted: false,
+                version: Version::default(),
                 block_hashes: vec![[1u8; 32]],
             }])
             .unwrap();
@@ -753,6 +755,7 @@ mod tests {
                 modified: 2_000_000_000,
                 block_size: 128 * 1024,
                 deleted: false,
+                version: Version::default(),
                 block_hashes: vec![[1u8; 32]],
             }])
             .unwrap();
@@ -773,6 +776,7 @@ mod tests {
                 modified: 1_000_000_000,
                 block_size: 128 * 1024,
                 deleted: false,
+                version: Version::default(),
                 block_hashes: vec![],
             }])
             .unwrap();
@@ -804,6 +808,7 @@ mod tests {
                 modified: 2_000_000_000,
                 block_size: 128 * 1024,
                 deleted: true,
+                version: Version::default(),
                 block_hashes: vec![],
             }])
             .unwrap();
@@ -824,6 +829,7 @@ mod tests {
                 block_size: 128 * 1024,
                 block_hashes: vec![],
                 deleted: true,
+                version: Version::default(),
             }])
             .unwrap();
         let row = engine
@@ -860,6 +866,7 @@ mod tests {
                 block_size: 128 * 1024,
                 block_hashes: vec![],
                 deleted: true,
+                version: Version::default(),
             }])
             .unwrap();
         let row = engine.index.get("doc.txt").unwrap().unwrap();
@@ -877,6 +884,7 @@ mod tests {
                 modified: 1_000_000_000,
                 block_size: 128 * 1024,
                 deleted: false,
+                version: Version::default(),
                 block_hashes: vec![[0u8; 32]],
             }])
             .unwrap();

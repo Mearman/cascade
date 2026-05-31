@@ -100,6 +100,88 @@ pub struct Folder {
     pub label: String,
 }
 
+/// A version vector — one `(device_short_id, counter)` entry per device
+/// that has ever modified the file. An empty vector means the row has
+/// never been written.
+///
+/// Ordering rules (Syncthing-compatible):
+/// - A *dominates* B when every counter in B is less than or equal to
+///   the corresponding counter in A, and A has at least one entry that
+///   is strictly greater than the matching entry in B (or present in A
+///   and absent in B with a non-zero counter).
+/// - Equal vectors (`a == b`) do not dominate one another.
+/// - When neither dominates the other, the two versions are concurrent
+///   — a conflict, in which case the caller must decide how to resolve.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Version {
+    /// Sorted ascending by `device_short_id` for a stable wire encoding
+    /// and deterministic comparisons.
+    pub counters: Vec<(u64, u64)>,
+}
+
+impl Version {
+    /// Increment this device's counter, inserting a new entry at
+    /// counter 1 if the device is not yet present.
+    pub fn bump(&mut self, device_short_id: u64) {
+        if let Some(entry) = self
+            .counters
+            .iter_mut()
+            .find(|(id, _)| *id == device_short_id)
+        {
+            entry.1 += 1;
+        } else {
+            self.counters.push((device_short_id, 1));
+            self.counters.sort_by_key(|(id, _)| *id);
+        }
+    }
+
+    /// `true` if `self` dominates `other`.
+    ///
+    /// `self` dominates `other` when every counter in `other` is less
+    /// than or equal to the corresponding counter in `self`, and at
+    /// least one entry in `self` is strictly greater than the matching
+    /// entry in `other` (treating absent entries as zero). Equal
+    /// vectors are not considered to dominate — use `==` for equality.
+    #[must_use]
+    pub fn dominates(&self, other: &Self) -> bool {
+        let mut at_least_one_greater = false;
+        for (other_id, other_ctr) in &other.counters {
+            let self_ctr = self
+                .counters
+                .iter()
+                .find(|(id, _)| id == other_id)
+                .map_or(0, |(_, c)| *c);
+            if self_ctr < *other_ctr {
+                return false;
+            }
+            if self_ctr > *other_ctr {
+                at_least_one_greater = true;
+            }
+        }
+        // Any non-zero counter present in self but absent in other
+        // implies self has additional history beyond other.
+        for (self_id, self_ctr) in &self.counters {
+            if *self_ctr > 0 && !other.counters.iter().any(|(id, _)| id == self_id) {
+                at_least_one_greater = true;
+            }
+        }
+        at_least_one_greater
+    }
+
+    /// Merge `other` into `self`, taking the maximum of each device's
+    /// counter. Entries present only in `other` are inserted.
+    pub fn merge(&mut self, other: &Self) {
+        for (other_id, other_ctr) in &other.counters {
+            if let Some(entry) = self.counters.iter_mut().find(|(id, _)| id == other_id) {
+                entry.1 = entry.1.max(*other_ctr);
+            } else {
+                self.counters.push((*other_id, *other_ctr));
+            }
+        }
+        self.counters.sort_by_key(|(id, _)| *id);
+    }
+}
+
 /// Description of a file's blocks as announced in Index messages.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileInfo {
@@ -115,8 +197,12 @@ pub struct FileInfo {
     pub block_size: u32,
     /// Tombstone flag. When `true`, the row records a delete event:
     /// the peer should mark its local copy deleted (subject to the
-    /// last-write-wins comparison on `modified`).
+    /// version-vector comparison on `version`).
     pub deleted: bool,
+    /// Per-file version vector. Used to detect concurrent edits that
+    /// happened on disconnected peers — a strict generalisation of the
+    /// previous `modified`-only LWW comparison.
+    pub version: Version,
     /// SHA-256 hashes of each block, in order.
     pub block_hashes: Vec<[u8; 32]>,
 }
@@ -232,6 +318,7 @@ fn encode_file_infos(buf: &mut Vec<u8>, files: &[FileInfo]) -> Result<()> {
         encode_i64(buf, fi.modified);
         encode_u32(buf, fi.block_size);
         encode_u32(buf, u32::from(fi.deleted));
+        encode_version(buf, &fi.version)?;
         encode_u32(
             buf,
             u32::try_from(fi.block_hashes.len())
@@ -240,6 +327,19 @@ fn encode_file_infos(buf: &mut Vec<u8>, files: &[FileInfo]) -> Result<()> {
         for hash in &fi.block_hashes {
             encode_opaque(buf, hash)?;
         }
+    }
+    Ok(())
+}
+
+fn encode_version(buf: &mut Vec<u8>, version: &Version) -> Result<()> {
+    encode_u32(
+        buf,
+        u32::try_from(version.counters.len())
+            .map_err(|_| anyhow::anyhow!("version vector too long"))?,
+    );
+    for (id, ctr) in &version.counters {
+        encode_u64(buf, *id);
+        encode_u64(buf, *ctr);
     }
     Ok(())
 }
@@ -343,6 +443,7 @@ fn decode_file_infos(data: &[u8]) -> Result<(Vec<FileInfo>, &[u8])> {
         let (modified, rest) = decode_i64(rest)?;
         let (block_size, rest) = decode_u32(rest)?;
         let (deleted_flag, rest) = decode_u32(rest)?;
+        let (version, rest) = decode_version(rest)?;
         let (hash_count, mut rest) = decode_u32(rest)?;
         let mut block_hashes = Vec::with_capacity(hash_count as usize);
         for _ in 0..hash_count {
@@ -362,11 +463,24 @@ fn decode_file_infos(data: &[u8]) -> Result<(Vec<FileInfo>, &[u8])> {
             modified,
             block_size,
             deleted: deleted_flag != 0,
+            version,
             block_hashes,
         });
         data = rest;
     }
     Ok((files, data))
+}
+
+fn decode_version(data: &[u8]) -> Result<(Version, &[u8])> {
+    let (count, mut rest) = decode_u32(data)?;
+    let mut counters = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let (id, after_id) = decode_u64(rest)?;
+        let (ctr, after_ctr) = decode_u64(after_id)?;
+        counters.push((id, ctr));
+        rest = after_ctr;
+    }
+    Ok((Version { counters }, rest))
 }
 
 #[cfg(test)]
@@ -411,6 +525,7 @@ mod tests {
                 modified: 1700000000,
                 block_size: 128 * 1024,
                 deleted: false,
+                version: Version::default(),
                 block_hashes: vec![[0xAB; 32]],
             }],
         });
@@ -428,6 +543,7 @@ mod tests {
                     modified: 100,
                     block_size: 128 * 1024,
                     deleted: false,
+                    version: Version::default(),
                     block_hashes: vec![[1u8; 32]],
                 },
                 FileInfo {
@@ -437,6 +553,7 @@ mod tests {
                     modified: 200,
                     block_size: 128 * 1024,
                     deleted: false,
+                    version: Version::default(),
                     block_hashes: vec![[2u8; 32], [3u8; 32]],
                 },
             ],
@@ -454,6 +571,7 @@ mod tests {
                 modified: 1700000001,
                 block_size: 512 * 1024,
                 deleted: false,
+                version: Version::default(),
                 block_hashes: vec![[0xFF; 32], [0xEE; 32]],
             }],
         });
@@ -470,6 +588,7 @@ mod tests {
                 modified: 1700000002,
                 block_size: 128 * 1024,
                 deleted: true,
+                version: Version::default(),
                 block_hashes: vec![],
             }],
         });
@@ -486,7 +605,27 @@ mod tests {
                 modified: -1_000_000,
                 block_size: 128 * 1024,
                 deleted: false,
+                version: Version::default(),
                 block_hashes: vec![[0x77; 32]],
+            }],
+        });
+    }
+
+    #[test]
+    fn encode_decode_index_with_version_vector() {
+        round_trip(BepMessage::Index {
+            folder: "folder-1".into(),
+            files: vec![FileInfo {
+                name: "doc.txt".into(),
+                file_type: 0,
+                size: 99,
+                modified: 1_700_000_000,
+                block_size: 128 * 1024,
+                deleted: false,
+                version: Version {
+                    counters: vec![(7, 3), (42, 1), (1024, 9)],
+                },
+                block_hashes: vec![[0x11; 32]],
             }],
         });
     }

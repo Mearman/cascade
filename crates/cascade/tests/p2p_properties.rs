@@ -2,7 +2,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use cascade_p2p::block::{BlockHash, reassemble_blocks, split_data};
-use cascade_p2p::protocol::{BepMessage, FileInfo, Folder, decode_message, encode_message};
+use cascade_p2p::protocol::{
+    BepMessage, FileInfo, Folder, Version, decode_message, encode_message,
+};
 use cascade_p2p::wan::{GossipMessage, GossipPeer, PeerBook};
 use proptest::prelude::*;
 use std::net::SocketAddr;
@@ -134,6 +136,7 @@ fn bep_message_strategy() -> impl Strategy<Value = BepMessage> {
             modified,
             block_size: 128 * 1024,
             deleted: false,
+            version: Version::default(),
             block_hashes: vec![hash],
         });
 
