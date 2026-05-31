@@ -986,6 +986,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn make_ctx(dir: &TempDir) -> CliContext {
         let config_dir: PathBuf = dir.path().to_path_buf();
         CliContext {
