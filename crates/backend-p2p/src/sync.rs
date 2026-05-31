@@ -26,15 +26,18 @@
 //!    the local [`BlockStore`], each connected peer is asked in turn
 //!    via [`BepMessage::Request`] and the first matching block is kept.
 //!
-//! BEP v1 has no per-message correlation IDs, so block requests on a
-//! single peer connection are serialised — at most one outstanding
-//! [`BepMessage::Request`] per peer at any moment. Multiple peers can
-//! be queried concurrently.
+//! Each [`BepMessage::Request`] carries a monotonic per-peer `request_id`
+//! chosen by the requester; the peer echoes it in the corresponding
+//! [`BepMessage::Response`]. The requester routes the payload to the
+//! matching waiter via a `HashMap<u64, oneshot::Sender>`, so multiple
+//! block requests can be in flight on one connection without queueing
+//! behind each other.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -70,13 +73,19 @@ pub struct Peer {
 #[derive(Debug)]
 struct PeerHandle {
     outbound: mpsc::UnboundedSender<BepMessage>,
-    /// Oneshot senders for outstanding Request → Response correlation.
-    /// BEP v1 has no message IDs, so we enforce strict request ordering.
-    pending: Arc<Mutex<VecDeque<oneshot::Sender<Vec<u8>>>>>,
+    /// Outstanding block requests, keyed by the `request_id` allocated
+    /// when the Request frame was sent. The responder echoes the id in
+    /// the matching Response so the entry can be removed and the payload
+    /// delivered to the right waiter.
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<u8>>>>>,
+    /// Source of fresh `request_id` values. Starts at 1 because 0 is
+    /// reserved as a sentinel for "no correlation".
+    next_request_id: Arc<AtomicU64>,
 }
 
 impl PeerHandle {
-    /// Send a Request frame and await the next Response payload.
+    /// Send a Request frame and await the matching Response payload,
+    /// correlated by the `request_id` carried in both frames.
     async fn request_block(
         &self,
         folder: String,
@@ -85,14 +94,15 @@ impl PeerHandle {
         size: u32,
         hash: [u8; 32],
     ) -> Result<Vec<u8>> {
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().await;
-            pending.push_back(tx);
+            pending.insert(request_id, tx);
         }
         self.outbound
             .send(BepMessage::Request {
-                request_id: 0,
+                request_id,
                 folder,
                 name,
                 block_offset: offset,
@@ -103,8 +113,18 @@ impl PeerHandle {
 
         match tokio::time::timeout(BLOCK_REQUEST_TIMEOUT, rx).await {
             Ok(Ok(data)) => Ok(data),
-            Ok(Err(_)) => anyhow::bail!("peer session dropped before responding"),
-            Err(_) => anyhow::bail!("peer block request timed out"),
+            Ok(Err(_)) => {
+                // Responder dropped without sending — clean up the map
+                // entry so it doesn't leak if the session is still alive.
+                let mut pending = self.pending.lock().await;
+                pending.remove(&request_id);
+                anyhow::bail!("peer session dropped before responding");
+            }
+            Err(_) => {
+                let mut pending = self.pending.lock().await;
+                pending.remove(&request_id);
+                anyhow::bail!("peer block request timed out");
+            }
         }
     }
 }
@@ -307,8 +327,9 @@ impl SyncEngine {
 
         // Outbound channel — the writer task drains this.
         let (tx, mut rx) = mpsc::unbounded_channel::<BepMessage>();
-        let pending: Arc<Mutex<VecDeque<oneshot::Sender<Vec<u8>>>>> =
-            Arc::new(Mutex::new(VecDeque::new()));
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<u8>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let next_request_id = Arc::new(AtomicU64::new(1));
 
         // Register handle.
         {
@@ -318,6 +339,7 @@ impl SyncEngine {
                 PeerHandle {
                     outbound: tx.clone(),
                     pending: pending.clone(),
+                    next_request_id: next_request_id.clone(),
                 },
             );
         }
@@ -391,7 +413,7 @@ impl SyncEngine {
         &self,
         msg: BepMessage,
         outbound: &mpsc::UnboundedSender<BepMessage>,
-        pending: &Arc<Mutex<VecDeque<oneshot::Sender<Vec<u8>>>>>,
+        pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<u8>>>>>,
     ) -> Result<()> {
         match msg {
             BepMessage::ClusterConfig { .. } | BepMessage::Ping => Ok(()),
@@ -432,15 +454,18 @@ impl SyncEngine {
                     .ok();
                 Ok(())
             }
-            BepMessage::Response { request_id: _, data } => {
+            BepMessage::Response { request_id, data } => {
                 let waiter = {
                     let mut pending = pending.lock().await;
-                    pending.pop_front()
+                    pending.remove(&request_id)
                 };
                 if let Some(waiter) = waiter {
                     let _ = waiter.send(data);
                 } else {
-                    debug!("dropping unsolicited Response ({} bytes)", data.len());
+                    debug!(
+                        "dropping unsolicited Response for unknown request_id {request_id} ({} bytes)",
+                        data.len(),
+                    );
                 }
                 Ok(())
             }
@@ -574,6 +599,7 @@ impl SyncEngine {
                         PeerHandle {
                             outbound: h.outbound.clone(),
                             pending: h.pending.clone(),
+                            next_request_id: h.next_request_id.clone(),
                         },
                     )
                 })
