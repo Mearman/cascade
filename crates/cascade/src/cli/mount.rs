@@ -44,7 +44,16 @@ impl PresenterResources {
 }
 
 /// Start the Cascade daemon.
-pub async fn start(ctx: &CliContext, mount_point: Option<&str>, no_mount: bool) -> Result<()> {
+///
+/// `p2p_override` lets the CLI flag (`--p2p` / `--no-p2p`) override the
+/// `[p2p].enabled` value from `config.toml`. `None` falls through to
+/// whatever the config file says.
+pub async fn start(
+    ctx: &CliContext,
+    mount_point: Option<&str>,
+    no_mount: bool,
+    p2p_override: Option<bool>,
+) -> Result<()> {
     tracing::info!("Starting Cascade daemon");
 
     ensure_directory(&ctx.config_dir, "config directory")?;
@@ -63,6 +72,12 @@ pub async fn start(ctx: &CliContext, mount_point: Option<&str>, no_mount: bool) 
 
     // Read main config.toml written by `cascade init`.
     let main_config = load_main_config(&ctx.config_dir)?;
+
+    // Resolve P2P enablement: CLI override > config file > default off.
+    let enable_p2p = p2p_override.unwrap_or(main_config.p2p.enabled);
+    if enable_p2p {
+        tracing::info!("P2P optimisation layer enabled");
+    }
 
     // Create backends from config.
     if main_config.backends.is_empty() {
@@ -102,7 +117,7 @@ pub async fn start(ctx: &CliContext, mount_point: Option<&str>, no_mount: bool) 
         if !no_mount {
             let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
             tracing::info!(strategy = "fskit", "attempting FSKit mount");
-            match try_fskit(ctx, &mount_path, backends).await {
+            match try_fskit(ctx, &mount_path, backends, enable_p2p).await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     tracing::warn!(error = %e, "FSKit mount failed, falling back to WebDAV");
@@ -114,7 +129,7 @@ pub async fn start(ctx: &CliContext, mount_point: Option<&str>, no_mount: bool) 
         // Attempt 2: WebDAV.
         let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
         tracing::info!(strategy = "webdav", "attempting WebDAV mount");
-        match try_webdav(ctx, &mount_path, backends, no_mount).await {
+        match try_webdav(ctx, &mount_path, backends, no_mount, enable_p2p).await {
             Ok(()) => return Ok(()),
             Err(e) => {
                 tracing::warn!(error = %e, "WebDAV mount failed, falling back to NFS");
@@ -124,7 +139,7 @@ pub async fn start(ctx: &CliContext, mount_point: Option<&str>, no_mount: bool) 
 
         // Attempt 3: NFS (v4 → v3 escalation inside mount_nfs).
         let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
-        try_nfs(ctx, &mount_path, backends, no_mount).await
+        try_nfs(ctx, &mount_path, backends, no_mount, enable_p2p).await
     }
 
     #[cfg(target_os = "linux")]
@@ -132,7 +147,7 @@ pub async fn start(ctx: &CliContext, mount_point: Option<&str>, no_mount: bool) 
         // FUSE first (native, runs as the calling user), NFS fallback.
         let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
         tracing::info!(strategy = "fuse", "attempting FUSE mount");
-        match try_fuse(ctx, &mount_path, backends).await {
+        match try_fuse(ctx, &mount_path, backends, enable_p2p).await {
             Ok(()) => return Ok(()),
             Err(e) => {
                 tracing::warn!(error = %e, "FUSE mount failed, falling back to NFS");
@@ -141,7 +156,7 @@ pub async fn start(ctx: &CliContext, mount_point: Option<&str>, no_mount: bool) 
         }
 
         let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
-        try_nfs(ctx, &mount_path, backends, no_mount).await
+        try_nfs(ctx, &mount_path, backends, no_mount, enable_p2p).await
     }
 
     #[cfg(target_os = "windows")]
@@ -149,13 +164,13 @@ pub async fn start(ctx: &CliContext, mount_point: Option<&str>, no_mount: bool) 
         // Windows: WebDAV server + mount via WebClient (`net use`).
         let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
         tracing::info!(strategy = "webdav", "attempting WebDAV mount");
-        try_webdav(ctx, &mount_path, backends, no_mount).await
+        try_webdav(ctx, &mount_path, backends, no_mount, enable_p2p).await
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
-        try_nfs(ctx, &mount_path, backends, no_mount).await
+        try_nfs(ctx, &mount_path, backends, no_mount, enable_p2p).await
     }
 }
 
@@ -174,13 +189,14 @@ async fn try_fskit(
     ctx: &CliContext,
     mount_path: &Path,
     backends: Vec<Arc<dyn cascade_engine::backend::Backend>>,
+    enable_p2p: bool,
 ) -> Result<()> {
     let engine_config = EngineConfig {
         db_path: ctx.db_path.clone(),
         mount_point: mount_path.to_path_buf(),
         backends,
         cache_dir: None,
-        enable_p2p: false,
+        enable_p2p,
         p2p_data_dir: None,
     };
     let engine = Engine::new(engine_config).await?;
@@ -260,13 +276,14 @@ async fn try_webdav(
     mount_path: &Path,
     backends: Vec<Arc<dyn cascade_engine::backend::Backend>>,
     no_mount: bool,
+    enable_p2p: bool,
 ) -> Result<()> {
     let engine_config = EngineConfig {
         db_path: ctx.db_path.clone(),
         mount_point: mount_path.to_path_buf(),
         backends,
         cache_dir: None,
-        enable_p2p: false,
+        enable_p2p,
         p2p_data_dir: None,
     };
     let engine = Engine::new(engine_config).await?;
@@ -375,13 +392,14 @@ async fn try_fuse(
     ctx: &CliContext,
     mount_path: &Path,
     backends: Vec<Arc<dyn cascade_engine::backend::Backend>>,
+    enable_p2p: bool,
 ) -> Result<()> {
     let engine_config = EngineConfig {
         db_path: ctx.db_path.clone(),
         mount_point: mount_path.to_path_buf(),
         backends,
         cache_dir: None,
-        enable_p2p: false,
+        enable_p2p,
         p2p_data_dir: None,
     };
     let engine = Engine::new(engine_config).await?;
@@ -451,13 +469,14 @@ async fn try_nfs(
     mount_path: &Path,
     backends: Vec<Arc<dyn cascade_engine::backend::Backend>>,
     no_mount: bool,
+    enable_p2p: bool,
 ) -> Result<()> {
     let engine_config = EngineConfig {
         db_path: ctx.db_path.clone(),
         mount_point: mount_path.to_path_buf(),
         backends,
         cache_dir: None,
-        enable_p2p: false,
+        enable_p2p,
         p2p_data_dir: None,
     };
     let engine = Engine::new(engine_config).await?;

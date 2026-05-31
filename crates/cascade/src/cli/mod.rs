@@ -165,6 +165,16 @@ pub enum Commands {
         /// Start the server without mounting the filesystem — useful for e2e testing against localhost
         #[arg(long)]
         no_mount: bool,
+
+        /// Enable the P2P optimisation layer (overrides config.toml `[p2p].enabled`).
+        /// When set, the daemon checks LAN peers for file blocks before falling
+        /// back to the cloud backend.
+        #[arg(long)]
+        p2p: bool,
+
+        /// Disable the P2P optimisation layer even if config.toml enables it.
+        #[arg(long, conflicts_with = "p2p")]
+        no_p2p: bool,
     },
 
     /// Stop the daemon and unmount
@@ -321,11 +331,24 @@ impl Cli {
             Commands::Start {
                 mount_point,
                 no_mount,
-            } => mount::start(ctx, mount_point.as_deref(), no_mount).await,
+                p2p,
+                no_p2p,
+            } => {
+                // Tri-state override: --p2p forces on, --no-p2p forces off,
+                // neither falls through to the config-file default.
+                let p2p_override = if p2p {
+                    Some(true)
+                } else if no_p2p {
+                    Some(false)
+                } else {
+                    None
+                };
+                mount::start(ctx, mount_point.as_deref(), no_mount, p2p_override).await
+            }
             Commands::Stop => mount::stop(ctx),
             Commands::Restart => {
                 mount::stop(ctx)?;
-                mount::start(ctx, None, false).await
+                mount::start(ctx, None, false, None).await
             }
             Commands::Status => status::show(ctx),
             Commands::Pin { path } => cache::pin(ctx, &path),

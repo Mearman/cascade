@@ -42,12 +42,27 @@ pub struct CascadeConfig {
     pub backends: toml::Table,
     #[serde(default)]
     pub mount: MountConfig,
+    #[serde(default)]
+    pub p2p: P2pConfig,
 }
 
 /// Mount configuration.
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct MountConfig {
     pub point: String,
+}
+
+/// P2P engine configuration.
+///
+/// The P2P layer sits between the VFS and each cloud backend as an
+/// optimisation: when a file isn't in the local cache, the engine
+/// checks LAN peers for the blocks first before falling back to the
+/// cloud. Default off — opt-in via `[p2p] enabled = true` in
+/// `config.toml`, or `--p2p` on the CLI.
+#[derive(Debug, Serialize, Deserialize, Default)]
+pub struct P2pConfig {
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 /// A single backend configuration entry.
