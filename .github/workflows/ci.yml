@@ -790,9 +790,14 @@ jobs:
             throw "WebDAV server port not detected in daemon log"
           }
           Write-Host "WebDAV port: $port"
-          $req = Invoke-WebRequest -Method 'PROPFIND' -Uri "http://localhost:$port/" -Headers @{ Depth = '1' } -UseBasicParsing
-          if ($req.StatusCode -ne 207) { throw "expected 207, got $($req.StatusCode)" }
-          if ($req.Content -notmatch 'smoke') { throw "registered backend not in PROPFIND response" }
+          # Invoke-WebRequest only knows standard HTTP verbs; WebDAV's
+          # PROPFIND isn't in its WebRequestMethod enum. curl.exe ships
+          # with Windows 10+/Server 2019+ and accepts any verb.
+          $body = curl.exe -sS -X PROPFIND -H "Depth: 1" -w "%{http_code}" -o response.xml "http://localhost:$port/"
+          Write-Host "HTTP $body"
+          if ($body -ne '207') { throw "expected 207, got $body" }
+          $content = Get-Content response.xml -Raw
+          if ($content -notmatch 'smoke') { throw "registered backend not in PROPFIND response" }
           Write-Host "PROPFIND returned 207 with backend present."
           cascade --config "$smoke\config" stop
           Wait-Process -Id $proc.Id -Timeout 10 -ErrorAction SilentlyContinue
