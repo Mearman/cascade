@@ -473,7 +473,56 @@ mod tests {
             .await;
 
         let result = accept_task.await.unwrap();
-        assert!(result.is_err());
+        let error = result.expect_err("expected accept to reject the untrusted peer");
+        // The rejection now happens during the TLS handshake itself,
+        // not as a post-handshake fingerprint check. The accept call
+        // wraps the rustls error with this context message.
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("TLS handshake with incoming peer"),
+            "expected handshake-time rejection, got: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_direct_rejects_untrusted_server() {
+        // The client pins an expected device ID that the server does
+        // not match. The TLS handshake must fail at the client's
+        // ServerCertVerifier — no application data flows.
+        let server_identity = DeviceIdentity::generate().unwrap();
+        let server_device_id = server_identity.device_id.clone();
+        let server_manager = ConnectionManager::new(
+            server_identity.clone(),
+            vec![server_device_id.clone()],
+            vec![],
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        // The server side may or may not surface its own error first;
+        // we don't care here because we are testing the client.
+        let _accept_task = tokio::spawn(async move {
+            let acceptor = server_manager.build_server_acceptor()?;
+            let (stream, _) = listener.accept().await?;
+            let _ = acceptor.accept(stream).await;
+            Ok::<(), anyhow::Error>(())
+        });
+
+        let client_identity = DeviceIdentity::generate().unwrap();
+        let client_manager =
+            ConnectionManager::new(client_identity, vec![server_device_id], vec![]);
+
+        let result = client_manager
+            .connect_direct(address, "SOME-OTHER-DEVICE-WE-DO-NOT-TRUST")
+            .await;
+
+        let error = result.expect_err("expected client to reject server with wrong device ID");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("TLS handshake with peer"),
+            "expected handshake-time rejection, got: {rendered}"
+        );
     }
 
     #[tokio::test]
