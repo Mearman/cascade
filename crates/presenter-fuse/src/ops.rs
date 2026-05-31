@@ -24,6 +24,10 @@ pub struct FileAttr {
 
 impl FileAttr {
     /// Build attributes for a directory.
+    // On non-unix the body is entirely const (uid/gid are const stubs);
+    // clippy would suggest `const fn`, but the unix body is not const so
+    // we'd need duplicate cfg-gated impls. Easier to allow.
+    #[allow(clippy::missing_const_for_fn)]
     #[must_use]
     pub fn directory(inode: u64) -> Self {
         Self {
@@ -38,6 +42,7 @@ impl FileAttr {
     }
 
     /// Build attributes for a regular file.
+    #[allow(clippy::missing_const_for_fn)]
     #[must_use]
     pub fn file(inode: u64, size: u64) -> Self {
         Self {
