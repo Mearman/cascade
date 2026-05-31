@@ -158,6 +158,15 @@ impl SyncEngine {
         peers.contains_key(device_id)
     }
 
+    /// `true` if `device_id` is in the trusted set.
+    ///
+    /// Used by the LAN discovery loop to skip announcements from
+    /// untrusted devices before attempting an outbound connect.
+    pub async fn is_trusted(&self, device_id: &str) -> bool {
+        let trusted = self.trusted.lock().await;
+        trusted.iter().any(|id| id == device_id)
+    }
+
     /// Start accepting incoming TLS connections on `addr`.
     ///
     /// Returns the bound `SocketAddr` (useful when binding to port 0)

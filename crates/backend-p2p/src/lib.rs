@@ -10,6 +10,17 @@
 //! deduplicating content-addressed store. The same file uploaded twice
 //! costs blocks once. Peer sync is a follow-up that wires the existing
 //! `cascade_p2p::BepMessage` machinery onto this index.
+//!
+//! ## LAN discovery
+//!
+//! UDP-multicast LAN discovery is opt-in via `enable_discovery = true`
+//! in the per-backend TOML. When enabled (and a `listen_addr` is set),
+//! the backend periodically broadcasts its device ID and listening port
+//! on the discovery multicast group, and listens for announcements from
+//! other devices. Discovered peers that are in the trusted set and not
+//! already connected get an outbound BEP connection attempt. With
+//! discovery disabled, peer connectivity relies entirely on the static
+//! `[[peers]]` config list.
 
 pub mod index;
 pub mod sync;
@@ -66,6 +77,9 @@ pub struct P2pBackendConfig {
     pub listen_addr: Option<std::net::SocketAddr>,
     /// Static peer list — connection attempts run in the background.
     pub peers: Vec<ConfiguredPeer>,
+    /// Enable UDP-multicast LAN discovery. Default `false` so the
+    /// existing static-peer story is opt-out.
+    pub enable_discovery: bool,
 }
 
 /// A P2P backend instance.
@@ -110,6 +124,7 @@ impl P2pBackend {
         let cfg_listen_addr = cfg.listen_addr;
         let cfg_instance_id = cfg.instance_id.clone();
         let cfg_peers = cfg.peers.clone();
+        let cfg_enable_discovery = cfg.enable_discovery;
         tokio::spawn(async move {
             for peer in &cfg_peers {
                 sync_for_listener.trust(peer.device_id.clone()).await;
@@ -133,6 +148,17 @@ impl P2pBackend {
                 let sync_clone = sync_for_listener.clone();
                 tokio::spawn(async move {
                     keep_peer_connected(sync_clone, peer).await;
+                });
+            }
+            if cfg_enable_discovery && let Some(addr) = cfg_listen_addr {
+                let listen_port = addr.port();
+                let announce_sync = sync_for_listener.clone();
+                tokio::spawn(async move {
+                    discovery_announce_loop(announce_sync, listen_port).await;
+                });
+                let listen_sync = sync_for_listener.clone();
+                tokio::spawn(async move {
+                    discovery_listen_loop(listen_sync).await;
                 });
             }
         });
@@ -459,6 +485,93 @@ async fn resolve_first(raw: &str) -> Result<std::net::SocketAddr> {
         .with_context(|| format!("`{raw}` resolved to no records"))
 }
 
+/// Periodically broadcast our presence on the LAN discovery multicast
+/// group.
+///
+/// `cascade_p2p::discovery::announce` is a blocking std-net call, so we
+/// hop onto `spawn_blocking` for each tick. Errors are logged and
+/// swallowed — discovery is best-effort.
+async fn discovery_announce_loop(sync: SyncEngine, listen_port: u16) {
+    let device_id = sync.device_id().to_string();
+    loop {
+        let id = device_id.clone();
+        let result =
+            tokio::task::spawn_blocking(move || cascade_p2p::discovery::announce(&id, listen_port))
+                .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::debug!(
+                target: "cascade::backend::p2p",
+                "LAN discovery announce failed: {e:#}",
+            ),
+            Err(e) => tracing::debug!(
+                target: "cascade::backend::p2p",
+                "LAN discovery announce task panicked: {e:#}",
+            ),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    }
+}
+
+/// Listen for peer announcements on the LAN and, for any trusted device
+/// we don't already have a session to, kick off an outbound connect.
+///
+/// `cascade_p2p::discovery::listen` is blocking; each call runs on
+/// `spawn_blocking` with a 15 s timeout. Errors are logged and the loop
+/// continues.
+async fn discovery_listen_loop(sync: SyncEngine) {
+    loop {
+        let result = tokio::task::spawn_blocking(|| {
+            cascade_p2p::discovery::listen(std::time::Duration::from_secs(15))
+        })
+        .await;
+        let peers = match result {
+            Ok(Ok(peers)) => peers,
+            Ok(Err(e)) => {
+                tracing::debug!(
+                    target: "cascade::backend::p2p",
+                    "LAN discovery listen failed: {e:#}",
+                );
+                Vec::new()
+            }
+            Err(e) => {
+                tracing::debug!(
+                    target: "cascade::backend::p2p",
+                    "LAN discovery listen task panicked: {e:#}",
+                );
+                Vec::new()
+            }
+        };
+        for peer in peers {
+            // Skip ourselves — multicast loopback can deliver our own
+            // announcement back to us.
+            if peer.device_id == sync.device_id() {
+                continue;
+            }
+            if !sync.is_trusted(&peer.device_id).await {
+                continue;
+            }
+            if sync.has_peer(&peer.device_id).await {
+                continue;
+            }
+            if let Err(e) = sync
+                .connect_to(crate::sync::Peer {
+                    device_id: peer.device_id.clone(),
+                    address: peer.address,
+                })
+                .await
+            {
+                tracing::debug!(
+                    target: "cascade::backend::p2p",
+                    "LAN discovery connect to {} at {} failed: {e:#}",
+                    peer.device_id,
+                    peer.address,
+                );
+            }
+        }
+    }
+}
+
 /// CLI entry point — construct a backend from a TOML config table.
 ///
 /// Expected keys:
@@ -468,6 +581,8 @@ async fn resolve_first(raw: &str) -> Result<std::net::SocketAddr> {
 ///   defaults to `${HOME}/.config/cascade/p2p-{name}`
 /// - `listen_addr` (optional) — `"host:port"` for the BEP listener
 /// - `peers` (optional) — array of `{ device_id = "...", address = "host:port" }`
+/// - `enable_discovery` (optional, default `false`) — opt in to
+///   UDP-multicast LAN peer discovery. Requires `listen_addr` to be set.
 pub fn create_backend(config: &toml::Value) -> Result<Box<dyn Backend>> {
     let name = config
         .get("name")
@@ -492,6 +607,10 @@ pub fn create_backend(config: &toml::Value) -> Result<Box<dyn Backend>> {
         })
         .transpose()?;
     let peers = parse_peers(config.get("peers"))?;
+    let enable_discovery = config
+        .get("enable_discovery")
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false);
 
     let instance_id = format!("p2p-{name}");
     let cfg = P2pBackendConfig {
@@ -503,6 +622,7 @@ pub fn create_backend(config: &toml::Value) -> Result<Box<dyn Backend>> {
         identity_dir: data_dir.join("identity"),
         listen_addr,
         peers,
+        enable_discovery,
     };
 
     let backend = P2pBackend::open(cfg)?;
@@ -733,5 +853,28 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         backend_b.download(&entry_b, &mut out).await.unwrap();
         assert_eq!(out, payload);
+    }
+
+    /// Enabling LAN discovery must not block or panic on backend open.
+    /// We can't reliably exercise the full multicast handshake on
+    /// loopback in CI, so we just confirm the spawned loops come up
+    /// cleanly and the backend can be dropped after a short delay.
+    #[tokio::test]
+    async fn discovery_loop_starts_without_panicking() {
+        let dir = tempdir().unwrap();
+        let cfg = P2pBackendConfig {
+            instance_id: "p2p-discovery".to_string(),
+            folder_id: "p2p-discovery".to_string(),
+            display_name: "Discovery".to_string(),
+            index_path: dir.path().join("index.db"),
+            block_store_root: dir.path().join("blocks"),
+            identity_dir: dir.path().join("identity"),
+            listen_addr: Some("127.0.0.1:0".parse().unwrap()),
+            enable_discovery: true,
+            ..Default::default()
+        };
+        let backend = P2pBackend::open(cfg).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(backend);
     }
 }
