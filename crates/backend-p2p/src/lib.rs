@@ -391,7 +391,8 @@ impl Backend for P2pBackend {
             modified: chrono::Utc::now().timestamp(),
             block_hashes: hash_blob,
             deleted: false,
-            version: 0,
+            row_version: 0,
+            version: Vec::new(),
         };
         self.index.upsert(&entry)?;
         self.sync.broadcast_update(&entry).await;
@@ -430,7 +431,8 @@ impl Backend for P2pBackend {
             modified: chrono::Utc::now().timestamp(),
             block_hashes: Vec::new(),
             deleted: false,
-            version: 0,
+            row_version: 0,
+            version: Vec::new(),
         };
         self.index.upsert(&entry)?;
         Ok(self.entry_to_file(&entry))

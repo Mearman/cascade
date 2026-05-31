@@ -1,9 +1,11 @@
 //! Folder index — persistent file metadata for a P2P backend instance.
 //!
 //! Stores per-file: path, type (file/dir), size, modified time, the list of
-//! content-addressed block hashes that reassemble the file, and a per-file
-//! monotonically-increasing version used for change detection and Last-Write-
-//! Wins merge with peer Index updates.
+//! content-addressed block hashes that reassemble the file, a row-level
+//! monotonically-increasing counter used for `changes()` cursors, and a
+//! per-file version vector (one `(device_short_id, counter)` entry per
+//! device that has ever modified the row) used to resolve concurrent
+//! edits with peer Index updates.
 //!
 //! The index lives in its own `SQLite` database file (one per backend instance)
 //! so it can be rebuilt or wiped without touching the main cascade state DB.
@@ -24,7 +26,16 @@ pub struct IndexEntry {
     /// Concatenated 32-byte block hashes, in order.
     pub block_hashes: Vec<u8>,
     pub deleted: bool,
-    pub version: i64,
+    /// Monotonic row sequence number used by the `changes()` cursor.
+    /// This is *not* a version vector — see `version`. Bumped on every
+    /// upsert and tombstone.
+    pub row_version: i64,
+    /// Per-file version vector — one `(device_short_id, counter)`
+    /// entry per device that has ever modified the row, sorted ascending
+    /// by `device_short_id`. Empty for rows that pre-date the version
+    /// vector schema migration; new writes always carry at least one
+    /// entry (the local device's counter).
+    pub version: Vec<(u64, u64)>,
 }
 
 /// SQLite-backed folder index.
@@ -43,6 +54,10 @@ impl std::fmt::Debug for FolderIndex {
 
 impl FolderIndex {
     /// Open or create an index at the given path.
+    ///
+    /// New databases get every column from the start. Older databases —
+    /// created before the version-vector schema — are migrated in
+    /// place: the `version_blob` column is added with an empty default.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -59,7 +74,8 @@ impl FolderIndex {
                 modified INTEGER NOT NULL DEFAULT 0,
                 block_hashes BLOB NOT NULL DEFAULT (x''),
                 deleted INTEGER NOT NULL DEFAULT 0,
-                version INTEGER NOT NULL DEFAULT 1
+                version INTEGER NOT NULL DEFAULT 1,
+                version_blob BLOB NOT NULL DEFAULT (x'')
             );
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY NOT NULL,
@@ -69,26 +85,33 @@ impl FolderIndex {
             ",
         )
         .context("init schema")?;
+        ensure_version_blob_column(&conn).context("migrating files.version_blob")?;
         Ok(Self {
             conn: Mutex::new(conn),
             db_path: path.to_path_buf(),
         })
     }
 
-    /// Insert or update an entry. Always bumps the version.
+    /// Insert or update an entry. Always bumps the row sequence number.
+    ///
+    /// The per-file `version` vector is persisted verbatim — callers
+    /// are responsible for bumping the local device's counter before
+    /// calling this when the change originates locally.
     pub fn upsert(&self, entry: &IndexEntry) -> Result<i64> {
-        let next_version = self.next_version()?;
+        let next_row_version = self.next_row_version()?;
+        let version_blob = encode_version_blob(&entry.version);
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         conn.execute(
-            "INSERT INTO files (path, is_dir, size, modified, block_hashes, deleted, version)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO files (path, is_dir, size, modified, block_hashes, deleted, version, version_blob)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(path) DO UPDATE SET
                is_dir = excluded.is_dir,
                size = excluded.size,
                modified = excluded.modified,
                block_hashes = excluded.block_hashes,
                deleted = excluded.deleted,
-               version = excluded.version",
+               version = excluded.version,
+               version_blob = excluded.version_blob",
             params![
                 entry.path,
                 i64::from(entry.is_dir),
@@ -96,26 +119,31 @@ impl FolderIndex {
                 entry.modified,
                 entry.block_hashes,
                 i64::from(entry.deleted),
-                next_version,
+                next_row_version,
+                version_blob,
             ],
         )?;
-        Ok(next_version)
+        Ok(next_row_version)
     }
 
-    /// Mark an entry as deleted (tombstone). Returns the new version.
+    /// Mark an entry as deleted (tombstone). Returns the new row
+    /// sequence number.
     ///
     /// The row's `modified` column is bumped to the current wall-clock
-    /// timestamp so the LWW comparison treats the delete as a fresh
-    /// write event when peers compare their copies.
+    /// timestamp. The version vector is *not* mutated here — callers
+    /// that originate the delete locally must bump the local device's
+    /// counter and call `upsert` instead. This helper exists for
+    /// remote-driven deletes where the peer's version vector is
+    /// supplied directly through `upsert`.
     pub fn mark_deleted(&self, path: &str) -> Result<i64> {
-        let next_version = self.next_version()?;
+        let next_row_version = self.next_row_version()?;
         let now = chrono::Utc::now().timestamp();
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         conn.execute(
             "UPDATE files SET deleted = 1, modified = ?2, version = ?3 WHERE path = ?1",
-            params![path, now, next_version],
+            params![path, now, next_row_version],
         )?;
-        Ok(next_version)
+        Ok(next_row_version)
     }
 
     /// Get a single entry by path.
@@ -123,7 +151,7 @@ impl FolderIndex {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let row = conn
             .query_row(
-                "SELECT path, is_dir, size, modified, block_hashes, deleted, version
+                "SELECT path, is_dir, size, modified, block_hashes, deleted, version, version_blob
                  FROM files WHERE path = ?1",
                 params![path],
                 Self::map_row,
@@ -143,7 +171,7 @@ impl FolderIndex {
         };
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let mut stmt = conn.prepare(
-            "SELECT path, is_dir, size, modified, block_hashes, deleted, version
+            "SELECT path, is_dir, size, modified, block_hashes, deleted, version, version_blob
              FROM files
              WHERE path LIKE ?1 || '%'
                AND deleted = 0
@@ -156,12 +184,12 @@ impl FolderIndex {
         Ok(rows)
     }
 
-    /// All entries (including tombstones) with version greater than `since`.
-    /// Used to generate Change events from a cursor.
+    /// All entries (including tombstones) with row sequence greater
+    /// than `since`. Used to generate Change events from a cursor.
     pub fn entries_since(&self, since: i64) -> Result<Vec<IndexEntry>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let mut stmt = conn.prepare(
-            "SELECT path, is_dir, size, modified, block_hashes, deleted, version
+            "SELECT path, is_dir, size, modified, block_hashes, deleted, version, version_blob
              FROM files WHERE version > ?1 ORDER BY version ASC",
         )?;
         let rows = stmt
@@ -170,7 +198,8 @@ impl FolderIndex {
         Ok(rows)
     }
 
-    /// Current max version (cursor value to report after a `changes()` poll).
+    /// Current max row sequence number (cursor value to report after a
+    /// `changes()` poll).
     pub fn max_version(&self) -> Result<i64> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         let v: Option<i64> = conn
@@ -180,11 +209,15 @@ impl FolderIndex {
         Ok(v.unwrap_or(0))
     }
 
-    fn next_version(&self) -> Result<i64> {
+    fn next_row_version(&self) -> Result<i64> {
         Ok(self.max_version()? + 1)
     }
 
     fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexEntry> {
+        let blob: Vec<u8> = row.get(7)?;
+        let version = decode_version_blob(&blob).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Blob, e.into())
+        })?;
         Ok(IndexEntry {
             path: row.get(0)?,
             is_dir: row.get::<_, i64>(1)? != 0,
@@ -192,9 +225,66 @@ impl FolderIndex {
             modified: row.get(3)?,
             block_hashes: row.get(4)?,
             deleted: row.get::<_, i64>(5)? != 0,
-            version: row.get(6)?,
+            row_version: row.get(6)?,
+            version,
         })
     }
+}
+
+/// Ensure the `version_blob` column exists on the `files` table. New
+/// databases get it via the `CREATE TABLE` above; pre-existing ones
+/// (created before this commit) need an explicit `ALTER TABLE`.
+///
+/// `SQLite` has no `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, so we
+/// inspect `PRAGMA table_info` and only run the alter if the column is
+/// missing.
+fn ensure_version_blob_column(conn: &Connection) -> Result<()> {
+    let has_column = {
+        let mut stmt = conn.prepare("PRAGMA table_info(files)")?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.iter().any(|name| name == "version_blob")
+    };
+    if !has_column {
+        conn.execute(
+            "ALTER TABLE files ADD COLUMN version_blob BLOB NOT NULL DEFAULT (x'')",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// Encode a version vector as a flat blob: pairs of 8-byte big-endian
+/// (`device_short_id`, counter), in stored order.
+fn encode_version_blob(version: &[(u64, u64)]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(version.len() * 16);
+    for (id, ctr) in version {
+        buf.extend_from_slice(&id.to_be_bytes());
+        buf.extend_from_slice(&ctr.to_be_bytes());
+    }
+    buf
+}
+
+/// Decode the on-disk version vector blob. An empty blob is a valid
+/// empty vector (used for rows that pre-date the schema migration).
+fn decode_version_blob(blob: &[u8]) -> Result<Vec<(u64, u64)>> {
+    if blob.len() % 16 != 0 {
+        anyhow::bail!(
+            "version_blob has length {}, not a multiple of 16",
+            blob.len()
+        );
+    }
+    let mut out = Vec::with_capacity(blob.len() / 16);
+    for chunk in blob.chunks_exact(16) {
+        let (id_bytes, ctr_bytes) = chunk.split_at(8);
+        let mut id_arr = [0u8; 8];
+        let mut ctr_arr = [0u8; 8];
+        id_arr.copy_from_slice(id_bytes);
+        ctr_arr.copy_from_slice(ctr_bytes);
+        out.push((u64::from_be_bytes(id_arr), u64::from_be_bytes(ctr_arr)));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -211,7 +301,8 @@ mod tests {
             modified: 0,
             block_hashes: Vec::new(),
             deleted: false,
-            version: 0,
+            row_version: 0,
+            version: Vec::new(),
         }
     }
 
@@ -224,7 +315,52 @@ mod tests {
         let got = idx.get("foo.txt").unwrap().unwrap();
         assert_eq!(got.size, 42);
         assert!(!got.is_dir);
-        assert_eq!(got.version, 1);
+        assert_eq!(got.row_version, 1);
+    }
+
+    #[test]
+    fn upsert_preserves_version_vector() {
+        let dir = tempdir().unwrap();
+        let idx = FolderIndex::open(&dir.path().join("vv.db")).unwrap();
+        let mut e = entry("doc.txt", false, 1);
+        e.version = vec![(7, 3), (42, 1)];
+        idx.upsert(&e).unwrap();
+        let got = idx.get("doc.txt").unwrap().unwrap();
+        assert_eq!(got.version, vec![(7, 3), (42, 1)]);
+    }
+
+    #[test]
+    fn open_migrates_pre_version_blob_database() {
+        // Build a database with the *old* schema (no version_blob), then
+        // reopen via FolderIndex::open and confirm the column is added
+        // with an empty default for the existing row.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE files (
+                    path TEXT PRIMARY KEY NOT NULL,
+                    is_dir INTEGER NOT NULL,
+                    size INTEGER NOT NULL DEFAULT 0,
+                    modified INTEGER NOT NULL DEFAULT 0,
+                    block_hashes BLOB NOT NULL DEFAULT (x''),
+                    deleted INTEGER NOT NULL DEFAULT 0,
+                    version INTEGER NOT NULL DEFAULT 1
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO files (path, is_dir, size, modified, deleted, version)
+                 VALUES ('legacy.txt', 0, 99, 1700000000, 0, 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let idx = FolderIndex::open(&path).unwrap();
+        let row = idx.get("legacy.txt").unwrap().unwrap();
+        assert_eq!(row.size, 99);
+        assert!(row.version.is_empty(), "legacy row has empty vector");
     }
 
     #[test]

@@ -465,7 +465,8 @@ impl SyncEngine {
                         modified: file.modified,
                         block_hashes: vec![],
                         deleted: true,
-                        version: 0,
+                        row_version: 0,
+                        version: Vec::new(),
                     };
                     self.index.upsert(&entry)?;
                 }
@@ -482,7 +483,8 @@ impl SyncEngine {
                 modified: file.modified,
                 block_hashes: hash_blob,
                 deleted: false,
-                version: 0,
+                row_version: 0,
+                version: Vec::new(),
             };
             self.index.upsert(&entry)?;
         }
@@ -635,7 +637,8 @@ mod tests {
             modified: 1_700_000_000,
             block_hashes: vec![0u8; 32],
             deleted: false,
-            version: 0,
+            row_version: 0,
+            version: Vec::new(),
         };
         engine_a.index.upsert(&entry).unwrap();
         engine_a.broadcast_update(&entry).await;
@@ -710,7 +713,8 @@ mod tests {
                 modified: 2_000_000_000,
                 block_hashes: vec![0u8; 32],
                 deleted: false,
-                version: 0,
+                row_version: 0,
+                version: Vec::new(),
             })
             .unwrap();
 
@@ -744,7 +748,8 @@ mod tests {
                 modified: 1_000_000_000,
                 block_hashes: vec![0u8; 32],
                 deleted: false,
-                version: 0,
+                row_version: 0,
+                version: Vec::new(),
             })
             .unwrap();
         engine
@@ -796,7 +801,8 @@ mod tests {
                 modified: 1_000_000_000,
                 block_hashes: vec![0u8; 32],
                 deleted: false,
-                version: 0,
+                row_version: 0,
+                version: Vec::new(),
             })
             .unwrap();
         // Incoming tombstone with a newer timestamp should win.
@@ -854,7 +860,8 @@ mod tests {
                 modified: ts,
                 block_hashes: vec![0u8; 32],
                 deleted: false,
-                version: 0,
+                row_version: 0,
+                version: Vec::new(),
             })
             .unwrap();
         engine
@@ -904,7 +911,8 @@ mod tests {
             modified: 0,
             block_hashes: vec![],
             deleted: false,
-            version: 0,
+            row_version: 0,
+            version: Vec::new(),
         };
         engine.broadcast_update(&dir).await;
     }
@@ -918,7 +926,8 @@ mod tests {
             modified: 0,
             block_hashes: vec![0u8; 31], // not a multiple of 32
             deleted: false,
-            version: 0,
+            row_version: 0,
+            version: Vec::new(),
         };
         let err = entry_to_file_info(&entry).unwrap_err();
         assert!(err.to_string().contains("partial hash"));
