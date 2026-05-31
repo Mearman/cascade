@@ -443,12 +443,28 @@ impl SyncEngine {
                     return Ok(());
                 }
                 let hash = BlockHash(block_hash);
-                let data = self
-                    .blocks
-                    .get_block(&hash)
-                    .await
-                    .unwrap_or(None)
-                    .unwrap_or_default();
+                let data = match self.blocks.get_block(&hash).await {
+                    Ok(Some(data)) => data,
+                    Ok(None) => {
+                        // Block genuinely not in our store — send an empty
+                        // response so the requester treats it as a miss and
+                        // tries the next peer.
+                        Vec::new()
+                    }
+                    Err(e) => {
+                        // Block store error — log it, then send an empty
+                        // response so the requester can fall through to the
+                        // next peer. Returning Err here would tear down the
+                        // whole session for one bad lookup.
+                        tracing::warn!(
+                            target: "cascade::backend::p2p",
+                            block = %hash,
+                            error = %e,
+                            "block store get failed while serving peer request"
+                        );
+                        Vec::new()
+                    }
+                };
                 outbound
                     .send(BepMessage::Response { request_id, data })
                     .ok();
