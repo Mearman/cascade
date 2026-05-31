@@ -88,6 +88,10 @@ pub struct P2pBackend {
     index: Arc<FolderIndex>,
     blocks: Arc<BlockStore>,
     sync: SyncEngine,
+    /// Signals all spawned background tasks to exit. Set to `true` on
+    /// drop. Tasks select on `cancel.changed()` and break their loops
+    /// when they observe the flag flip.
+    cancel: tokio::sync::watch::Sender<bool>,
 }
 
 impl std::fmt::Debug for P2pBackend {
@@ -99,6 +103,15 @@ impl std::fmt::Debug for P2pBackend {
     }
 }
 
+impl Drop for P2pBackend {
+    fn drop(&mut self) {
+        // Best-effort: signal every background task to exit. If all
+        // receivers have already been dropped (no tasks running), the
+        // send is a no-op error we intentionally ignore.
+        let _ = self.cancel.send(true);
+    }
+}
+
 impl P2pBackend {
     /// Open or create a P2P backend at the given index + block store
     /// paths. Synchronous: filesystem setup happens up-front so this
@@ -106,6 +119,15 @@ impl P2pBackend {
     /// nested-runtime panics. If `cfg.listen_addr` is set, a BEP
     /// listener is spawned (via `tokio::spawn`); every configured peer
     /// gets a background reconnect task.
+    ///
+    /// All spawned background tasks share a `tokio::sync::watch`
+    /// channel; when the returned `P2pBackend` is dropped, every task
+    /// observes the cancellation flag and exits cleanly. This matters
+    /// in tests and when a backend is removed at runtime — without it
+    /// the listener, the per-peer reconnect loops, and the LAN
+    /// discovery loops would leak past the backend's lifetime,
+    /// keeping `Arc<FolderIndex>` and `Arc<BlockStore>` alive
+    /// indefinitely.
     pub fn open(cfg: P2pBackendConfig) -> Result<Self> {
         let index = Arc::new(FolderIndex::open(&cfg.index_path)?);
         let blocks = Arc::new(BlockStore::new(&cfg.block_store_root).context("open block store")?);
@@ -118,6 +140,11 @@ impl P2pBackend {
             identity,
         );
 
+        // Cancellation channel for all background tasks. `false` =
+        // run, `true` = stop. The `Sender` lives on `P2pBackend`; its
+        // `Drop` flips the flag.
+        let (cancel, _) = tokio::sync::watch::channel(false);
+
         // Trust + reconnect tasks need a runtime — spawn them on the
         // current handle. The caller must be inside a tokio context.
         let sync_for_listener = sync.clone();
@@ -125,40 +152,63 @@ impl P2pBackend {
         let cfg_instance_id = cfg.instance_id.clone();
         let cfg_peers = cfg.peers.clone();
         let cfg_enable_discovery = cfg.enable_discovery;
+        let bootstrap_cancel = cancel.subscribe();
+        let cancel_for_children = cancel.clone();
         tokio::spawn(async move {
             for peer in &cfg_peers {
                 sync_for_listener.trust(peer.device_id.clone()).await;
             }
-            if let Some(addr) = cfg_listen_addr {
-                match sync_for_listener.start_listener(addr).await {
-                    Ok(_) => tracing::info!(
-                        target: "cascade::backend::p2p",
-                        "P2P backend `{}` listening on {addr} as device {}",
-                        cfg_instance_id,
-                        sync_for_listener.device_id(),
-                    ),
-                    Err(e) => tracing::error!(
-                        target: "cascade::backend::p2p",
-                        "P2P backend `{}` failed to listen on {addr}: {e:#}",
-                        cfg_instance_id,
-                    ),
-                }
+
+            // Bind the listener first so subsequent announce loops can
+            // advertise the actual bound port (important when
+            // `listen_addr` uses port 0 — peers receiving a port-0
+            // announcement would be unable to connect back).
+            let bound_port = match cfg_listen_addr {
+                Some(addr) => match sync_for_listener.start_listener(addr).await {
+                    Ok((bound, _handle)) => {
+                        tracing::info!(
+                            target: "cascade::backend::p2p",
+                            "P2P backend `{}` listening on {bound} as device {}",
+                            cfg_instance_id,
+                            sync_for_listener.device_id(),
+                        );
+                        Some(bound.port())
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            target: "cascade::backend::p2p",
+                            "P2P backend `{}` failed to listen on {addr}: {e:#}",
+                            cfg_instance_id,
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+
+            // If we were cancelled while starting the listener, bail
+            // out before spawning any further children.
+            if *bootstrap_cancel.borrow() {
+                return;
             }
+
             for peer in cfg_peers {
                 let sync_clone = sync_for_listener.clone();
+                let peer_cancel = cancel_for_children.subscribe();
                 tokio::spawn(async move {
-                    keep_peer_connected(sync_clone, peer).await;
+                    keep_peer_connected(sync_clone, peer, peer_cancel).await;
                 });
             }
-            if cfg_enable_discovery && let Some(addr) = cfg_listen_addr {
-                let listen_port = addr.port();
+            if cfg_enable_discovery && let Some(listen_port) = bound_port {
                 let announce_sync = sync_for_listener.clone();
+                let announce_cancel = cancel_for_children.subscribe();
                 tokio::spawn(async move {
-                    discovery_announce_loop(announce_sync, listen_port).await;
+                    discovery_announce_loop(announce_sync, listen_port, announce_cancel).await;
                 });
                 let listen_sync = sync_for_listener.clone();
+                let listen_cancel = cancel_for_children.subscribe();
                 tokio::spawn(async move {
-                    discovery_listen_loop(listen_sync).await;
+                    discovery_listen_loop(listen_sync, listen_cancel).await;
                 });
             }
         });
@@ -168,6 +218,7 @@ impl P2pBackend {
             index,
             blocks,
             sync,
+            cancel,
         })
     }
 
@@ -443,10 +494,19 @@ impl Backend for P2pBackend {
 /// DNS resolution happens here, not at config-parse time, so a peer
 /// hostname that isn't yet routable at startup (the typical Docker
 /// case) becomes routable on the next tick.
-async fn keep_peer_connected(sync: SyncEngine, peer: ConfiguredPeer) {
+///
+/// Exits as soon as `cancel` flips to `true`.
+async fn keep_peer_connected(
+    sync: SyncEngine,
+    peer: ConfiguredPeer,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+) {
     let peer_id = peer.device_id.clone();
     let peer_addr_raw = peer.address.clone();
     loop {
+        if *cancel.borrow() {
+            return;
+        }
         let already = sync.has_peer(&peer_id).await;
         if !already {
             match resolve_first(&peer_addr_raw).await {
@@ -472,7 +532,14 @@ async fn keep_peer_connected(sync: SyncEngine, peer: ConfiguredPeer) {
                 }
             }
         }
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        tokio::select! {
+            () = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+            res = cancel.changed() => {
+                if res.is_err() || *cancel.borrow() {
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -498,9 +565,18 @@ async fn resolve_first(raw: &str) -> Result<std::net::SocketAddr> {
 /// `cascade_p2p::discovery::announce` is a blocking std-net call, so we
 /// hop onto `spawn_blocking` for each tick. Errors are logged and
 /// swallowed — discovery is best-effort.
-async fn discovery_announce_loop(sync: SyncEngine, listen_port: u16) {
+///
+/// Exits as soon as `cancel` flips to `true`.
+async fn discovery_announce_loop(
+    sync: SyncEngine,
+    listen_port: u16,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+) {
     let device_id = sync.device_id().to_string();
     loop {
+        if *cancel.borrow() {
+            return;
+        }
         let id = device_id.clone();
         let result =
             tokio::task::spawn_blocking(move || cascade_p2p::discovery::announce(&id, listen_port))
@@ -516,7 +592,14 @@ async fn discovery_announce_loop(sync: SyncEngine, listen_port: u16) {
                 "LAN discovery announce task panicked: {e:#}",
             ),
         }
-        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        tokio::select! {
+            () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+            res = cancel.changed() => {
+                if res.is_err() || *cancel.borrow() {
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -526,8 +609,16 @@ async fn discovery_announce_loop(sync: SyncEngine, listen_port: u16) {
 /// `cascade_p2p::discovery::listen` is blocking; each call runs on
 /// `spawn_blocking` with a 15 s timeout. Errors are logged and the loop
 /// continues.
-async fn discovery_listen_loop(sync: SyncEngine) {
+///
+/// Exits as soon as `cancel` flips to `true`. Cancellation is checked
+/// at the top of each iteration; an in-flight 15 s `listen` call may
+/// still need to finish before the loop notices, so callers should
+/// expect a bounded delay on shutdown.
+async fn discovery_listen_loop(sync: SyncEngine, cancel: tokio::sync::watch::Receiver<bool>) {
     loop {
+        if *cancel.borrow() {
+            return;
+        }
         let result = tokio::task::spawn_blocking(|| {
             cascade_p2p::discovery::listen(std::time::Duration::from_secs(15))
         })
@@ -866,6 +957,10 @@ mod tests {
     /// We can't reliably exercise the full multicast handshake on
     /// loopback in CI, so we just confirm the spawned loops come up
     /// cleanly and the backend can be dropped after a short delay.
+    ///
+    /// On drop, the backend's cancellation watch is flipped to `true`.
+    /// We subscribe before drop and confirm the receiver sees the
+    /// change, proving the spawned tasks will exit.
     #[tokio::test]
     async fn discovery_loop_starts_without_panicking() {
         let dir = tempdir().unwrap();
@@ -881,7 +976,13 @@ mod tests {
             ..Default::default()
         };
         let backend = P2pBackend::open(cfg).unwrap();
+        let mut cancel_rx = backend.cancel.subscribe();
+        assert!(!*cancel_rx.borrow());
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         drop(backend);
+        // After drop, the cancel watch must have fired; spawned tasks
+        // will observe `true` on their next tick and exit.
+        cancel_rx.changed().await.unwrap();
+        assert!(*cancel_rx.borrow());
     }
 }
