@@ -143,37 +143,40 @@ impl DiskProvider {
     }
 
     /// Collect disk stats for the filesystem containing the given path.
-    #[allow(unsafe_code, clippy::missing_const_for_fn)]
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
     #[must_use]
     pub fn collect_for_path(path: &str) -> DiskContext {
-        #[cfg(unix)]
-        {
-            let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
-            let c_path = std::ffi::CString::new(path).unwrap_or_default();
-            let result = unsafe { libc::statfs(c_path.as_ptr(), &raw mut stat) };
-            if result == 0 {
-                #[cfg(target_os = "linux")]
-                let block_size = stat.f_bsize.unsigned_abs();
-                #[cfg(not(target_os = "linux"))]
-                let block_size = u64::from(stat.f_bsize);
-                DiskContext {
-                    total_bytes: stat.f_blocks * block_size,
-                    free_bytes: stat.f_bavail * block_size,
-                }
-            } else {
-                DiskContext {
-                    total_bytes: 0,
-                    free_bytes: 0,
-                }
+        let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+        let c_path = std::ffi::CString::new(path).unwrap_or_default();
+        let result = unsafe { libc::statfs(c_path.as_ptr(), &raw mut stat) };
+        if result == 0 {
+            #[cfg(target_os = "linux")]
+            let block_size = stat.f_bsize.unsigned_abs();
+            #[cfg(not(target_os = "linux"))]
+            let block_size = u64::from(stat.f_bsize);
+            DiskContext {
+                total_bytes: stat.f_blocks * block_size,
+                free_bytes: stat.f_bavail * block_size,
             }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = path;
+        } else {
             DiskContext {
                 total_bytes: 0,
                 free_bytes: 0,
             }
+        }
+    }
+
+    /// Collect disk stats for the filesystem containing the given path.
+    ///
+    /// Non-Unix stub: returns zeroed `DiskContext`. A real Windows implementation
+    /// would call `GetDiskFreeSpaceExW` via the `windows` crate.
+    #[cfg(not(unix))]
+    #[must_use]
+    pub const fn collect_for_path(_path: &str) -> DiskContext {
+        DiskContext {
+            total_bytes: 0,
+            free_bytes: 0,
         }
     }
 }
