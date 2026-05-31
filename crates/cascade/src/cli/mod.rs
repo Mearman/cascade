@@ -68,6 +68,7 @@ impl CliContext {
 /// On non-Unix platforms, a reliable cross-process liveness check is not
 /// available without an OS-specific crate, so the presence of the PID file is
 /// treated as sufficient and this function always returns `true`.
+#[allow(clippy::missing_const_for_fn)] // unix branch is not const
 pub fn is_process_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
