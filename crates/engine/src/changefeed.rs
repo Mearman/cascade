@@ -696,20 +696,20 @@ mod tests {
             .parent_changes_since("scripted", &old_parent, None)
             .await
         {
-            ChangeQueryResult::Delta { events, .. } => {
-                assert_eq!(events.len(), 1);
-                assert!(matches!(events[0], Change::Deleted(_)));
-            }
+            ChangeQueryResult::Delta { events, .. } => match events.as_slice() {
+                [Change::Deleted(_)] => {}
+                other => panic!("expected exactly one Deleted event, got {other:?}"),
+            },
             other => panic!("expected Delta on old parent, got {other:?}"),
         }
         match feed
             .parent_changes_since("scripted", &new_parent, None)
             .await
         {
-            ChangeQueryResult::Delta { events, .. } => {
-                assert_eq!(events.len(), 1);
-                assert!(matches!(events[0], Change::Created(_)));
-            }
+            ChangeQueryResult::Delta { events, .. } => match events.as_slice() {
+                [Change::Created(_)] => {}
+                other => panic!("expected exactly one Created event, got {other:?}"),
+            },
             other => panic!("expected Delta on new parent, got {other:?}"),
         }
 
@@ -717,7 +717,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn polling_loop_drains_backend_into_feed() {
+    async fn polling_loop_drains_backend_into_feed() -> anyhow::Result<()> {
         // A single batch is scripted; the poll task should pick it up
         // within one POLL_INTERVAL.
         let entry = make_entry("scripted", "f", "root", "f.txt");
@@ -728,7 +728,7 @@ mod tests {
         // Wait for the first poll to complete.
         tokio::time::timeout(Duration::from_secs(2), notify.notified())
             .await
-            .expect("backend should be polled within the test timeout");
+            .map_err(|_| anyhow::anyhow!("backend was not polled within the test timeout"))?;
         // Give the feed a moment to file the event after the notify.
         tokio::task::yield_now().await;
         // Drain any remaining file work; the polling task writes after
@@ -756,5 +756,6 @@ mod tests {
         }
 
         feed.shutdown().await;
+        Ok(())
     }
 }
