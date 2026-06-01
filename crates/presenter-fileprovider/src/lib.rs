@@ -7,6 +7,7 @@
 pub mod bridge;
 pub mod handlers;
 pub mod items;
+pub mod server;
 pub mod wire;
 
 use std::path::{Path, PathBuf};
