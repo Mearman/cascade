@@ -523,10 +523,18 @@ impl VfsPresenter for ProjFsPresenter {
 
         #[cfg(target_os = "windows")]
         {
-            windows_impl::start_virtualising(mount_point, &self.handle).await?;
+            windows_impl::start_virtualising(
+                mount_point,
+                &self.handle,
+                &self.callback_ctx,
+                Arc::clone(&self.items),
+                Arc::clone(&self.root_id),
+                Arc::clone(&self.enumerations),
+            )
+            .await?;
             tracing::info!(
                 mount_point = %mount_display,
-                "ProjFS virtualisation started (callbacks are stubs)"
+                "ProjFS virtualisation started (browse callbacks live; read/write stubs)"
             );
             Ok(())
         }
@@ -546,7 +554,7 @@ impl VfsPresenter for ProjFsPresenter {
     async fn stop(&self) -> anyhow::Result<()> {
         #[cfg(target_os = "windows")]
         {
-            windows_impl::stop_virtualising(&self.handle).await
+            windows_impl::stop_virtualising(&self.handle, &self.callback_ctx).await
         }
 
         #[cfg(not(target_os = "windows"))]
@@ -565,27 +573,46 @@ impl VfsPresenter for ProjFsPresenter {
 mod windows_impl {
     //! Real `ProjFS` bindings — only compiled on Windows targets.
     //!
-    //! The callback table is intentionally stubbed: every callback
-    //! returns `S_OK` with no results (or an "empty" `HRESULT` where
-    //! `S_OK` would lie about success). The mount appears as an empty
-    //! directory until the full callback set is implemented.
+    //! Browse callbacks (`QueryFileName`, `GetPlaceholderInfo`,
+    //! `Start/Get/End` directory enumeration) consult the in-memory
+    //! items map shared with the presenter. `GetFileData`,
+    //! `Notification` and `CancelCommand` remain stubbed pending the
+    //! read/write follow-up callbacks.
 
+    use std::collections::HashMap;
     use std::ffi::c_void;
     use std::path::Path;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use anyhow::{Context as _, Result};
+    use cascade_engine::types::{ItemId, VfsItem};
+    use tokio::sync::RwLock;
     use windows::Win32::Foundation::{
-        ERROR_CALL_NOT_IMPLEMENTED, ERROR_FILE_NOT_FOUND, HRESULT, S_OK,
+        ERROR_CALL_NOT_IMPLEMENTED, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, HRESULT, S_OK,
     };
     use windows::Win32::Storage::ProjectedFileSystem::{
-        PRJ_CALLBACK_DATA, PRJ_CALLBACKS, PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT, PRJ_NOTIFICATION,
-        PRJ_NOTIFICATION_PARAMETERS, PRJ_PLACEHOLDER_VERSION_INFO, PrjMarkDirectoryAsPlaceholder,
-        PrjStartVirtualizing, PrjStopVirtualizing,
+        PRJ_CALLBACK_DATA, PRJ_CALLBACKS, PRJ_CB_DATA_FLAG_ENUM_RESTART_SCAN,
+        PRJ_DIR_ENTRY_BUFFER_HANDLE, PRJ_FILE_BASIC_INFO, PRJ_NOTIFICATION,
+        PRJ_NOTIFICATION_PARAMETERS, PRJ_PLACEHOLDER_INFO, PrjFillDirEntryBuffer,
+        PrjMarkDirectoryAsPlaceholder, PrjStartVirtualizing, PrjStopVirtualizing,
+        PrjWritePlaceholderInfo,
     };
     use windows::core::{GUID, HSTRING, PCWSTR};
 
     use super::handle::NamespaceHandle;
+    use super::{
+        CallbackContext, EnumerationState, build_enumeration_state, collect_children, resolve_path,
+    };
+
+    /// Heap-allocated state the callbacks consult. Kept distinct from
+    /// the public [`CallbackContext`] wrapper so the wrapper can stay
+    /// `Send + Sync` while the raw pointer to this inner struct is
+    /// the one ProjFS dereferences.
+    pub(super) struct CallbackContextInner {
+        items: Arc<RwLock<HashMap<String, VfsItem>>>,
+        root_id: Arc<RwLock<Option<ItemId>>>,
+        enumerations: Arc<Mutex<HashMap<u128, EnumerationState>>>,
+    }
 
     /// Translate a Win32 error code into an `HRESULT` in the
     /// `FACILITY_WIN32` space, matching the `HRESULT_FROM_WIN32` C
@@ -599,52 +626,280 @@ mod windows_impl {
         HRESULT(value)
     }
 
-    /// Stub callback for `PRJ_START_DIRECTORY_ENUMERATION_CB`.
+    /// Convert a `PCWSTR` into an owned Rust `String`. Returns `None`
+    /// when the pointer is null or the UTF-16 sequence cannot be
+    /// decoded.
     #[allow(unsafe_code)]
-    unsafe extern "system" fn start_directory_enumeration(
-        _callback_data: *const PRJ_CALLBACK_DATA,
-        _enumeration_id: *const GUID,
-    ) -> HRESULT {
-        S_OK
+    unsafe fn pcwstr_to_string(value: PCWSTR) -> Option<String> {
+        if value.is_null() {
+            return None;
+        }
+        // SAFETY: caller guarantees `value` is null-terminated and
+        // valid for reads up to and including the terminator; ProjFS
+        // honours that contract for FilePathName and related fields.
+        let s = unsafe { value.to_string() }.ok()?;
+        Some(s)
     }
 
-    /// Stub callback for `PRJ_END_DIRECTORY_ENUMERATION_CB`.
+    /// Recover the `CallbackContextInner` from the `PRJ_CALLBACK_DATA`
+    /// instance context pointer. Returns `None` when the pointer is
+    /// null, which only happens if the caller forgot to set it on
+    /// `PrjStartVirtualizing`.
     #[allow(unsafe_code)]
-    unsafe extern "system" fn end_directory_enumeration(
-        _callback_data: *const PRJ_CALLBACK_DATA,
-        _enumeration_id: *const GUID,
-    ) -> HRESULT {
-        S_OK
+    unsafe fn context_from_callback_data<'a>(
+        data: *const PRJ_CALLBACK_DATA,
+    ) -> Option<&'a CallbackContextInner> {
+        if data.is_null() {
+            return None;
+        }
+        // SAFETY: ProjFS guarantees `data` points to a valid
+        // PRJ_CALLBACK_DATA for the duration of the callback. The
+        // InstanceContext field was set to a `Box::into_raw` value of
+        // `CallbackContextInner` by `start_virtualising`; the Box is
+        // alive until `stop_virtualising` runs, which only happens
+        // after PrjStopVirtualizing returns and outstanding callbacks
+        // have drained.
+        let ctx_ptr = unsafe { (*data).InstanceContext } as *const CallbackContextInner;
+        if ctx_ptr.is_null() {
+            return None;
+        }
+        // SAFETY: ctx_ptr is non-null and points to a live
+        // CallbackContextInner held by the presenter.
+        Some(unsafe { &*ctx_ptr })
     }
 
-    /// Stub callback for `PRJ_GET_DIRECTORY_ENUMERATION_CB`.
-    ///
-    /// Returning `S_OK` with no entries written tells `ProjFS` the
-    /// directory is empty — the safest stub answer until the real
-    /// enumeration logic lands.
+    /// `PRJ_QUERY_FILE_NAME_CB` — existence check used by ProjFS to
+    /// decide whether to descend into the projection.
     #[allow(unsafe_code)]
-    unsafe extern "system" fn get_directory_enumeration(
-        _callback_data: *const PRJ_CALLBACK_DATA,
-        _enumeration_id: *const GUID,
-        _search_expression: PCWSTR,
-        _dir_entry_buffer_handle: windows::Win32::Storage::ProjectedFileSystem::PRJ_DIR_ENTRY_BUFFER_HANDLE,
-    ) -> HRESULT {
-        S_OK
+    unsafe extern "system" fn query_file_name(callback_data: *const PRJ_CALLBACK_DATA) -> HRESULT {
+        // SAFETY: the inner blocks all dereference pointers ProjFS
+        // promised are live for the duration of this callback.
+        let Some(ctx) = (unsafe { context_from_callback_data(callback_data) }) else {
+            return hresult_from_win32(ERROR_FILE_NOT_FOUND.0);
+        };
+        let Some(path) = (unsafe { pcwstr_to_string((*callback_data).FilePathName) }) else {
+            return hresult_from_win32(ERROR_FILE_NOT_FOUND.0);
+        };
+
+        let items = ctx.items.blocking_read();
+        let root = ctx.root_id.blocking_read();
+        if resolve_path(&path, &items, root.as_ref()).is_some() {
+            S_OK
+        } else {
+            hresult_from_win32(ERROR_FILE_NOT_FOUND.0)
+        }
     }
 
-    /// Stub callback for `PRJ_GET_PLACEHOLDER_INFO_CB`.
-    ///
-    /// Returning `ERROR_FILE_NOT_FOUND` is the documented way to tell
-    /// `ProjFS` "this path does not exist in the projection" —
-    /// appropriate for an empty stub.
+    /// `PRJ_GET_PLACEHOLDER_INFO_CB` — emit a placeholder describing
+    /// the item at the queried path.
     #[allow(unsafe_code)]
     unsafe extern "system" fn get_placeholder_info(
-        _callback_data: *const PRJ_CALLBACK_DATA,
+        callback_data: *const PRJ_CALLBACK_DATA,
     ) -> HRESULT {
-        hresult_from_win32(ERROR_FILE_NOT_FOUND.0)
+        // SAFETY: see `query_file_name`. ProjFS holds `callback_data`
+        // alive for the duration of the call.
+        let Some(ctx) = (unsafe { context_from_callback_data(callback_data) }) else {
+            return hresult_from_win32(ERROR_FILE_NOT_FOUND.0);
+        };
+        let Some(path) = (unsafe { pcwstr_to_string((*callback_data).FilePathName) }) else {
+            return hresult_from_win32(ERROR_FILE_NOT_FOUND.0);
+        };
+
+        let items = ctx.items.blocking_read();
+        let root = ctx.root_id.blocking_read();
+        let Some(item) = resolve_path(&path, &items, root.as_ref()) else {
+            return hresult_from_win32(ERROR_FILE_NOT_FOUND.0);
+        };
+
+        let mut info = PRJ_PLACEHOLDER_INFO::default();
+        info.FileBasicInfo.IsDirectory = item.is_dir;
+        // PRJ_FILE_BASIC_INFO uses `i64` for FileSize. `u64 -> i64`
+        // saturates here because file sizes that overflow `i64` cannot
+        // be represented in NTFS anyway (max file size is `1 << 60`).
+        #[allow(clippy::cast_possible_wrap)]
+        {
+            let size = item.size.unwrap_or(0).min(i64::MAX as u64);
+            info.FileBasicInfo.FileSize = size as i64;
+        }
+
+        let path_hstring = HSTRING::from(path.as_str());
+        // SAFETY: PrjWritePlaceholderInfo reads `destination_file_name`
+        // and the placeholder info for the duration of the call; both
+        // outlive the FFI on the stack. The namespace context is the
+        // one ProjFS itself supplied via callback_data.
+        let result = unsafe {
+            PrjWritePlaceholderInfo(
+                (*callback_data).NamespaceVirtualizationContext,
+                PCWSTR(path_hstring.as_ptr()),
+                &info,
+                u32::try_from(std::mem::size_of::<PRJ_PLACEHOLDER_INFO>()).unwrap_or(u32::MAX),
+            )
+        };
+        match result {
+            Ok(()) => S_OK,
+            Err(err) => err.code(),
+        }
     }
 
-    /// Stub callback for `PRJ_GET_FILE_DATA_CB`.
+    /// `PRJ_START_DIRECTORY_ENUMERATION_CB` — snapshot the children
+    /// of the queried directory and remember them under
+    /// `enumeration_id`.
+    #[allow(unsafe_code)]
+    unsafe extern "system" fn start_directory_enumeration(
+        callback_data: *const PRJ_CALLBACK_DATA,
+        enumeration_id: *const GUID,
+    ) -> HRESULT {
+        // SAFETY: ProjFS holds both pointers alive for the duration
+        // of the call.
+        let Some(ctx) = (unsafe { context_from_callback_data(callback_data) }) else {
+            return hresult_from_win32(ERROR_FILE_NOT_FOUND.0);
+        };
+        if enumeration_id.is_null() {
+            return hresult_from_win32(ERROR_FILE_NOT_FOUND.0);
+        }
+        let id = unsafe { *enumeration_id };
+        let key = guid_to_u128(id);
+
+        let path = unsafe { pcwstr_to_string((*callback_data).FilePathName) }.unwrap_or_default();
+
+        let items = ctx.items.blocking_read();
+        let root = ctx.root_id.blocking_read();
+
+        // Empty path = enumerate the projection root.
+        let state = if path.is_empty() {
+            let parent_id = root
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| ItemId(String::from("root")));
+            build_enumeration_state(&parent_id, &items)
+        } else {
+            let Some(dir) = resolve_path(&path, &items, root.as_ref()) else {
+                return hresult_from_win32(ERROR_FILE_NOT_FOUND.0);
+            };
+            if !dir.is_dir {
+                return hresult_from_win32(ERROR_FILE_NOT_FOUND.0);
+            }
+            EnumerationState {
+                entries: collect_children(&dir.id, &items),
+                position: 0,
+            }
+        };
+
+        let Ok(mut sessions) = ctx.enumerations.lock() else {
+            // Poisoned mutex — surface a generic failure so ProjFS
+            // can retry. ERROR_CALL_NOT_IMPLEMENTED is the closest
+            // generic "we cannot serve this right now" signal that
+            // the kernel will not retry forever.
+            return hresult_from_win32(ERROR_CALL_NOT_IMPLEMENTED.0);
+        };
+        sessions.insert(key, state);
+        S_OK
+    }
+
+    /// `PRJ_END_DIRECTORY_ENUMERATION_CB` — release the stored
+    /// session state.
+    #[allow(unsafe_code)]
+    unsafe extern "system" fn end_directory_enumeration(
+        callback_data: *const PRJ_CALLBACK_DATA,
+        enumeration_id: *const GUID,
+    ) -> HRESULT {
+        // SAFETY: ProjFS guarantees the pointers are live for the
+        // duration of the call.
+        let Some(ctx) = (unsafe { context_from_callback_data(callback_data) }) else {
+            return S_OK;
+        };
+        if enumeration_id.is_null() {
+            return S_OK;
+        }
+        let key = guid_to_u128(unsafe { *enumeration_id });
+        if let Ok(mut sessions) = ctx.enumerations.lock() {
+            sessions.remove(&key);
+        }
+        S_OK
+    }
+
+    /// `PRJ_GET_DIRECTORY_ENUMERATION_CB` — yield the next batch of
+    /// entries into the buffer ProjFS provides.
+    ///
+    /// Filtering by `search_expression` is performed by
+    /// `PrjFileNameMatch` server-side per the API contract; we
+    /// currently emit every child and let ProjFS drop the ones that
+    /// do not match. A future optimisation can short-circuit by
+    /// calling `PrjFileNameMatch` from here.
+    #[allow(unsafe_code)]
+    unsafe extern "system" fn get_directory_enumeration(
+        callback_data: *const PRJ_CALLBACK_DATA,
+        enumeration_id: *const GUID,
+        _search_expression: PCWSTR,
+        dir_entry_buffer_handle: PRJ_DIR_ENTRY_BUFFER_HANDLE,
+    ) -> HRESULT {
+        // SAFETY: ProjFS guarantees the pointers are live for the
+        // duration of the call.
+        let Some(ctx) = (unsafe { context_from_callback_data(callback_data) }) else {
+            return S_OK;
+        };
+        if enumeration_id.is_null() {
+            return S_OK;
+        }
+        let key = guid_to_u128(unsafe { *enumeration_id });
+
+        // If ProjFS asked for a restart, reset the cursor before
+        // filling the buffer. The flag is a bit in `Flags`, not the
+        // full value, so use bitwise-and rather than equality.
+        let restart_scan =
+            unsafe { (*callback_data).Flags.0 & PRJ_CB_DATA_FLAG_ENUM_RESTART_SCAN.0 != 0 };
+
+        let Ok(mut sessions) = ctx.enumerations.lock() else {
+            return S_OK;
+        };
+        let Some(state) = sessions.get_mut(&key) else {
+            // ProjFS would not normally call Get without Start, but
+            // returning S_OK with no entries written tells it the
+            // directory is empty rather than crashing.
+            return S_OK;
+        };
+        if restart_scan {
+            state.position = 0;
+        }
+
+        let buffer_full_hresult = hresult_from_win32(ERROR_INSUFFICIENT_BUFFER.0);
+        while let Some(entry) = state.entries.get(state.position) {
+            let name_hstring = HSTRING::from(entry.name.as_str());
+            let mut basic = PRJ_FILE_BASIC_INFO::default();
+            basic.IsDirectory = entry.is_dir;
+            #[allow(clippy::cast_possible_wrap)]
+            {
+                basic.FileSize = entry.size.min(i64::MAX as u64) as i64;
+            }
+
+            // SAFETY: PrjFillDirEntryBuffer reads `filename` and
+            // `filebasicinfo` for the duration of the call. Both
+            // outlive the FFI; the buffer handle is the one ProjFS
+            // handed us.
+            let result = unsafe {
+                PrjFillDirEntryBuffer(
+                    PCWSTR(name_hstring.as_ptr()),
+                    Some(&basic),
+                    dir_entry_buffer_handle,
+                )
+            };
+            match result {
+                Ok(()) => {
+                    state.position += 1;
+                }
+                Err(err) if err.code() == buffer_full_hresult => {
+                    // Buffer full — leave position unchanged; ProjFS
+                    // will call us again with a fresh buffer.
+                    return S_OK;
+                }
+                Err(err) => return err.code(),
+            }
+        }
+        S_OK
+    }
+
+    /// Stub callback for `PRJ_GET_FILE_DATA_CB`. Read implementation
+    /// follows in a later commit.
     #[allow(unsafe_code)]
     unsafe extern "system" fn get_file_data(
         _callback_data: *const PRJ_CALLBACK_DATA,
@@ -654,17 +909,12 @@ mod windows_impl {
         hresult_from_win32(ERROR_CALL_NOT_IMPLEMENTED.0)
     }
 
-    /// Stub callback for `PRJ_QUERY_FILE_NAME_CB`.
-    #[allow(unsafe_code)]
-    unsafe extern "system" fn query_file_name(_callback_data: *const PRJ_CALLBACK_DATA) -> HRESULT {
-        hresult_from_win32(ERROR_FILE_NOT_FOUND.0)
-    }
-
-    /// Stub callback for `PRJ_NOTIFICATION_CB`.
+    /// Stub callback for `PRJ_NOTIFICATION_CB`. Write-back hooks
+    /// follow in a later commit.
     #[allow(unsafe_code)]
     unsafe extern "system" fn notification(
         _callback_data: *const PRJ_CALLBACK_DATA,
-        _is_directory: windows::Win32::Foundation::BOOLEAN,
+        _is_directory: bool,
         _notification: PRJ_NOTIFICATION,
         _destination_file_name: PCWSTR,
         _operation_parameters: *mut PRJ_NOTIFICATION_PARAMETERS,
@@ -672,13 +922,12 @@ mod windows_impl {
         S_OK
     }
 
-    /// Stub callback for `PRJ_CANCEL_COMMAND_CB`.
+    /// Stub callback for `PRJ_CANCEL_COMMAND_CB`. There is no
+    /// in-flight async work to cancel until `GetFileData` is real.
     #[allow(unsafe_code)]
-    unsafe extern "system" fn cancel_command(_callback_data: *const PRJ_CALLBACK_DATA) {
-        // No outstanding work to cancel in the stub implementation.
-    }
+    unsafe extern "system" fn cancel_command(_callback_data: *const PRJ_CALLBACK_DATA) {}
 
-    /// Build the stub callback table.
+    /// Build the live callback table used by `PrjStartVirtualizing`.
     fn build_callbacks() -> PRJ_CALLBACKS {
         PRJ_CALLBACKS {
             StartDirectoryEnumerationCallback: Some(start_directory_enumeration),
@@ -692,12 +941,29 @@ mod windows_impl {
         }
     }
 
+    /// Convert a `GUID` to its little-endian `u128` representation
+    /// for use as a `HashMap` key. ProjFS treats enumeration IDs as
+    /// opaque, so any total order works as long as it is stable for
+    /// the lifetime of the enumeration.
+    fn guid_to_u128(guid: GUID) -> u128 {
+        let mut bytes = [0u8; 16];
+        bytes[..4].copy_from_slice(&guid.data1.to_le_bytes());
+        bytes[4..6].copy_from_slice(&guid.data2.to_le_bytes());
+        bytes[6..8].copy_from_slice(&guid.data3.to_le_bytes());
+        bytes[8..].copy_from_slice(&guid.data4);
+        u128::from_le_bytes(bytes)
+    }
+
     /// Mark the mount directory as a `ProjFS` placeholder and start
     /// virtualising. Stores the resulting namespace handle in the
     /// presenter so [`stop_virtualising`] can release it later.
     pub(super) async fn start_virtualising(
         mount_point: &Path,
         handle_slot: &Arc<tokio::sync::Mutex<Option<NamespaceHandle>>>,
+        callback_ctx_slot: &Arc<tokio::sync::Mutex<Option<CallbackContext>>>,
+        items: Arc<RwLock<HashMap<String, VfsItem>>>,
+        root_id: Arc<RwLock<Option<ItemId>>>,
+        enumerations: Arc<Mutex<HashMap<u128, EnumerationState>>>,
     ) -> Result<()> {
         let mount_hstring = HSTRING::from(mount_point.as_os_str());
         let mount_pcwstr = PCWSTR(mount_hstring.as_ptr());
@@ -705,51 +971,78 @@ mod windows_impl {
         // SAFETY: PrjMarkDirectoryAsPlaceholder reads the path string
         // for the duration of the call. `mount_hstring` outlives the
         // call because it is held on the stack until after the FFI
-        // returns. The other parameters are nullable per the API
-        // contract; we pass null for target_path (no overlay source),
-        // version_info (no provider version tracking yet), and
-        // virtualisation_instance_id (let ProjFS pick).
+        // returns. The version_info and virtualisation_instance_id
+        // arguments are optional; we pass `None`/null for both since
+        // we do not yet track provider version metadata.
         #[allow(unsafe_code)]
         let mark_result = unsafe {
             PrjMarkDirectoryAsPlaceholder(
                 mount_pcwstr,
                 PCWSTR::null(),
-                std::ptr::null::<PRJ_PLACEHOLDER_VERSION_INFO>(),
+                None,
                 std::ptr::null::<GUID>(),
             )
         };
-        mark_result
-            .ok()
-            .context("PrjMarkDirectoryAsPlaceholder failed")?;
+        mark_result.context("PrjMarkDirectoryAsPlaceholder failed")?;
+
+        // Build the callback context. The Box is the owning handle:
+        // we hand its raw pointer to ProjFS via instance_context and
+        // recover it in `stop_virtualising` to free the allocation.
+        let inner = Box::new(CallbackContextInner {
+            items: Arc::clone(&items),
+            root_id: Arc::clone(&root_id),
+            enumerations: Arc::clone(&enumerations),
+        });
+        let inner_ptr = Box::into_raw(inner);
+        let instance_context = inner_ptr.cast::<c_void>();
 
         let callbacks = build_callbacks();
 
-        // SAFETY: PrjStartVirtualizing takes ownership of the callback
-        // table by copying its function pointer fields. The stack-local
-        // `callbacks` is valid for the duration of the call. The
-        // out-parameter receives an owned PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT
-        // that we must release with PrjStopVirtualizing.
-        let mut ctx = PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT::default();
+        // SAFETY: PrjStartVirtualizing copies the callback function
+        // pointers out of `callbacks`. The stack-local table is valid
+        // for the duration of the call. The instance_context pointer
+        // is the raw Box we just allocated; the kernel keeps it until
+        // PrjStopVirtualizing returns.
         #[allow(unsafe_code)]
         let start_result = unsafe {
             PrjStartVirtualizing(
                 mount_pcwstr,
                 &callbacks,
-                std::ptr::null::<c_void>(),
-                std::ptr::null(),
-                &mut ctx,
+                Some(instance_context.cast_const()),
+                None,
             )
         };
-        start_result.ok().context("PrjStartVirtualizing failed")?;
+        let ctx = match start_result {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                // PrjStartVirtualizing failed — reclaim the Box so it
+                // is not leaked. SAFETY: inner_ptr originated from
+                // Box::into_raw above and has not been freed yet.
+                #[allow(unsafe_code)]
+                unsafe {
+                    drop(Box::from_raw(inner_ptr));
+                }
+                return Err(anyhow::Error::from(err).context("PrjStartVirtualizing failed"));
+            }
+        };
 
-        let mut slot = handle_slot.lock().await;
-        *slot = Some(NamespaceHandle(ctx));
+        let mut handle_slot_guard = handle_slot.lock().await;
+        *handle_slot_guard = Some(NamespaceHandle(ctx));
+
+        let mut ctx_slot = callback_ctx_slot.lock().await;
+        *ctx_slot = Some(CallbackContext {
+            items,
+            root_id,
+            enumerations,
+            raw_ptr: inner_ptr as usize,
+        });
         Ok(())
     }
 
     /// Release the stored `ProjFS` namespace handle, if any.
     pub(super) async fn stop_virtualising(
         handle_slot: &Arc<tokio::sync::Mutex<Option<NamespaceHandle>>>,
+        callback_ctx_slot: &Arc<tokio::sync::Mutex<Option<CallbackContext>>>,
     ) -> Result<()> {
         let handle = {
             let mut slot = handle_slot.lock().await;
@@ -765,6 +1058,25 @@ mod windows_impl {
                 PrjStopVirtualizing(ctx);
             }
             tracing::info!("ProjFS virtualisation stopped");
+        }
+
+        // Reclaim the callback context allocation after ProjFS has
+        // stopped — any in-flight callback will have returned before
+        // PrjStopVirtualizing returned.
+        let ctx = {
+            let mut slot = callback_ctx_slot.lock().await;
+            slot.take()
+        };
+        if let Some(CallbackContext { raw_ptr, .. }) = ctx
+            && raw_ptr != 0
+        {
+            // SAFETY: raw_ptr originated from Box::into_raw in
+            // start_virtualising. ProjFS has stopped and no further
+            // callbacks can dereference it, so it is safe to drop.
+            #[allow(unsafe_code)]
+            unsafe {
+                drop(Box::from_raw(raw_ptr as *mut CallbackContextInner));
+            }
         }
         Ok(())
     }
