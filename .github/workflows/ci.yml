@@ -384,7 +384,7 @@ jobs:
         env:
           VERSION: ${{ needs.release.outputs.version }}
         run: |
-          VERSION_NUM="${VERSION#v}"
+          VERSION_NUM="${VERSION#cascade-v}"
           MACOS_ARM_SHA=$(cat sha-macos-arm)
           MACOS_X86_SHA=$(cat sha-macos-x86)
           LINUX_X86_SHA=$(cat sha-linux-x86)
@@ -461,7 +461,7 @@ jobs:
         env:
           VERSION: ${{ needs.release.outputs.version }}
         run: |
-          VERSION_NUM="${VERSION#v}"
+          VERSION_NUM="${VERSION#cascade-v}"
           WINDOWS_X86_SHA=$(cat sha-windows-x86)
 
           mkdir -p bucket
@@ -521,7 +521,7 @@ jobs:
           cascade --version
           # Verify the installed version matches the release tag.
           INSTALLED=$(cascade --version | awk '{print $2}')
-          EXPECTED="${VERSION#v}"
+          EXPECTED="${VERSION#cascade-v}"
           if [ "$INSTALLED" != "$EXPECTED" ]; then
             echo "version mismatch: installed=$INSTALLED expected=$EXPECTED"
             exit 1
@@ -559,7 +559,7 @@ jobs:
         run: |
           cascade --version
           INSTALLED=$(cascade --version | awk '{print $2}')
-          EXPECTED="${VERSION#v}"
+          EXPECTED="${VERSION#cascade-v}"
           if [ "$INSTALLED" != "$EXPECTED" ]; then
             echo "version mismatch: installed=$INSTALLED expected=$EXPECTED"
             exit 1
