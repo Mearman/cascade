@@ -865,6 +865,14 @@ async fn detect_nat_and_publish(
                     "RFC 5780 NAT type detected",
                 );
                 sync.set_local_nat_type(outcome.nat_type()).await;
+                // Stash the external mapping so gather_local_candidates
+                // can fold a ServerReflexive candidate into the
+                // gossiped set. The single-server path below has no
+                // way to extract this — `NatTraversal::detect_nat_type`
+                // discards the XOR-MAPPED-ADDRESS — so only RFC 5780
+                // populates it.
+                sync.set_local_external_addr(outcome.external_socket_addr())
+                    .await;
             }
             Err(e) => tracing::warn!(
                 target: "cascade::backend::p2p",
