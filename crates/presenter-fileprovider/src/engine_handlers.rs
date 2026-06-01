@@ -2661,9 +2661,12 @@ mod tests {
     /// First call with no prior cursor must return every current child
     /// as added, an empty deleted set, and a non-empty new cursor.
     #[tokio::test]
-    async fn enumerate_changes_first_call_returns_all_as_added() {
+    async fn enumerate_changes_first_call_returns_all_as_added() -> anyhow::Result<()> {
         let (handlers, _backend, _tempdir) = make_handlers();
-        let output = handlers.enumerate_changes("stub:root", None).await.unwrap();
+        let output = handlers
+            .enumerate_changes("stub:root", None)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e.message))?;
 
         // Seeded child is `stub:file1` with name "hello.txt".
         assert_eq!(output.added_or_modified.len(), 1);
@@ -2677,10 +2680,11 @@ mod tests {
         // returns. Verify the new cursor decodes back to the right
         // backend/parent pair.
         let decoded = SyncCursorV2::decode(&output.new_cursor)
-            .expect("V2 cursor decodes")
-            .expect("V2 cursor matched the magic");
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .ok_or_else(|| anyhow::anyhow!("V2 cursor must be present"))?;
         assert_eq!(decoded.backend_id, "stub");
         assert_eq!(decoded.parent_id, ItemId::new("stub", "root"));
+        Ok(())
     }
 
     /// After the snapshot is taken, an unchanged view must yield no
@@ -2876,18 +2880,24 @@ mod tests {
     /// calls carrying that cursor must drive the change-feed path
     /// rather than the snapshot fallback.
     #[tokio::test]
-    async fn enumerate_changes_first_call_stores_v2_cursor_and_snapshot() {
+    async fn enumerate_changes_first_call_stores_v2_cursor_and_snapshot() -> anyhow::Result<()> {
         let (handlers, _backend, _tempdir) = make_handlers();
-        let first = handlers.enumerate_changes("stub:root", None).await.unwrap();
+        let first = handlers
+            .enumerate_changes("stub:root", None)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e.message))?;
 
         let decoded = SyncCursorV2::decode(&first.new_cursor)
-            .expect("V2 cursor decodes")
-            .expect("V2 cursor matched the magic");
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .ok_or_else(|| anyhow::anyhow!("V2 cursor must be present"))?;
         assert_eq!(decoded.backend_id, "stub");
         assert_eq!(decoded.parent_id, ItemId::new("stub", "root"));
         // The snapshot hash mirrors derive_sync_cursor for the same
         // child set.
-        let live = handlers.current_sync_cursor("stub:root").await.unwrap();
+        let live = handlers
+            .current_sync_cursor("stub:root")
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e.message))?;
         assert_eq!(decoded.snapshot_hash, live.as_bytes());
 
         // Replaying the same cursor with no change must return an
@@ -2895,29 +2905,36 @@ mod tests {
         let again = handlers
             .enumerate_changes("stub:root", Some(&first.new_cursor))
             .await
-            .unwrap();
+            .map_err(|e| anyhow::anyhow!("{}", e.message))?;
         assert!(again.added_or_modified.is_empty());
         assert!(again.deleted.is_empty());
         assert_eq!(again.new_cursor, first.new_cursor);
+        Ok(())
     }
 
     /// A stale V1 cursor (no `CF2` magic) must drop to the snapshot
     /// fallback and be treated as a fresh enumeration on the first
     /// observation, then resume cleanly on the next call.
     #[tokio::test]
-    async fn enumerate_changes_legacy_v1_cursor_falls_back_to_snapshot() {
+    async fn enumerate_changes_legacy_v1_cursor_falls_back_to_snapshot() -> anyhow::Result<()> {
         let (handlers, _backend, _tempdir) = make_handlers();
         // Seed the snapshot store so the legacy cursor can be matched
         // against it.
-        let _ = handlers.enumerate_changes("stub:root", None).await.unwrap();
+        let _ = handlers
+            .enumerate_changes("stub:root", None)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e.message))?;
 
         // Fabricate a V1-shaped cursor that doesn't carry the V2 magic
         // — this is what an older daemon would have stored on disk.
-        let legacy = handlers.current_sync_cursor("stub:root").await.unwrap();
+        let legacy = handlers
+            .current_sync_cursor("stub:root")
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e.message))?;
         let fallback = handlers
             .enumerate_changes("stub:root", Some(&legacy))
             .await
-            .unwrap();
+            .map_err(|e| anyhow::anyhow!("{}", e.message))?;
 
         // Snapshot fallback diffs against the stored snapshot, which
         // matches the live state, so this is an empty delta.
@@ -2926,8 +2943,9 @@ mod tests {
         // But the returned cursor is now V2 so the next call resumes
         // the feed path.
         let new_decoded = SyncCursorV2::decode(&fallback.new_cursor)
-            .expect("V2 cursor decodes")
-            .expect("returned cursor must be V2 even after legacy input");
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .ok_or_else(|| anyhow::anyhow!("returned cursor must be V2 even after legacy input"))?;
         assert_eq!(new_decoded.backend_id, "stub");
+        Ok(())
     }
 }
