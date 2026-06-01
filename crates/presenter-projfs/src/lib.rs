@@ -60,12 +60,55 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use cascade_engine::presenter::VfsPresenter;
 use cascade_engine::types::{CacheState, ItemId, VfsItem};
 use tokio::sync::RwLock;
+
+/// One-shot cancellation flag shared between a long-running callback
+/// and `CancelCommand`.
+///
+/// The flag is set to `true` when `ProjFS` invokes
+/// [`PRJ_CANCEL_COMMAND_CB`][cancel-cb] for the matching `CommandId`;
+/// the running callback polls [`Self::is_cancelled`] between
+/// expensive steps and bails with `ERROR_OPERATION_ABORTED` when it
+/// sees the flag.
+///
+/// Kept as a thin newtype around `Arc<AtomicBool>` rather than
+/// reaching for `tokio_util::sync::CancellationToken` because the
+/// workspace does not depend on `tokio-util` outside the `WebDAV`
+/// presenter and the simpler primitive is enough for the
+/// `ProjFS` callback model.
+///
+/// [cancel-cb]: https://learn.microsoft.com/en-us/windows/win32/api/projectedfslib/nc-projectedfslib-prj_cancel_command_cb
+#[derive(Debug, Clone, Default)]
+pub struct CancellationToken {
+    flag: Arc<AtomicBool>,
+}
+
+impl CancellationToken {
+    /// A fresh, un-cancelled token.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Mark the token cancelled. Subsequent calls to
+    /// [`Self::is_cancelled`] return `true`.
+    pub fn cancel(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+    }
+
+    /// `true` once [`Self::cancel`] has been called on this token or
+    /// any clone.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+}
 
 /// User-driven filesystem event surfaced by the `ProjFS`
 /// `NotificationCallback`.
@@ -555,6 +598,13 @@ pub struct ProjFsPresenter {
     /// [`Self::with_content_provider`].
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     content_provider: Option<Arc<dyn ContentProvider>>,
+    /// In-flight cancellation tokens keyed by
+    /// `PRJ_CALLBACK_DATA::CommandId`. Populated by `get_file_data`
+    /// on entry, removed on exit, and signalled by `cancel_command`
+    /// when `ProjFS` aborts the operation. Shared with the heap
+    /// `CallbackContextInner` so both callbacks see the same map.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    cancellation_tokens: Arc<Mutex<HashMap<i32, CancellationToken>>>,
 }
 
 /// Owning record of the heap allocation handed to `ProjFS` via
@@ -636,6 +686,7 @@ impl ProjFsPresenter {
             handle: Arc::new(tokio::sync::Mutex::new(None)),
             callback_ctx: Arc::new(tokio::sync::Mutex::new(None)),
             content_provider: None,
+            cancellation_tokens: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -757,6 +808,7 @@ impl VfsPresenter for ProjFsPresenter {
                 Arc::clone(&self.root_id),
                 Arc::clone(&self.enumerations),
                 self.content_provider.clone(),
+                Arc::clone(&self.cancellation_tokens),
             )
             .await?;
             tracing::info!(
@@ -805,12 +857,14 @@ mod windows_impl {
     //! items map shared with the presenter. `GetFileData` reads a
     //! byte range from the installed [`ContentProvider`] (when one is
     //! present) and forwards it via `PrjWriteFileData`; without a
-    //! provider it returns `ERROR_CALL_NOT_IMPLEMENTED`.
+    //! provider it returns `ERROR_CALL_NOT_IMPLEMENTED`. The read
+    //! registers a [`super::CancellationToken`] keyed by
+    //! `PRJ_CALLBACK_DATA::CommandId` and checks it between expensive
+    //! steps; `CancelCommandCallback` triggers the matching token to
+    //! abort the read with `ERROR_OPERATION_ABORTED`.
     //! `NotificationCallback` decodes the event via
     //! [`super::NotificationEvent`], logs at `debug`, and vetoes
     //! deletes via [`super::allow_delete`] when the policy says no.
-    //! `CancelCommandCallback` remains stubbed pending the follow-up
-    //! commit.
 
     use std::collections::HashMap;
     use std::ffi::c_void;
@@ -821,7 +875,8 @@ mod windows_impl {
     use cascade_engine::types::{ItemId, VfsItem};
     use tokio::sync::RwLock;
     use windows::Win32::Foundation::{
-        ERROR_CALL_NOT_IMPLEMENTED, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, S_OK,
+        ERROR_CALL_NOT_IMPLEMENTED, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER,
+        ERROR_OPERATION_ABORTED, S_OK,
     };
     use windows::Win32::Storage::ProjectedFileSystem::{
         PRJ_CALLBACK_DATA, PRJ_CALLBACKS, PRJ_CB_DATA_FLAG_ENUM_RESTART_SCAN,
@@ -834,8 +889,8 @@ mod windows_impl {
 
     use super::handle::NamespaceHandle;
     use super::{
-        CallbackContext, ContentProvider, EnumerationState, build_enumeration_state,
-        collect_children, resolve_path,
+        CallbackContext, CancellationToken, ContentProvider, EnumerationState,
+        build_enumeration_state, collect_children, resolve_path,
     };
 
     /// Heap-allocated state the callbacks consult. Kept distinct from
@@ -849,6 +904,12 @@ mod windows_impl {
         /// Optional source of file bytes for the `GetFileData`
         /// callback. `None` keeps the projection browse-only.
         content_provider: Option<Arc<dyn ContentProvider>>,
+        /// Cancellation tokens for in-flight commands, keyed by the
+        /// `PRJ_CALLBACK_DATA::CommandId`. `get_file_data` inserts
+        /// on entry and removes on exit; `cancel_command` looks up
+        /// the entry and triggers the token. Reachable from any
+        /// callback thread, so wrapped in a `std::sync::Mutex`.
+        cancellation_tokens: Arc<Mutex<HashMap<i32, CancellationToken>>>,
     }
 
     /// Translate a Win32 error code into an `HRESULT` in the
@@ -1151,18 +1212,24 @@ mod windows_impl {
     /// 1. Recover the [`CallbackContextInner`] and bail with
     ///    `ERROR_CALL_NOT_IMPLEMENTED` if no [`ContentProvider`] is
     ///    installed (browse-only mode).
-    /// 2. Resolve the relative path to a [`VfsItem`] via
+    /// 2. Register a [`CancellationToken`] keyed by the
+    ///    `PRJ_CALLBACK_DATA::CommandId` so the matching
+    ///    `CancelCommand` invocation can abort us mid-flight.
+    /// 3. Resolve the relative path to a [`VfsItem`] via
     ///    [`resolve_path`]; a directory or unknown path returns
     ///    `ERROR_FILE_NOT_FOUND`.
-    /// 3. Ask the provider for `[byte_offset, byte_offset + length)`.
-    /// 4. Allocate an aligned buffer via `PrjAllocateAlignedBuffer`,
+    /// 4. Ask the provider for `[byte_offset, byte_offset + length)`.
+    /// 5. Allocate an aligned buffer via `PrjAllocateAlignedBuffer`,
     ///    copy the bytes in, hand it to `PrjWriteFileData`, then free
     ///    the buffer regardless of the outcome.
+    /// 6. Remove the cancellation token from the map on every exit
+    ///    path via [`TokenGuard`].
     ///
     /// I/O errors from the provider currently fall through as
     /// `ERROR_CALL_NOT_IMPLEMENTED` — a richer mapping (network vs.
     /// permission vs. transient) is follow-up work once the engine's
-    /// error taxonomy is settled.
+    /// error taxonomy is settled. Cancellation returns
+    /// `ERROR_OPERATION_ABORTED`.
     #[allow(unsafe_code)]
     unsafe extern "system" fn get_file_data(
         callback_data: *const PRJ_CALLBACK_DATA,
@@ -1186,6 +1253,23 @@ mod windows_impl {
         // alive across the entire call.
         let namespace_ctx = unsafe { (*callback_data).NamespaceVirtualizationContext };
         let data_stream_id = unsafe { (*callback_data).DataStreamId };
+        let command_id = unsafe { (*callback_data).CommandId };
+
+        // Register a cancellation token before the first expensive
+        // step. `TokenGuard` removes the entry on drop regardless of
+        // which return path we take.
+        let token = CancellationToken::new();
+        if let Ok(mut tokens) = ctx.cancellation_tokens.lock() {
+            tokens.insert(command_id, token.clone());
+        }
+        let _guard = TokenGuard {
+            tokens: &ctx.cancellation_tokens,
+            command_id,
+        };
+
+        if token.is_cancelled() {
+            return hresult_from_win32(ERROR_OPERATION_ABORTED.0);
+        }
 
         // Resolve the item under the read lock and drop the guards
         // before invoking the provider so a slow read does not block
@@ -1203,6 +1287,10 @@ mod windows_impl {
             item.id.clone()
         };
 
+        if token.is_cancelled() {
+            return hresult_from_win32(ERROR_OPERATION_ABORTED.0);
+        }
+
         let bytes = match provider.read_range(&item_id, byte_offset, length) {
             Ok(bytes) => bytes,
             Err(err) => {
@@ -1216,6 +1304,10 @@ mod windows_impl {
                 return hresult_from_win32(ERROR_CALL_NOT_IMPLEMENTED.0);
             }
         };
+
+        if token.is_cancelled() {
+            return hresult_from_win32(ERROR_OPERATION_ABORTED.0);
+        }
 
         if bytes.is_empty() {
             // End of file — ProjFS treats S_OK with zero bytes as a
@@ -1353,10 +1445,48 @@ mod windows_impl {
         S_OK
     }
 
-    /// Stub callback for `PRJ_CANCEL_COMMAND_CB`. There is no
-    /// in-flight async work to cancel until `GetFileData` is real.
+    /// RAII guard — removes the cancellation token entry from the
+    /// shared map when the holder is dropped. `get_file_data` holds
+    /// one for the duration of its work so the map cannot grow
+    /// unboundedly across calls.
+    struct TokenGuard<'a> {
+        tokens: &'a Arc<Mutex<HashMap<i32, CancellationToken>>>,
+        command_id: i32,
+    }
+
+    impl Drop for TokenGuard<'_> {
+        fn drop(&mut self) {
+            if let Ok(mut tokens) = self.tokens.lock() {
+                tokens.remove(&self.command_id);
+            }
+        }
+    }
+
+    /// `PRJ_CANCEL_COMMAND_CB` — signal the in-flight callback for
+    /// `CommandId` to abort. Looks up the cancellation token in the
+    /// shared map and triggers it; the running callback sees the flag
+    /// at its next checkpoint and returns `ERROR_OPERATION_ABORTED`.
+    ///
+    /// `ProjFS` may invoke this concurrently with the callback the
+    /// token belongs to, so the lookup is read-only and idempotent.
     #[allow(unsafe_code)]
-    const unsafe extern "system" fn cancel_command(_callback_data: *const PRJ_CALLBACK_DATA) {}
+    unsafe extern "system" fn cancel_command(callback_data: *const PRJ_CALLBACK_DATA) {
+        // SAFETY: ProjFS keeps callback_data alive for the duration of
+        // this call.
+        let Some(ctx) = (unsafe { context_from_callback_data(callback_data) }) else {
+            return;
+        };
+        let command_id = unsafe { (*callback_data).CommandId };
+        let token = ctx
+            .cancellation_tokens
+            .lock()
+            .ok()
+            .and_then(|tokens| tokens.get(&command_id).cloned());
+        if let Some(token) = token {
+            tracing::debug!(command_id, "ProjFS CancelCommand received");
+            token.cancel();
+        }
+    }
 
     /// Build the live callback table used by `PrjStartVirtualizing`.
     fn build_callbacks() -> PRJ_CALLBACKS {
@@ -1396,6 +1526,7 @@ mod windows_impl {
         root_id: Arc<RwLock<Option<ItemId>>>,
         enumerations: Arc<Mutex<HashMap<u128, EnumerationState>>>,
         content_provider: Option<Arc<dyn ContentProvider>>,
+        cancellation_tokens: Arc<Mutex<HashMap<i32, CancellationToken>>>,
     ) -> Result<()> {
         // Acquire both presenter-side locks before any FFI work. The
         // raw pointers and ProjFS namespace handle produced below are
@@ -1434,6 +1565,7 @@ mod windows_impl {
             root_id: Arc::clone(&root_id),
             enumerations: Arc::clone(&enumerations),
             content_provider,
+            cancellation_tokens,
         });
         let inner_ptr = Box::into_raw(inner);
         let instance_context = inner_ptr.cast::<c_void>();
@@ -1941,6 +2073,24 @@ mod tests {
         let items: HashMap<String, VfsItem> = HashMap::new();
         assert!(allow_delete("any/path.txt", &items));
         assert!(allow_delete("", &items));
+    }
+
+    /// A fresh token is un-cancelled; cancelling one clone is
+    /// observable on every other clone because they share the
+    /// underlying `Arc<AtomicBool>`. This is the contract
+    /// `cancel_command` relies on: it holds a clone of the token the
+    /// running callback registered and signals it from a different
+    /// thread.
+    #[test]
+    fn cancellation_token_propagates_across_clones() {
+        let token = CancellationToken::new();
+        let other = token.clone();
+        assert!(!token.is_cancelled());
+        assert!(!other.is_cancelled());
+
+        other.cancel();
+        assert!(token.is_cancelled());
+        assert!(other.is_cancelled());
     }
 
     /// `MockContentProvider` returns the byte range it was asked for
