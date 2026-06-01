@@ -16,10 +16,10 @@ use futures_util::{SinkExt, StreamExt};
 use http::{Response, StatusCode};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
+use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::accept_hdr_async;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request};
-use tokio_tungstenite::WebSocketStream;
 use tracing::{info, warn};
 
 use crate::auth::{HandshakeError, verify_handshake};
@@ -84,7 +84,14 @@ pub async fn spawn(config: RelayConfig) -> Result<RelayHandle> {
     let listener_config = config.clone();
 
     let listener_task = tokio::spawn(async move {
-        run_listener(listener, listener_config, listener_registry, listener_counters, &mut shutdown_rx).await;
+        run_listener(
+            listener,
+            listener_config,
+            listener_registry,
+            listener_counters,
+            &mut shutdown_rx,
+        )
+        .await;
     });
 
     info!(addr = %local_addr, metrics = ?metrics_addr, "cascade-relay listening");
@@ -340,8 +347,8 @@ mod pairing {
 
     use anyhow::{Context, Result};
     use tokio::net::TcpStream;
-    use tokio::sync::oneshot;
     use tokio::sync::Mutex;
+    use tokio::sync::oneshot;
     use tokio_tungstenite::WebSocketStream;
 
     use crate::metrics::Counters;
@@ -370,8 +377,9 @@ mod pairing {
             // and us trying to hand off the stream. Drop our socket.
             anyhow::bail!("first peer dropped before hand-off");
         };
-        slot.send(second_ws)
-            .map_err(|_| anyhow::anyhow!("first peer task dropped before receiving second stream"))?;
+        slot.send(second_ws).map_err(|_| {
+            anyhow::anyhow!("first peer task dropped before receiving second stream")
+        })?;
         // The first peer's task is responsible for the byte-pipe; we're
         // done. Counters are updated by the first peer's task.
         let _ = counters;

@@ -61,8 +61,8 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let shared_secret = RelayConfig::parse_shared_secret(&cli.shared_secret)
-        .context("invalid --shared-secret")?;
+    let shared_secret =
+        RelayConfig::parse_shared_secret(&cli.shared_secret).context("invalid --shared-secret")?;
 
     let config = RelayConfig {
         bind: cli.bind,

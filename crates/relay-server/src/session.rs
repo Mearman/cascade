@@ -189,10 +189,7 @@ mod tests {
             panic!("expected first to park, got {first:?}");
         };
         assert!(matches!(second, RegisterOutcome::Paired));
-        assert!(matches!(
-            wait_for_peer.await.unwrap(),
-            SessionEvent::Paired
-        ));
+        assert!(matches!(wait_for_peer.await.unwrap(), SessionEvent::Paired));
     }
 
     #[tokio::test]

@@ -35,7 +35,10 @@ impl Counters {
     #[must_use]
     pub fn render_prometheus(&self) -> String {
         let mut out = String::new();
-        let _ = writeln!(out, "# HELP cascade_relay_sessions_active Currently paired sessions.");
+        let _ = writeln!(
+            out,
+            "# HELP cascade_relay_sessions_active Currently paired sessions."
+        );
         let _ = writeln!(out, "# TYPE cascade_relay_sessions_active gauge");
         let _ = writeln!(
             out,
@@ -145,11 +148,7 @@ mod axum_endpoint {
 
     async fn metrics_handler(State(counters): State<Arc<Counters>>) -> Response {
         let body = counters.render_prometheus();
-        (
-            [(CONTENT_TYPE, "text/plain; version=0.0.4")],
-            body,
-        )
-            .into_response()
+        ([(CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
     }
 }
 

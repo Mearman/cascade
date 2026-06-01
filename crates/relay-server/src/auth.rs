@@ -99,9 +99,8 @@ pub fn encode_handshake(
 
     let tag = compute_tag(device_id.as_bytes(), session_id.as_bytes(), shared_secret)?;
 
-    let mut frame = Vec::with_capacity(
-        1 + 2 + device_id.len() + 2 + session_id.len() + HMAC_TAG_LEN,
-    );
+    let mut frame =
+        Vec::with_capacity(1 + 2 + device_id.len() + 2 + session_id.len() + HMAC_TAG_LEN);
     frame.push(HANDSHAKE_VERSION);
     frame.extend_from_slice(&device_id_len.to_be_bytes());
     frame.extend_from_slice(device_id.as_bytes());
