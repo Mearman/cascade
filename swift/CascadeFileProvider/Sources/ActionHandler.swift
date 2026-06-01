@@ -318,18 +318,26 @@ final class ActionHandler {
         return FileProviderItem(item: result.item)
     }
 
-    func enumerateItems(parentIdentifier: NSFileProviderItemIdentifier, page: Data) async throws -> [NSFileProviderItem] {
-        let pageString = page.isEmpty ? nil : page.base64EncodedString()
+    /// Fetch a single page of children for `parentIdentifier`.
+    ///
+    /// `pageCursor` is the opaque base64url-no-pad string the Rust side
+    /// last emitted via `next_page`, or `nil` for the first page. The
+    /// caller is responsible for looping until `nextPage` is `nil`.
+    func enumerateItems(
+        parentIdentifier: NSFileProviderItemIdentifier,
+        pageCursor: String?
+    ) async throws -> (items: [NSFileProviderItem], nextPage: String?) {
         let parentID = engineID(for: parentIdentifier)
         var params: [String: Any] = ["parent_id": parentID]
-        if let pageString { params["page"] = pageString }
+        if let pageCursor { params["page"] = pageCursor }
 
         let result: EnumerateItemsResult = try await engine.send(
             method: "enumerateItems",
             params: params,
             itemID: parentID
         )
-        return result.items.map(FileProviderItem.init(item:))
+        let items = result.items.map(FileProviderItem.init(item:))
+        return (items, result.nextPage)
     }
 
     func fetchContents(for identifier: NSFileProviderItemIdentifier) async throws -> URL {
