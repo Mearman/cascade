@@ -74,3 +74,8 @@ version_group = "workspace"
 name = "cascade-backend-p2p"
 release = false
 version_group = "workspace"
+
+[[package]]
+name = "cascade-relay-server"
+release = false
+version_group = "workspace"

@@ -1,0 +1,419 @@
+name: Release relay
+
+# Triggers:
+#   1. A tag matching cascade-relay-v* — for relay-only releases.
+#   2. The ci.yml workflow completes successfully on main — so the relay
+#      Docker image and binaries are published alongside every cascade-v*
+#      release without a separate manual step.
+#
+# The Docker image is pushed to ghcr.io/mearman/cascade-relay.
+# Binary tarballs are attached to the GitHub release identified by the
+# triggering tag (cascade-relay-v*) or, when triggered by the main CI
+# workflow, the corresponding cascade-v* release.
+
+on:
+  push:
+    tags:
+      - 'cascade-relay-v*'
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+concurrency:
+  group: release-relay-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  IMAGE_NAME: mearman/cascade-relay
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Determine the version tag.
+  # On a direct cascade-relay-v* tag push: use the tag itself.
+  # On a workflow_run trigger: find the latest cascade-v* release tag.
+  # ---------------------------------------------------------------------------
+  resolve-version:
+    name: Resolve version tag
+    # Skip if triggered by a failed CI run.
+    if: >
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+      relay_tag: ${{ steps.tag.outputs.relay_tag }}
+    steps:
+      - name: Resolve tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            # Direct cascade-relay-v* tag push.
+            TAG="${GITHUB_REF#refs/tags/}"
+            VERSION="${TAG#cascade-relay-v}"
+            RELAY_TAG="$TAG"
+          else
+            # workflow_run: find the latest cascade-v* release.
+            TAG=$(gh api repos/Mearman/cascade/releases \
+              --jq '[.[] | select(.tag_name | startswith("cascade-v"))] | first | .tag_name')
+            if [ -z "$TAG" ]; then
+              echo "No cascade-v* release found — nothing to publish." >&2
+              exit 1
+            fi
+            VERSION="${TAG#cascade-v}"
+            RELAY_TAG="cascade-relay-v${VERSION}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "relay_tag=$RELAY_TAG" >> "$GITHUB_OUTPUT"
+          echo "Resolved: tag=$TAG version=$VERSION relay_tag=$RELAY_TAG"
+
+  # ---------------------------------------------------------------------------
+  # Build and push the Docker image to ghcr.io.
+  # Uses docker buildx for multi-platform (amd64 + arm64) in a single push.
+  # Login uses GITHUB_TOKEN via the docker CLI — no third-party Actions.
+  # ---------------------------------------------------------------------------
+  docker:
+    name: Docker image (ghcr.io)
+    needs: resolve-version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.resolve-version.outputs.tag }}
+
+      - name: Set up QEMU (for cross-platform builds)
+        run: docker run --privileged --rm tonistiigi/binfmt --install all
+
+      - name: Set up buildx
+        run: |
+          docker buildx create --use --name relay-builder --driver docker-container
+          docker buildx inspect --bootstrap
+
+      - name: Log in to ghcr.io
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+
+      - name: Build and push
+        env:
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+        run: |
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --file crates/relay-server/Dockerfile \
+            --tag "ghcr.io/${IMAGE_NAME}:${VERSION}" \
+            --tag "ghcr.io/${IMAGE_NAME}:latest" \
+            --label "org.opencontainers.image.source=https://github.com/Mearman/cascade" \
+            --label "org.opencontainers.image.version=${VERSION}" \
+            --label "org.opencontainers.image.revision=${{ github.sha }}" \
+            --label "org.opencontainers.image.description=cascade-relay — opaque byte-pipe relay for Cascade peers behind NATs" \
+            --label "org.opencontainers.image.licenses=MIT" \
+            --push \
+            .
+
+  # ---------------------------------------------------------------------------
+  # Build relay binaries.
+  # Each job checks out the source at the resolved tag, builds the
+  # cascade-relay-server crate, packages a tarball, and uploads to the
+  # GitHub release.  Release creation (if missing) is handled by the
+  # first job to run (build-relay-macos-arm); the others just upload.
+  # ---------------------------------------------------------------------------
+  build-relay-macos-arm:
+    name: Build relay macOS ARM
+    needs: resolve-version
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.resolve-version.outputs.tag }}
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+            sh -s -- -y --default-toolchain stable --target aarch64-apple-darwin
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: relay-aarch64-apple-darwin-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: relay-aarch64-apple-darwin-
+      - name: Build
+        run: cargo build --release --target aarch64-apple-darwin -p cascade-relay-server
+      - name: Package archive
+        run: |
+          mkdir -p dist
+          cp target/aarch64-apple-darwin/release/cascade-relay dist/cascade-relay
+          cd dist
+          tar czf cascade-relay-aarch64-macos.tar.gz cascade-relay
+          shasum -a 256 cascade-relay-aarch64-macos.tar.gz | awk '{print $1}' \
+            > cascade-relay-aarch64-macos.tar.gz.sha256
+      - name: Create release if missing and upload
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELAY_TAG: ${{ needs.resolve-version.outputs.relay_tag }}
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+        run: |
+          if ! gh release view "$RELAY_TAG" --repo Mearman/cascade >/dev/null 2>&1; then
+            gh release create "$RELAY_TAG" \
+              --repo Mearman/cascade \
+              --title "cascade-relay v${VERSION}" \
+              --notes "Relay server release v${VERSION}. See [relay-deployment.md](https://github.com/Mearman/cascade/blob/${RELAY_TAG}/docs/relay-deployment.md) for installation instructions." \
+              --target "${{ github.sha }}"
+          fi
+          gh release upload "$RELAY_TAG" \
+            dist/cascade-relay-aarch64-macos.tar.gz \
+            dist/cascade-relay-aarch64-macos.tar.gz.sha256 \
+            --repo Mearman/cascade \
+            --clobber
+
+  build-relay-macos-x86:
+    name: Build relay macOS x86_64
+    needs: resolve-version
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.resolve-version.outputs.tag }}
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+            sh -s -- -y --default-toolchain stable --target x86_64-apple-darwin
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          rustup target add x86_64-apple-darwin
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: relay-x86_64-apple-darwin-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: relay-x86_64-apple-darwin-
+      - name: Build
+        run: cargo build --release --target x86_64-apple-darwin -p cascade-relay-server
+      - name: Package archive
+        run: |
+          mkdir -p dist
+          cp target/x86_64-apple-darwin/release/cascade-relay dist/cascade-relay
+          cd dist
+          tar czf cascade-relay-x86_64-macos.tar.gz cascade-relay
+          shasum -a 256 cascade-relay-x86_64-macos.tar.gz | awk '{print $1}' \
+            > cascade-relay-x86_64-macos.tar.gz.sha256
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELAY_TAG: ${{ needs.resolve-version.outputs.relay_tag }}
+        run: |
+          gh release upload "$RELAY_TAG" \
+            dist/cascade-relay-x86_64-macos.tar.gz \
+            dist/cascade-relay-x86_64-macos.tar.gz.sha256 \
+            --repo Mearman/cascade \
+            --clobber
+
+  build-relay-linux-x86:
+    name: Build relay Linux x86_64
+    needs: resolve-version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.resolve-version.outputs.tag }}
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+            sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: relay-x86_64-unknown-linux-gnu-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: relay-x86_64-unknown-linux-gnu-
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
+      - name: Build
+        run: cargo build --release --target x86_64-unknown-linux-gnu -p cascade-relay-server
+      - name: Package archive
+        run: |
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-gnu/release/cascade-relay dist/cascade-relay
+          cd dist
+          tar czf cascade-relay-x86_64-linux.tar.gz cascade-relay
+          sha256sum cascade-relay-x86_64-linux.tar.gz | awk '{print $1}' \
+            > cascade-relay-x86_64-linux.tar.gz.sha256
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELAY_TAG: ${{ needs.resolve-version.outputs.relay_tag }}
+        run: |
+          gh release upload "$RELAY_TAG" \
+            dist/cascade-relay-x86_64-linux.tar.gz \
+            dist/cascade-relay-x86_64-linux.tar.gz.sha256 \
+            --repo Mearman/cascade \
+            --clobber
+
+  build-relay-linux-arm:
+    name: Build relay Linux ARM64
+    needs: resolve-version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.resolve-version.outputs.tag }}
+      - name: Install Rust toolchain and cross target
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+            sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          rustup target add aarch64-unknown-linux-gnu
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: relay-aarch64-unknown-linux-gnu-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: relay-aarch64-unknown-linux-gnu-
+      - name: Install cross-compilation toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu libfuse3-dev
+      - name: Build
+        run: cargo build --release --target aarch64-unknown-linux-gnu -p cascade-relay-server
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      - name: Package archive
+        run: |
+          mkdir -p dist
+          cp target/aarch64-unknown-linux-gnu/release/cascade-relay dist/cascade-relay
+          cd dist
+          tar czf cascade-relay-aarch64-linux.tar.gz cascade-relay
+          sha256sum cascade-relay-aarch64-linux.tar.gz | awk '{print $1}' \
+            > cascade-relay-aarch64-linux.tar.gz.sha256
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELAY_TAG: ${{ needs.resolve-version.outputs.relay_tag }}
+        run: |
+          gh release upload "$RELAY_TAG" \
+            dist/cascade-relay-aarch64-linux.tar.gz \
+            dist/cascade-relay-aarch64-linux.tar.gz.sha256 \
+            --repo Mearman/cascade \
+            --clobber
+
+  # ---------------------------------------------------------------------------
+  # Update the Homebrew tap with the new cascade-relay formula.
+  # ---------------------------------------------------------------------------
+  update-tap-relay:
+    name: Update Homebrew tap (relay)
+    needs:
+      - resolve-version
+      - build-relay-macos-arm
+      - build-relay-macos-x86
+      - build-relay-linux-x86
+      - build-relay-linux-arm
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tap via SSH deploy key
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: Mearman/homebrew-cascade
+          ssh-key: ${{ secrets.TAP_DEPLOY_KEY }}
+      - name: Download checksums
+        env:
+          RELAY_TAG: ${{ needs.resolve-version.outputs.relay_tag }}
+        run: |
+          TAG_URL="https://github.com/Mearman/cascade/releases/download/${RELAY_TAG}"
+          fetch_sha() {
+            local name="$1"
+            local out="$2"
+            curl -sL --fail --retry 6 --retry-delay 5 --retry-all-errors \
+              "${TAG_URL}/${name}.sha256" | awk '{print $1}' > "${out}"
+            if ! [[ "$(cat "${out}")" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::checksum for ${name} not a 64-char hex digest: $(cat "${out}")"
+              exit 1
+            fi
+          }
+          fetch_sha cascade-relay-aarch64-macos.tar.gz sha-macos-arm
+          fetch_sha cascade-relay-x86_64-macos.tar.gz sha-macos-x86
+          fetch_sha cascade-relay-x86_64-linux.tar.gz sha-linux-x86
+          fetch_sha cascade-relay-aarch64-linux.tar.gz sha-linux-arm
+      - name: Generate formula
+        env:
+          RELAY_TAG: ${{ needs.resolve-version.outputs.relay_tag }}
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+        run: |
+          MACOS_ARM_SHA=$(cat sha-macos-arm)
+          MACOS_X86_SHA=$(cat sha-macos-x86)
+          LINUX_X86_SHA=$(cat sha-linux-x86)
+          LINUX_ARM_SHA=$(cat sha-linux-arm)
+
+          mkdir -p Formula
+          cat > Formula/cascade-relay.rb <<EOF
+          # Auto-generated by CI — do not edit manually.
+          # Regenerated on each semantic release from Mearman/cascade.
+
+          class CascadeRelay < Formula
+            desc "Opaque byte-pipe relay server for Cascade peers behind NATs"
+            homepage "https://github.com/Mearman/cascade"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/Mearman/cascade/releases/download/${RELAY_TAG}/cascade-relay-aarch64-macos.tar.gz"
+                sha256 "${MACOS_ARM_SHA}"
+              else
+                url "https://github.com/Mearman/cascade/releases/download/${RELAY_TAG}/cascade-relay-x86_64-macos.tar.gz"
+                sha256 "${MACOS_X86_SHA}"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm?
+                url "https://github.com/Mearman/cascade/releases/download/${RELAY_TAG}/cascade-relay-aarch64-linux.tar.gz"
+                sha256 "${LINUX_ARM_SHA}"
+              else
+                url "https://github.com/Mearman/cascade/releases/download/${RELAY_TAG}/cascade-relay-x86_64-linux.tar.gz"
+                sha256 "${LINUX_X86_SHA}"
+              end
+            end
+
+            def install
+              bin.install "cascade-relay"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/cascade-relay --version")
+            end
+          end
+          EOF
+      - name: Commit and push
+        env:
+          RELAY_TAG: ${{ needs.resolve-version.outputs.relay_tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/cascade-relay.rb
+          git diff --cached --quiet || git commit -m "chore: update cascade-relay formula to ${RELAY_TAG}"
+          git push
