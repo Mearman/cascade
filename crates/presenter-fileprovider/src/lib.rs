@@ -8,6 +8,12 @@ pub mod bridge;
 pub mod engine_handlers;
 pub mod handlers;
 pub mod items;
+// `server` uses `tokio::net::UnixListener`, which is `cfg(unix)`-only in tokio.
+// The File Provider extension only runs on macOS so Unix-family targets are
+// the relevant set; Windows builds don't need this module and `tokio::net`
+// would refuse to compile it. Linux/BSD are kept buildable so the crate
+// stays workspace-clean on every Unix-family CI target.
+#[cfg(unix)]
 pub mod server;
 pub mod wire;
 
