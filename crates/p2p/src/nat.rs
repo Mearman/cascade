@@ -1,22 +1,34 @@
-//! STUN-based NAT traversal helpers.
+//! `STUN`-based `NAT` traversal helpers.
 //!
-//! The STUN client implements RFC 5389 Binding Requests and parses
-//! XOR-MAPPED-ADDRESS from the response. Full NAT classification needs a STUN
-//! server pair with change-request support; with the single-server API exposed
-//! here, Cascade reports `Public` when the mapped address matches the local
-//! socket and conservatively reports `Symmetric` otherwise so callers know to
-//! use relay fallback.
+//! The `STUN` client implements `RFC 5389` Binding Requests and parses
+//! `XOR-MAPPED-ADDRESS` from the response. Two interfaces are exposed:
+//!
+//! * [`NatTraversal::detect_nat_type`] — single-server probe that distinguishes
+//!   only `Open` from `Symmetric`. Kept for callers that have a single
+//!   `STUN` endpoint configured.
+//! * [`detect_nat_type_rfc5780`] — `RFC 5780` two-server detection that
+//!   classifies the full `NAT` taxonomy by issuing four Binding Requests
+//!   against a primary server (supporting `CHANGE-REQUEST`) and a
+//!   secondary server on a different `IP`.
+//!
+//! See [`crate::traversal::NatType`] for the dialect used by the
+//! hole-punching decision tree; the two enums will be reconciled once
+//! callers migrate. See `TODO(nat-reconcile)`.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use thiserror::Error;
 use tokio::net::UdpSocket;
 use tokio::time::{Duration, timeout};
 
 const BINDING_REQUEST: u16 = 0x0001;
 const BINDING_SUCCESS_RESPONSE: u16 = 0x0101;
 const XOR_MAPPED_ADDRESS: u16 = 0x0020;
+const CHANGE_REQUEST: u16 = 0x0003;
+const RESPONSE_ORIGIN: u16 = 0x802b;
+const OTHER_ADDRESS: u16 = 0x802c;
 const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
 const STUN_HEADER_LEN: usize = 20;
 const STUN_TRANSACTION_ID_LEN: usize = 12;
@@ -24,24 +36,88 @@ const STUN_ATTRIBUTE_HEADER_LEN: usize = 4;
 const STUN_IPV6_ADDR_LEN: usize = 16;
 const STUN_IPV4_ATTRIBUTE_VALUE_LEN: usize = 8;
 const STUN_IPV6_ATTRIBUTE_VALUE_LEN: usize = 20;
+const STUN_CHANGE_REQUEST_VALUE_LEN: u16 = 4;
 const STUN_FAMILY_IPV4: u8 = 0x01;
 const STUN_FAMILY_IPV6: u8 = 0x02;
 const STUN_RESPONSE_MAX_LEN: usize = 1500;
 const STUN_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// NAT type detected by STUN.
+/// `CHANGE-REQUEST` flag asking the server to respond from a different `IP`.
+/// `RFC 5780 §7.2` reserves bit position 2 of the high byte for "change `IP`".
+const CHANGE_REQUEST_FLAG_CHANGE_IP: u32 = 0x0000_0004;
+/// `CHANGE-REQUEST` flag asking the server to respond from a different port.
+/// `RFC 5780 §7.2` reserves bit position 1 of the high byte for "change port".
+const CHANGE_REQUEST_FLAG_CHANGE_PORT: u32 = 0x0000_0002;
+
+/// `NAT` type detected by `STUN`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NatType {
-    /// No NAT — directly reachable.
-    Public,
-    /// Full cone NAT — mapped port reachable from any external host.
+    /// Host is directly reachable on a public address — no `NAT`.
+    Open,
+    /// Full cone `NAT` — mapped port reachable from any external host.
     FullCone,
-    /// Restricted cone NAT — only reachable from hosts that have received packets.
+    /// Restricted cone `NAT` — only reachable from hosts that have received packets.
     RestrictedCone,
-    /// Port-restricted cone NAT — like restricted but port-specific.
+    /// Port-restricted cone `NAT` — like restricted but port-specific.
     PortRestrictedCone,
-    /// Symmetric NAT — different mapping per destination. Requires relay.
+    /// Symmetric `NAT` — different mapping per destination. Requires relay.
     Symmetric,
+    /// Detection failed or returned an inconclusive result. Treated
+    /// conservatively as needing relay.
+    Unknown,
+}
+
+// TODO(nat-reconcile): merge this enum with `crate::traversal::NatType` in a
+// follow-up round. Both share five variants; this one is kept distinct until
+// every caller of `nat::NatType::Open` / `nat::NatType::Symmetric` has been
+// audited and migrated.
+
+/// Error returned by `RFC 5780` `NAT` detection.
+#[derive(Debug, Error)]
+pub enum NatDetectionError {
+    /// Underlying `I/O` error from the socket.
+    #[error("STUN socket I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    /// Single-request timeout exhausted retries.
+    #[error("STUN request timed out after all retries")]
+    Timeout,
+    /// Server response could not be parsed.
+    #[error("malformed STUN response: {0}")]
+    MalformedStunResponse(&'static str),
+    /// Primary server returned a `Test II` response from the same address
+    /// as `Test I`, so `CHANGE-REQUEST` cannot be honoured and the
+    /// classification cannot proceed past `Test II`.
+    #[error("STUN server does not honour CHANGE-REQUEST")]
+    NoChangeRequestSupport,
+}
+
+/// Configuration for `RFC 5780` `NAT` detection.
+#[derive(Debug, Clone, Copy)]
+pub struct NatDetectionConfig {
+    /// Primary `STUN` server — must support `CHANGE-REQUEST` per `RFC 5780`.
+    pub primary: SocketAddr,
+    /// Secondary `STUN` server. Must be on a different `IP` from `primary`
+    /// for the symmetric-`NAT` distinguisher to work.
+    pub secondary: SocketAddr,
+    /// How long to wait for each individual `STUN` response.
+    pub per_request_timeout: Duration,
+    /// How many times to retry a single request before giving up.
+    pub retries: u32,
+}
+
+/// Decoded `STUN` Binding Success response.
+#[derive(Debug, Clone, Copy)]
+struct BindingResponse {
+    /// `XOR-MAPPED-ADDRESS` — the external (mapped) address the server
+    /// observed the client at.
+    mapped: SocketAddr,
+    /// `RESPONSE-ORIGIN` — the address the server sent the response from.
+    /// `None` when the server did not include this attribute (legacy
+    /// `STUN`).
+    response_origin: Option<SocketAddr>,
+    /// `OTHER-ADDRESS` — the alternate address+port the server can be
+    /// reached at, used to validate `CHANGE-REQUEST` support.
+    other_address: Option<SocketAddr>,
 }
 
 /// NAT traversal coordinator.
@@ -49,19 +125,22 @@ pub enum NatType {
 pub struct NatTraversal;
 
 impl NatTraversal {
-    /// Detect the local NAT type using STUN.
+    /// Detect the local `NAT` type using `STUN` against a single server.
+    ///
+    /// Distinguishes only `Open` from `Symmetric` — full classification
+    /// requires [`detect_nat_type_rfc5780`].
     pub async fn detect_nat_type(stun_server: &str) -> Result<NatType> {
         let (local_address, external_address) = stun_binding_request(stun_server).await?;
         if local_address.ip() == external_address.ip()
             && local_address.port() == external_address.port()
         {
-            Ok(NatType::Public)
+            Ok(NatType::Open)
         } else {
             Ok(NatType::Symmetric)
         }
     }
 
-    /// Get the external address as seen by a STUN server.
+    /// Get the external address as seen by a `STUN` server.
     pub async fn external_address(stun_server: &str) -> Result<SocketAddr> {
         let (_, external_address) = stun_binding_request(stun_server).await?;
         Ok(external_address)
@@ -85,7 +164,7 @@ async fn stun_binding_request(stun_server: &str) -> Result<(SocketAddr, SocketAd
         .context("connecting STUN UDP socket")?;
 
     let transaction_id = transaction_id()?;
-    let request = encode_binding_request(&transaction_id);
+    let request = encode_binding_request(&transaction_id, 0);
     socket
         .send(&request)
         .await
@@ -99,12 +178,245 @@ async fn stun_binding_request(stun_server: &str) -> Result<(SocketAddr, SocketAd
     let response_slice = response
         .get(..received)
         .ok_or_else(|| anyhow::anyhow!("STUN response length out of range"))?;
-    let external_address = decode_binding_response(response_slice, &transaction_id)?;
+    let parsed = decode_binding_response(response_slice, &transaction_id)
+        .map_err(|reason| anyhow::anyhow!("decoding STUN response: {reason}"))?;
     let local_address = socket
         .local_addr()
         .context("reading STUN socket local address")?;
 
-    Ok((local_address, external_address))
+    Ok((local_address, parsed.mapped))
+}
+
+/// Send a single `STUN` Binding Request and wait for the response.
+///
+/// `target` is the server's `IP`+port. `change_request_flags` is the value
+/// of the `CHANGE-REQUEST` attribute payload (zero to omit the attribute).
+async fn send_binding_request(
+    socket: &UdpSocket,
+    target: SocketAddr,
+    change_request_flags: u32,
+    per_request_timeout: Duration,
+) -> Result<BindingResponse, NatDetectionError> {
+    let transaction_id =
+        transaction_id().map_err(|_| NatDetectionError::MalformedStunResponse("transaction ID"))?;
+    let request = encode_binding_request(&transaction_id, change_request_flags);
+    socket.send_to(&request, target).await?;
+
+    let mut response = [0u8; STUN_RESPONSE_MAX_LEN];
+    // Loop reading until we get a response that matches our transaction
+    // ID or the deadline elapses. STUN servers occasionally retransmit
+    // earlier replies, so a mismatched packet is not a fatal error.
+    let received = loop {
+        let outcome = timeout(per_request_timeout, socket.recv_from(&mut response)).await;
+        let (len, src) = match outcome {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(err)) => return Err(NatDetectionError::Io(err)),
+            Err(_) => return Err(NatDetectionError::Timeout),
+        };
+        let slice = response
+            .get(..len)
+            .ok_or(NatDetectionError::MalformedStunResponse("length"))?;
+        if response_matches_transaction(slice, &transaction_id) {
+            break (slice, src);
+        }
+        // Otherwise drop the stray packet and keep waiting; the timeout
+        // bounds the loop.
+    };
+
+    let (response_slice, src) = received;
+    let mut parsed = decode_binding_response(response_slice, &transaction_id)
+        .map_err(NatDetectionError::MalformedStunResponse)?;
+    // If the server omitted `RESPONSE-ORIGIN`, fall back to the packet's
+    // source address — that's where the response demonstrably came from.
+    if parsed.response_origin.is_none() {
+        parsed.response_origin = Some(src);
+    }
+    Ok(parsed)
+}
+
+/// Send a Binding Request, retrying up to `config.retries` extra attempts.
+async fn send_with_retries(
+    socket: &UdpSocket,
+    target: SocketAddr,
+    change_request_flags: u32,
+    config: &NatDetectionConfig,
+) -> Result<BindingResponse, NatDetectionError> {
+    let mut last_timeout = false;
+    let attempts = config.retries.saturating_add(1);
+    for _ in 0..attempts {
+        match send_binding_request(
+            socket,
+            target,
+            change_request_flags,
+            config.per_request_timeout,
+        )
+        .await
+        {
+            Ok(response) => return Ok(response),
+            Err(NatDetectionError::Timeout) => {
+                last_timeout = true;
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    if last_timeout {
+        Err(NatDetectionError::Timeout)
+    } else {
+        Err(NatDetectionError::MalformedStunResponse("no attempts"))
+    }
+}
+
+/// `RFC 5780 §4` two-server `NAT` detection.
+///
+/// Runs the standard probe sequence using `socket` for all four probes so
+/// the caller can reuse the same socket for hole-punching afterwards:
+///
+/// 1. **`Test I`** — Binding Request to `config.primary`. Establishes the
+///    baseline `XOR-MAPPED-ADDRESS`.
+/// 2. **`Test II`** — Binding Request to `config.primary` with
+///    `CHANGE-REQUEST = change IP + change port`. A response from a
+///    different `IP`+port proves endpoint-independent filtering and
+///    classifies the path as `Open` or `FullCone`.
+/// 3. **`Test III`** — Binding Request to `config.secondary`. A different
+///    `XOR-MAPPED-ADDRESS` here implies endpoint-dependent mapping and
+///    classifies as `Symmetric`.
+/// 4. **`Test IV`** — Binding Request to `config.primary` with
+///    `CHANGE-REQUEST = change port` only. Distinguishes
+///    `RestrictedCone` from `PortRestrictedCone` per `RFC 5780 §4.4`.
+///
+/// # Errors
+///
+/// Returns [`NatDetectionError::Timeout`] when `Test I` exhausts retries,
+/// [`NatDetectionError::NoChangeRequestSupport`] when the server's
+/// `Test II` reply came from the same address as `Test I` (so the
+/// `CHANGE-REQUEST` attribute was not honoured), and
+/// [`NatDetectionError::MalformedStunResponse`] when any response cannot
+/// be parsed.
+pub async fn detect_nat_type_rfc5780(
+    socket: &UdpSocket,
+    config: &NatDetectionConfig,
+) -> Result<NatType, NatDetectionError> {
+    // Test I — baseline binding against the primary server.
+    let test_i = send_with_retries(socket, config.primary, 0, config).await?;
+
+    // If the mapped address matches the socket's local address, the host
+    // is on a public address; no NAT is in the path.
+    let local_address = socket.local_addr()?;
+    if address_matches_local(local_address, test_i.mapped) {
+        return Ok(NatType::Open);
+    }
+
+    // Record the primary's `OTHER-ADDRESS` (where it claims it can
+    // reply from when asked to change its source). When Test II
+    // arrives, the responding origin should match it.
+    let primary_alternate = test_i.other_address;
+
+    // Test II — ask the primary to respond from a different IP+port.
+    let test_ii_flags = CHANGE_REQUEST_FLAG_CHANGE_IP | CHANGE_REQUEST_FLAG_CHANGE_PORT;
+    let test_ii_outcome = send_with_retries(socket, config.primary, test_ii_flags, config).await;
+    let test_ii_origin_changed = match &test_ii_outcome {
+        Ok(response) => {
+            // The response came back. Verify it actually came from a
+            // different address+port than the primary server.
+            let origin =
+                response
+                    .response_origin
+                    .ok_or(NatDetectionError::MalformedStunResponse(
+                        "missing RESPONSE-ORIGIN",
+                    ))?;
+            if origin == config.primary {
+                // Server returned a response but did not actually change
+                // its source address. Treat this as a STUN server that
+                // does not honour CHANGE-REQUEST.
+                return Err(NatDetectionError::NoChangeRequestSupport);
+            }
+            // If the server advertised an OTHER-ADDRESS in Test I,
+            // confirm the response came from there. A mismatch means
+            // the server's advertisement is inconsistent — reject.
+            if let Some(alternate) = primary_alternate
+                && origin != alternate
+            {
+                return Err(NatDetectionError::MalformedStunResponse(
+                    "Test II origin does not match OTHER-ADDRESS",
+                ));
+            }
+            true
+        }
+        Err(NatDetectionError::Timeout) => false,
+        Err(other) => return Err(NatDetectionError::MalformedStunResponse(error_label(other))),
+    };
+
+    if test_ii_origin_changed {
+        // Filtering allows traffic from any external host once a mapping
+        // exists — full cone NAT (or open Internet, but we ruled that
+        // out above by comparing the mapped address).
+        return Ok(NatType::FullCone);
+    }
+
+    // Test III — ask the secondary server for its view of the mapped
+    // address. A different external port between Test I and Test III
+    // implies the NAT is symmetric (mapping changes per destination).
+    let test_iii = send_with_retries(socket, config.secondary, 0, config).await?;
+    if test_iii.mapped != test_i.mapped {
+        return Ok(NatType::Symmetric);
+    }
+
+    // Test IV — ask the primary to respond from the same IP but a
+    // different port. If we hear back, only the destination IP needed
+    // to match — that's address-restricted (RestrictedCone). If we
+    // time out, both IP and port must match — port-restricted.
+    let test_iv = send_with_retries(
+        socket,
+        config.primary,
+        CHANGE_REQUEST_FLAG_CHANGE_PORT,
+        config,
+    )
+    .await;
+    match test_iv {
+        Ok(_) => Ok(NatType::RestrictedCone),
+        Err(NatDetectionError::Timeout) => Ok(NatType::PortRestrictedCone),
+        Err(other) => Err(NatDetectionError::MalformedStunResponse(error_label(
+            &other,
+        ))),
+    }
+}
+
+/// Map an arbitrary `NatDetectionError` to a static label for re-wrapping
+/// under [`NatDetectionError::MalformedStunResponse`]. Used where the
+/// outer probe semantically only allows `MalformedStunResponse`.
+const fn error_label(err: &NatDetectionError) -> &'static str {
+    match err {
+        NatDetectionError::Io(_) => "I/O error during probe",
+        NatDetectionError::Timeout => "timeout during probe",
+        NatDetectionError::MalformedStunResponse(reason) => reason,
+        NatDetectionError::NoChangeRequestSupport => "CHANGE-REQUEST unsupported",
+    }
+}
+
+/// Does the externally-mapped address match the local socket's address?
+///
+/// `local_address` may carry an unspecified `IP` (the typical result of
+/// binding to `0.0.0.0`); in that case the address is considered to
+/// match when only the port agrees. This is the same rule the
+/// single-server probe uses.
+fn address_matches_local(local_address: SocketAddr, mapped: SocketAddr) -> bool {
+    if local_address.port() != mapped.port() {
+        return false;
+    }
+    if local_address.ip().is_unspecified() {
+        return true;
+    }
+    local_address.ip() == mapped.ip()
+}
+
+fn response_matches_transaction(
+    response: &[u8],
+    transaction_id: &[u8; STUN_TRANSACTION_ID_LEN],
+) -> bool {
+    let Some(slice) = response.get(8..STUN_HEADER_LEN) else {
+        return false;
+    };
+    slice == transaction_id
 }
 
 async fn resolve_stun_server(stun_server: &str) -> Result<SocketAddr> {
@@ -114,127 +426,166 @@ async fn resolve_stun_server(stun_server: &str) -> Result<SocketAddr> {
         .ok_or_else(|| anyhow::anyhow!("STUN server resolved to no socket addresses"))
 }
 
-fn encode_binding_request(transaction_id: &[u8; STUN_TRANSACTION_ID_LEN]) -> [u8; STUN_HEADER_LEN] {
-    let mut request = [0u8; STUN_HEADER_LEN];
-    request[0..2].copy_from_slice(&BINDING_REQUEST.to_be_bytes());
-    request[4..8].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
-    request[8..STUN_HEADER_LEN].copy_from_slice(transaction_id);
+/// Encode a Binding Request with an optional `CHANGE-REQUEST` attribute.
+///
+/// `change_request_flags` is the four-byte attribute value (bit 2 =
+/// change `IP`, bit 1 = change port). When zero, the attribute is
+/// omitted and the request is the bare 20-byte header.
+fn encode_binding_request(
+    transaction_id: &[u8; STUN_TRANSACTION_ID_LEN],
+    change_request_flags: u32,
+) -> Vec<u8> {
+    let attribute_len: u16 = if change_request_flags == 0 {
+        0
+    } else {
+        // STUN_ATTRIBUTE_HEADER_LEN (4) + STUN_CHANGE_REQUEST_VALUE_LEN (4) = 8,
+        // which fits in u16 trivially.
+        let header_u16 = u16::try_from(STUN_ATTRIBUTE_HEADER_LEN).unwrap_or(u16::MAX);
+        header_u16.saturating_add(STUN_CHANGE_REQUEST_VALUE_LEN)
+    };
+    let capacity = STUN_HEADER_LEN.saturating_add(usize::from(attribute_len));
+    let mut request = Vec::with_capacity(capacity);
+    request.extend_from_slice(&BINDING_REQUEST.to_be_bytes());
+    request.extend_from_slice(&attribute_len.to_be_bytes());
+    request.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+    request.extend_from_slice(transaction_id);
+
+    if change_request_flags != 0 {
+        request.extend_from_slice(&CHANGE_REQUEST.to_be_bytes());
+        request.extend_from_slice(&STUN_CHANGE_REQUEST_VALUE_LEN.to_be_bytes());
+        request.extend_from_slice(&change_request_flags.to_be_bytes());
+    }
     request
 }
 
 fn decode_binding_response(
     response: &[u8],
     transaction_id: &[u8; STUN_TRANSACTION_ID_LEN],
-) -> Result<SocketAddr> {
+) -> Result<BindingResponse, &'static str> {
     if response.len() < STUN_HEADER_LEN {
-        anyhow::bail!("STUN response too short");
+        return Err("response too short for header");
     }
 
-    let message_type = u16::from_be_bytes(
-        response
-            .get(0..2)
-            .ok_or_else(|| anyhow::anyhow!("STUN response too short for message type"))?
-            .try_into()?,
-    );
+    let message_type_bytes: [u8; 2] = response
+        .get(0..2)
+        .and_then(|s| s.try_into().ok())
+        .ok_or("message type out of bounds")?;
+    let message_type = u16::from_be_bytes(message_type_bytes);
     if message_type != BINDING_SUCCESS_RESPONSE {
-        anyhow::bail!("unexpected STUN message type {message_type:#06x}");
+        return Err("unexpected message type");
     }
 
-    let message_len = usize::from(u16::from_be_bytes(
-        response
-            .get(2..4)
-            .ok_or_else(|| anyhow::anyhow!("STUN response too short for message length"))?
-            .try_into()?,
-    ));
-    let magic_cookie = u32::from_be_bytes(
-        response
-            .get(4..8)
-            .ok_or_else(|| anyhow::anyhow!("STUN response too short for magic cookie"))?
-            .try_into()?,
-    );
+    let message_len_bytes: [u8; 2] = response
+        .get(2..4)
+        .and_then(|s| s.try_into().ok())
+        .ok_or("message length out of bounds")?;
+    let message_len = usize::from(u16::from_be_bytes(message_len_bytes));
+
+    let magic_cookie_bytes: [u8; 4] = response
+        .get(4..8)
+        .and_then(|s| s.try_into().ok())
+        .ok_or("magic cookie out of bounds")?;
+    let magic_cookie = u32::from_be_bytes(magic_cookie_bytes);
     if magic_cookie != STUN_MAGIC_COOKIE {
-        anyhow::bail!("invalid STUN magic cookie {magic_cookie:#010x}");
+        return Err("invalid magic cookie");
     }
 
     if response
         .get(8..STUN_HEADER_LEN)
-        .ok_or_else(|| anyhow::anyhow!("STUN response too short for transaction ID"))?
+        .ok_or("missing transaction ID")?
         != transaction_id
     {
-        anyhow::bail!("STUN transaction ID mismatch");
+        return Err("transaction ID mismatch");
     }
 
-    if response.len() < STUN_HEADER_LEN + message_len {
-        anyhow::bail!("STUN attributes truncated");
+    if response.len() < STUN_HEADER_LEN.saturating_add(message_len) {
+        return Err("attributes truncated");
     }
 
     let mut offset = STUN_HEADER_LEN;
-    let attributes_end = STUN_HEADER_LEN + message_len;
-    while offset + STUN_ATTRIBUTE_HEADER_LEN <= attributes_end {
+    let attributes_end = STUN_HEADER_LEN.saturating_add(message_len);
+    let mut mapped: Option<SocketAddr> = None;
+    let mut response_origin: Option<SocketAddr> = None;
+    let mut other_address: Option<SocketAddr> = None;
+    while offset.saturating_add(STUN_ATTRIBUTE_HEADER_LEN) <= attributes_end {
+        let header_end = offset.saturating_add(STUN_ATTRIBUTE_HEADER_LEN);
         let attr_header: &[u8; STUN_ATTRIBUTE_HEADER_LEN] = response
-            .get(offset..offset + STUN_ATTRIBUTE_HEADER_LEN)
-            .ok_or_else(|| anyhow::anyhow!("STUN attribute header out of bounds"))?
-            .try_into()?;
+            .get(offset..header_end)
+            .and_then(|s| s.try_into().ok())
+            .ok_or("attribute header out of bounds")?;
         let attribute_type = u16::from_be_bytes([attr_header[0], attr_header[1]]);
         let attribute_len = usize::from(u16::from_be_bytes([attr_header[2], attr_header[3]]));
-        let value_start = offset + STUN_ATTRIBUTE_HEADER_LEN;
-        let value_end = value_start + attribute_len;
+        let value_start = header_end;
+        let value_end = value_start.saturating_add(attribute_len);
         if value_end > attributes_end {
-            anyhow::bail!("STUN attribute truncated");
+            return Err("attribute truncated");
         }
 
-        if attribute_type == XOR_MAPPED_ADDRESS {
-            let value = response
-                .get(value_start..value_end)
-                .ok_or_else(|| anyhow::anyhow!("STUN XOR-MAPPED-ADDRESS value out of bounds"))?;
-            return decode_xor_mapped_address(value, transaction_id);
+        let value = response
+            .get(value_start..value_end)
+            .ok_or("attribute value out of bounds")?;
+
+        match attribute_type {
+            XOR_MAPPED_ADDRESS => {
+                mapped = Some(decode_xor_mapped_address(value, transaction_id)?);
+            }
+            RESPONSE_ORIGIN => {
+                response_origin = Some(decode_plain_address(value)?);
+            }
+            OTHER_ADDRESS => {
+                other_address = Some(decode_plain_address(value)?);
+            }
+            _ => {
+                // Unknown attribute; ignore and keep parsing.
+            }
         }
 
-        offset = value_end + padding_for(attribute_len);
+        offset = value_end.saturating_add(padding_for(attribute_len));
     }
 
-    anyhow::bail!("STUN response did not include XOR-MAPPED-ADDRESS")
+    let mapped = mapped.ok_or("missing XOR-MAPPED-ADDRESS")?;
+    Ok(BindingResponse {
+        mapped,
+        response_origin,
+        other_address,
+    })
 }
 
 fn decode_xor_mapped_address(
     value: &[u8],
     transaction_id: &[u8; STUN_TRANSACTION_ID_LEN],
-) -> Result<SocketAddr> {
+) -> Result<SocketAddr, &'static str> {
     if value.len() < STUN_IPV4_ATTRIBUTE_VALUE_LEN {
-        anyhow::bail!("XOR-MAPPED-ADDRESS attribute too short");
+        return Err("XOR-MAPPED-ADDRESS attribute too short");
     }
 
-    let family = value
-        .get(1)
-        .copied()
-        .ok_or_else(|| anyhow::anyhow!("XOR-MAPPED-ADDRESS too short for family byte"))?;
-    let x_port = u16::from_be_bytes(
-        value
-            .get(2..4)
-            .ok_or_else(|| anyhow::anyhow!("XOR-MAPPED-ADDRESS too short for port"))?
-            .try_into()?,
-    );
-    let port = x_port ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
+    let family = value.get(1).copied().ok_or("missing family byte")?;
+    let x_port_bytes: [u8; 2] = value
+        .get(2..4)
+        .and_then(|s| s.try_into().ok())
+        .ok_or("missing port")?;
+    let x_port = u16::from_be_bytes(x_port_bytes);
+    // `STUN_MAGIC_COOKIE >> 16` is always a 16-bit value, so the
+    // truncation here is intentional and safe.
+    let cookie_high: u16 = u16::try_from(STUN_MAGIC_COOKIE >> 16).map_err(|_| "cookie overflow")?;
+    let port = x_port ^ cookie_high;
 
     match family {
         STUN_FAMILY_IPV4 => {
             if value.len() != STUN_IPV4_ATTRIBUTE_VALUE_LEN {
-                anyhow::bail!("invalid IPv4 XOR-MAPPED-ADDRESS length");
+                return Err("invalid IPv4 XOR-MAPPED-ADDRESS length");
             }
-            let x_addr = u32::from_be_bytes(
-                value
-                    .get(4..8)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("XOR-MAPPED-ADDRESS too short for IPv4 address")
-                    })?
-                    .try_into()?,
-            );
+            let x_addr_bytes: [u8; 4] = value
+                .get(4..8)
+                .and_then(|s| s.try_into().ok())
+                .ok_or("missing IPv4 address")?;
+            let x_addr = u32::from_be_bytes(x_addr_bytes);
             let addr = x_addr ^ STUN_MAGIC_COOKIE;
             Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::from(addr)), port))
         }
         STUN_FAMILY_IPV6 => {
             if value.len() != STUN_IPV6_ATTRIBUTE_VALUE_LEN {
-                anyhow::bail!("invalid IPv6 XOR-MAPPED-ADDRESS length");
+                return Err("invalid IPv6 XOR-MAPPED-ADDRESS length");
             }
             let mut xor_key = [0u8; STUN_IPV6_ADDR_LEN];
             xor_key[..4].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
@@ -242,8 +593,8 @@ fn decode_xor_mapped_address(
 
             let ipv6_bytes: &[u8; STUN_IPV6_ADDR_LEN] = value
                 .get(4..4 + STUN_IPV6_ADDR_LEN)
-                .ok_or_else(|| anyhow::anyhow!("XOR-MAPPED-ADDRESS too short for IPv6 address"))?
-                .try_into()?;
+                .and_then(|s| s.try_into().ok())
+                .ok_or("missing IPv6 address")?;
             let mut address_bytes = [0u8; STUN_IPV6_ADDR_LEN];
             for (byte, (raw, key)) in address_bytes
                 .iter_mut()
@@ -256,7 +607,56 @@ fn decode_xor_mapped_address(
                 port,
             ))
         }
-        _ => anyhow::bail!("unsupported XOR-MAPPED-ADDRESS family {family}"),
+        _ => Err("unsupported XOR-MAPPED-ADDRESS family"),
+    }
+}
+
+/// Decode a plain (non-`XOR`ed) `MAPPED-ADDRESS` style attribute value.
+///
+/// `RESPONSE-ORIGIN` and `OTHER-ADDRESS` share the same wire format as
+/// the legacy `MAPPED-ADDRESS` attribute defined by `RFC 5389 §15.1`:
+/// one reserved byte, one address-family byte, two port bytes, then
+/// the address bytes (`4` for `IPv4`, `16` for `IPv6`).
+fn decode_plain_address(value: &[u8]) -> Result<SocketAddr, &'static str> {
+    if value.len() < STUN_IPV4_ATTRIBUTE_VALUE_LEN {
+        return Err("address attribute too short");
+    }
+
+    let family = value.get(1).copied().ok_or("missing family byte")?;
+    let port_bytes: [u8; 2] = value
+        .get(2..4)
+        .and_then(|s| s.try_into().ok())
+        .ok_or("missing port")?;
+    let port = u16::from_be_bytes(port_bytes);
+
+    match family {
+        STUN_FAMILY_IPV4 => {
+            if value.len() != STUN_IPV4_ATTRIBUTE_VALUE_LEN {
+                return Err("invalid IPv4 address attribute length");
+            }
+            let addr_bytes: [u8; 4] = value
+                .get(4..8)
+                .and_then(|s| s.try_into().ok())
+                .ok_or("missing IPv4 address bytes")?;
+            Ok(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::from(addr_bytes)),
+                port,
+            ))
+        }
+        STUN_FAMILY_IPV6 => {
+            if value.len() != STUN_IPV6_ATTRIBUTE_VALUE_LEN {
+                return Err("invalid IPv6 address attribute length");
+            }
+            let addr_bytes: [u8; STUN_IPV6_ADDR_LEN] = value
+                .get(4..4 + STUN_IPV6_ADDR_LEN)
+                .and_then(|s| s.try_into().ok())
+                .ok_or("missing IPv6 address bytes")?;
+            Ok(SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::from(addr_bytes)),
+                port,
+            ))
+        }
+        _ => Err("unsupported address family"),
     }
 }
 
@@ -334,7 +734,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(nat_type, NatType::Public);
+        assert_eq!(nat_type, NatType::Open);
     }
 
     #[test]
