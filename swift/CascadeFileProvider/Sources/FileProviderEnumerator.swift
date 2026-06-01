@@ -103,14 +103,36 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
         observer.finishEnumeratingChanges(upTo: syncAnchor, moreComing: false)
     }
 
-    // TODO(fileprovider): once the Rust bridge exposes a stable change
-    // cursor (e.g. a `currentSyncCursor` method returning an opaque
-    // byte string the engine increments per write), return its bytes
-    // here. Returning an empty Data tells the system the anchor is
-    // meaningless, which forces a full re-enumeration on every sync
-    // tick. Acceptable while the engine cursor isn't wired through;
-    // not acceptable for steady-state operation.
+    /// Return the system the engine's current sync cursor for this
+    /// container, wrapped as an `NSFileProviderSyncAnchor`.
+    ///
+    /// The Rust side derives a deterministic byte string from the state
+    /// of every item beneath `parentIdentifier` and serialises it as
+    /// base64url-no-pad. Two calls with no intervening changes return
+    /// the same cursor; any mutation underneath the parent produces a
+    /// different one. We decode the wire string back to raw bytes and
+    /// hand those to the system as the anchor, so future calls to
+    /// `enumerateChanges(from:)` compare like-for-like against what the
+    /// engine emitted.
+    ///
+    /// On any failure — RPC error, decode failure — log and call back
+    /// with `nil`. The system treats a nil anchor as "no stable cursor
+    /// available" and falls back to a full re-enumeration on the next
+    /// sync tick, which is the safe outcome while the bridge is down.
     func currentSyncAnchor(completionHandler: @escaping (NSFileProviderSyncAnchor?) -> Void) {
-        completionHandler(NSFileProviderSyncAnchor(Data()))
+        Task {
+            do {
+                let encoded = try await actions.currentSyncCursor(parentIdentifier: parentIdentifier)
+                guard let bytes = base64URLNoPadDecode(encoded) else {
+                    enumeratorLogger.error("currentSyncCursor returned a string that failed base64url-no-pad decode: \(encoded, privacy: .public)")
+                    completionHandler(nil)
+                    return
+                }
+                completionHandler(NSFileProviderSyncAnchor(bytes))
+            } catch {
+                enumeratorLogger.error("currentSyncCursor RPC failed: \(error.localizedDescription, privacy: .public)")
+                completionHandler(nil)
+            }
+        }
     }
 }

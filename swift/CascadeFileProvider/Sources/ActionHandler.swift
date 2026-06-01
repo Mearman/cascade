@@ -118,6 +118,17 @@ struct MoveItemResult: Decodable {
     let item: CascadeVfsItem
 }
 
+/// Result of `currentSyncCursor`.
+///
+/// `cursor` is a base64url-no-pad string carrying opaque bytes the
+/// Rust side derives from the current state of the requested parent.
+/// The Swift side treats the bytes as a stable opaque identifier:
+/// equal cursors mean nothing changed, unequal cursors invalidate
+/// the system's cached enumeration.
+struct CurrentSyncCursorResult: Decodable {
+    let cursor: String
+}
+
 // MARK: - Error mapping
 
 /// Map a structured RPC error to an `NSFileProviderError`.
@@ -338,6 +349,22 @@ final class ActionHandler {
         )
         let items = result.items.map(FileProviderItem.init(item:))
         return (items, result.nextPage)
+    }
+
+    /// Fetch the current sync cursor for `parentIdentifier`.
+    ///
+    /// Returns the base64url-no-pad-encoded opaque cursor the Rust side
+    /// derived from the current state of the parent. The caller is
+    /// responsible for wrapping the decoded bytes in an
+    /// `NSFileProviderSyncAnchor`.
+    func currentSyncCursor(parentIdentifier: NSFileProviderItemIdentifier) async throws -> String {
+        let parentID = engineID(for: parentIdentifier)
+        let result: CurrentSyncCursorResult = try await engine.send(
+            method: "currentSyncCursor",
+            params: ["parent_id": parentID],
+            itemID: parentID
+        )
+        return result.cursor
     }
 
     func fetchContents(for identifier: NSFileProviderItemIdentifier) async throws -> URL {
