@@ -105,6 +105,153 @@ impl EngineHandlers {
             .map_or_else(|| "unknown".to_string(), |t| t.timestamp().to_string());
         self.cache_dir_for(&entry.id).join(version)
     }
+
+    /// Execute a cross-backend move as a download / upload / delete dance.
+    ///
+    /// The destination upload is committed before the source delete runs.
+    /// If the upload fails, the source is left untouched and the local
+    /// staging file is removed. If the source delete fails after a
+    /// successful upload, the move is reported as `Internal` with both
+    /// `ItemId`s — the data is now in both places and the user must
+    /// clean up the source manually. We deliberately do not roll back
+    /// the destination in that case because that would destroy the only
+    /// successful copy of the data.
+    ///
+    /// Directories are rejected up front with `NotSupported`; recursive
+    /// cross-backend directory moves require a per-child walk and are
+    /// out of scope for this round.
+    ///
+    /// Concurrency: the Apple File Provider framework serialises
+    /// per-item operations on the system side, so this method does not
+    /// take any additional locks. Two clients moving the same item
+    /// concurrently is the system's problem to resolve, not the
+    /// presenter's.
+    async fn cross_backend_move(
+        &self,
+        item_id: &ItemId,
+        new_parent: &ItemId,
+        new_name: &str,
+    ) -> HandlerResult<FileProviderItem> {
+        let src_entry = self
+            .db
+            .get_file(item_id)?
+            .ok_or_else(|| HandlerError::not_found(format!("item not found: {item_id}")))?;
+        if src_entry.is_dir {
+            // TODO(fileprovider): recursive cross-backend directory move.
+            return Err(HandlerError::not_supported(
+                "cross-backend directory moves require recursive copy; only files are supported"
+                    .to_string(),
+            ));
+        }
+
+        let src_backend = self.backend_for(item_id)?;
+        let dst_backend = self.backend_for(new_parent)?;
+
+        // Reject obvious name collisions before doing any I/O. The
+        // destination backend may still reject the upload itself if a
+        // collision sneaks in concurrently, in which case the existing
+        // anyhow → HandlerError mapping will surface AlreadyExists if
+        // the backend wraps it as `BackendError::Conflict`.
+        let dst_children = dst_backend
+            .list_children(new_parent.native_id())
+            .await
+            .map_err(|err| HandlerError::internal(format!("list destination children: {err}")))?;
+        if dst_children.iter().any(|entry| entry.name == new_name) {
+            return Err(HandlerError::already_exists(format!(
+                "destination {new_parent} already contains an item named {new_name}"
+            )));
+        }
+
+        let staging_path = self
+            .stage_for_move(&src_entry, src_backend.as_ref())
+            .await?;
+
+        let mut reader = tokio::fs::File::open(&staging_path).await.map_err(|err| {
+            HandlerError::internal(format!(
+                "open staging file {}: {err}",
+                staging_path.display()
+            ))
+        })?;
+        let dst_parent_file_id = FileId(new_parent.0.clone());
+        let upload_result = dst_backend
+            .upload(Path::new(new_name), &mut reader, &dst_parent_file_id)
+            .await;
+        drop(reader);
+
+        // The staging file is no longer needed after upload returns,
+        // regardless of outcome. Best-effort cleanup — a failure here
+        // does not change the move outcome.
+        if let Err(err) = tokio::fs::remove_file(&staging_path).await {
+            tracing::warn!(
+                path = %staging_path.display(),
+                error = %err,
+                "failed to remove cross-backend move staging file",
+            );
+        }
+
+        let dst_entry = match upload_result {
+            Ok(entry) => entry,
+            Err(err) => return Err(HandlerError::from(err)),
+        };
+
+        // Upload committed — try to delete the source. If this fails the
+        // data is in BOTH places; we have to surface that loudly rather
+        // than silently lose data by rolling back the destination.
+        if let Err(err) = src_backend.delete(&src_entry).await {
+            tracing::error!(
+                source_id = %src_entry.id,
+                destination_id = %dst_entry.id,
+                error = %err,
+                "cross-backend move: destination upload succeeded but source delete failed; manual cleanup required",
+            );
+            // The destination already exists in the DB once we upsert
+            // below, so keep the bookkeeping consistent before
+            // returning.
+            self.db.upsert_file(&dst_entry)?;
+            return Err(HandlerError::internal(format!(
+                "cross-backend move partially completed: destination {} is the new copy; source {} still exists and could not be deleted ({err})",
+                dst_entry.id, src_entry.id,
+            )));
+        }
+
+        self.db.upsert_file(&dst_entry)?;
+        self.db.delete_subtree(&src_entry.id)?;
+        Ok(FileProviderItem::from(VfsItem::from(dst_entry)))
+    }
+
+    /// Materialise `src_entry` to a private staging file under the cache
+    /// directory and return its path.
+    ///
+    /// This is similar to the staging step inside `fetch_contents`, but
+    /// the resulting file is single-use: the cross-backend move uploads
+    /// from it once and then unlinks it. We do not place it at the
+    /// canonical cache path because a partially-uploaded cross-backend
+    /// move should not poison the cache for a subsequent `fetch_contents`
+    /// on the same source ID.
+    async fn stage_for_move(
+        &self,
+        src_entry: &FileEntry,
+        src_backend: &dyn Backend,
+    ) -> HandlerResult<PathBuf> {
+        let staging_dir = self.cache_dir_for(&src_entry.id);
+        tokio::fs::create_dir_all(&staging_dir)
+            .await
+            .map_err(|err| HandlerError::internal(format!("create staging dir: {err}")))?;
+        let staging_path = staging_dir.join("cross-backend-move.tmp");
+
+        let file = tokio::fs::File::create(&staging_path)
+            .await
+            .map_err(|err| HandlerError::internal(format!("create staging file: {err}")))?;
+        let mut writer = WriterAdapter { inner: file };
+        src_backend.download(src_entry, &mut writer).await?;
+        writer
+            .inner
+            .flush()
+            .await
+            .map_err(|err| HandlerError::internal(format!("flush staging file: {err}")))?;
+        drop(writer);
+        Ok(staging_path)
+    }
 }
 
 #[async_trait]
@@ -291,11 +438,9 @@ impl FileProviderHandlers for EngineHandlers {
         let item_id = ItemId(id.to_string());
         let new_parent = ItemId(new_parent_id.to_string());
         if item_id.backend_id() != new_parent.backend_id() {
-            return Err(HandlerError::not_supported(format!(
-                "cross-backend move not yet supported; download/upload/delete dance is the planned follow-up ({} -> {})",
-                item_id.backend_id(),
-                new_parent.backend_id()
-            )));
+            return self
+                .cross_backend_move(&item_id, &new_parent, new_name)
+                .await;
         }
         let backend = self.backend_for(&item_id)?;
         let src_file_id = FileId(item_id.0.clone());
@@ -839,13 +984,381 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn move_item_rejects_cross_backend_moves() {
+    async fn move_item_cross_backend_unknown_destination_is_not_found() {
+        // No `other` backend is registered, so the cross-backend branch
+        // bails out at the destination lookup with NotFound.
         let (handlers, _backend, _tempdir) = make_handlers();
         let err = handlers
             .move_item("stub:file1", "other:root", "renamed.txt")
             .await
             .unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
+    }
+
+    /// Stand up an `EngineHandlers` with two backends — `src` (mounted at
+    /// the root) and `dst` (mounted at `/dst`) — each pre-seeded with a
+    /// root directory entry. The source backend additionally holds a
+    /// single file `hello.txt` under its root with known bytes.
+    fn make_cross_backend_handlers() -> (
+        EngineHandlers,
+        Arc<InMemoryBackend>,
+        Arc<InMemoryBackend>,
+        tempfile::TempDir,
+    ) {
+        let src = Arc::new(InMemoryBackend::new("src"));
+        let dst = Arc::new(InMemoryBackend::new("dst"));
+
+        let mut tree = VfsTree::new(src.clone());
+        tree.mount(PathBuf::from("/dst"), dst.clone());
+        let vfs = Arc::new(RwLock::new(tree));
+        let cache_dir = tempfile::tempdir().unwrap();
+
+        let db = Arc::new(StateDb::open_in_memory().unwrap());
+        db.register_backend("src", "stub", "Src", None, None)
+            .unwrap();
+        db.register_backend("dst", "stub", "Dst", Some("/dst"), None)
+            .unwrap();
+
+        for backend in [&src, &dst] {
+            let root_id = ItemId::new(backend.id(), "root");
+            let root_entry = FileEntry {
+                id: root_id,
+                parent_id: ItemId::new(backend.id(), ""),
+                name: "root".to_string(),
+                is_dir: true,
+                size: None,
+                mod_time: Some(Utc::now()),
+                mime_type: None,
+                hash: None,
+            };
+            backend.insert(root_entry.clone());
+            db.upsert_file(&root_entry).unwrap();
+        }
+
+        let src_file_id = ItemId::new("src", "file1");
+        let src_file = FileEntry {
+            id: src_file_id.clone(),
+            parent_id: ItemId::new("src", "root"),
+            name: "hello.txt".to_string(),
+            is_dir: false,
+            size: Some(11),
+            mod_time: Some(Utc::now()),
+            mime_type: Some("text/plain".to_string()),
+            hash: None,
+        };
+        src.insert(src_file.clone());
+        db.upsert_file(&src_file).unwrap();
+        src.content
+            .lock()
+            .unwrap()
+            .insert(src_file_id.0.clone(), b"hello world".to_vec());
+
+        let handlers = EngineHandlers::new(vfs, db, cache_dir.path().to_path_buf());
+        (handlers, src, dst, cache_dir)
+    }
+
+    #[tokio::test]
+    async fn move_item_cross_backend_file_succeeds() {
+        let (handlers, src, dst, _tempdir) = make_cross_backend_handlers();
+
+        let moved = handlers
+            .move_item("src:file1", "dst:root", "renamed.txt")
+            .await
+            .unwrap();
+
+        assert_eq!(moved.parent_id, "dst:root");
+        assert_eq!(moved.filename, "renamed.txt");
+        assert!(!moved.is_directory);
+
+        // Destination has the file with the moved bytes.
+        let dst_files = dst.files.lock().unwrap();
+        let dst_entry = dst_files
+            .values()
+            .find(|entry| entry.name == "renamed.txt")
+            .expect("destination should now contain the moved file");
+        let dst_content = dst
+            .content
+            .lock()
+            .unwrap()
+            .get(&dst_entry.id.0)
+            .cloned()
+            .expect("destination must have content for moved file");
+        assert_eq!(dst_content, b"hello world");
+
+        // Source is gone.
+        assert!(
+            !src.files.lock().unwrap().contains_key("src:file1"),
+            "source backend must no longer hold the original entry"
+        );
+        assert!(
+            !src.content.lock().unwrap().contains_key("src:file1"),
+            "source backend must no longer hold the original bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_item_cross_backend_directory_returns_not_supported() {
+        let (handlers, src, _dst, _tempdir) = make_cross_backend_handlers();
+
+        // Seed a directory under the source root that we'll try to move.
+        let dir_id = ItemId::new("src", "subdir");
+        let dir_entry = FileEntry {
+            id: dir_id,
+            parent_id: ItemId::new("src", "root"),
+            name: "subdir".to_string(),
+            is_dir: true,
+            size: None,
+            mod_time: Some(Utc::now()),
+            mime_type: None,
+            hash: None,
+        };
+        src.insert(dir_entry.clone());
+        handlers.db.upsert_file(&dir_entry).unwrap();
+
+        let err = handlers
+            .move_item("src:subdir", "dst:root", "subdir")
+            .await
+            .unwrap_err();
         assert_eq!(err.code, ErrorCode::NotSupported);
+        assert!(
+            err.message.contains("recursive"),
+            "message should explain why directories are rejected: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn move_item_cross_backend_name_collision_returns_already_exists() {
+        let (handlers, _src, dst, _tempdir) = make_cross_backend_handlers();
+
+        // Pre-seed the destination with a file of the target name.
+        let collide_id = ItemId::new("dst", "existing");
+        let collide_entry = FileEntry {
+            id: collide_id,
+            parent_id: ItemId::new("dst", "root"),
+            name: "renamed.txt".to_string(),
+            is_dir: false,
+            size: Some(3),
+            mod_time: Some(Utc::now()),
+            mime_type: Some("text/plain".to_string()),
+            hash: None,
+        };
+        dst.insert(collide_entry.clone());
+        handlers.db.upsert_file(&collide_entry).unwrap();
+
+        let err = handlers
+            .move_item("src:file1", "dst:root", "renamed.txt")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::AlreadyExists);
+    }
+
+    /// A backend whose `delete` always fails, used to simulate the
+    /// partial-failure path of a cross-backend move where the upload
+    /// committed but cleaning up the source did not.
+    #[derive(Debug)]
+    struct DeleteFailingBackend {
+        inner: InMemoryBackend,
+    }
+
+    impl DeleteFailingBackend {
+        fn new(id: &str) -> Self {
+            Self {
+                inner: InMemoryBackend::new(id),
+            }
+        }
+
+        fn insert(&self, entry: FileEntry) {
+            self.inner.insert(entry);
+        }
+    }
+
+    #[async_trait]
+    impl Backend for DeleteFailingBackend {
+        fn id(&self) -> &str {
+            self.inner.id()
+        }
+
+        fn display_name(&self) -> &str {
+            self.inner.display_name()
+        }
+
+        async fn quota(&self) -> anyhow::Result<Option<Quota>> {
+            self.inner.quota().await
+        }
+
+        async fn changes(&self, cursor: Option<&Cursor>) -> anyhow::Result<(Vec<Change>, Cursor)> {
+            self.inner.changes(cursor).await
+        }
+
+        async fn metadata(&self, path: &Path) -> anyhow::Result<FileEntry> {
+            self.inner.metadata(path).await
+        }
+
+        async fn download(
+            &self,
+            file: &FileEntry,
+            writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
+        ) -> anyhow::Result<()> {
+            self.inner.download(file, writer).await
+        }
+
+        async fn upload(
+            &self,
+            path: &Path,
+            reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+            parent_id: &FileId,
+        ) -> anyhow::Result<FileEntry> {
+            self.inner.upload(path, reader, parent_id).await
+        }
+
+        async fn update(
+            &self,
+            file_id: &FileId,
+            reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+        ) -> anyhow::Result<FileEntry> {
+            self.inner.update(file_id, reader).await
+        }
+
+        async fn create_dir(&self, path: &Path) -> anyhow::Result<FileEntry> {
+            self.inner.create_dir(path).await
+        }
+
+        async fn create_dir_with_parent(
+            &self,
+            name: &str,
+            parent_id: &FileId,
+        ) -> anyhow::Result<FileEntry> {
+            self.inner.create_dir_with_parent(name, parent_id).await
+        }
+
+        async fn delete(&self, _file: &FileEntry) -> anyhow::Result<()> {
+            anyhow::bail!("simulated delete failure")
+        }
+
+        async fn move_entry(&self, src: &Path, dst: &Path) -> anyhow::Result<FileEntry> {
+            self.inner.move_entry(src, dst).await
+        }
+
+        async fn move_by_id(
+            &self,
+            src_id: &FileId,
+            dst_parent_id: &FileId,
+            new_name: &str,
+        ) -> anyhow::Result<FileEntry> {
+            self.inner.move_by_id(src_id, dst_parent_id, new_name).await
+        }
+
+        async fn list_children(&self, parent_native_id: &str) -> anyhow::Result<Vec<FileEntry>> {
+            self.inner.list_children(parent_native_id).await
+        }
+
+        async fn poll_interval(&self) -> Option<Duration> {
+            self.inner.poll_interval().await
+        }
+    }
+
+    #[tokio::test]
+    async fn move_item_cross_backend_partial_failure_after_upload_returns_internal() {
+        // Build a tree where the source backend's `delete` is rigged to
+        // fail. The destination upload should still succeed and the
+        // handler must report Internal with both IDs.
+        let src = Arc::new(DeleteFailingBackend::new("src"));
+        let dst = Arc::new(InMemoryBackend::new("dst"));
+
+        let src_dyn: Arc<dyn Backend> = src.clone();
+        let mut tree = VfsTree::new(src_dyn);
+        tree.mount(PathBuf::from("/dst"), dst.clone());
+        let vfs = Arc::new(RwLock::new(tree));
+        let cache_dir = tempfile::tempdir().unwrap();
+
+        let db = Arc::new(StateDb::open_in_memory().unwrap());
+        db.register_backend("src", "stub", "Src", None, None)
+            .unwrap();
+        db.register_backend("dst", "stub", "Dst", Some("/dst"), None)
+            .unwrap();
+
+        // Seed the source root via the wrapper's insert (DeleteFailingBackend
+        // does not own a public `insert` of its own — it delegates to its
+        // inner `InMemoryBackend`).
+        let src_root = FileEntry {
+            id: ItemId::new("src", "root"),
+            parent_id: ItemId::new("src", ""),
+            name: "root".to_string(),
+            is_dir: true,
+            size: None,
+            mod_time: Some(Utc::now()),
+            mime_type: None,
+            hash: None,
+        };
+        src.inner.insert(src_root.clone());
+        db.upsert_file(&src_root).unwrap();
+
+        let dst_root = FileEntry {
+            id: ItemId::new("dst", "root"),
+            parent_id: ItemId::new("dst", ""),
+            name: "root".to_string(),
+            is_dir: true,
+            size: None,
+            mod_time: Some(Utc::now()),
+            mime_type: None,
+            hash: None,
+        };
+        dst.insert(dst_root.clone());
+        db.upsert_file(&dst_root).unwrap();
+
+        let src_file_id = ItemId::new("src", "file1");
+        let src_file = FileEntry {
+            id: src_file_id.clone(),
+            parent_id: ItemId::new("src", "root"),
+            name: "hello.txt".to_string(),
+            is_dir: false,
+            size: Some(11),
+            mod_time: Some(Utc::now()),
+            mime_type: Some("text/plain".to_string()),
+            hash: None,
+        };
+        src.insert(src_file.clone());
+        db.upsert_file(&src_file).unwrap();
+        src.inner
+            .content
+            .lock()
+            .unwrap()
+            .insert(src_file_id.0.clone(), b"hello world".to_vec());
+
+        let handlers = EngineHandlers::new(vfs, db.clone(), cache_dir.path().to_path_buf());
+
+        let err = handlers
+            .move_item("src:file1", "dst:root", "renamed.txt")
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert!(
+            err.message.contains("src:file1"),
+            "message must name the source item: {}",
+            err.message
+        );
+        // Destination should have the new file, and a matching entry should
+        // have been persisted in the DB before the error returned.
+        let dst_entry = dst
+            .files
+            .lock()
+            .unwrap()
+            .values()
+            .find(|entry| entry.name == "renamed.txt")
+            .cloned()
+            .expect("destination upload must have committed");
+        assert!(
+            err.message.contains(&dst_entry.id.0),
+            "message must name the destination item: {}",
+            err.message
+        );
+        let persisted = db.get_file(&dst_entry.id).unwrap();
+        assert!(
+            persisted.is_some(),
+            "destination must be in the DB even on partial failure"
+        );
     }
 
     #[tokio::test]
