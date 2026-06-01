@@ -406,11 +406,11 @@ impl Drop for ProjFsPresenter {
     /// Reclaim the `CallbackContextInner` Box-allocation on drop if the
     /// caller forgot to call `stop()`. Without this, a presenter that
     /// `start()`s and then drops would leak the heap-allocated context
-    /// that we handed to ProjFS via `instance_context`. The `VfsPresenter`
+    /// that we handed to `ProjFS` via `instance_context`. The `VfsPresenter`
     /// trait contract requires `stop()` on shutdown, but the language
     /// can't enforce it — this is the belt-and-braces.
     ///
-    /// On non-Windows targets the handle and callback_ctx are always
+    /// On non-Windows targets the handle and `callback_ctx` are always
     /// `None` (start returns an error before allocation), so this is a
     /// no-op.
     #[cfg(target_os = "windows")]
@@ -645,8 +645,8 @@ mod windows_impl {
     /// Heap-allocated state the callbacks consult. Kept distinct from
     /// the public [`CallbackContext`] wrapper so the wrapper can stay
     /// `Send + Sync` while the raw pointer to this inner struct is
-    /// the one ProjFS dereferences.
-    pub(super) struct CallbackContextInner {
+    /// the one `ProjFS` dereferences.
+    pub struct CallbackContextInner {
         items: Arc<RwLock<HashMap<String, VfsItem>>>,
         root_id: Arc<RwLock<Option<ItemId>>>,
         enumerations: Arc<Mutex<HashMap<u128, EnumerationState>>>,
@@ -684,7 +684,7 @@ mod windows_impl {
     /// null, which only happens if the caller forgot to set it on
     /// `PrjStartVirtualizing`.
     #[allow(unsafe_code)]
-    unsafe fn context_from_callback_data<'a>(
+    const unsafe fn context_from_callback_data<'a>(
         data: *const PRJ_CALLBACK_DATA,
     ) -> Option<&'a CallbackContextInner> {
         if data.is_null() {
@@ -706,10 +706,10 @@ mod windows_impl {
         Some(unsafe { &*ctx_ptr })
     }
 
-    /// `PRJ_QUERY_FILE_NAME_CB` — existence check used by ProjFS to
+    /// `PRJ_QUERY_FILE_NAME_CB` — existence check used by `ProjFS` to
     /// decide whether to descend into the projection.
     ///
-    /// **Thread model**: ProjFS dispatches callbacks from kernel-owned
+    /// **Thread model**: `ProjFS` dispatches callbacks from kernel-owned
     /// worker threads that are NOT part of any Tokio runtime. The
     /// `blocking_read` calls below are therefore correct. Do NOT
     /// invoke these callbacks directly from inside a `#[tokio::test]`
@@ -778,7 +778,7 @@ mod windows_impl {
             PrjWritePlaceholderInfo(
                 (*callback_data).NamespaceVirtualizationContext,
                 PCWSTR(path_hstring.as_ptr()),
-                &info,
+                &raw const info,
                 u32::try_from(std::mem::size_of::<PRJ_PLACEHOLDER_INFO>()).unwrap_or(u32::MAX),
             )
         };
@@ -866,11 +866,11 @@ mod windows_impl {
     }
 
     /// `PRJ_GET_DIRECTORY_ENUMERATION_CB` — yield the next batch of
-    /// entries into the buffer ProjFS provides.
+    /// entries into the buffer `ProjFS` provides.
     ///
     /// Filtering by `search_expression` is performed by
     /// `PrjFileNameMatch` server-side per the API contract; we
-    /// currently emit every child and let ProjFS drop the ones that
+    /// currently emit every child and let `ProjFS` drop the ones that
     /// do not match. A future optimisation can short-circuit by
     /// calling `PrjFileNameMatch` from here.
     #[allow(unsafe_code)]
@@ -926,7 +926,7 @@ mod windows_impl {
             let result = unsafe {
                 PrjFillDirEntryBuffer(
                     PCWSTR(name_hstring.as_ptr()),
-                    Some(&basic),
+                    Some(&raw const basic),
                     dir_entry_buffer_handle,
                 )
             };
@@ -948,7 +948,7 @@ mod windows_impl {
     /// Stub callback for `PRJ_GET_FILE_DATA_CB`. Read implementation
     /// follows in a later commit.
     #[allow(unsafe_code)]
-    unsafe extern "system" fn get_file_data(
+    const unsafe extern "system" fn get_file_data(
         _callback_data: *const PRJ_CALLBACK_DATA,
         _byte_offset: u64,
         _length: u32,
@@ -959,7 +959,7 @@ mod windows_impl {
     /// Stub callback for `PRJ_NOTIFICATION_CB`. Write-back hooks
     /// follow in a later commit.
     #[allow(unsafe_code)]
-    unsafe extern "system" fn notification(
+    const unsafe extern "system" fn notification(
         _callback_data: *const PRJ_CALLBACK_DATA,
         _is_directory: bool,
         _notification: PRJ_NOTIFICATION,
@@ -972,7 +972,7 @@ mod windows_impl {
     /// Stub callback for `PRJ_CANCEL_COMMAND_CB`. There is no
     /// in-flight async work to cancel until `GetFileData` is real.
     #[allow(unsafe_code)]
-    unsafe extern "system" fn cancel_command(_callback_data: *const PRJ_CALLBACK_DATA) {}
+    const unsafe extern "system" fn cancel_command(_callback_data: *const PRJ_CALLBACK_DATA) {}
 
     /// Build the live callback table used by `PrjStartVirtualizing`.
     fn build_callbacks() -> PRJ_CALLBACKS {
@@ -989,7 +989,7 @@ mod windows_impl {
     }
 
     /// Convert a `GUID` to its little-endian `u128` representation
-    /// for use as a `HashMap` key. ProjFS treats enumeration IDs as
+    /// for use as a `HashMap` key. `ProjFS` treats enumeration IDs as
     /// opaque, so any total order works as long as it is stable for
     /// the lifetime of the enumeration.
     fn guid_to_u128(guid: GUID) -> u128 {
@@ -1004,7 +1004,7 @@ mod windows_impl {
     /// Mark the mount directory as a `ProjFS` placeholder and start
     /// virtualising. Stores the resulting namespace handle in the
     /// presenter so [`stop_virtualising`] can release it later.
-    pub(super) async fn start_virtualising(
+    pub async fn start_virtualising(
         mount_point: &Path,
         handle_slot: &Arc<tokio::sync::Mutex<Option<NamespaceHandle>>>,
         callback_ctx_slot: &Arc<tokio::sync::Mutex<Option<CallbackContext>>>,
@@ -1063,7 +1063,7 @@ mod windows_impl {
         let start_result = unsafe {
             PrjStartVirtualizing(
                 mount_pcwstr,
-                &callbacks,
+                &raw const callbacks,
                 Some(instance_context.cast_const()),
                 None,
             )
@@ -1090,7 +1090,7 @@ mod windows_impl {
     }
 
     /// Release the stored `ProjFS` namespace handle, if any.
-    pub(super) async fn stop_virtualising(
+    pub async fn stop_virtualising(
         handle_slot: &Arc<tokio::sync::Mutex<Option<NamespaceHandle>>>,
         callback_ctx_slot: &Arc<tokio::sync::Mutex<Option<CallbackContext>>>,
     ) -> Result<()> {
