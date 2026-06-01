@@ -1,19 +1,19 @@
 import Darwin
 import FileProvider
 import Foundation
+import os
 
 private let cascadeSocketPath = "\(NSHomeDirectory())/.config/cascade/fileprovider.sock"
 private let rootIdentifier = "root"
 
+private let actionLogger = Logger(subsystem: "com.cascade.fileprovider", category: "ActionHandler")
+
 enum CascadeFileProviderError: LocalizedError {
-    case engineError(String)
     case invalidResponse(String)
     case socket(String)
 
     var errorDescription: String? {
         switch self {
-        case .engineError(let message):
-            return message
         case .invalidResponse(let message):
             return "Invalid Cascade engine response: \(message)"
         case .socket(let message):
@@ -22,15 +22,170 @@ enum CascadeFileProviderError: LocalizedError {
     }
 }
 
+// MARK: - Wire envelope
+
+/// Structured error returned by the Rust File Provider bridge.
+///
+/// Mirrors `crates/presenter-fileprovider/src/wire.rs::RpcError`. `code`
+/// is the machine-readable identifier the Swift side switches on;
+/// `message` is a free-form human-readable string carried through for
+/// logging only.
+struct RpcError: Decodable {
+    let code: String
+    let message: String
+}
+
+/// Inbound RPC response envelope.
+///
+/// Mirrors `crates/presenter-fileprovider/src/wire.rs::RpcResponse`.
+/// Exactly one of `result` or `error` is present in a well-formed
+/// response; the decoder leaves both optional so callers can validate
+/// the shape explicitly.
+struct RpcResponse<Result: Decodable>: Decodable {
+    let id: UInt32
+    let result: Result?
+    let error: RpcError?
+}
+
+// MARK: - Per-method result types
+
+/// Wire shape of a File Provider item, mirroring
+/// `crates/presenter-fileprovider/src/items.rs::FileProviderItem`.
+///
+/// Field names are snake_case to match the JSON the Rust side emits;
+/// `JSONDecoder.keyDecodingStrategy = .convertFromSnakeCase` handles
+/// the conversion centrally so this struct can keep camelCase property
+/// names internally.
+struct CascadeVfsItem: Decodable, Sendable {
+    let id: String
+    let parentID: String
+    let filename: String
+    let isDirectory: Bool
+    let size: Int64?
+    let contentType: String?
+    let lastModified: Date?
+    let cacheState: String
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case parentID = "parent_id"
+        case filename
+        case isDirectory = "is_directory"
+        case size
+        case contentType = "content_type"
+        case lastModified = "last_modified"
+        case cacheState = "cache_state"
+    }
+}
+
+/// Result of `getItem`.
+struct GetItemResult: Decodable {
+    let item: CascadeVfsItem
+}
+
+/// Result of `enumerateItems`.
+struct EnumerateItemsResult: Decodable {
+    let items: [CascadeVfsItem]
+    let nextPage: String?
+
+    enum CodingKeys: String, CodingKey {
+        case items
+        case nextPage = "next_page"
+    }
+}
+
+/// Result of `fetchContents`.
+struct FetchContentsResult: Decodable {
+    let path: String
+}
+
+/// Result of `importDocument`.
+struct ImportDocumentResult: Decodable {
+    let item: CascadeVfsItem
+}
+
+/// Result of `createDirectory`.
+struct CreateDirectoryResult: Decodable {
+    let item: CascadeVfsItem
+}
+
+/// Result of `deleteItem` — the Rust side returns an empty object,
+/// modelled here as a struct with no fields.
+struct DeleteItemResult: Decodable {}
+
+/// Result of `moveItem`.
+struct MoveItemResult: Decodable {
+    let item: CascadeVfsItem
+}
+
+// MARK: - Error mapping
+
+/// Map a structured RPC error to an `NSFileProviderError`.
+///
+/// The mapping is the single source of truth for translating engine
+/// failures into File Provider error codes the system understands.
+/// Unknown codes fall through to `.serverUnreachable` with a logged
+/// warning so a forward-compatible Rust release that adds a new code
+/// still surfaces something visible to the user.
+func makeError(from rpcError: RpcError, method: String, itemID: String?) -> NSFileProviderError {
+    let userInfo: [String: Any] = [NSLocalizedDescriptionKey: rpcError.message]
+
+    switch rpcError.code {
+    case "not_found":
+        actionLogger.error("RPC \(method, privacy: .public) for \(itemID ?? "-", privacy: .public) failed: not_found — \(rpcError.message, privacy: .public)")
+        return NSFileProviderError(.noSuchItem, userInfo: userInfo)
+    case "permission_denied":
+        actionLogger.error("RPC \(method, privacy: .public) for \(itemID ?? "-", privacy: .public) failed: permission_denied — \(rpcError.message, privacy: .public)")
+        return NSFileProviderError(.notAuthenticated, userInfo: userInfo)
+    case "already_exists":
+        actionLogger.error("RPC \(method, privacy: .public) for \(itemID ?? "-", privacy: .public) failed: already_exists — \(rpcError.message, privacy: .public)")
+        return NSFileProviderError(.filenameCollision, userInfo: userInfo)
+    case "internal":
+        actionLogger.error("RPC \(method, privacy: .public) for \(itemID ?? "-", privacy: .public) failed: internal — \(rpcError.message, privacy: .public)")
+        return NSFileProviderError(.serverUnreachable, userInfo: userInfo)
+    default:
+        actionLogger.warning("RPC \(method, privacy: .public) for \(itemID ?? "-", privacy: .public) returned unknown error code \(rpcError.code, privacy: .public) — \(rpcError.message, privacy: .public)")
+        return NSFileProviderError(.serverUnreachable, userInfo: userInfo)
+    }
+}
+
+/// Build the shared `JSONDecoder` used for every response.
+///
+/// `dateDecodingStrategy = .iso8601` matches the RFC 3339 strings the
+/// Rust side emits via `chrono::DateTime::to_rfc3339()`. Key conversion
+/// is per-struct via explicit `CodingKeys` rather than global
+/// `convertFromSnakeCase` so any per-field renames stay obvious at the
+/// definition site.
+private func makeResponseDecoder() -> JSONDecoder {
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    return decoder
+}
+
+// MARK: - Engine client
+
 actor EngineClient {
     private let socketPath: String
     private var nextID: UInt32 = 1
+    private let decoder = makeResponseDecoder()
 
     init(socketPath: String = cascadeSocketPath) {
         self.socketPath = socketPath
     }
 
-    func send(method: String, params: [String: Any]) async throws -> Any {
+    /// Send an RPC and decode the response into `Result`.
+    ///
+    /// Throws an `NSFileProviderError` directly when the Rust side
+    /// returns a structured `error`; throws a `CascadeFileProviderError`
+    /// for transport or decode failures. The split lets the File
+    /// Provider extension surface engine errors verbatim while still
+    /// translating its own socket/decode issues at the boundary.
+    func send<Result: Decodable>(
+        method: String,
+        params: [String: Any],
+        itemID: String? = nil,
+        as resultType: Result.Type = Result.self
+    ) async throws -> Result {
         let requestID = nextID
         nextID += 1
 
@@ -41,19 +196,22 @@ actor EngineClient {
         ]
         let requestBody = try JSONSerialization.data(withJSONObject: request)
         let responseBody = try await writeFrameAndReadResponse(body: requestBody)
-        let decoded = try JSONSerialization.jsonObject(with: responseBody)
 
-        guard let response = decoded as? [String: Any] else {
-            throw CascadeFileProviderError.invalidResponse("top-level response was not an object")
+        let envelope: RpcResponse<Result>
+        do {
+            envelope = try decoder.decode(RpcResponse<Result>.self, from: responseBody)
+        } catch {
+            throw CascadeFileProviderError.invalidResponse("could not decode response envelope: \(error.localizedDescription)")
         }
-        if let responseID = response["id"] as? NSNumber, responseID.uint32Value != requestID {
-            throw CascadeFileProviderError.invalidResponse("response id \(responseID) did not match request id \(requestID)")
+
+        if envelope.id != requestID {
+            throw CascadeFileProviderError.invalidResponse("response id \(envelope.id) did not match request id \(requestID)")
         }
-        if let error = response["error"] as? String {
-            throw CascadeFileProviderError.engineError(error)
+        if let rpcError = envelope.error {
+            throw makeError(from: rpcError, method: method, itemID: itemID)
         }
-        guard let result = response["result"] else {
-            throw CascadeFileProviderError.invalidResponse("missing result")
+        guard let result = envelope.result else {
+            throw CascadeFileProviderError.invalidResponse("response carried neither result nor error")
         }
         return result
     }
@@ -132,6 +290,8 @@ actor EngineClient {
     }
 }
 
+// MARK: - Action handler
+
 final class ActionHandler {
     private let engine: EngineClient
 
@@ -141,66 +301,85 @@ final class ActionHandler {
 
     func item(for identifier: NSFileProviderItemIdentifier) async throws -> FileProviderItem {
         let id = engineID(for: identifier)
-        let result = try await engine.send(method: "getItem", params: ["id": id])
-        guard let json = result as? [String: Any] else {
-            throw CascadeFileProviderError.invalidResponse("getItem result was not an object")
-        }
-        return try FileProviderItem(item: CascadeVfsItem(json: json))
+        let result: GetItemResult = try await engine.send(
+            method: "getItem",
+            params: ["id": id],
+            itemID: id
+        )
+        return FileProviderItem(item: result.item)
     }
 
     func enumerateItems(parentIdentifier: NSFileProviderItemIdentifier, page: Data) async throws -> [NSFileProviderItem] {
         let pageString = page.isEmpty ? nil : page.base64EncodedString()
-        var params: [String: Any] = ["parent_id": engineID(for: parentIdentifier)]
+        let parentID = engineID(for: parentIdentifier)
+        var params: [String: Any] = ["parent_id": parentID]
         if let pageString { params["page"] = pageString }
 
-        let result = try await engine.send(method: "enumerateItems", params: params)
-        guard let array = result as? [[String: Any]] else {
-            throw CascadeFileProviderError.invalidResponse("enumerateItems result was not an item array")
-        }
-        return try array.map { try FileProviderItem(item: CascadeVfsItem(json: $0)) }
+        let result: EnumerateItemsResult = try await engine.send(
+            method: "enumerateItems",
+            params: params,
+            itemID: parentID
+        )
+        return result.items.map(FileProviderItem.init(item:))
     }
 
     func fetchContents(for identifier: NSFileProviderItemIdentifier) async throws -> URL {
-        let result = try await engine.send(method: "fetchContents", params: ["id": engineID(for: identifier)])
-        guard let json = result as? [String: Any], let path = json["path"] as? String else {
-            throw CascadeFileProviderError.invalidResponse("fetchContents result did not contain a path")
-        }
-        return URL(fileURLWithPath: path)
+        let id = engineID(for: identifier)
+        let result: FetchContentsResult = try await engine.send(
+            method: "fetchContents",
+            params: ["id": id],
+            itemID: id
+        )
+        return URL(fileURLWithPath: result.path)
     }
 
     func uploadChangedItem(identifier: NSFileProviderItemIdentifier, fileURL: URL) async throws {
-        _ = try await engine.send(method: "importDocument", params: [
-            "source_url": fileURL.path,
-            "parent_id": rootIdentifier,
-            "existing_id": engineID(for: identifier),
-        ])
+        let id = engineID(for: identifier)
+        let _: ImportDocumentResult = try await engine.send(
+            method: "importDocument",
+            params: [
+                "source_url": fileURL.path,
+                "parent_id": rootIdentifier,
+                "existing_id": id,
+            ],
+            itemID: id
+        )
     }
 
     func createDirectory(named name: String, parentIdentifier: NSFileProviderItemIdentifier) async throws -> FileProviderItem {
-        let result = try await engine.send(method: "createDirectory", params: [
-            "name": name,
-            "parent_id": engineID(for: parentIdentifier),
-        ])
-        guard let json = result as? [String: Any] else {
-            throw CascadeFileProviderError.invalidResponse("createDirectory result was not an object")
-        }
-        return try FileProviderItem(item: CascadeVfsItem(json: json))
+        let parentID = engineID(for: parentIdentifier)
+        let result: CreateDirectoryResult = try await engine.send(
+            method: "createDirectory",
+            params: [
+                "name": name,
+                "parent_id": parentID,
+            ],
+            itemID: parentID
+        )
+        return FileProviderItem(item: result.item)
     }
 
     func deleteItem(identifier: NSFileProviderItemIdentifier) async throws {
-        _ = try await engine.send(method: "deleteItem", params: ["id": engineID(for: identifier)])
+        let id = engineID(for: identifier)
+        let _: DeleteItemResult = try await engine.send(
+            method: "deleteItem",
+            params: ["id": id],
+            itemID: id
+        )
     }
 
     func moveItem(identifier: NSFileProviderItemIdentifier, newParentIdentifier: NSFileProviderItemIdentifier, newName: String) async throws -> FileProviderItem {
-        let result = try await engine.send(method: "moveItem", params: [
-            "id": engineID(for: identifier),
-            "new_parent_id": engineID(for: newParentIdentifier),
-            "new_name": newName,
-        ])
-        guard let json = result as? [String: Any] else {
-            throw CascadeFileProviderError.invalidResponse("moveItem result was not an object")
-        }
-        return try FileProviderItem(item: CascadeVfsItem(json: json))
+        let id = engineID(for: identifier)
+        let result: MoveItemResult = try await engine.send(
+            method: "moveItem",
+            params: [
+                "id": id,
+                "new_parent_id": engineID(for: newParentIdentifier),
+                "new_name": newName,
+            ],
+            itemID: id
+        )
+        return FileProviderItem(item: result.item)
     }
 
     /// Replicated File Provider create-item entry point.
@@ -215,18 +394,20 @@ final class ActionHandler {
         contents url: URL?
     ) async throws -> FileProviderItem {
         let parent = template.parentItemIdentifier
+        let parentID = engineID(for: parent)
         let name = template.filename
 
         if let url {
-            let result = try await engine.send(method: "importDocument", params: [
-                "source_url": url.path,
-                "parent_id": engineID(for: parent),
-                "name": name,
-            ])
-            guard let json = result as? [String: Any] else {
-                throw CascadeFileProviderError.invalidResponse("importDocument result was not an object")
-            }
-            return try FileProviderItem(item: CascadeVfsItem(json: json))
+            let result: ImportDocumentResult = try await engine.send(
+                method: "importDocument",
+                params: [
+                    "source_url": url.path,
+                    "parent_id": parentID,
+                    "name": name,
+                ],
+                itemID: parentID
+            )
+            return FileProviderItem(item: result.item)
         }
 
         return try await createDirectory(named: name, parentIdentifier: parent)
@@ -258,11 +439,16 @@ final class ActionHandler {
         }
 
         if changedFields.contains(.contents), let url = newContents {
-            _ = try await engine.send(method: "importDocument", params: [
-                "source_url": url.path,
-                "parent_id": engineID(for: item.parentItemIdentifier),
-                "existing_id": engineID(for: identifier),
-            ])
+            let id = engineID(for: identifier)
+            let _: ImportDocumentResult = try await engine.send(
+                method: "importDocument",
+                params: [
+                    "source_url": url.path,
+                    "parent_id": engineID(for: item.parentItemIdentifier),
+                    "existing_id": id,
+                ],
+                itemID: id
+            )
             latest = try await self.item(for: identifier)
         }
 

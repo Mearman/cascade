@@ -166,14 +166,18 @@ final class CascadeFileProvider: NSObject, NSFileProviderReplicatedExtension {
     /// Promote a raw engine error to the File Provider error domain.
     ///
     /// macOS surfaces these via the Finder's "Unable to … (Error code)"
-    /// dialogue. Mapping unknowns to `.serverUnreachable` is conservative
-    /// but lets the user see a meaningful state when the socket is down.
+    /// dialogue. Structured RPC errors are already mapped to specific
+    /// `NSFileProviderError` cases inside `ActionHandler`; those pass
+    /// through untouched. Local transport and decode failures collapse
+    /// to `.serverUnreachable` (socket gone) or `.cannotSynchronize`
+    /// (engine returned an unparseable response) so the user sees a
+    /// meaningful state regardless of which side of the bridge failed.
     private func mapEngineError(_ error: Error) -> Error {
         if let cascadeError = error as? CascadeFileProviderError {
             switch cascadeError {
             case .socket:
                 return NSFileProviderError(.serverUnreachable)
-            case .engineError, .invalidResponse:
+            case .invalidResponse:
                 return NSFileProviderError(.cannotSynchronize)
             }
         }

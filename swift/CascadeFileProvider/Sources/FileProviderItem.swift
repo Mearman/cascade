@@ -15,73 +15,11 @@ import FileProvider
 import Foundation
 import UniformTypeIdentifiers
 
-/// JSON payload shape returned by the Cascade engine for a VFS item.
-///
-/// The field names mirror `crates/presenter-fileprovider/src/items.rs::FileProviderItem`,
-/// which is the canonical wire schema for the Rust ↔ Swift bridge.
-struct CascadeVfsItem: Sendable {
-    let id: String
-    let parentID: String
-    let filename: String
-    let isDirectory: Bool
-    let size: Int64?
-    let contentType: String?
-    let lastModified: Date?
-    let cacheState: String
-
-    init(json: [String: Any]) throws {
-        self.id = try Self.string(json, "id")
-        self.parentID = try Self.string(json, "parent_id")
-        self.filename = try Self.string(json, "filename")
-        self.isDirectory = try Self.bool(json, "is_directory")
-        self.size = Self.optionalInt64(json, "size")
-        self.contentType = json["content_type"] as? String
-        self.cacheState = try Self.string(json, "cache_state")
-
-        if let value = json["last_modified"] as? String {
-            self.lastModified = ISO8601DateFormatter().date(from: value)
-        } else {
-            self.lastModified = nil
-        }
-    }
-
-    var asJSON: [String: Any] {
-        var json: [String: Any] = [
-            "id": id,
-            "parent_id": parentID,
-            "filename": filename,
-            "is_directory": isDirectory,
-            "cache_state": cacheState,
-        ]
-        if let size { json["size"] = size }
-        if let contentType { json["content_type"] = contentType }
-        if let lastModified { json["last_modified"] = ISO8601DateFormatter().string(from: lastModified) }
-        return json
-    }
-
-    private static func string(_ json: [String: Any], _ key: String) throws -> String {
-        guard let value = json[key] as? String else {
-            throw CascadeFileProviderError.invalidResponse("missing string field: \(key)")
-        }
-        return value
-    }
-
-    private static func bool(_ json: [String: Any], _ key: String) throws -> Bool {
-        guard let value = json[key] as? Bool else {
-            throw CascadeFileProviderError.invalidResponse("missing boolean field: \(key)")
-        }
-        return value
-    }
-
-    private static func optionalInt64(_ json: [String: Any], _ key: String) -> Int64? {
-        if let value = json[key] as? Int64 { return value }
-        if let value = json[key] as? Int { return Int64(value) }
-        if let value = json[key] as? NSNumber { return value.int64Value }
-        return nil
-    }
-}
-
 /// `NSFileProviderItem` implementation backed by a `CascadeVfsItem`.
+///
+/// The `CascadeVfsItem` wire shape is defined in `ActionHandler.swift`
+/// alongside the rest of the RPC envelope types so the entire protocol
+/// surface stays in one place.
 ///
 /// `contentType: UTType` replaces the macOS-unavailable
 /// `typeIdentifier: String`. `itemVersion` is required by the replicated
