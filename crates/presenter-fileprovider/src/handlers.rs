@@ -13,6 +13,7 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
+use cascade_engine::types::SyncCursor;
 use serde::{Deserialize, Serialize};
 
 use crate::items::FileProviderItem;
@@ -186,6 +187,14 @@ pub trait FileProviderHandlers: Send + Sync + std::fmt::Debug {
         new_parent_id: &str,
         new_name: &str,
     ) -> HandlerResult<FileProviderItem>;
+
+    /// Return the cursor representing the current state of all items
+    /// under `parent_id`. Used by the Swift File Provider extension to
+    /// compare against its last-known anchor and decide whether a full
+    /// re-enumeration is needed.
+    ///
+    /// The cursor is opaque bytes; consumers must not interpret them.
+    async fn current_sync_cursor(&self, parent_id: &str) -> HandlerResult<SyncCursor>;
 }
 
 /// Return value for [`FileProviderHandlers::enumerate_items`].

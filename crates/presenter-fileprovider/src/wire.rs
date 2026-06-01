@@ -9,6 +9,7 @@
 //! Each handler module defines its own params/result types and re-exports
 //! them here.
 
+use cascade_engine::types::SyncCursor;
 use serde::{Deserialize, Serialize};
 
 use crate::items::FileProviderItem;
@@ -27,6 +28,7 @@ pub mod methods {
     pub const CREATE_DIRECTORY: &str = "createDirectory";
     pub const DELETE_ITEM: &str = "deleteItem";
     pub const MOVE_ITEM: &str = "moveItem";
+    pub const CURRENT_SYNC_CURSOR: &str = "currentSyncCursor";
 }
 
 /// Structured error returned in an [`RpcResponse`].
@@ -183,6 +185,20 @@ pub struct MoveItemResult {
     pub item: FileProviderItem,
 }
 
+// ---------------------------------------------------------------------------
+// currentSyncCursor
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CurrentSyncCursorParams {
+    pub parent_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CurrentSyncCursorResult {
+    pub cursor: SyncCursor,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,5 +235,24 @@ mod tests {
             serde_json::from_value(json!({"parent_id": "gdrive:root"})).unwrap();
         assert_eq!(params.parent_id, "gdrive:root");
         assert!(params.page.is_none());
+    }
+
+    #[test]
+    fn current_sync_cursor_params_deserialises() {
+        let params: CurrentSyncCursorParams =
+            serde_json::from_value(json!({"parent_id": "gdrive:root"})).unwrap();
+        assert_eq!(params.parent_id, "gdrive:root");
+    }
+
+    #[test]
+    fn current_sync_cursor_result_round_trips() {
+        let result = CurrentSyncCursorResult {
+            cursor: SyncCursor::new(vec![1, 2, 3, 4]),
+        };
+        let encoded = serde_json::to_value(&result).unwrap();
+        // SyncCursor encodes as base64url-no-pad string.
+        assert!(encoded["cursor"].is_string());
+        let decoded: CurrentSyncCursorResult = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.cursor.as_bytes(), &[1, 2, 3, 4]);
     }
 }

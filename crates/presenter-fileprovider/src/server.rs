@@ -32,10 +32,10 @@ const SOCKET_MODE: u32 = 0o600;
 use crate::handlers::{FileProviderHandlers, HandlerError, HandlerResult};
 use crate::items::FileProviderItem;
 use crate::wire::{
-    CreateDirectoryParams, CreateDirectoryResult, DeleteItemParams, DeleteItemResult,
-    EnumerateItemsParams, EnumerateItemsResult, FetchContentsParams, FetchContentsResult,
-    GetItemParams, GetItemResult, ImportDocumentParams, ImportDocumentResult, MoveItemParams,
-    MoveItemResult, RpcError, RpcResponse, methods,
+    CreateDirectoryParams, CreateDirectoryResult, CurrentSyncCursorParams, CurrentSyncCursorResult,
+    DeleteItemParams, DeleteItemResult, EnumerateItemsParams, EnumerateItemsResult,
+    FetchContentsParams, FetchContentsResult, GetItemParams, GetItemResult, ImportDocumentParams,
+    ImportDocumentResult, MoveItemParams, MoveItemResult, RpcError, RpcResponse, methods,
 };
 
 /// Server that listens on a Unix domain socket and dispatches each
@@ -169,6 +169,7 @@ pub async fn dispatch(handlers: &dyn FileProviderHandlers, request: &Request) ->
         methods::CREATE_DIRECTORY => handle_create_directory(handlers, params).await,
         methods::DELETE_ITEM => handle_delete_item(handlers, params).await,
         methods::MOVE_ITEM => handle_move_item(handlers, params).await,
+        methods::CURRENT_SYNC_CURSOR => handle_current_sync_cursor(handlers, params).await,
         other => Err(HandlerError::internal(format!(
             "unknown File Provider RPC method: {other}"
         ))),
@@ -290,6 +291,18 @@ async fn handle_move_item(
     serialise_result(methods::MOVE_ITEM, &MoveItemResult { item })
 }
 
+async fn handle_current_sync_cursor(
+    handlers: &dyn FileProviderHandlers,
+    params: serde_json::Value,
+) -> HandlerResult<serde_json::Value> {
+    let params: CurrentSyncCursorParams = parse_params(methods::CURRENT_SYNC_CURSOR, params)?;
+    let cursor = handlers.current_sync_cursor(&params.parent_id).await?;
+    serialise_result(
+        methods::CURRENT_SYNC_CURSOR,
+        &CurrentSyncCursorResult { cursor },
+    )
+}
+
 // Re-export so callers can build a server without pulling the
 // `wire::methods` constants individually.
 #[doc(inline)]
@@ -301,7 +314,7 @@ mod tests {
     use crate::handlers::{EnumerateOutput, ErrorCode};
     use async_trait::async_trait;
     use cascade_engine::protocol::Request;
-    use cascade_engine::types::CacheState;
+    use cascade_engine::types::{CacheState, SyncCursor};
     use serde_json::json;
     use std::sync::Mutex;
 
@@ -403,6 +416,11 @@ mod tests {
         ) -> HandlerResult<FileProviderItem> {
             self.record("move_item");
             Ok(sample_item(id, new_parent_id, new_name))
+        }
+
+        async fn current_sync_cursor(&self, _parent_id: &str) -> HandlerResult<SyncCursor> {
+            self.record("current_sync_cursor");
+            Ok(SyncCursor::new(vec![0xab, 0xcd, 0xef]))
         }
     }
 
@@ -506,6 +524,23 @@ mod tests {
 
         let result = response.result.unwrap();
         assert_eq!(result, json!({}));
+    }
+
+    #[tokio::test]
+    async fn dispatch_current_sync_cursor_returns_cursor_string() {
+        let handlers = StubHandlers::default();
+        let request = make_request(
+            12,
+            methods::CURRENT_SYNC_CURSOR,
+            json!({"parent_id": "gdrive:root"}),
+        );
+
+        let response = dispatch(&handlers, &request).await;
+
+        assert!(response.error.is_none());
+        let result = response.result.unwrap();
+        // Cursor encodes as base64url-no-pad of [0xab, 0xcd, 0xef] = "q83v".
+        assert_eq!(result["cursor"], "q83v");
     }
 
     #[tokio::test]

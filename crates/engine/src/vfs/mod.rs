@@ -2,4 +2,4 @@
 
 pub mod tree;
 
-pub use tree::VfsTree;
+pub use tree::{VfsTree, derive_sync_cursor};

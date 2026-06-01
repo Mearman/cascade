@@ -116,7 +116,7 @@ impl Serialize for SyncCursor {
 
 impl<'de> Deserialize<'de> for SyncCursor {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let encoded = <&str as Deserialize>::deserialize(deserializer)?;
+        let encoded = String::deserialize(deserializer)?;
         let bytes = BASE64URL_NOPAD
             .decode(encoded.as_bytes())
             .map_err(serde::de::Error::custom)?;

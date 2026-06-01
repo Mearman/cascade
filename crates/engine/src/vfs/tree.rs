@@ -161,27 +161,44 @@ impl VfsTree {
     /// scheme in future, but consumers must keep treating the cursor as
     /// opaque bytes.
     pub async fn current_sync_cursor(&self, parent_id: &ItemId) -> anyhow::Result<SyncCursor> {
-        let backend = self.backend_by_id(parent_id.backend_id()).ok_or_else(|| {
-            anyhow::anyhow!(
-                "no backend registered for parent id {}",
-                parent_id.backend_id()
-            )
-        })?;
-        let mut entries = backend.list_children(parent_id.native_id()).await?;
-        entries.sort_by(|a, b| a.id.0.cmp(&b.id.0));
-
-        let mut hasher = Sha256::new();
-        for entry in &entries {
-            hasher.update(entry.id.0.as_bytes());
-            hasher.update([0u8]);
-            hasher.update(entry.name.as_bytes());
-            hasher.update([0u8]);
-            hasher.update([u8::from(entry.is_dir)]);
-            hasher.update(entry.size.unwrap_or(0).to_be_bytes());
-            hasher.update(entry.mod_time.map_or(0i64, |t| t.timestamp()).to_be_bytes());
-        }
-        Ok(SyncCursor::new(hasher.finalize().to_vec()))
+        let backend = self
+            .backend_by_id(parent_id.backend_id())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no backend registered for parent id {}",
+                    parent_id.backend_id()
+                )
+            })?
+            .clone();
+        derive_sync_cursor(backend.as_ref(), parent_id.native_id()).await
     }
+}
+
+/// Compute the cursor for a backend's view of a parent directory.
+///
+/// Free function (rather than a `VfsTree` method) so callers that already
+/// hold the owning `Arc<dyn Backend>` can derive the cursor without
+/// re-acquiring a lock on the tree. Used by both `VfsTree::current_sync_cursor`
+/// and presenter-side handlers that need to release a synchronous lock
+/// before awaiting.
+pub async fn derive_sync_cursor(
+    backend: &dyn Backend,
+    parent_native_id: &str,
+) -> anyhow::Result<SyncCursor> {
+    let mut entries = backend.list_children(parent_native_id).await?;
+    entries.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+
+    let mut hasher = Sha256::new();
+    for entry in &entries {
+        hasher.update(entry.id.0.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(entry.name.as_bytes());
+        hasher.update([0u8]);
+        hasher.update([u8::from(entry.is_dir)]);
+        hasher.update(entry.size.unwrap_or(0).to_be_bytes());
+        hasher.update(entry.mod_time.map_or(0i64, |t| t.timestamp()).to_be_bytes());
+    }
+    Ok(SyncCursor::new(hasher.finalize().to_vec()))
 }
 
 #[cfg(test)]

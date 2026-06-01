@@ -11,8 +11,8 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use cascade_engine::backend::Backend;
 use cascade_engine::db::StateDb;
-use cascade_engine::types::{CacheState, FileEntry, FileId, ItemId, VfsItem};
-use cascade_engine::vfs::VfsTree;
+use cascade_engine::types::{CacheState, FileEntry, FileId, ItemId, SyncCursor, VfsItem};
+use cascade_engine::vfs::{VfsTree, derive_sync_cursor};
 use tokio::io::AsyncWriteExt;
 
 use crate::handlers::{EnumerateOutput, FileProviderHandlers, HandlerError, HandlerResult};
@@ -278,6 +278,15 @@ impl FileProviderHandlers for EngineHandlers {
             .await?;
         self.db.upsert_file(&entry)?;
         Ok(FileProviderItem::from(VfsItem::from(entry)))
+    }
+
+    async fn current_sync_cursor(&self, parent_id: &str) -> HandlerResult<SyncCursor> {
+        let parent = ItemId(parent_id.to_string());
+        // backend_for() releases the std::sync RwLock guard before
+        // returning — it would not be Send across the await otherwise.
+        let backend = self.backend_for(&parent)?;
+        let cursor = derive_sync_cursor(backend.as_ref(), parent.native_id()).await?;
+        Ok(cursor)
     }
 }
 
@@ -782,5 +791,44 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::NotSupported);
+    }
+
+    #[tokio::test]
+    async fn current_sync_cursor_returns_stable_value_when_no_changes() {
+        let (handlers, _backend, _tempdir) = make_handlers();
+        let first = handlers.current_sync_cursor("stub:root").await.unwrap();
+        let second = handlers.current_sync_cursor("stub:root").await.unwrap();
+        assert_eq!(first, second);
+        assert!(!first.is_empty());
+    }
+
+    #[tokio::test]
+    async fn current_sync_cursor_changes_after_upsert() {
+        let (handlers, backend, _tempdir) = make_handlers();
+        let before = handlers.current_sync_cursor("stub:root").await.unwrap();
+
+        backend.insert(FileEntry {
+            id: ItemId::new("stub", "file2"),
+            parent_id: ItemId::new("stub", "root"),
+            name: "second.txt".to_string(),
+            is_dir: false,
+            size: Some(4),
+            mod_time: Some(Utc::now()),
+            mime_type: None,
+            hash: None,
+        });
+
+        let after = handlers.current_sync_cursor("stub:root").await.unwrap();
+        assert_ne!(before, after);
+    }
+
+    #[tokio::test]
+    async fn current_sync_cursor_fails_for_unknown_backend() {
+        let (handlers, _backend, _tempdir) = make_handlers();
+        let err = handlers
+            .current_sync_cursor("ghost:root")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
     }
 }
