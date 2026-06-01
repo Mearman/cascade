@@ -393,16 +393,13 @@ mod linux {
             // Ask the VFS whether this item has children. A non-directory
             // (file) will return an empty vec or an error; treat both as
             // ENOTDIR so the kernel receives the expected error code.
-            let children = match self.list_children_sync(&id) {
-                Ok(children) => children,
-                Err(_) => {
-                    // If the item is a file or the backend is unavailable,
-                    // report ENOTDIR — the kernel treats readdir on a
-                    // non-directory as ENOTDIR regardless of the underlying
-                    // cause.
-                    reply.error(Errno::ENOTDIR);
-                    return;
-                }
+            let Ok(children) = self.list_children_sync(&id) else {
+                // If the item is a file or the backend is unavailable,
+                // report ENOTDIR — the kernel treats readdir on a
+                // non-directory as ENOTDIR regardless of the underlying
+                // cause.
+                reply.error(Errno::ENOTDIR);
+                return;
             };
 
             // Allocate stable inodes for every child before emitting any
