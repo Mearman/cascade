@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.29](https://github.com/Mearman/cascade/compare/cascade-v0.1.28...cascade-v0.1.29) - 2026-06-01
+
+### Other
+
+- update Cargo.toml dependencies
+
 ## [0.1.28](https://github.com/Mearman/cascade/compare/cascade-v0.1.27...cascade-v0.1.28) - 2026-06-01
 
 ### Other
