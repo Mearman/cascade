@@ -63,12 +63,15 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
     func enumerateItems(for observer: NSFileProviderEnumerationObserver, startingAt page: NSFileProviderPage) {
         Task {
             do {
-                let initialCursor = decodeStartingPage(page)
-                let (items, _) = try await actions.enumerateItems(
-                    parentIdentifier: parentIdentifier,
-                    pageCursor: initialCursor
-                )
-                observer.didEnumerate(items)
+                var cursor: String? = decodeStartingPage(page)
+                repeat {
+                    let (items, nextPage) = try await actions.enumerateItems(
+                        parentIdentifier: parentIdentifier,
+                        pageCursor: cursor
+                    )
+                    observer.didEnumerate(items)
+                    cursor = nextPage
+                } while cursor != nil
                 observer.finishEnumerating(upTo: nil)
             } catch {
                 observer.finishEnumeratingWithError(error)
