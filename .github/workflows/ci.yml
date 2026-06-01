@@ -81,6 +81,38 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
+  nat-integration:
+    name: NAT integration (Linux netns)
+    needs: [check, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: nat-integration-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: nat-integration-
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev iproute2 iptables
+      - name: Build nat-integration test binary
+        run: cargo test -p cascade-p2p --features nat-integration --test nat_integration --no-run
+      - name: Run NAT integration tests (requires root for CAP_NET_ADMIN)
+        # sudo -E forwards the full environment (including PATH so cargo is
+        # found) and HOME so the Cargo registry cache is accessible.
+        run: |
+          sudo -E env "PATH=$PATH" "HOME=$HOME" \
+            cargo test -p cascade-p2p \
+              --features nat-integration \
+              --test nat_integration \
+              -- --test-threads=1 --nocapture
+
   e2e-p2p:
     name: E2E (P2P mesh in Docker Compose)
     needs: [check, test]
