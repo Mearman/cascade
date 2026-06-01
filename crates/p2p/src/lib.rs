@@ -27,6 +27,7 @@
 //!   base32-encoded device ID.
 
 pub mod block;
+pub mod candidate;
 pub mod connection;
 pub mod discovery;
 pub mod framed;
