@@ -67,6 +67,31 @@ use cascade_engine::presenter::VfsPresenter;
 use cascade_engine::types::{CacheState, ItemId, VfsItem};
 use tokio::sync::RwLock;
 
+/// Source of file bytes consulted by the `ProjFS` `GetFileData`
+/// callback when the OS asks for the contents of a virtualised file.
+///
+/// The presenter holds an optional `Arc<dyn ContentProvider>`; when
+/// unset, `GetFileData` returns `ERROR_CALL_NOT_IMPLEMENTED` and the
+/// projection remains browse-only (the historic behaviour). When set,
+/// the callback resolves the path back to a [`VfsItem`], asks the
+/// provider for the requested byte range, and forwards the bytes to
+/// `ProjFS` via `PrjWriteFileData`.
+///
+/// Implementations must be cheap to clone (the trait is consumed
+/// through an `Arc`) and safe to call from `ProjFS`'s kernel-owned
+/// worker threads — i.e. they must not enter the Tokio runtime
+/// implicitly. A backend-backed implementation should perform any
+/// async fetch on a separate executor and block on the result, or
+/// rely on a pre-warmed cache.
+pub trait ContentProvider: Send + Sync + std::fmt::Debug {
+    /// Read `length` bytes starting at `offset` from the file
+    /// identified by `id`. Returns the bytes on success.
+    ///
+    /// Implementations should return a short read (fewer bytes than
+    /// requested) at end of file rather than an error.
+    fn read_range(&self, id: &ItemId, offset: u64, length: u32) -> std::io::Result<Vec<u8>>;
+}
+
 /// State tracked for an in-flight directory enumeration session.
 ///
 /// `ProjFS` opens an enumeration with `StartDirectoryEnumeration`, pulls
@@ -385,6 +410,15 @@ pub struct ProjFsPresenter {
     /// [`Self::stop`].
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     callback_ctx: Arc<tokio::sync::Mutex<Option<CallbackContext>>>,
+    /// Optional source of file bytes for the `GetFileData` callback.
+    /// When `None`, `GetFileData` returns `ERROR_CALL_NOT_IMPLEMENTED`
+    /// and the projection stays browse-only — the historic scaffold
+    /// behaviour. When `Some`, the callback asks the provider for the
+    /// requested byte range and pushes the bytes back via
+    /// `PrjWriteFileData`. Configured through
+    /// [`Self::with_content_provider`].
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    content_provider: Option<Arc<dyn ContentProvider>>,
 }
 
 /// Owning record of the heap allocation handed to `ProjFS` via
@@ -465,6 +499,7 @@ impl ProjFsPresenter {
             enumerations: Arc::new(Mutex::new(HashMap::new())),
             handle: Arc::new(tokio::sync::Mutex::new(None)),
             callback_ctx: Arc::new(tokio::sync::Mutex::new(None)),
+            content_provider: None,
         }
     }
 
@@ -497,10 +532,27 @@ impl ProjFsPresenter {
         self
     }
 
+    /// Install a [`ContentProvider`] for the `GetFileData` callback.
+    /// Without one, the callback returns `ERROR_CALL_NOT_IMPLEMENTED`
+    /// and the projection remains browse-only.
+    #[must_use]
+    pub fn with_content_provider(mut self, provider: Arc<dyn ContentProvider>) -> Self {
+        self.content_provider = Some(provider);
+        self
+    }
+
     /// The configured mount point.
     #[must_use]
     pub fn mount_point(&self) -> &Path {
         &self.mount_point
+    }
+
+    /// Access the configured content provider, if any. Exposed for
+    /// tests and the (future) consistency checks that want to confirm
+    /// the presenter was built with one before `start()`.
+    #[must_use]
+    pub fn content_provider(&self) -> Option<&Arc<dyn ContentProvider>> {
+        self.content_provider.as_ref()
     }
 
     /// Access the in-memory item store. Tests and (in the future) the
@@ -568,6 +620,7 @@ impl VfsPresenter for ProjFsPresenter {
                 Arc::clone(&self.items),
                 Arc::clone(&self.root_id),
                 Arc::clone(&self.enumerations),
+                self.content_provider.clone(),
             )
             .await?;
             tracing::info!(
@@ -639,7 +692,8 @@ mod windows_impl {
 
     use super::handle::NamespaceHandle;
     use super::{
-        CallbackContext, EnumerationState, build_enumeration_state, collect_children, resolve_path,
+        CallbackContext, ContentProvider, EnumerationState, build_enumeration_state,
+        collect_children, resolve_path,
     };
 
     /// Heap-allocated state the callbacks consult. Kept distinct from
@@ -650,6 +704,9 @@ mod windows_impl {
         items: Arc<RwLock<HashMap<String, VfsItem>>>,
         root_id: Arc<RwLock<Option<ItemId>>>,
         enumerations: Arc<Mutex<HashMap<u128, EnumerationState>>>,
+        /// Optional source of file bytes for the `GetFileData`
+        /// callback. `None` keeps the projection browse-only.
+        content_provider: Option<Arc<dyn ContentProvider>>,
     }
 
     /// Translate a Win32 error code into an `HRESULT` in the
@@ -1011,6 +1068,7 @@ mod windows_impl {
         items: Arc<RwLock<HashMap<String, VfsItem>>>,
         root_id: Arc<RwLock<Option<ItemId>>>,
         enumerations: Arc<Mutex<HashMap<u128, EnumerationState>>>,
+        content_provider: Option<Arc<dyn ContentProvider>>,
     ) -> Result<()> {
         // Acquire both presenter-side locks before any FFI work. The
         // raw pointers and ProjFS namespace handle produced below are
@@ -1048,6 +1106,7 @@ mod windows_impl {
             items: Arc::clone(&items),
             root_id: Arc::clone(&root_id),
             enumerations: Arc::clone(&enumerations),
+            content_provider,
         });
         let inner_ptr = Box::into_raw(inner);
         let instance_context = inner_ptr.cast::<c_void>();
@@ -1433,5 +1492,78 @@ mod tests {
         let root = ItemId::new("backend", "root");
         let presenter = presenter.with_root(root.clone());
         assert_eq!(presenter.root().await, Some(root));
+    }
+
+    /// A trivial in-memory [`ContentProvider`] used by the presenter
+    /// tests and the `GetFileData` unit tests. Returns bytes from a
+    /// pre-populated `HashMap<ItemId, Vec<u8>>` and supports short
+    /// reads at end of file. Not used in production.
+    #[derive(Debug, Default)]
+    struct MockContentProvider {
+        files: Mutex<HashMap<ItemId, Vec<u8>>>,
+    }
+
+    impl MockContentProvider {
+        fn insert(&self, id: ItemId, bytes: Vec<u8>) {
+            self.files.lock().unwrap().insert(id, bytes);
+        }
+    }
+
+    impl ContentProvider for MockContentProvider {
+        fn read_range(&self, id: &ItemId, offset: u64, length: u32) -> std::io::Result<Vec<u8>> {
+            let files = self.files.lock().unwrap();
+            let Some(bytes) = files.get(id) else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no such id",
+                ));
+            };
+            let start = usize::try_from(offset).map_err(|err| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string())
+            })?;
+            if start >= bytes.len() {
+                return Ok(Vec::new());
+            }
+            let want = usize::try_from(length).map_err(|err| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string())
+            })?;
+            let end = start.saturating_add(want).min(bytes.len());
+            Ok(bytes.get(start..end).unwrap_or_default().to_vec())
+        }
+    }
+
+    /// `with_content_provider` installs the provider and `content_provider()`
+    /// returns the same Arc back. Without one, the accessor returns
+    /// `None` so callers can detect the browse-only mode.
+    #[tokio::test]
+    async fn with_content_provider_round_trips() {
+        let presenter = ProjFsPresenter::new(PathBuf::from("/tmp/cascade-projfs-test"));
+        assert!(presenter.content_provider().is_none());
+
+        let provider: Arc<dyn ContentProvider> = Arc::new(MockContentProvider::default());
+        let presenter = presenter.with_content_provider(Arc::clone(&provider));
+        let installed = presenter.content_provider().unwrap();
+        assert!(Arc::ptr_eq(installed, &provider));
+    }
+
+    /// `MockContentProvider` returns the byte range it was asked for
+    /// and a short read at end of file. This exercises the boundary
+    /// the real `GetFileData` callback relies on — the loop terminates
+    /// when the provider returns fewer bytes than requested.
+    #[test]
+    fn mock_content_provider_returns_short_read_at_eof() {
+        let id = ItemId::new("backend", "file");
+        let provider = MockContentProvider::default();
+        provider.insert(id.clone(), b"hello, world".to_vec());
+
+        let chunk = provider.read_range(&id, 0, 5).unwrap();
+        assert_eq!(chunk, b"hello");
+
+        let tail = provider.read_range(&id, 7, 100).unwrap();
+        assert_eq!(tail, b"world");
+
+        // Past end of file returns empty, not error.
+        let beyond = provider.read_range(&id, 100, 10).unwrap();
+        assert!(beyond.is_empty());
     }
 }
