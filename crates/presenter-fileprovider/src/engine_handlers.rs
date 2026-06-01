@@ -264,8 +264,8 @@ impl FileProviderHandlers for EngineHandlers {
         let item_id = ItemId(id.to_string());
         let new_parent = ItemId(new_parent_id.to_string());
         if item_id.backend_id() != new_parent.backend_id() {
-            return Err(HandlerError::permission_denied(format!(
-                "cross-backend move is not yet supported ({} -> {})",
+            return Err(HandlerError::not_supported(format!(
+                "cross-backend move not yet supported; download/upload/delete dance is the planned follow-up ({} -> {})",
                 item_id.backend_id(),
                 new_parent.backend_id()
             )));
@@ -781,6 +781,6 @@ mod tests {
             .move_item("stub:file1", "other:root", "renamed.txt")
             .await
             .unwrap_err();
-        assert_eq!(err.code, ErrorCode::PermissionDenied);
+        assert_eq!(err.code, ErrorCode::NotSupported);
     }
 }
