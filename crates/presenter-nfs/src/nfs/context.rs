@@ -206,7 +206,7 @@ mod tests {
     }
 }
 
-/// Property-based tests for NfsContext.
+/// Property-based tests for `NfsContext`.
 #[cfg(test)]
 mod proptests {
     use super::*;

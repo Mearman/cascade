@@ -1,3 +1,12 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::string_slice
+    )
+)]
 //! macOS `FSKit` presenter bridge.
 //!
 //! Connects the Cascade engine to Apple's `FSKit` framework on macOS 15.4+ (Tahoe

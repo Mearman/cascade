@@ -48,7 +48,13 @@ jobs:
       - name: Format
         run: cargo fmt --check
       - name: Clippy
-        run: cargo clippy --workspace
+        # --all-targets so test and bench code is linted too, not just lib/bin.
+        # -D warnings promotes every clippy warning (including default-level
+        # lints the workspace table does not explicitly deny) to an error.
+        # The four restriction lints (unwrap_used/expect_used/indexing_slicing/
+        # string_slice) are scoped out of test code at each crate root — see
+        # the comment in the root Cargo.toml's [workspace.lints.clippy].
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Docs
         run: cargo doc --workspace --no-deps --document-private-items
         env:

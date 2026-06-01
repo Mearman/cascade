@@ -1,3 +1,12 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::string_slice
+    )
+)]
 //! Expression language — PEG grammar parser and evaluator.
 //!
 //! Conditional rules in `.cascade` files use a small expression language

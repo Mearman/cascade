@@ -1,9 +1,14 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::string_slice
+)]
 //! End-to-end P2P data path test.
 //!
 //! Exercises the full path: create two P2P engines, index a file on one,
 //! share block data between their block stores (simulating P2P transfer),
 //! and verify the second engine can reassemble the data.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use cascade_engine::db::StateDb;
 use cascade_engine::p2p_bridge::P2pBridge;

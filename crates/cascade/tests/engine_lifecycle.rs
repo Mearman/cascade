@@ -1,5 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::string_slice
+)]
 //! Integration tests for the unified Engine lifecycle.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -7,9 +12,7 @@ use std::sync::Arc;
 use cascade_engine::backend::NullBackend;
 use cascade_engine::engine::{Engine, EngineConfig};
 
-async fn make_engine_with_backends(
-    backends: Vec<Arc<dyn cascade_engine::backend::Backend>>,
-) -> Engine {
+fn make_engine_with_backends(backends: Vec<Arc<dyn cascade_engine::backend::Backend>>) -> Engine {
     let dir = tempfile::tempdir().unwrap();
     Engine::new(EngineConfig {
         db_path: dir.path().join("state.db"),
@@ -24,7 +27,7 @@ async fn make_engine_with_backends(
 
 #[tokio::test]
 async fn full_engine_lifecycle() {
-    let engine = make_engine_with_backends(vec![Arc::new(NullBackend::new("test"))]).await;
+    let engine = make_engine_with_backends(vec![Arc::new(NullBackend::new("test"))]);
 
     // Engine should report as running before shutdown.
     let status = engine.status();
@@ -52,8 +55,7 @@ async fn engine_with_two_backends() {
     let engine = make_engine_with_backends(vec![
         Arc::new(NullBackend::new("root")),
         Arc::new(NullBackend::new("work")),
-    ])
-    .await;
+    ]);
 
     let status = engine.status();
     assert_eq!(status.backends.len(), 2);
@@ -66,7 +68,7 @@ async fn engine_with_two_backends() {
 
 #[tokio::test]
 async fn engine_start_stop_idempotent() {
-    let engine = make_engine_with_backends(vec![Arc::new(NullBackend::new("test"))]).await;
+    let engine = make_engine_with_backends(vec![Arc::new(NullBackend::new("test"))]);
 
     // Start and shutdown twice — should not panic or deadlock.
     let handle = engine.start().unwrap();
@@ -77,7 +79,7 @@ async fn engine_start_stop_idempotent() {
 
 #[tokio::test]
 async fn engine_pin_unpin_affects_status() {
-    let engine = make_engine_with_backends(vec![Arc::new(NullBackend::new("test"))]).await;
+    let engine = make_engine_with_backends(vec![Arc::new(NullBackend::new("test"))]);
 
     engine.pin("Photos/**", true).unwrap();
     engine.pin("Documents/report.pdf", false).unwrap();
@@ -96,7 +98,7 @@ async fn engine_pin_unpin_affects_status() {
 
 #[tokio::test]
 async fn engine_mount_unmount_during_runtime() {
-    let engine = make_engine_with_backends(vec![Arc::new(NullBackend::new("root"))]).await;
+    let engine = make_engine_with_backends(vec![Arc::new(NullBackend::new("root"))]);
 
     // Mount a second backend.
     engine.mount_backend(

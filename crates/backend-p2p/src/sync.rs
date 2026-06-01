@@ -1898,7 +1898,7 @@ mod tests {
     use cascade_p2p::identity::DeviceIdentity;
     use tempfile::tempdir;
 
-    async fn make_engine(folder_id: &str) -> (tempfile::TempDir, SyncEngine) {
+    fn make_engine(folder_id: &str) -> (tempfile::TempDir, SyncEngine) {
         let dir = tempdir().unwrap();
         let index = Arc::new(FolderIndex::open(&dir.path().join("idx.db")).unwrap());
         let blocks = Arc::new(BlockStore::new(&dir.path().join("blocks")).unwrap());
@@ -1908,11 +1908,11 @@ mod tests {
     }
 
     /// Two engines on loopback. A uploads a file, B should see it in
-    /// its index after the IndexUpdate broadcast.
+    /// its index after the `IndexUpdate` broadcast.
     #[tokio::test]
     async fn upload_propagates_via_index_update() {
-        let (_dir_a, engine_a) = make_engine("shared").await;
-        let (_dir_b, engine_b) = make_engine("shared").await;
+        let (_dir_a, engine_a) = make_engine("shared");
+        let (_dir_b, engine_b) = make_engine("shared");
 
         engine_a.trust(engine_b.device_id().to_string()).await;
         engine_b.trust(engine_a.device_id().to_string()).await;
@@ -1960,8 +1960,8 @@ mod tests {
     /// Block-level fetch round trip. A has a block, B requests it.
     #[tokio::test]
     async fn fetch_block_from_peer() {
-        let (_dir_a, engine_a) = make_engine("shared").await;
-        let (_dir_b, engine_b) = make_engine("shared").await;
+        let (_dir_a, engine_a) = make_engine("shared");
+        let (_dir_b, engine_b) = make_engine("shared");
 
         engine_a.trust(engine_b.device_id().to_string()).await;
         engine_b.trust(engine_a.device_id().to_string()).await;
@@ -2010,8 +2010,8 @@ mod tests {
     /// payload — no Response can be misrouted by FIFO order.
     #[tokio::test]
     async fn request_block_uses_distinct_request_ids_concurrently() {
-        let (_dir_a, engine_a) = make_engine("shared").await;
-        let (_dir_b, engine_b) = make_engine("shared").await;
+        let (_dir_a, engine_a) = make_engine("shared");
+        let (_dir_b, engine_b) = make_engine("shared");
 
         engine_a.trust(engine_b.device_id().to_string()).await;
         engine_b.trust(engine_a.device_id().to_string()).await;
@@ -2072,7 +2072,7 @@ mod tests {
 
     #[tokio::test]
     async fn merge_files_skips_when_local_dominates() {
-        let (_dir, engine) = make_engine("f").await;
+        let (_dir, engine) = make_engine("f");
         // Local row carries a strictly newer vector for device 1.
         engine
             .index
@@ -2116,7 +2116,7 @@ mod tests {
 
     #[tokio::test]
     async fn merge_files_takes_dominating_peer() {
-        let (_dir, engine) = make_engine("f").await;
+        let (_dir, engine) = make_engine("f");
         engine
             .index
             .upsert(&IndexEntry {
@@ -2160,7 +2160,7 @@ mod tests {
 
     #[tokio::test]
     async fn merge_files_noop_on_equal_vector() {
-        let (_dir, engine) = make_engine("f").await;
+        let (_dir, engine) = make_engine("f");
         engine
             .index
             .upsert(&IndexEntry {
@@ -2278,7 +2278,7 @@ mod tests {
 
     #[tokio::test]
     async fn persist_conflict_copy_uses_friendly_name_when_set() {
-        let (_dir, engine) = make_engine("f").await;
+        let (_dir, engine) = make_engine("f");
         let engine = engine.with_local_device_name(Some("Work Laptop".to_string()));
         // Seed a local row so `merge_files` has something to displace.
         engine
@@ -2340,7 +2340,7 @@ mod tests {
 
     #[tokio::test]
     async fn persist_conflict_copy_falls_back_to_short_id_without_name() {
-        let (_dir, engine) = make_engine("f").await;
+        let (_dir, engine) = make_engine("f");
         // No friendly name configured — `local_device_name` is `None`
         // by default — so the short device id must identify the
         // displaced side.
@@ -2403,7 +2403,7 @@ mod tests {
         // and is still preferred over the short device id. The
         // genuine empty-string case (which would otherwise produce a
         // bare `.conflict--<ts>.` path) is the one we must guard.
-        let (_dir, engine) = make_engine("f").await;
+        let (_dir, engine) = make_engine("f");
         let engine = engine.with_local_device_name(Some(String::new()));
         let short_id = local_short_device_id(engine.device_id());
         let conflict_prefix = format!("doc.conflict-{short_id}-");
@@ -2458,7 +2458,7 @@ mod tests {
 
     #[tokio::test]
     async fn seed_peer_names_round_trips_via_peer_name_lookup() {
-        let (_dir, engine) = make_engine("f").await;
+        let (_dir, engine) = make_engine("f");
         engine
             .seed_peer_names(vec![
                 ("AAAAA".to_string(), "home-laptop".to_string()),
@@ -2476,7 +2476,7 @@ mod tests {
 
     #[tokio::test]
     async fn merge_files_concurrent_edit_accepts_incoming() {
-        let (_dir, engine) = make_engine("f").await;
+        let (_dir, engine) = make_engine("f");
         // Local row bumped by device 1; incoming row bumped by device 2.
         // Neither dominates — concurrent edit on disconnected peers.
         engine
@@ -2532,7 +2532,7 @@ mod tests {
 
     #[tokio::test]
     async fn merge_files_merges_version_vectors_on_conflict() {
-        let (_dir, engine) = make_engine("f").await;
+        let (_dir, engine) = make_engine("f");
         // Seed local: version = [(1, 1)]
         engine
             .index
@@ -2582,7 +2582,7 @@ mod tests {
 
     #[tokio::test]
     async fn merge_files_ignores_directory_entries() {
-        let (_dir, engine) = make_engine("f").await;
+        let (_dir, engine) = make_engine("f");
         engine
             .merge_files(
                 "peer-test",
@@ -2606,7 +2606,7 @@ mod tests {
 
     #[tokio::test]
     async fn merge_files_applies_dominating_tombstone() {
-        let (_dir, engine) = make_engine("f").await;
+        let (_dir, engine) = make_engine("f");
         // Seed an undeleted local row with version `(1, 1)`.
         engine
             .index
@@ -2649,7 +2649,7 @@ mod tests {
 
     #[tokio::test]
     async fn merge_files_creates_tombstone_for_unknown_path() {
-        let (_dir, engine) = make_engine("f").await;
+        let (_dir, engine) = make_engine("f");
         // No prior upsert for "gone.txt".
         engine
             .merge_files(
@@ -2683,7 +2683,7 @@ mod tests {
 
     #[tokio::test]
     async fn merge_files_skips_unknown_file_type() {
-        let (_dir, engine) = make_engine("f").await;
+        let (_dir, engine) = make_engine("f");
         engine
             .merge_files(
                 "peer-test",
@@ -2707,7 +2707,7 @@ mod tests {
 
     #[tokio::test]
     async fn broadcast_update_skips_directories() {
-        let (_dir, engine) = make_engine("f").await;
+        let (_dir, engine) = make_engine("f");
         // No peers connected; broadcast should be a quiet no-op for
         // dir entries (we just confirm no panic). Tombstones are now
         // broadcast normally and are exercised by the integration test.
@@ -2727,8 +2727,8 @@ mod tests {
     /// `connect_to` should record the dialled peer in our `PeerBook`.
     #[tokio::test]
     async fn peer_book_records_outbound_connections() {
-        let (_dir_a, engine_a) = make_engine("shared").await;
-        let (_dir_b, engine_b) = make_engine("shared").await;
+        let (_dir_a, engine_a) = make_engine("shared");
+        let (_dir_b, engine_b) = make_engine("shared");
 
         engine_a.trust(engine_b.device_id().to_string()).await;
         engine_b.trust(engine_a.device_id().to_string()).await;
@@ -2764,8 +2764,8 @@ mod tests {
     /// `handle_inbound` should record the accepted peer in our `PeerBook`.
     #[tokio::test]
     async fn peer_book_records_inbound_connections() {
-        let (_dir_a, engine_a) = make_engine("shared").await;
-        let (_dir_b, engine_b) = make_engine("shared").await;
+        let (_dir_a, engine_a) = make_engine("shared");
+        let (_dir_b, engine_b) = make_engine("shared");
 
         engine_a.trust(engine_b.device_id().to_string()).await;
         engine_b.trust(engine_a.device_id().to_string()).await;
@@ -2808,7 +2808,7 @@ mod tests {
     /// confirm both come back through the snapshot.
     #[tokio::test]
     async fn broadcast_gossip_uses_per_peer_last_seen() {
-        let (_dir, engine) = make_engine("f").await;
+        let (_dir, engine) = make_engine("f");
         {
             let mut book = engine.peer_book.write().await;
             book.add_peer(
@@ -2842,7 +2842,7 @@ mod tests {
     /// fabricate a contact time we cannot vouch for.
     #[tokio::test]
     async fn gossip_introduced_peers_broadcast_with_zero_last_seen() {
-        let (_dir, engine) = make_engine("f").await;
+        let (_dir, engine) = make_engine("f");
         {
             let mut book = engine.peer_book.write().await;
             // Simulate a peer learned solely through gossip — never
@@ -2884,7 +2884,7 @@ mod tests {
 
     #[tokio::test]
     async fn merge_files_advances_peer_max_sequence() {
-        let (_dir, engine) = make_engine("f").await;
+        let (_dir, engine) = make_engine("f");
         engine
             .merge_files(
                 "peer-x",
@@ -2927,7 +2927,7 @@ mod tests {
 
     #[tokio::test]
     async fn merge_files_does_not_regress_peer_max_sequence() {
-        let (_dir, engine) = make_engine("f").await;
+        let (_dir, engine) = make_engine("f");
         // Seed: peer reports a high watermark first.
         engine.index.set_peer_max_sequence("peer-x", 100).unwrap();
         // A later batch with a lower max sequence must NOT overwrite
@@ -2964,7 +2964,7 @@ mod tests {
     async fn snapshot_since_filters_by_row_version() {
         // Three rows seeded into the index; entries_since(2) yields
         // only the third. Snapshot_since must mirror that.
-        let (_dir, engine) = make_engine("f").await;
+        let (_dir, engine) = make_engine("f");
         for path in ["one.txt", "two.txt", "three.txt"] {
             engine
                 .index
@@ -2988,7 +2988,7 @@ mod tests {
 
     #[tokio::test]
     async fn merge_files_skips_invalid_entries() {
-        let (_dir, engine) = make_engine("f").await;
+        let (_dir, engine) = make_engine("f");
         engine
             .merge_files(
                 "peer-x",
@@ -3017,7 +3017,7 @@ mod tests {
 
     #[tokio::test]
     async fn merge_files_skips_no_permissions_entries() {
-        let (_dir, engine) = make_engine("f").await;
+        let (_dir, engine) = make_engine("f");
         engine
             .merge_files(
                 "peer-x",
@@ -3051,7 +3051,7 @@ mod tests {
     /// lifetime.
     #[tokio::test]
     async fn start_listener_exits_on_cancel() {
-        let (_dir, engine) = make_engine("f").await;
+        let (_dir, engine) = make_engine("f");
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let (_bound, handle) = engine
             .start_listener("127.0.0.1:0".parse().unwrap(), cancel_rx)
@@ -3198,7 +3198,7 @@ mod tests {
         // The background detection task calls `set_local_external_addr`
         // and the connection-time `gather_local_candidates` reads it
         // back. The round-trip is the contract under test here.
-        let (_dir, engine) = make_engine("f").await;
+        let (_dir, engine) = make_engine("f");
         assert!(
             engine.local_external_addr().await.is_none(),
             "default is None until detection publishes a reading"
@@ -3224,7 +3224,7 @@ mod tests {
         // Receiving a `BepMessage::Candidates` must store the wire
         // candidates on the peer book so the next traversal decision
         // can pair them against the local set.
-        let (_dir, engine) = make_engine("f").await;
+        let (_dir, engine) = make_engine("f");
         let (tx, _rx) = mpsc::unbounded_channel();
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<u8>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -3255,7 +3255,7 @@ mod tests {
         // Inbound `SyncPunch` must record the peer's nonce and
         // deadline. The matching `run_hole_punch` call reads them back
         // via `PeerBook::current_punch_agreement`.
-        let (_dir, engine) = make_engine("f").await;
+        let (_dir, engine) = make_engine("f");
         let (tx, _rx) = mpsc::unbounded_channel();
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<u8>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -3287,7 +3287,7 @@ mod tests {
         // This is the conservative reading the strategy table treats
         // as "route through Relay (or best-effort punch)" rather than
         // a brittle optimistic Direct.
-        let (_dir, engine) = make_engine("f").await;
+        let (_dir, engine) = make_engine("f");
         assert_eq!(engine.local_nat_type().await, NatType::Unknown);
     }
 
@@ -3296,7 +3296,7 @@ mod tests {
         // The background detection task calls `set_local_nat_type` and
         // the connection-time `decide_connectivity` reads it back. The
         // round-trip is the contract under test here.
-        let (_dir, engine) = make_engine("f").await;
+        let (_dir, engine) = make_engine("f");
         engine.set_local_nat_type(NatType::FullCone).await;
         assert_eq!(engine.local_nat_type().await, NatType::FullCone);
     }
@@ -3307,7 +3307,7 @@ mod tests {
         // of allocating a new one — both sides must probe with the
         // same value or `run_hole_punch` will treat the matched probe
         // as a wrong-nonce stray and time out.
-        let (_dir, engine) = make_engine("f").await;
+        let (_dir, engine) = make_engine("f");
         let peer_agreement = SyncPunchAgreement {
             nonce: 0xDEAD_BEEF,
             deadline_unix_ms: unix_now_ms() + 10_000,
@@ -3328,7 +3328,7 @@ mod tests {
         // budget on a doomed attempt. We stamp the stored nonce with
         // `u64::MAX` so the freshly-allocated one (drawn from the
         // monotonic process counter) cannot collide.
-        let (_dir, engine) = make_engine("f").await;
+        let (_dir, engine) = make_engine("f");
         {
             let mut book = engine.peer_book.write().await;
             book.start_punch_with(
@@ -3349,7 +3349,7 @@ mod tests {
         // The trust check runs before any traversal logic — an
         // untrusted device must not get as far as candidate selection
         // or UDP socket binding.
-        let (_dir, engine) = make_engine("f").await;
+        let (_dir, engine) = make_engine("f");
         let err = engine
             .connect_to_with_strategy(Peer {
                 device_id: "STRANGER".to_string(),

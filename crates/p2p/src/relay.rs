@@ -590,7 +590,7 @@ mod tests {
             // Accept and then sleep forever — the WebSocket upgrade never
             // completes, simulating a hung relay.
             if let Ok((_stream, _)) = listener.accept().await {
-                tokio::time::sleep(Duration::from_secs(60)).await;
+                tokio::time::sleep(Duration::from_mins(1)).await;
             }
         });
 

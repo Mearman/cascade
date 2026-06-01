@@ -638,12 +638,12 @@ mod proptests {
         let (sd2, r) = decode_u32(r).ok()?;
         let (fsid, r) = decode_u64(r).ok()?;
         let (fileid, r) = decode_u64(r).ok()?;
-        let (at_s, r) = decode_u32(r).ok()?;
-        let (at_ns, r) = decode_u32(r).ok()?;
-        let (mt_s, r) = decode_u32(r).ok()?;
-        let (mt_ns, r) = decode_u32(r).ok()?;
-        let (ct_s, r) = decode_u32(r).ok()?;
-        let (ct_ns, _) = decode_u32(r).ok()?;
+        let (atime_secs, r) = decode_u32(r).ok()?;
+        let (atime_nanos, r) = decode_u32(r).ok()?;
+        let (mtime_secs, r) = decode_u32(r).ok()?;
+        let (mtime_nanos, r) = decode_u32(r).ok()?;
+        let (ctime_secs, r) = decode_u32(r).ok()?;
+        let (ctime_nanos, _) = decode_u32(r).ok()?;
         Some(Fattr3 {
             ftype,
             mode,
@@ -659,16 +659,16 @@ mod proptests {
             fsid,
             fileid,
             atime: NfsTime {
-                seconds: at_s,
-                nseconds: at_ns,
+                seconds: atime_secs,
+                nseconds: atime_nanos,
             },
             mtime: NfsTime {
-                seconds: mt_s,
-                nseconds: mt_ns,
+                seconds: mtime_secs,
+                nseconds: mtime_nanos,
             },
             ctime: NfsTime {
-                seconds: ct_s,
-                nseconds: ct_ns,
+                seconds: ctime_secs,
+                nseconds: ctime_nanos,
             },
         })
     }

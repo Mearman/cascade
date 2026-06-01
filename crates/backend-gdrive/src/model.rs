@@ -178,7 +178,10 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             mime_type: mime.to_string(),
-            parents: parents.iter().map(|s| s.to_string()).collect(),
+            parents: parents
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
             size: None,
             modified_time: None,
             md5_checksum: None,

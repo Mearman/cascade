@@ -1,3 +1,12 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::string_slice
+    )
+)]
 //! Cascade P2P engine — block-level file sharing between devices on a LAN.
 //!
 //! Based on Syncthing's Block Exchange Protocol (BEP) v1. The P2P engine sits

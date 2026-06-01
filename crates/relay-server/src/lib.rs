@@ -1,3 +1,12 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::string_slice
+    )
+)]
 //! Cascade relay server.
 //!
 //! An opaque byte-pipe relay that pairs two `WebSocket` clients sharing a

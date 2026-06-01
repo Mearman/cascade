@@ -326,7 +326,7 @@ mod tests {
     use super::*;
     use crate::backend::NullBackend;
 
-    async fn make_test_engine() -> Engine {
+    fn make_test_engine() -> Engine {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("state.db");
         Engine::new(EngineConfig {
@@ -342,7 +342,7 @@ mod tests {
 
     #[tokio::test]
     async fn engine_new_with_null_backend() {
-        let engine = make_test_engine().await;
+        let engine = make_test_engine();
 
         let status = engine.status();
         // NullBackend's display_name is "P2P Only", registered with type "unknown".
@@ -353,7 +353,7 @@ mod tests {
 
     #[tokio::test]
     async fn engine_mount_unmount_backend() {
-        let engine = make_test_engine().await;
+        let engine = make_test_engine();
 
         engine.mount_backend(PathBuf::from("Work"), Arc::new(NullBackend::new("work")));
 
@@ -369,7 +369,7 @@ mod tests {
 
     #[tokio::test]
     async fn engine_pin_unpin_list() {
-        let engine = make_test_engine().await;
+        let engine = make_test_engine();
 
         engine.pin("Documents/**", true).unwrap();
 
@@ -386,7 +386,7 @@ mod tests {
 
     #[tokio::test]
     async fn engine_status_reflects_state() {
-        let engine = make_test_engine().await;
+        let engine = make_test_engine();
 
         let status = engine.status();
         assert!(status.running);
@@ -396,7 +396,7 @@ mod tests {
 
     #[tokio::test]
     async fn engine_shutdown_signals_cancel() {
-        let engine = make_test_engine().await;
+        let engine = make_test_engine();
         engine.shutdown();
 
         let status = engine.status();
@@ -405,7 +405,7 @@ mod tests {
 
     #[tokio::test]
     async fn engine_start_and_shutdown() {
-        let engine = make_test_engine().await;
+        let engine = make_test_engine();
         let handle = engine.start().unwrap();
 
         // Give the task a moment to start.

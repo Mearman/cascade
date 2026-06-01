@@ -1,9 +1,14 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::string_slice
+)]
 //! Integration tests for NFS and FUSE presenters with the engine's VFS tree.
 //!
 //! Exercises the full `VfsPresenter` trait cycle (upsert → fetch → delete)
 //! with `NullBackend` and verifies the presenters integrate correctly with
 //! the engine's `VfsTree`.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use std::sync::{Arc, RwLock};
 

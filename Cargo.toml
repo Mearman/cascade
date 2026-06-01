@@ -119,7 +119,19 @@ default_trait_access = "allow"
 needless_pass_by_value = "allow"
 return_self_not_must_use = "allow"
 
-# Correctness lints — deny outright. Per-site #[allow] requires justification.
+# Correctness lints — deny outright in library and binary code. Per-site
+# #[allow] requires justification.
+#
+# These four are clippy *restriction*-group lints: opt-in by design and not
+# meant for test code, where `unwrap()`/`expect()`/indexing are idiomatic and
+# a panic is the intended failure signal. Each crate root therefore carries
+# `#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used,
+# clippy::indexing_slicing, clippy::string_slice))]`, and every integration
+# test file (`tests/*.rs`) carries the plain `#![allow(...)]` form. That keeps
+# the deny in force for shipping code while letting `cargo clippy --all-targets
+# -- -D warnings` (run in CI) still enforce the full pedantic/nursery/cargo
+# groups on tests. When adding a new crate or integration-test file, copy the
+# attribute from an existing one.
 unwrap_used = "deny"
 expect_used = "deny"
 indexing_slicing = "deny"

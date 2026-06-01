@@ -1,3 +1,12 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::string_slice
+    )
+)]
 //! `.cascade` config parser — four formats, merge, directory walk.
 //!
 //! Supports gitignore-style, TOML, YAML, and JSON formats.

@@ -1,3 +1,12 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::string_slice
+    )
+)]
 //! FUSE presenter — exposes the VFS tree as a mounted Linux FUSE filesystem.
 //!
 //! Implements the engine's `VfsPresenter` trait. On Linux, the FUSE mount is

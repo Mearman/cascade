@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::string_slice
+)]
 //! Integration tests for the Google Drive backend against a wiremock server.
 //!
 //! Each test starts a fresh mock HTTP server, registers the Drive API responses it
@@ -43,7 +49,7 @@ fn make_backend(server: &MockServer) -> Box<dyn Backend> {
 }
 
 /// Register a default `/files/root` response so tests that exercise paths
-/// invoking `my_drive_root()` (changes stream, upload, create_dir, move)
+/// invoking `my_drive_root()` (changes stream, upload, `create_dir`, move)
 /// don't fail with a 404 from the mock server.
 async fn mock_drive_root(server: &MockServer, real_root_id: &str) {
     Mock::given(method("GET"))
@@ -455,5 +461,5 @@ async fn poll_interval_is_sixty_seconds() {
     let server = MockServer::start().await;
     let backend = make_backend(&server);
     let interval = backend.poll_interval().await;
-    assert_eq!(interval, Some(std::time::Duration::from_secs(60)));
+    assert_eq!(interval, Some(std::time::Duration::from_mins(1)));
 }

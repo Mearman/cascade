@@ -1398,10 +1398,10 @@ mod tests {
             let entry = FileEntry {
                 id: item_id.clone(),
                 parent_id: parent_item,
-                name: path
-                    .file_name()
-                    .map(|os| os.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "unnamed".to_string()),
+                name: path.file_name().map_or_else(
+                    || "unnamed".to_string(),
+                    |os| os.to_string_lossy().into_owned(),
+                ),
                 is_dir: false,
                 size: Some(bytes.len() as u64),
                 mod_time: Some(Utc::now()),
@@ -1412,7 +1412,7 @@ mod tests {
             self.content
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(item_id.0.clone(), bytes);
+                .insert(item_id.0, bytes);
             self.insert(entry.clone());
             Ok(entry)
         }
@@ -1563,7 +1563,7 @@ mod tests {
         let child_id = ItemId::new("stub", "file1");
         let child_entry = FileEntry {
             id: child_id.clone(),
-            parent_id: parent_id.clone(),
+            parent_id,
             name: "hello.txt".to_string(),
             is_dir: false,
             size: Some(11),
@@ -1577,7 +1577,7 @@ mod tests {
             .content
             .lock()
             .unwrap()
-            .insert(child_id.0.clone(), b"hello world".to_vec());
+            .insert(child_id.0, b"hello world".to_vec());
 
         let feed = make_feed();
         let handlers = EngineHandlers::new(vfs, db, cache_dir.path().to_path_buf(), feed);
@@ -1811,7 +1811,7 @@ mod tests {
         src.content
             .lock()
             .unwrap()
-            .insert(src_file_id.0.clone(), b"hello world".to_vec());
+            .insert(src_file_id.0, b"hello world".to_vec());
 
         let feed = make_feed();
         let handlers = EngineHandlers::new(vfs, db, cache_dir.path().to_path_buf(), feed);

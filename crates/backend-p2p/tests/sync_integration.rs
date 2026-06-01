@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::string_slice
+)]
 //! Multi-engine integration tests for the P2P backend.
 //!
 //! These tests exercise the public [`Backend`] surface against two or
@@ -5,8 +11,6 @@
 //! mutual TLS — exactly the wire path the daemon uses, just without
 //! Docker. The Docker compose tests in `test/e2e/p2p/` cover the same
 //! scenarios against multiple real OS network stacks.
-
-#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::io::Cursor;
 use std::path::Path;
@@ -27,7 +31,7 @@ struct Node {
 }
 
 impl Node {
-    async fn new(name: &str, folder_id: &str) -> Self {
+    fn new(name: &str, folder_id: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let cfg = P2pBackendConfig {
             instance_id: format!("p2p-{name}"),
@@ -97,12 +101,12 @@ async fn wait_for_file(node: &Node, name: &str) -> Option<u64> {
 }
 
 /// Three-peer star: A is the hub, B and C connect to it. An upload on
-/// A should appear in both B and C's indexes via IndexUpdate.
+/// A should appear in both B and C's indexes via `IndexUpdate`.
 #[tokio::test]
 async fn three_peer_index_propagation() {
-    let a = Node::new("a", "shared").await;
-    let b = Node::new("b", "shared").await;
-    let c = Node::new("c", "shared").await;
+    let a = Node::new("a", "shared");
+    let b = Node::new("b", "shared");
+    let c = Node::new("c", "shared");
 
     mutual_trust(&a, &b).await;
     mutual_trust(&a, &c).await;
@@ -175,8 +179,8 @@ async fn three_peer_index_propagation() {
 /// `modified`) wins on both sides.
 #[tokio::test]
 async fn last_write_wins_conflict() {
-    let a = Node::new("a", "shared").await;
-    let b = Node::new("b", "shared").await;
+    let a = Node::new("a", "shared");
+    let b = Node::new("b", "shared");
     mutual_trust(&a, &b).await;
     let _cancel = connect_via_listener(&a, &b).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -231,8 +235,8 @@ async fn last_write_wins_conflict() {
 /// disappear from both `metadata` and `list_children`.
 #[tokio::test]
 async fn deletes_propagate_to_peers() {
-    let a = Node::new("a", "shared").await;
-    let b = Node::new("b", "shared").await;
+    let a = Node::new("a", "shared");
+    let b = Node::new("b", "shared");
     mutual_trust(&a, &b).await;
     let _cancel = connect_via_listener(&a, &b).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -289,8 +293,8 @@ async fn deletes_propagate_to_peers() {
 /// empty / missing row.
 #[tokio::test]
 async fn version_vectors_resolve_concurrent_upload() {
-    let a = Node::new("a", "shared").await;
-    let b = Node::new("b", "shared").await;
+    let a = Node::new("a", "shared");
+    let b = Node::new("b", "shared");
     mutual_trust(&a, &b).await;
 
     // Disconnected uploads — each node bumps its own short_id only.
@@ -343,8 +347,8 @@ async fn version_vectors_resolve_concurrent_upload() {
 /// path holds one payload, and a conflict-copy row holds the other.
 #[tokio::test]
 async fn concurrent_edit_preserves_loser_as_conflict_copy() {
-    let a = Node::new("a", "shared").await;
-    let b = Node::new("b", "shared").await;
+    let a = Node::new("a", "shared");
+    let b = Node::new("b", "shared");
     mutual_trust(&a, &b).await;
 
     // Disconnected uploads — each node bumps its own short_id only.
@@ -383,20 +387,24 @@ async fn concurrent_edit_preserves_loser_as_conflict_copy() {
         tokio::time::sleep(Duration::from_millis(50)).await;
         if !found_on_a {
             let kids = a.backend.list_children("root").await.unwrap();
-            if let Some(c) = kids
-                .iter()
-                .find(|e| e.name.starts_with("doc.conflict-") && e.name.ends_with(".txt"))
-            {
+            if let Some(c) = kids.iter().find(|e| {
+                e.name.starts_with("doc.conflict-")
+                    && std::path::Path::new(&e.name)
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("txt"))
+            }) {
                 conflict_size_a = c.size.unwrap_or(0);
                 found_on_a = true;
             }
         }
         if !found_on_b {
             let kids = b.backend.list_children("root").await.unwrap();
-            if let Some(c) = kids
-                .iter()
-                .find(|e| e.name.starts_with("doc.conflict-") && e.name.ends_with(".txt"))
-            {
+            if let Some(c) = kids.iter().find(|e| {
+                e.name.starts_with("doc.conflict-")
+                    && std::path::Path::new(&e.name)
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("txt"))
+            }) {
                 conflict_size_b = c.size.unwrap_or(0);
                 found_on_b = true;
             }
@@ -437,8 +445,8 @@ async fn concurrent_edit_preserves_loser_as_conflict_copy() {
 /// with the right content, well inside the worst-case-serial bound.
 #[tokio::test]
 async fn concurrent_downloads_do_not_serialise() {
-    let a = Node::new("a", "shared").await;
-    let b = Node::new("b", "shared").await;
+    let a = Node::new("a", "shared");
+    let b = Node::new("b", "shared");
     mutual_trust(&a, &b).await;
     let _cancel = connect_via_listener(&a, &b).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -517,9 +525,9 @@ async fn concurrent_downloads_do_not_serialise() {
 /// instead of waiting for the 60s timer in the spawned loop.
 #[tokio::test]
 async fn wan_gossip_introduces_peers_transitively() {
-    let a = Node::new("a", "shared").await;
-    let b = Node::new("b", "shared").await;
-    let c = Node::new("c", "shared").await;
+    let a = Node::new("a", "shared");
+    let b = Node::new("b", "shared");
+    let c = Node::new("c", "shared");
 
     // A↔B and B↔C trust each other, but A and C do NOT — without
     // gossip A would never learn about C.
@@ -593,8 +601,8 @@ async fn wan_gossip_introduces_peers_transitively() {
 /// must satisfy the read by pulling the block from A.
 #[tokio::test]
 async fn download_pulls_missing_blocks_from_peer() {
-    let a = Node::new("a", "shared").await;
-    let b = Node::new("b", "shared").await;
+    let a = Node::new("a", "shared");
+    let b = Node::new("b", "shared");
     mutual_trust(&a, &b).await;
     let _cancel = connect_via_listener(&a, &b).await;
     tokio::time::sleep(Duration::from_millis(200)).await;

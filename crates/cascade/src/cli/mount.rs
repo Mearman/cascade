@@ -823,11 +823,9 @@ async fn try_nfs(
     let nfs_port = server.local_addr.port();
     tracing::info!(port = nfs_port, "NFS server started");
 
-    if !no_mount {
-        if let Err(e) = mount_nfs(mount_path, nfs_port) {
-            resources.shutdown();
-            return Err(e);
-        }
+    if !no_mount && let Err(e) = mount_nfs(mount_path, nfs_port) {
+        resources.shutdown();
+        return Err(e);
     }
 
     if let Err(e) = write_pid_file(&ctx.pid_path) {

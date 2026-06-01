@@ -152,7 +152,8 @@ impl Manifest {
 
     /// Number of entries in the manifest.
     #[cfg(test)]
-    pub fn len(&self) -> usize {
+    #[must_use]
+    pub fn entry_count(&self) -> usize {
         self.entries.len()
     }
 }
@@ -276,7 +277,7 @@ mod tests {
             hash: "abc".to_string(),
         };
         let mut manifest = Manifest::default();
-        manifest.update(&[old_state.clone()]);
+        manifest.update(&[old_state]);
 
         let new_state = FileState {
             path: "hello.txt".to_string(),
@@ -321,7 +322,7 @@ mod tests {
             hash: "abc".to_string(),
         };
         let mut manifest = Manifest::default();
-        manifest.update(&[state.clone()]);
+        manifest.update(std::slice::from_ref(&state));
 
         let diff = manifest.diff(&[state]);
         assert!(diff.created.is_empty());
@@ -376,7 +377,7 @@ mod tests {
         };
         manifest.update(&[updated]);
 
-        assert_eq!(manifest.len(), 1);
+        assert_eq!(manifest.entry_count(), 1);
         assert_eq!(manifest.get("hello.txt").unwrap().hash, "def");
     }
 
@@ -391,10 +392,10 @@ mod tests {
         };
         let mut manifest = Manifest::default();
         manifest.update(&[state]);
-        assert_eq!(manifest.len(), 1);
+        assert_eq!(manifest.entry_count(), 1);
 
         manifest.remove(&["hello.txt"]);
-        assert_eq!(manifest.len(), 0);
+        assert_eq!(manifest.entry_count(), 0);
     }
 
     #[tokio::test]
@@ -415,7 +416,7 @@ mod tests {
         manifest.save(&path).await.unwrap();
 
         let loaded = Manifest::load(&path).await.unwrap();
-        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded.entry_count(), 1);
         let loaded_state = loaded.get("hello.txt").unwrap();
         assert_eq!(loaded_state.mtime_secs, 100);
         assert_eq!(loaded_state.mtime_nanos, 500);

@@ -852,7 +852,7 @@ mod tests {
                 name: "test.txt".into(),
                 file_type: 0,
                 size: 1024,
-                modified: 1700000000,
+                modified: 1_700_000_000,
                 sequence: 0,
                 block_size: 128 * 1024,
                 deleted: false,
@@ -885,7 +885,7 @@ mod tests {
                 FileInfo {
                     name: "b.txt".into(),
                     file_type: 0,
-                    size: 200000,
+                    size: 200_000,
                     modified: 200,
                     sequence: 0,
                     block_size: 128 * 1024,
@@ -906,8 +906,8 @@ mod tests {
             files: vec![FileInfo {
                 name: "updated.bin".into(),
                 file_type: 0,
-                size: 999999,
-                modified: 1700000001,
+                size: 999_999,
+                modified: 1_700_000_001,
                 sequence: 0,
                 block_size: 512 * 1024,
                 deleted: false,
@@ -927,7 +927,7 @@ mod tests {
                 name: "gone.txt".into(),
                 file_type: 0,
                 size: 0,
-                modified: 1700000002,
+                modified: 1_700_000_002,
                 sequence: 0,
                 block_size: 128 * 1024,
                 deleted: true,
@@ -987,8 +987,8 @@ mod tests {
             request_id: 42,
             folder: "folder-1".into(),
             name: "bigfile.iso".into(),
-            block_offset: 524288,
-            block_size: 524288,
+            block_offset: 524_288,
+            block_size: 524_288,
             block_hash: [0x42; 32],
         });
     }

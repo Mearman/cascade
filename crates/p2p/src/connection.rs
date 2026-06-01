@@ -460,7 +460,7 @@ mod tests {
     #[test]
     fn connection_manager_builds_server_acceptor() {
         let identity = DeviceIdentity::generate().unwrap();
-        let manager = ConnectionManager::new(identity.clone(), vec!["SOME-PEER".to_string()]);
+        let manager = ConnectionManager::new(identity, vec!["SOME-PEER".to_string()]);
         let acceptor = manager.build_server_acceptor();
         assert!(acceptor.is_ok());
     }
@@ -570,7 +570,7 @@ mod tests {
         accept_task.await.unwrap();
     }
 
-    /// Build a DigitallySignedStruct via the public Codec path —
+    /// Build a `DigitallySignedStruct` via the public Codec path —
     /// rustls keeps its constructor `pub(crate)`, so we synthesise the
     /// on-wire form and parse it back.
     fn forged_dss(
@@ -590,7 +590,7 @@ mod tests {
         tokio_rustls::rustls::DigitallySignedStruct::read(&mut reader).unwrap()
     }
 
-    /// A corrupted DigitallySignedStruct must be rejected by the signature
+    /// A corrupted `DigitallySignedStruct` must be rejected by the signature
     /// verifier — the previous implementation accepted everything blindly.
     ///
     /// This exercises the verifier method directly rather than driving a
@@ -632,7 +632,7 @@ mod tests {
         );
     }
 
-    /// Same as above for the server-side ClientCertVerifier — exercising
+    /// Same as above for the server-side `ClientCertVerifier` — exercising
     /// the client-cert signature path on the server.
     #[test]
     fn client_cert_verifier_rejects_forged_signature() {

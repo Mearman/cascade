@@ -908,9 +908,8 @@ mod tests {
             tokio::spawn(async move {
                 let mut buf = [0u8; STUN_RESPONSE_MAX_LEN];
                 loop {
-                    let (len, peer) = match socket.recv_from(&mut buf).await {
-                        Ok(pair) => pair,
-                        Err(_) => return,
+                    let Ok((len, peer)) = socket.recv_from(&mut buf).await else {
+                        return;
                     };
                     let Some(slice) = buf.get(..len) else {
                         continue;
@@ -1051,7 +1050,7 @@ mod tests {
     /// Append a single STUN attribute to `out`.
     fn push_attribute(out: &mut Vec<u8>, attr_type: u16, value: &[u8]) {
         out.extend_from_slice(&attr_type.to_be_bytes());
-        out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        out.extend_from_slice(&u16::try_from(value.len()).unwrap().to_be_bytes());
         out.extend_from_slice(value);
         let pad = padding_for(value.len());
         for _ in 0..pad {
@@ -1081,7 +1080,7 @@ mod tests {
 
         let mut packet = Vec::with_capacity(STUN_HEADER_LEN + attributes.len());
         packet.extend_from_slice(&BINDING_SUCCESS_RESPONSE.to_be_bytes());
-        packet.extend_from_slice(&(attributes.len() as u16).to_be_bytes());
+        packet.extend_from_slice(&u16::try_from(attributes.len()).unwrap().to_be_bytes());
         packet.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
         packet.extend_from_slice(transaction_id);
         packet.extend(attributes);
@@ -1525,7 +1524,7 @@ mod tests {
 
     #[test]
     fn host_enumeration_filters_loopback_and_ipv6_link_local() {
-        let loopback_v4 = v4_interface("lo0", Ipv4Addr::new(127, 0, 0, 1), 0);
+        let loopback_v4 = v4_interface("lo0", Ipv4Addr::LOCALHOST, 0);
         let routable_v4 = v4_interface("en0", Ipv4Addr::new(192, 168, 1, 50), 1);
         let link_local_v6 =
             v6_interface("en0", Ipv6Addr::new(0xfe80, 0, 0, 0, 0x1, 0x2, 0x3, 0x4), 1);

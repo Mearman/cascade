@@ -1,3 +1,12 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::string_slice
+    )
+)]
 //! `cascade-relay` binary entry point.
 //!
 //! Parses CLI flags via clap, configures `tracing` for structured logging,

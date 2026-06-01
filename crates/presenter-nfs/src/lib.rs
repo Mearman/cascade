@@ -1,3 +1,12 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::string_slice
+    )
+)]
 //! NFS presenter — `NFSv3` server on loopback.
 //!
 //! Implements the engine's `VfsPresenter` trait, serving files via `NFSv3`

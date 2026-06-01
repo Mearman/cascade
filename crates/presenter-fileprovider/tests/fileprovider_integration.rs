@@ -1,8 +1,14 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::string_slice
+)]
 //! Integration tests for the macOS File Provider presenter.
 //!
 //! Exercises the bridge protocol, VfsItem↔FileProviderItem round-trips,
 //! request building, and error handling. macOS-specific socket operations
-//! are gated behind #[cfg(target_os = "macos")].
+//! are gated behind #[`cfg(target_os` = "macos")].
 
 use cascade_engine::protocol::{Request, Response, decode_message, encode_message};
 use cascade_engine::types::{CacheState, ItemId, VfsItem};
@@ -155,7 +161,7 @@ fn directory_vfs_item_round_trips() {
         mime_type: None,
     };
 
-    let fp_item = FileProviderItem::from(dir_item.clone());
+    let fp_item = FileProviderItem::from(dir_item);
     assert!(fp_item.is_directory);
     assert_eq!(fp_item.size, None);
 
@@ -305,8 +311,7 @@ fn invalid_json_body_produces_decode_error() {
     let result: Result<(usize, Request), _> = decode_message(&buf)
         .ok()
         .flatten()
-        .map(Ok)
-        .unwrap_or_else(|| Err(anyhow::anyhow!("decode failed")));
+        .map_or_else(|| Err(anyhow::anyhow!("decode failed")), Ok);
     assert!(result.is_err(), "malformed JSON should fail to decode");
 }
 
@@ -357,7 +362,7 @@ mod proptests {
             let item = VfsItem {
                 id: ItemId::new(&backend_id, &native_id),
                 parent_id: ItemId::new(&backend_id, "root"),
-                name: name.clone(),
+                name,
                 is_dir,
                 size,
                 mod_time: None,

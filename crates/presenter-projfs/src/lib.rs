@@ -1,3 +1,12 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::string_slice
+    )
+)]
 //! `ProjFS` presenter — exposes the VFS tree as a native Windows
 //! Projected File System mount.
 //!
@@ -683,7 +692,7 @@ fn collect_children(parent_id: &ItemId, items: &HashMap<String, VfsItem>) -> Vec
             }
         })
         .collect();
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out.sort_by_key(|a| a.name.to_lowercase());
     out
 }
 
@@ -1868,7 +1877,6 @@ mod windows_impl {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
 

@@ -1,9 +1,14 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::string_slice
+)]
 //! Integration tests: .cascade config parse → resolved → ignore filtering.
 //!
 //! Tests the full config pipeline: write temp files in multiple formats,
 //! resolve via directory walk, and verify ignore rules are accumulated
 //! and applied correctly.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use cascade_config::merge;
 use cascade_config::parse;

@@ -1,22 +1,15 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::string_slice
+)]
 //! End-to-end integration tests for the relay server.
 //!
 //! Each test spawns a real `RelayHandle` bound to `127.0.0.1:0`, drives one or
 //! more `WebSocket` clients against it over loopback `TCP`, and asserts both
 //! the wire-level behaviour (frames forwarded, connection closed, etc.) and
 //! the published counters.
-
-// Tests use `unwrap`/`expect`/indexing extensively for fail-fast assertion
-// semantics; the workspace lints deny these by default outside the `tests`
-// module of each source file. Allow them here at the integration-test crate
-// root to keep the test bodies readable.
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::indexing_slicing,
-    clippy::missing_panics_doc,
-    clippy::missing_errors_doc,
-    clippy::doc_markdown
-)]
 
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;

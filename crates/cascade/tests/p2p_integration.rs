@@ -1,6 +1,11 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::string_slice
+)]
 //! P2P integration tests — bridge lifecycle, cross-engine block sharing,
 //! and sync-runner integration.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use cascade_engine::backend::NullBackend;
 use cascade_engine::cache::manager::{CacheManager, CacheManagerConfig};

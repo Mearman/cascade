@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::string_slice
+)]
 //! Integration tests for the local filesystem backend.
 //!
 //! Exercises the full Backend trait contract against a real temp directory,
@@ -402,7 +408,7 @@ mod proptests {
         fn walk_discovers_all_files(
             files in prop::collection::hash_map(
                 "[a-z]{1,5}",
-                any::<u8>().prop_map(|v| (v as usize).min(100).max(1)),
+                any::<u8>().prop_map(|v| (v as usize).clamp(1, 100)),
                 1..10
             )
         ) {
@@ -412,7 +418,7 @@ mod proptests {
                 let backend = make_backend(dir.path(), "prop-walk");
 
                 for (name, size) in &files {
-                    let content: Vec<u8> = (0..*size as u8).cycle().take(*size).collect();
+                    let content: Vec<u8> = (0..u8::try_from(*size).unwrap()).cycle().take(*size).collect();
                     tokio::fs::write(dir.path().join(format!("{name}.txt")), &content)
                         .await
                         .unwrap();

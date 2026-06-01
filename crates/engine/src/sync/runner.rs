@@ -468,7 +468,7 @@ mod tests {
     #[async_trait]
     impl VfsPresenter for MockPresenter {
         async fn upsert_item(&self, item: VfsItem) -> anyhow::Result<()> {
-            self.upserts.lock().unwrap().push(item.name.clone());
+            self.upserts.lock().unwrap().push(item.name);
             Ok(())
         }
         async fn delete_item(&self, id: &ItemId) -> anyhow::Result<()> {

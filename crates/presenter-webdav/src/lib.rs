@@ -1,3 +1,12 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::string_slice
+    )
+)]
 //! `WebDAV` presenter — serves files via `WebDAV` on loopback.
 //!
 //! Implements the engine's `VfsPresenter` trait, providing a `WebDAV` server

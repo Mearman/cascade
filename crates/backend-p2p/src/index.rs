@@ -351,7 +351,7 @@ fn encode_version_blob(version: &[(u64, u64)]) -> Vec<u8> {
 /// Decode the on-disk version vector blob. An empty blob is a valid
 /// empty vector (used for rows that pre-date the schema migration).
 fn decode_version_blob(blob: &[u8]) -> Result<Vec<(u64, u64)>> {
-    if blob.len() % 16 != 0 {
+    if !blob.len().is_multiple_of(16) {
         anyhow::bail!(
             "version_blob has length {}, not a multiple of 16",
             blob.len()

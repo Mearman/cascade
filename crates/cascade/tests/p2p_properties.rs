@@ -1,5 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::string_slice
+)]
 //! Property-based tests for P2P block operations, protocol messages, and gossip.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use cascade_p2p::block::{BlockHash, reassemble_blocks, split_data};
 use cascade_p2p::protocol::{

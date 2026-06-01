@@ -1,3 +1,12 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::string_slice
+    )
+)]
 //! P2P-only storage backend.
 //!
 //! Unlike `cascade-backend-{gdrive,s3,local}`, this backend has no cloud
@@ -1236,13 +1245,12 @@ fn default_data_dir(name: &str) -> PathBuf {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
     use std::io::Cursor as IoCursor;
     use tempfile::tempdir;
 
-    async fn make_backend() -> (tempfile::TempDir, P2pBackend) {
+    fn make_backend() -> (tempfile::TempDir, P2pBackend) {
         let dir = tempdir().unwrap();
         let cfg = P2pBackendConfig {
             instance_id: "p2p-test".to_string(),
@@ -1259,7 +1267,7 @@ mod tests {
 
     #[tokio::test]
     async fn upload_then_download_round_trips() {
-        let (_dir, backend) = make_backend().await;
+        let (_dir, backend) = make_backend();
         let data = b"hello world".repeat(1000);
         let mut reader: IoCursor<Vec<u8>> = IoCursor::new(data.clone());
         let entry = backend
@@ -1280,7 +1288,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_children_after_uploads() {
-        let (_dir, backend) = make_backend().await;
+        let (_dir, backend) = make_backend();
         let mut reader = IoCursor::new(b"a".to_vec());
         backend
             .upload(
@@ -1307,7 +1315,7 @@ mod tests {
 
     #[tokio::test]
     async fn changes_after_upload() {
-        let (_dir, backend) = make_backend().await;
+        let (_dir, backend) = make_backend();
         let (initial, c0) = backend.changes(None).await.unwrap();
         assert!(initial.is_empty());
 
@@ -1328,7 +1336,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_marks_tombstone_excluded_from_listing() {
-        let (_dir, backend) = make_backend().await;
+        let (_dir, backend) = make_backend();
         let mut reader = IoCursor::new(b"x".to_vec());
         let entry = backend
             .upload(
@@ -1348,7 +1356,7 @@ mod tests {
     /// empty — the missing blocks must be fetched from A over the wire.
     #[tokio::test]
     async fn cross_backend_download_via_peer_fetch() {
-        async fn open_with_folder(dir: &std::path::Path, name: &str) -> P2pBackend {
+        fn open_with_folder(dir: &std::path::Path, name: &str) -> P2pBackend {
             let cfg = P2pBackendConfig {
                 instance_id: format!("p2p-{name}"),
                 folder_id: "shared".to_string(),
@@ -1362,8 +1370,8 @@ mod tests {
         }
         let dir_a = tempdir().unwrap();
         let dir_b = tempdir().unwrap();
-        let backend_a = open_with_folder(dir_a.path(), "a").await;
-        let backend_b = open_with_folder(dir_b.path(), "b").await;
+        let backend_a = open_with_folder(dir_a.path(), "a");
+        let backend_b = open_with_folder(dir_b.path(), "b");
 
         backend_a
             .sync()

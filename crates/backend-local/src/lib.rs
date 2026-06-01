@@ -1,3 +1,12 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::string_slice
+    )
+)]
 //! Local filesystem backend for Cascade.
 //!
 //! Adopts an existing local directory and presents it as a `Backend`.
@@ -394,7 +403,7 @@ impl Backend for LocalBackend {
         reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
     ) -> anyhow::Result<FileEntry> {
         let relative = file_id.native_id();
-        let full_path = self.root.join(&relative);
+        let full_path = self.root.join(relative);
 
         let mut data = Vec::new();
         tokio::io::AsyncReadExt::read_to_end(reader, &mut data).await?;
@@ -427,7 +436,7 @@ impl Backend for LocalBackend {
         let parent_id = ItemId::new(&self.id, &parent_relative);
 
         Ok(FileEntry {
-            id: ItemId::new(&self.id, &relative),
+            id: ItemId::new(&self.id, relative),
             parent_id,
             name,
             is_dir: false,

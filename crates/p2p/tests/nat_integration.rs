@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::string_slice
+)]
 //! End-to-end NAT integration tests using Linux network namespaces.
 //!
 //! Gated behind the `nat-integration` feature flag so regular `cargo test`

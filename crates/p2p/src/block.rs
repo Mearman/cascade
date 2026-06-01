@@ -195,7 +195,7 @@ mod tests {
         // Simulate storing and retrieving each block.
         let blocks: Vec<Vec<u8>> = original
             .chunks(fb.block_size as usize)
-            .map(|c| c.to_vec())
+            .map(<[u8]>::to_vec)
             .collect();
 
         let reassembled = reassemble_blocks(&blocks);
@@ -224,7 +224,7 @@ mod tests {
 
         let blocks: Vec<Vec<u8>> = data
             .chunks(fb.block_size as usize)
-            .map(|c| c.to_vec())
+            .map(<[u8]>::to_vec)
             .collect();
 
         reassemble_to_file(&blocks, &output).await.unwrap();

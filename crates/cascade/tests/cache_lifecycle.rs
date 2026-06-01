@@ -1,5 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::string_slice
+)]
 //! Integration tests: cache manager — pinning, eviction, lifecycle policies.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use cascade_engine::cache::lifecycle::{EvictionDecision, EvictionReason, LifecycleEvaluator};
 use cascade_engine::cache::manager::{CacheManager, CacheManagerConfig};

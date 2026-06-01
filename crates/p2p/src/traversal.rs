@@ -1239,7 +1239,7 @@ mod tests {
         // Bind to port 0 so the OS picks a free ephemeral port; both
         // sides of every test discover their actual ports via
         // `local_addr()`.
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0)
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
     }
 
     #[tokio::test]

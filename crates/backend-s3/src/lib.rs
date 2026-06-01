@@ -1,3 +1,12 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::string_slice
+    )
+)]
 //! S3-compatible backend for Cascade.
 //!
 //! Supports AWS S3, `MinIO`, Backblaze B2, Cloudflare R2, and any other
@@ -602,7 +611,7 @@ impl Backend for S3Backend {
         reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
     ) -> anyhow::Result<FileEntry> {
         let key = file_id.native_id();
-        let url = self.object_url(&key);
+        let url = self.object_url(key);
 
         let mut data = Vec::new();
         reader.read_to_end(&mut data).await?;
@@ -629,9 +638,9 @@ impl Backend for S3Backend {
             .rsplit_once('/')
             .map_or_else(String::new, |(prefix, _)| prefix.to_owned());
         let parent_id = ItemId::new(&self.backend_id, &parent_key);
-        let name = key.rsplit('/').next().unwrap_or(&key).to_string();
+        let name = key.rsplit('/').next().unwrap_or(key).to_string();
 
-        Ok(self.object_entry(&key, &name, size, Some(Utc::now()), &parent_id))
+        Ok(self.object_entry(key, &name, size, Some(Utc::now()), &parent_id))
     }
 
     async fn create_dir(&self, path: &Path) -> anyhow::Result<FileEntry> {
@@ -828,7 +837,7 @@ impl S3Backend {
     /// Strip the list prefix from a full S3 key, returning only the
     /// name component relative to the list prefix.
     #[cfg(test)]
-    fn strip_key_prefix<'a>(&self, key: &'a str, list_prefix: &str) -> Option<&'a str> {
+    fn strip_key_prefix<'a>(key: &'a str, list_prefix: &str) -> Option<&'a str> {
         key.strip_prefix(list_prefix)
     }
 }
@@ -986,25 +995,18 @@ mod tests {
 
     #[test]
     fn strip_key_prefix_works() {
-        let s3 = S3Backend {
-            config: S3Config {
-                endpoint: "https://s3.amazonaws.com".to_string(),
-                bucket: "my-bucket".to_string(),
-                region: "us-east-1".to_string(),
-                access_key_id: "KEY".to_string(),
-                secret_access_key: "SECRET".to_string(),
-                prefix: None,
-            },
-            http: reqwest::Client::new(),
-            backend_id: "s3".to_string(),
-        };
-
         assert_eq!(
-            s3.strip_key_prefix("folder/file.txt", "folder/"),
+            S3Backend::strip_key_prefix("folder/file.txt", "folder/"),
             Some("file.txt")
         );
-        assert_eq!(s3.strip_key_prefix("other/file.txt", "folder/"), None);
-        assert_eq!(s3.strip_key_prefix("file.txt", ""), Some("file.txt"));
+        assert_eq!(
+            S3Backend::strip_key_prefix("other/file.txt", "folder/"),
+            None
+        );
+        assert_eq!(
+            S3Backend::strip_key_prefix("file.txt", ""),
+            Some("file.txt")
+        );
     }
 
     #[test]
