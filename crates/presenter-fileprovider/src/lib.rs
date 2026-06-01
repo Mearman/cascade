@@ -5,6 +5,7 @@
 //! on every platform; operations fail clearly outside macOS.
 
 pub mod bridge;
+pub mod engine_handlers;
 pub mod handlers;
 pub mod items;
 pub mod server;
