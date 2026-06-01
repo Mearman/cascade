@@ -297,6 +297,56 @@ impl HResultCode {
     }
 }
 
+/// Map a [`std::io::Error`] to a typed [`HResultCode`] in the
+/// `FACILITY_WIN32` space.
+///
+/// The mapping is kind-aware and uses the Win32 numeric values listed
+/// below. Any [`std::io::ErrorKind`] not covered explicitly falls
+/// through to `ERROR_GEN_FAILURE` so the callback never silently
+/// erases a failure.
+///
+/// | [`std::io::ErrorKind`] | Win32 code (numeric) | Win32 constant |
+/// |---|---|---|
+/// | `NotFound` | 2 | `ERROR_FILE_NOT_FOUND` |
+/// | `PermissionDenied` | 5 | `ERROR_ACCESS_DENIED` |
+/// | `Interrupted` | 995 | `ERROR_OPERATION_ABORTED` |
+/// | `OutOfMemory` | 14 | `ERROR_OUTOFMEMORY` |
+/// | `TimedOut` | 1460 | `ERROR_TIMEOUT` |
+/// | `BrokenPipe` | 109 | `ERROR_BROKEN_PIPE` |
+/// | `UnexpectedEof` | 38 | `ERROR_HANDLE_EOF` |
+/// | `WouldBlock` | 1237 | `ERROR_RETRY` |
+/// | every other variant | 31 | `ERROR_GEN_FAILURE` |
+///
+/// The Win32 constants live in `windows::Win32::Foundation::*`; the
+/// numeric values are reproduced here so the mapping compiles on
+/// non-Windows targets and can be tested cross-platform.
+#[cfg_attr(
+    not(any(target_os = "windows", test)),
+    allow(
+        dead_code,
+        reason = "consumed only by Windows callbacks and unit tests"
+    )
+)]
+pub(crate) fn hresult_for_io_error(err: &std::io::Error) -> HResultCode {
+    // The numeric values match the corresponding `WIN32_ERROR`
+    // constants in `windows::Win32::Foundation`. Keeping them as
+    // literals lets this function compile without the `windows`
+    // crate and lets the unit tests assert the exact packed HRESULT
+    // produced for each `ErrorKind`.
+    let win32_code: u32 = match err.kind() {
+        std::io::ErrorKind::NotFound => 2,         // ERROR_FILE_NOT_FOUND
+        std::io::ErrorKind::PermissionDenied => 5, // ERROR_ACCESS_DENIED
+        std::io::ErrorKind::Interrupted => 995,    // ERROR_OPERATION_ABORTED
+        std::io::ErrorKind::OutOfMemory => 14,     // ERROR_OUTOFMEMORY
+        std::io::ErrorKind::TimedOut => 1460,      // ERROR_TIMEOUT
+        std::io::ErrorKind::BrokenPipe => 109,     // ERROR_BROKEN_PIPE
+        std::io::ErrorKind::UnexpectedEof => 38,   // ERROR_HANDLE_EOF
+        std::io::ErrorKind::WouldBlock => 1237,    // ERROR_RETRY
+        _ => 31,                                   // ERROR_GEN_FAILURE
+    };
+    HResultCode::from_win32(win32_code)
+}
+
 /// Source of file bytes consulted by the `ProjFS` `GetFileData`
 /// callback when the OS asks for the contents of a virtualised file.
 ///
@@ -2268,6 +2318,60 @@ mod tests {
         #[allow(clippy::cast_possible_wrap)]
         let expected = 0x8007_2345_u32 as i32;
         assert_eq!(code.get(), expected);
+    }
+
+    /// Every `io::ErrorKind` documented in the mapping table produces
+    /// the matching packed `HRESULT`, and any kind not in the table
+    /// falls through to `ERROR_GEN_FAILURE`. The expected codes are
+    /// computed via [`HResultCode::from_win32`] so the test stays in
+    /// sync with the packing rule rather than hard-coding magic
+    /// numbers.
+    #[test]
+    fn hresult_for_io_error_maps_each_kind() {
+        use std::io::{Error, ErrorKind};
+
+        // Pairs of `(ErrorKind, expected Win32 code)`. The numeric
+        // codes match `windows::Win32::Foundation::*` and are
+        // documented on `hresult_for_io_error`.
+        let cases: &[(ErrorKind, u32)] = &[
+            (ErrorKind::NotFound, 2),
+            (ErrorKind::PermissionDenied, 5),
+            (ErrorKind::Interrupted, 995),
+            (ErrorKind::OutOfMemory, 14),
+            (ErrorKind::TimedOut, 1460),
+            (ErrorKind::BrokenPipe, 109),
+            (ErrorKind::UnexpectedEof, 38),
+            (ErrorKind::WouldBlock, 1237),
+            // Variants not in the table fall through to
+            // `ERROR_GEN_FAILURE` (31). Cover a representative
+            // sample including the catch-all `Other`.
+            (ErrorKind::Other, 31),
+            (ErrorKind::InvalidInput, 31),
+            (ErrorKind::InvalidData, 31),
+            (ErrorKind::AlreadyExists, 31),
+            (ErrorKind::ConnectionRefused, 31),
+            (ErrorKind::WriteZero, 31),
+        ];
+
+        for (kind, win32) in cases {
+            let err = Error::from(*kind);
+            let got = hresult_for_io_error(&err);
+            let expected = HResultCode::from_win32(*win32);
+            assert_eq!(
+                got, expected,
+                "ErrorKind::{kind:?} should map to Win32 code {win32}"
+            );
+        }
+
+        // `Error::other` wraps an arbitrary payload as
+        // `ErrorKind::Other` — confirm the fall-through applies to a
+        // freshly constructed `other` value, not just `Error::from`.
+        let synthetic = Error::other("synthetic failure");
+        assert_eq!(
+            hresult_for_io_error(&synthetic),
+            HResultCode::from_win32(31),
+            "Error::other should map to ERROR_GEN_FAILURE"
+        );
     }
 
     /// `classify_read` collapses a `ContentProvider::read_range` result
