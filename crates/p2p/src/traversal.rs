@@ -759,4 +759,313 @@ mod tests {
     fn addr_for(port: u16) -> SocketAddr {
         addr(port)
     }
+
+    // ── Hole-punch state machine ──
+
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    /// One event the [`MockTransport`] returns from `recv_probe`.
+    ///
+    /// The state machine consumes one event per burst. The test queues
+    /// events in the order the bursts run. Transport-level errors on
+    /// the receive side are not currently exercised through this enum
+    /// because the propagation path is covered by
+    /// [`MockTransport::with_send_error`] — both paths funnel into
+    /// [`PunchError::Transport`].
+    #[derive(Debug, Clone)]
+    enum MockRecvEvent {
+        /// Return a probe. State machine compares the nonce against the
+        /// agreement to decide success vs. wrong-nonce skip.
+        Probe(ReceivedProbe),
+        /// Return [`io::ErrorKind::TimedOut`] — the state machine treats
+        /// this as "no receipt this burst" and moves on.
+        Timeout,
+    }
+
+    /// Deterministic in-memory transport. Sends are recorded; receives
+    /// pop from a queue.
+    #[derive(Debug, Default)]
+    struct MockTransport {
+        recv_queue: Mutex<VecDeque<MockRecvEvent>>,
+        sent: Mutex<Vec<(SocketAddr, u64)>>,
+        /// When set, every `send_probe` returns this error instead of
+        /// recording. Used to exercise the transport-error path.
+        send_error: Mutex<Option<(io::ErrorKind, &'static str)>>,
+    }
+
+    impl MockTransport {
+        fn new(events: Vec<MockRecvEvent>) -> Self {
+            Self {
+                recv_queue: Mutex::new(events.into_iter().collect()),
+                sent: Mutex::new(Vec::new()),
+                send_error: Mutex::new(None),
+            }
+        }
+
+        fn with_send_error(mut self, kind: io::ErrorKind, msg: &'static str) -> Self {
+            self.send_error = Mutex::new(Some((kind, msg)));
+            self
+        }
+
+        fn sent_count(&self) -> usize {
+            self.sent.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait]
+    impl PunchTransport for MockTransport {
+        async fn send_probe(&self, dst: SocketAddr, nonce: u64) -> io::Result<()> {
+            if let Some((kind, msg)) = *self.send_error.lock().unwrap() {
+                return Err(io::Error::new(kind, msg));
+            }
+            self.sent.lock().unwrap().push((dst, nonce));
+            Ok(())
+        }
+
+        async fn recv_probe(&self, _deadline: Instant) -> io::Result<ReceivedProbe> {
+            let event = self
+                .recv_queue
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(MockRecvEvent::Timeout);
+            match event {
+                MockRecvEvent::Probe(probe) => Ok(probe),
+                MockRecvEvent::Timeout => {
+                    Err(io::Error::new(io::ErrorKind::TimedOut, "mock recv timeout"))
+                }
+            }
+        }
+    }
+
+    /// Deterministic clock. `now()` advances only when the test calls
+    /// [`MockClock::advance`]; `now_unix_ms()` is set independently so
+    /// the test can verify the timestamp stamped into
+    /// [`EstablishedFlow`].
+    #[derive(Debug)]
+    struct MockClock {
+        instant: Mutex<Instant>,
+        unix_ms: Mutex<u64>,
+    }
+
+    impl MockClock {
+        fn new(start: Instant, unix_ms: u64) -> Self {
+            Self {
+                instant: Mutex::new(start),
+                unix_ms: Mutex::new(unix_ms),
+            }
+        }
+
+        fn set_unix_ms(&self, value: u64) {
+            *self.unix_ms.lock().unwrap() = value;
+        }
+    }
+
+    impl Clock for MockClock {
+        fn now(&self) -> Instant {
+            *self.instant.lock().unwrap()
+        }
+
+        fn now_unix_ms(&self) -> u64 {
+            *self.unix_ms.lock().unwrap()
+        }
+    }
+
+    fn punch_pair() -> CandidatePair {
+        CandidatePair {
+            local: addr(22_000),
+            remote: addr(22_001),
+        }
+    }
+
+    /// Build a `SyncPunchAgreement` whose deadline sits comfortably in
+    /// the future relative to the supplied clock. Used by every
+    /// success/timeout/error test that should not trip the deadline
+    /// guard.
+    fn future_agreement(clock: &MockClock, nonce: u64) -> SyncPunchAgreement {
+        SyncPunchAgreement {
+            nonce,
+            deadline_unix_ms: clock.now_unix_ms() + 60_000,
+        }
+    }
+
+    /// Config with a short overall deadline so timeout-path tests do
+    /// not waste virtual time. `start_paused` means sleep is free, but
+    /// keeping these snug also catches off-by-one bursts.
+    fn snug_config() -> PunchConfig {
+        PunchConfig::new(2, Duration::from_millis(20), 3, Duration::from_secs(1)).unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn punch_succeeds_on_first_burst() {
+        let pair = punch_pair();
+        let nonce = 0xDEAD_BEEF_u64;
+        let clock = MockClock::new(Instant::now(), 1_000);
+        let sync = future_agreement(&clock, nonce);
+        let transport = MockTransport::new(vec![MockRecvEvent::Probe(ReceivedProbe {
+            from: pair.remote,
+            nonce,
+        })]);
+
+        clock.set_unix_ms(1_234);
+        let flow = run_hole_punch(&transport, &pair, &sync, &snug_config(), &clock)
+            .await
+            .unwrap();
+
+        assert_eq!(flow.local, pair.local);
+        assert_eq!(flow.remote, pair.remote);
+        assert_eq!(flow.established_at_unix_ms, 1_234);
+        // Exactly one burst (2 probes) before the matching reply.
+        assert_eq!(transport.sent_count(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn punch_succeeds_on_third_burst() {
+        let pair = punch_pair();
+        let nonce = 0x1234_5678_u64;
+        let clock = MockClock::new(Instant::now(), 5_000);
+        let sync = future_agreement(&clock, nonce);
+        let transport = MockTransport::new(vec![
+            MockRecvEvent::Timeout,
+            MockRecvEvent::Timeout,
+            MockRecvEvent::Probe(ReceivedProbe {
+                from: pair.remote,
+                nonce,
+            }),
+        ]);
+
+        clock.set_unix_ms(7_777);
+        let flow = run_hole_punch(&transport, &pair, &sync, &snug_config(), &clock)
+            .await
+            .unwrap();
+
+        // The clock returns the value set at the moment recv resolves,
+        // so the recorded timestamp matches the test's clock.
+        assert_eq!(flow.established_at_unix_ms, 7_777);
+        // Three bursts × two probes per burst.
+        assert_eq!(transport.sent_count(), 6);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn punch_times_out_after_max_bursts() {
+        let pair = punch_pair();
+        let clock = MockClock::new(Instant::now(), 1_000);
+        let sync = future_agreement(&clock, 42);
+        // Queue more timeouts than `max_bursts` so the cap, not the
+        // queue, is the proximate cause of failure.
+        let transport = MockTransport::new(vec![
+            MockRecvEvent::Timeout,
+            MockRecvEvent::Timeout,
+            MockRecvEvent::Timeout,
+            MockRecvEvent::Timeout,
+            MockRecvEvent::Timeout,
+        ]);
+
+        let err = run_hole_punch(&transport, &pair, &sync, &snug_config(), &clock)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, PunchError::Timeout), "got {err:?}");
+        // `max_bursts = 3` × `burst_size = 2` probes.
+        assert_eq!(transport.sent_count(), 6);
+    }
+
+    #[tokio::test]
+    async fn punch_refuses_to_start_after_deadline() {
+        let pair = punch_pair();
+        let clock = MockClock::new(Instant::now(), 10_000);
+        let sync = SyncPunchAgreement {
+            nonce: 7,
+            deadline_unix_ms: 5_000,
+        };
+        let transport = MockTransport::default();
+
+        let err = run_hole_punch(&transport, &pair, &sync, &snug_config(), &clock)
+            .await
+            .unwrap_err();
+
+        match err {
+            PunchError::DeadlinePassed {
+                now_ms,
+                deadline_ms,
+            } => {
+                assert_eq!(now_ms, 10_000);
+                assert_eq!(deadline_ms, 5_000);
+            }
+            other => panic!("expected DeadlinePassed, got {other:?}"),
+        }
+        // The state machine must not have sent anything.
+        assert_eq!(transport.sent_count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn punch_propagates_transport_error() {
+        let pair = punch_pair();
+        let clock = MockClock::new(Instant::now(), 1_000);
+        let sync = future_agreement(&clock, 99);
+        let transport =
+            MockTransport::default().with_send_error(io::ErrorKind::ConnectionRefused, "boom");
+
+        let err = run_hole_punch(&transport, &pair, &sync, &snug_config(), &clock)
+            .await
+            .unwrap_err();
+
+        match err {
+            PunchError::Transport(e) => {
+                assert_eq!(e.kind(), io::ErrorKind::ConnectionRefused);
+            }
+            other => panic!("expected Transport, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn punch_ignores_probe_with_wrong_nonce() {
+        let pair = punch_pair();
+        let clock = MockClock::new(Instant::now(), 1_000);
+        let sync = future_agreement(&clock, 0xAAAA);
+        // First burst: stray probe with the wrong nonce — treated as a
+        // no-receipt. Second and third bursts time out, so the run
+        // ends in Timeout (not success, not error).
+        let transport = MockTransport::new(vec![
+            MockRecvEvent::Probe(ReceivedProbe {
+                from: pair.remote,
+                nonce: 0xBBBB,
+            }),
+            MockRecvEvent::Timeout,
+            MockRecvEvent::Timeout,
+        ]);
+
+        let err = run_hole_punch(&transport, &pair, &sync, &snug_config(), &clock)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PunchError::Timeout), "got {err:?}");
+        // All three bursts ran (the wrong-nonce probe did not abort).
+        assert_eq!(transport.sent_count(), 6);
+    }
+
+    #[test]
+    fn punch_rejects_invalid_config() {
+        let bad_burst = PunchConfig::new(0, Duration::from_millis(50), 3, Duration::from_secs(10));
+        match bad_burst {
+            Err(PunchError::InvalidConfig(msg)) => assert!(msg.contains("burst_size")),
+            other => panic!("expected InvalidConfig(burst_size), got {other:?}"),
+        }
+        let bad_max = PunchConfig::new(3, Duration::from_millis(50), 0, Duration::from_secs(10));
+        match bad_max {
+            Err(PunchError::InvalidConfig(msg)) => assert!(msg.contains("max_bursts")),
+            other => panic!("expected InvalidConfig(max_bursts), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn punch_config_default_matches_protocol_doc() {
+        // Sanity check that the documented defaults from
+        // `docs/nat-hole-punching.md` survive renames or refactors.
+        let cfg = PunchConfig::default();
+        assert_eq!(cfg.burst_size, 3);
+        assert_eq!(cfg.per_burst_gap, Duration::from_millis(50));
+        assert_eq!(cfg.max_bursts, 3);
+        assert_eq!(cfg.total_deadline, Duration::from_secs(10));
+    }
 }
