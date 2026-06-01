@@ -827,102 +827,132 @@ mod tests {
         ));
         backend.insert(FileEntry::dir(
             subdir_id.clone(),
-            dir_id.clone(),
+            dir_id,
             "subdir".to_string(),
         ));
-        backend.insert(FileEntry::file(
-            file_id.clone(),
-            subdir_id.clone(),
-            "file.txt".to_string(),
-        ));
+        backend.insert(FileEntry::file(file_id, subdir_id, "file.txt".to_string()));
 
         let vfs = Arc::new(RwLock::new(VfsTree::new(backend)));
         FuseOps::new_with_vfs(root_id, vfs)
     }
 
-    /// Helper: call `list_children_by_id` via the VfsTree directly.
+    /// Helper: call `list_children_by_id` via the `VfsTree` directly.
     ///
     /// The tests below exercise the VFS → backend path that `list_children_sync`
     /// wraps. Using an async helper here avoids the "cannot `block_on` inside a
     /// Tokio runtime" panic that would occur if `list_children_sync` were called
     /// from within a `#[tokio::test]` context.
-    async fn list_children(ops: &FuseOps, id: &ItemId) -> Vec<cascade_engine::types::FileEntry> {
-        let vfs = ops
-            .vfs
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        vfs.list_children_by_id(id).await.unwrap()
+    ///
+    /// The `Arc<dyn Backend>` is cloned while holding the read lock so that the
+    /// guard is dropped before the async `list_children` call, preventing an
+    /// `RwLockReadGuard` from being held across an `.await` point.
+    async fn list_children(
+        ops: &FuseOps,
+        id: &ItemId,
+    ) -> anyhow::Result<Vec<cascade_engine::types::FileEntry>> {
+        let backend = {
+            let vfs = ops
+                .vfs
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            vfs.backend_by_id(id.backend_id())
+                .map(std::sync::Arc::clone)
+                .ok_or_else(|| anyhow::anyhow!("no backend for id {}", id.backend_id()))?
+        };
+        backend.list_children(id.native_id()).await
     }
 
     /// `list_children_by_id` on root returns the top-level `dir` entry.
     #[tokio::test]
-    async fn list_children_root_returns_dir() {
+    async fn list_children_root_returns_dir() -> anyhow::Result<()> {
         let ops = make_nested_ops();
         let root_id = ItemId::new("fake", "root");
-        let children = list_children(&ops, &root_id).await;
+        let children = list_children(&ops, &root_id).await?;
         assert_eq!(children.len(), 1);
-        let child = &children[0];
+        let child = children
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("expected at least one child"))?;
         assert_eq!(child.name, "dir");
         assert!(child.is_dir);
         assert_eq!(child.id, ItemId::new("fake", "dir"));
+        Ok(())
     }
 
     /// `list_children_by_id` on `dir` returns `subdir`.
     #[tokio::test]
-    async fn list_children_nested_dir_returns_subdir() {
+    async fn list_children_nested_dir_returns_subdir() -> anyhow::Result<()> {
         let ops = make_nested_ops();
         let dir_id = ItemId::new("fake", "dir");
-        let children = list_children(&ops, &dir_id).await;
+        let children = list_children(&ops, &dir_id).await?;
         assert_eq!(children.len(), 1);
-        let child = &children[0];
+        let child = children
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("expected at least one child"))?;
         assert_eq!(child.name, "subdir");
         assert!(child.is_dir);
         assert_eq!(child.id, ItemId::new("fake", "subdir"));
+        Ok(())
     }
 
     /// `list_children_by_id` on `subdir` returns `file.txt`.
     #[tokio::test]
-    async fn list_children_subdir_returns_file() {
+    async fn list_children_subdir_returns_file() -> anyhow::Result<()> {
         let ops = make_nested_ops();
         let subdir_id = ItemId::new("fake", "subdir");
-        let children = list_children(&ops, &subdir_id).await;
+        let children = list_children(&ops, &subdir_id).await?;
         assert_eq!(children.len(), 1);
-        let child = &children[0];
+        let child = children
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("expected at least one child"))?;
         assert_eq!(child.name, "file.txt");
         assert!(!child.is_dir);
         assert_eq!(child.id, ItemId::new("fake", "file"));
+        Ok(())
     }
 
     /// `list_children_by_id` on `file.txt` returns an empty vec — a file has no
     /// children. The `readdir` handler treats this as ENOTDIR.
     #[tokio::test]
-    async fn list_children_file_returns_empty() {
+    async fn list_children_file_returns_empty() -> anyhow::Result<()> {
         let ops = make_nested_ops();
         let file_id = ItemId::new("fake", "file");
-        let children = list_children(&ops, &file_id).await;
+        let children = list_children(&ops, &file_id).await?;
         assert!(children.is_empty(), "expected no children for a file");
+        Ok(())
     }
 
     /// Inode allocation is idempotent: querying the same `ItemId` twice always
     /// yields the same inode number.
     #[tokio::test]
-    async fn inode_allocation_is_idempotent_across_list_calls() {
+    async fn inode_allocation_is_idempotent_across_list_calls() -> anyhow::Result<()> {
         let ops = make_nested_ops();
         let root_id = ItemId::new("fake", "root");
 
         // First call — allocates.
-        let first = list_children(&ops, &root_id).await;
-        let inode_first = {
-            let mut map = ops.inode_map.lock().unwrap();
-            map.allocate(first[0].id.clone())
-        };
+        let first = list_children(&ops, &root_id).await?;
+        let first_id = first
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("expected at least one child"))?
+            .id;
+        let inode_first = ops
+            .inode_map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .allocate(first_id.clone());
 
         // Second call — same ItemId must yield the same inode.
-        let second = list_children(&ops, &root_id).await;
-        let inode_second = {
-            let mut map = ops.inode_map.lock().unwrap();
-            map.allocate(second[0].id.clone())
-        };
+        let second = list_children(&ops, &root_id).await?;
+        let second_id = second
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("expected at least one child"))?
+            .id;
+        let inode_second = ops
+            .inode_map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .allocate(second_id);
 
         assert_eq!(
             inode_first, inode_second,
@@ -933,20 +963,28 @@ mod tests {
             crate::inode::ROOT_INODE,
             "child must not reuse root inode"
         );
+        Ok(())
     }
 
     /// A child inode must differ from root.
     #[tokio::test]
-    async fn child_inodes_are_distinct_from_root() {
+    async fn child_inodes_are_distinct_from_root() -> anyhow::Result<()> {
         let ops = make_nested_ops();
         let root_id = ItemId::new("fake", "root");
-        let children = list_children(&ops, &root_id).await;
+        let children = list_children(&ops, &root_id).await?;
 
-        let child_inode = {
-            let mut map = ops.inode_map.lock().unwrap();
-            map.allocate(children[0].id.clone())
-        };
+        let child_id = children
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("expected at least one child"))?
+            .id;
+        let child_inode = ops
+            .inode_map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .allocate(child_id);
 
         assert_ne!(child_inode, crate::inode::ROOT_INODE);
+        Ok(())
     }
 }
