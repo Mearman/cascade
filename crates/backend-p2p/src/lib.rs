@@ -95,7 +95,7 @@ pub struct P2pBackendConfig {
     pub device_name: Option<String>,
     /// Enable WAN peer gossip. When `true`, the backend broadcasts a
     /// snapshot of its known peer list to every connected peer every
-    /// 60 seconds via a [`BepMessage::Gossip`] frame, and merges any
+    /// 60 seconds via a `BepMessage::Gossip` frame, and merges any
     /// gossip frames it receives into its own peer book.
     ///
     /// The peers carried in gossip are the ones the local peer book

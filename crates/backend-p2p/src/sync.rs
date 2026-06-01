@@ -655,7 +655,7 @@ impl SyncEngine {
         book.merge_gossip(introducer_id, &self_id, &message);
     }
 
-    /// Build a [`BepMessage::Gossip`] payload from the current peer
+    /// Build a `BepMessage::Gossip` payload from the current peer
     /// book, suitable for sending to connected peers.
     ///
     /// Excludes the local device id from the snapshot — peers do not
@@ -681,7 +681,7 @@ impl SyncEngine {
             .collect()
     }
 
-    /// Build a [`BepMessage::Gossip`] frame from the current peer book
+    /// Build a `BepMessage::Gossip` frame from the current peer book
     /// and send it to every connected peer.
     ///
     /// No-op when the snapshot is empty — sending an empty gossip frame
@@ -709,7 +709,7 @@ impl SyncEngine {
     /// A peer row with `FileInfo.deleted` set marks the local entry
     /// as a tombstone rather than overwriting its blocks.
     ///
-    /// After processing the batch, the highest [`FileInfo::sequence`]
+    /// After processing the batch, the highest `FileInfo::sequence`
     /// observed is persisted via
     /// [`FolderIndex::set_peer_max_sequence`] for `peer_device_id`, so
     /// the next reconnect can request only the delta beyond what we
@@ -1035,7 +1035,7 @@ fn entry_to_file_info(entry: &IndexEntry) -> Result<FileInfo> {
         // Sequence space is per-INDEX (one FolderIndex per backend instance)
         // and the per-row `row_version` is monotonic across upserts and
         // tombstones, so it is exactly the per-device sequence number BEP
-        // expects. See [`FileInfo::sequence`] for the per-index/per-device
+        // expects. See `FileInfo::sequence` for the per-index/per-device
         // equivalence note.
         sequence: u64::try_from(entry.row_version).unwrap_or(0),
         block_size,

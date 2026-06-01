@@ -72,7 +72,7 @@ use tokio::sync::RwLock;
 /// `ProjFS` opens an enumeration with `StartDirectoryEnumeration`, pulls
 /// entries one batch at a time through `GetDirectoryEnumeration`, and
 /// closes it with `EndDirectoryEnumeration`. Each session is identified
-/// by a [`windows::core::GUID`] (stored here as the equivalent `u128`
+/// by a `windows::core::GUID` (stored here as the equivalent `u128`
 /// for `cfg`-independent map keys). The session needs a stable, ordered
 /// view of the directory's children plus a cursor into that view so
 /// consecutive calls resume where the previous one left off.

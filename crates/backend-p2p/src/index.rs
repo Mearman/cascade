@@ -59,7 +59,7 @@ impl FolderIndex {
     /// created before the version-vector schema — are migrated in
     /// place: the `version_blob` column is added with an empty default.
     /// A `peer_sequences` table is also created (or added on migration)
-    /// so the sync engine can record the highest [`FileInfo::sequence`]
+    /// so the sync engine can record the highest `FileInfo::sequence`
     /// it has seen from each peer and request only the delta on
     /// reconnect.
     ///
