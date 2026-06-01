@@ -655,33 +655,39 @@ impl SyncEngine {
         book.merge_gossip(introducer_id, &self_id, &message);
     }
 
-    /// Build a [`BepMessage::Gossip`] frame from the current peer book
-    /// and send it to every connected peer.
+    /// Build a [`BepMessage::Gossip`] payload from the current peer
+    /// book, suitable for sending to connected peers.
     ///
     /// Excludes the local device id from the snapshot — peers do not
-    /// need us to tell them about ourselves. The `snapshot_unix_seconds`
-    /// field is stamped with the broadcast time because the
-    /// [`PeerBook`] does not track per-peer last-contact yet; future
-    /// work can thread a precise timestamp through `record_peer`
-    /// without changing the wire shape.
+    /// need us to tell them about ourselves. Each entry's
+    /// `snapshot_unix_seconds` carries the per-peer `last_seen` value
+    /// stamped by [`PeerBook::mark_seen`] on the most recent confirmed
+    /// contact (outbound connect, inbound accept, or any frame
+    /// received). A peer that has been introduced via gossip but never
+    /// reached directly is broadcast with `snapshot_unix_seconds = 0`.
+    ///
+    /// Returns an empty vector when no peers are known.
+    pub async fn current_gossip_snapshot(&self) -> Vec<GossipPeer> {
+        let book = self.peer_book.read().await;
+        let self_id = self.device_id();
+        book.peers()
+            .values()
+            .filter(|p| p.device_id != self_id)
+            .map(|p| GossipPeer {
+                device_id: p.device_id.clone(),
+                addresses: p.addresses.iter().map(ToString::to_string).collect(),
+                snapshot_unix_seconds: p.last_seen,
+            })
+            .collect()
+    }
+
+    /// Build a [`BepMessage::Gossip`] frame from the current peer book
+    /// and send it to every connected peer.
     ///
     /// No-op when the snapshot is empty — sending an empty gossip frame
     /// every minute would just waste bandwidth.
     pub async fn broadcast_gossip(&self) {
-        let now = unix_timestamp_seconds();
-        let snapshot: Vec<GossipPeer> = {
-            let book = self.peer_book.read().await;
-            let self_id = self.device_id();
-            book.peers()
-                .values()
-                .filter(|p| p.device_id != self_id)
-                .map(|p| GossipPeer {
-                    device_id: p.device_id.clone(),
-                    addresses: p.addresses.iter().map(ToString::to_string).collect(),
-                    snapshot_unix_seconds: now,
-                })
-                .collect()
-        };
+        let snapshot = self.current_gossip_snapshot().await;
         if snapshot.is_empty() {
             return;
         }
