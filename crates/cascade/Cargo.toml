@@ -36,6 +36,15 @@ reqwest.workspace = true
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
 
+# The File Provider presenter is macOS-only (the Swift extension bridges
+# Finder to the engine over a Unix socket). The crate compiles
+# cross-platform, but only the macOS daemon wires up its RPC server, so it
+# is a macOS-target dependency. `async-trait` is needed here for the
+# pull-model no-op presenter the File Provider strategy drives.
+[target.'cfg(target_os = "macos")'.dependencies]
+cascade-presenter-fileprovider = { path = "../presenter-fileprovider" }
+async-trait = { workspace = true }
+
 [dev-dependencies]
 tempfile = "3"
 proptest = "1"

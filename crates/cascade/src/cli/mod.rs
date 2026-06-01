@@ -175,6 +175,17 @@ pub enum Commands {
         /// Disable the P2P optimisation layer even if config.toml enables it.
         #[arg(long, conflicts_with = "p2p")]
         no_p2p: bool,
+
+        /// Serve the macOS File Provider RPC bridge instead of `FSKit`.
+        ///
+        /// Stands up the File Provider Unix-socket server that the Swift
+        /// extension connects to (`~/.config/cascade/fileprovider.sock`) and
+        /// drives the sync runner to populate the state DB and change feed.
+        /// The Swift host app must be built, codesigned, and have registered
+        /// its File Provider domain separately — see
+        /// `docs/fileprovider-smoke-test.md`. No effect on Linux or Windows.
+        #[arg(long)]
+        file_provider: bool,
     },
 
     /// Stop the daemon and unmount
@@ -344,6 +355,7 @@ impl Cli {
                 no_mount,
                 p2p,
                 no_p2p,
+                file_provider,
             } => {
                 // Tri-state override: --p2p forces on, --no-p2p forces off,
                 // neither falls through to the config-file default.
@@ -354,12 +366,19 @@ impl Cli {
                 } else {
                     None
                 };
-                mount::start(ctx, mount_point.as_deref(), no_mount, p2p_override).await
+                mount::start(
+                    ctx,
+                    mount_point.as_deref(),
+                    no_mount,
+                    p2p_override,
+                    file_provider,
+                )
+                .await
             }
             Commands::Stop => mount::stop(ctx),
             Commands::Restart => {
                 mount::stop(ctx)?;
-                mount::start(ctx, None, false, None).await
+                mount::start(ctx, None, false, None, false).await
             }
             Commands::Status => status::show(ctx),
             Commands::Pin { path } => cache::pin(ctx, &path),

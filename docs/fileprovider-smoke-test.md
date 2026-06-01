@@ -113,22 +113,29 @@ EOF
 
 ## Step 4 — Start the Cascade daemon
 
+The File Provider bridge is an explicit opt-in via `--file-provider`. Without the flag,
+`cascade start` uses FSKit on macOS (the default native presenter), which does not open
+the File Provider socket. The two are alternatives, not a fallback chain — both are
+macOS-native and self-mounting — so pick one:
+
 ```bash
-./target/release/cascade start
+./target/release/cascade start --file-provider
 ```
 
-Wait for the daemon to report that it is running:
+Unlike the FSKit and WebDAV strategies, this does not mount anything itself. It stands up
+the File Provider RPC server and runs the sync runner so the state database and the
+engine's change feed stay populated; the Swift extension owns the Finder mount once its
+domain is registered (step 5). The daemon prints the RPC socket path on startup.
 
-```bash
-./target/release/cascade status
-```
-
-The daemon opens a Unix domain socket at `~/.config/cascade/fileprovider.sock`. Confirm
-it exists before continuing:
+Confirm the socket exists before continuing:
 
 ```bash
 ls -l ~/.config/cascade/fileprovider.sock
 ```
+
+If the socket is missing, the daemon did not start the File Provider server — check that
+you passed `--file-provider` and that no other `cascade` daemon is already running
+(`./target/release/cascade status`).
 
 ## Step 5 — Register the File Provider domain
 
