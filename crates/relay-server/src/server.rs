@@ -81,7 +81,7 @@ pub async fn spawn(config: RelayConfig) -> Result<RelayHandle> {
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
     let listener_registry = registry.clone();
     let listener_counters = counters.clone();
-    let listener_config = config.clone();
+    let listener_config = config;
 
     let listener_task = tokio::spawn(async move {
         run_listener(
@@ -126,7 +126,11 @@ async fn spawn_metrics_endpoint(
     }
 }
 
+// The `async` keyword is required here so this stub has the same signature as
+// the `cfg(feature = "metrics")` variant above — the call site awaits the
+// return value unconditionally regardless of which variant is selected.
 #[cfg(not(feature = "metrics"))]
+#[allow(clippy::unused_async)]
 async fn spawn_metrics_endpoint(
     config: &RelayConfig,
     _counters: Arc<Counters>,
@@ -170,7 +174,6 @@ async fn run_listener(
                     Ok((stream, peer)) => {
                         let registry = registry.clone();
                         let counters = counters.clone();
-                        let config = config.clone();
                         tokio::spawn(async move {
                             if let Err(err) = handle_connection(stream, peer, &config, &registry, &counters).await {
                                 warn!(error = %err, %peer, "relay connection ended with error");
@@ -189,6 +192,12 @@ async fn run_listener(
     reaper.abort();
 }
 
+#[allow(clippy::result_large_err)]
+// The `accept_hdr_async` callback is required to return
+// `Result<Response<()>, ErrorResponse>` by the tungstenite API. The `Err`
+// variant is a tungstenite `ErrorResponse` (an alias for
+// `http::Response<Option<String>>`) whose size we cannot reduce without
+// changing the third-party trait bound.
 async fn handle_connection(
     stream: TcpStream,
     peer: SocketAddr,
