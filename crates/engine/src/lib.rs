@@ -2,6 +2,7 @@
 
 pub mod backend;
 pub mod cache;
+pub mod changefeed;
 pub mod config;
 pub mod db;
 pub mod engine;
