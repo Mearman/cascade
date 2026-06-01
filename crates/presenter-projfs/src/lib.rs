@@ -387,17 +387,14 @@ pub struct ProjFsPresenter {
     callback_ctx: Arc<tokio::sync::Mutex<Option<CallbackContext>>>,
 }
 
-/// State the `ProjFS` callbacks need to consult, packaged up so it can
-/// be passed through `PrjStartVirtualizing`'s `instance_context`
-/// pointer. The actual struct lives on the heap behind a `Box`; we
-/// keep the `Box`'s ownership in [`ProjFsPresenter::callback_ctx`] so
-/// it outlives the namespace handle.
+/// Owning record of the heap allocation handed to `ProjFS` via
+/// `PrjStartVirtualizing`'s `instance_context`. The Arcs the callbacks
+/// dereference live on `CallbackContextInner` (heap-Boxed and reached
+/// through `raw_ptr`); the presenter already retains its own Arc clones
+/// of the same data, so we do not duplicate them here.
 #[derive(Debug)]
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 struct CallbackContext {
-    items: Arc<RwLock<HashMap<String, VfsItem>>>,
-    root_id: Arc<RwLock<Option<ItemId>>>,
-    enumerations: Arc<Mutex<HashMap<u128, EnumerationState>>>,
     /// Owning pointer handed to `ProjFS`, stored as `usize` so the
     /// field is `Send + Sync`. The pointer originally came from
     /// `Box::into_raw(Box::new(CallbackContextInner { .. }))` and is
@@ -434,7 +431,7 @@ impl Drop for ProjFsPresenter {
             }
         }
         if let Ok(mut slot) = self.callback_ctx.try_lock()
-            && let Some(CallbackContext { raw_ptr, .. }) = slot.take()
+            && let Some(CallbackContext { raw_ptr }) = slot.take()
             && raw_ptr != 0
         {
             // SAFETY: raw_ptr originated from Box::into_raw in
@@ -1087,9 +1084,6 @@ mod windows_impl {
 
         *handle_slot_guard = Some(NamespaceHandle(ctx));
         *ctx_slot_guard = Some(CallbackContext {
-            items,
-            root_id,
-            enumerations,
             raw_ptr: inner_ptr as usize,
         });
         Ok(())
@@ -1123,7 +1117,7 @@ mod windows_impl {
             let mut slot = callback_ctx_slot.lock().await;
             slot.take()
         };
-        if let Some(CallbackContext { raw_ptr, .. }) = ctx
+        if let Some(CallbackContext { raw_ptr }) = ctx
             && raw_ptr != 0
         {
             // SAFETY: raw_ptr originated from Box::into_raw in
