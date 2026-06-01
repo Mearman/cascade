@@ -856,14 +856,15 @@ async fn detect_nat_and_publish(
             retries: 2,
         };
         match cascade_p2p::nat::detect_nat_type_rfc5780(&socket, &cfg).await {
-            Ok(nat_type) => {
+            Ok(outcome) => {
                 tracing::info!(
                     target: "cascade::backend::p2p",
                     instance = %instance_id,
-                    nat = ?nat_type,
+                    nat = ?outcome.nat_type(),
+                    external = ?outcome.external_socket_addr(),
                     "RFC 5780 NAT type detected",
                 );
-                sync.set_local_nat_type(nat_type).await;
+                sync.set_local_nat_type(outcome.nat_type()).await;
             }
             Err(e) => tracing::warn!(
                 target: "cascade::backend::p2p",
