@@ -129,6 +129,29 @@ struct CurrentSyncCursorResult: Decodable {
     let cursor: String
 }
 
+/// Result of `enumerateChanges`.
+///
+/// Mirrors the Rust-side `EnumerateChangesResult` in
+/// `crates/presenter-fileprovider/src/wire.rs`. `addedOrModified`
+/// carries every item that should be re-observed by the system,
+/// `deleted` is the list of engine-side `ItemId` strings that no
+/// longer exist, and `newCursor` is the opaque base64url-no-pad
+/// cursor the caller must echo on the next call to receive an
+/// incremental delta. A `newCursor` that does not match what the
+/// engine has stored — for example after an engine restart — causes
+/// the next call to fall through to a fresh enumeration.
+struct EnumerateChangesResult: Decodable {
+    let addedOrModified: [CascadeVfsItem]
+    let deleted: [String]
+    let newCursor: String
+
+    enum CodingKeys: String, CodingKey {
+        case addedOrModified = "added_or_modified"
+        case deleted
+        case newCursor = "new_cursor"
+    }
+}
+
 // MARK: - Error mapping
 
 /// Map a structured RPC error to an `NSFileProviderError`.
@@ -365,6 +388,36 @@ final class ActionHandler {
             itemID: parentID
         )
         return result.cursor
+    }
+
+    /// Fetch the delta between `sinceCursor` and the current state of
+    /// `parentIdentifier`.
+    ///
+    /// `sinceCursor` is the base64url-no-pad string the engine handed
+    /// back via `currentSyncCursor` or a previous `enumerateChanges`
+    /// call. Pass `nil` for the first call after the extension starts
+    /// or after the system invalidates its anchor — the engine treats
+    /// either case (no cursor, or a cursor it no longer recognises) as
+    /// a fresh enumeration and reports every current child as added.
+    ///
+    /// Returns `(addedOrModified, deletedIDs, newCursor)`. The caller
+    /// must echo `newCursor` on the next call to receive incremental
+    /// behaviour.
+    func enumerateChanges(
+        parentIdentifier: NSFileProviderItemIdentifier,
+        sinceCursor: String?
+    ) async throws -> (addedOrModified: [NSFileProviderItem], deleted: [String], newCursor: String) {
+        let parentID = engineID(for: parentIdentifier)
+        var params: [String: Any] = ["parent_id": parentID]
+        if let sinceCursor { params["since_cursor"] = sinceCursor }
+
+        let result: EnumerateChangesResult = try await engine.send(
+            method: "enumerateChanges",
+            params: params,
+            itemID: parentID
+        )
+        let items = result.addedOrModified.map(FileProviderItem.init(item:))
+        return (items, result.deleted, result.newCursor)
     }
 
     func fetchContents(for identifier: NSFileProviderItemIdentifier) async throws -> URL {
