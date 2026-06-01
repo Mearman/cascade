@@ -67,6 +67,142 @@ use cascade_engine::presenter::VfsPresenter;
 use cascade_engine::types::{CacheState, ItemId, VfsItem};
 use tokio::sync::RwLock;
 
+/// User-driven filesystem event surfaced by the `ProjFS`
+/// `NotificationCallback`.
+///
+/// The variants mirror the `PRJ_NOTIFICATION_*` flag set so the
+/// callback can dispatch on a typed value rather than raw integers,
+/// and tests can assert the mapping cross-platform without depending
+/// on the `windows` crate.
+///
+/// The variants carry the destination path only for events where
+/// `ProjFS` supplies one (rename, hardlink). For every other event
+/// the path is the source path on `PRJ_CALLBACK_DATA::FilePathName`
+/// which the callback already has access to via the callback data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    not(any(target_os = "windows", test)),
+    allow(
+        dead_code,
+        reason = "consumed only by Windows callbacks and unit tests"
+    )
+)]
+pub enum NotificationEvent {
+    /// `PRJ_NOTIFICATION_FILE_OPENED` (2). A user-mode handle opened
+    /// the file.
+    FileOpened,
+    /// `PRJ_NOTIFICATION_NEW_FILE_CREATED` (4). A new file appeared
+    /// at the path.
+    NewFileCreated,
+    /// `PRJ_NOTIFICATION_FILE_OVERWRITTEN` (8). An existing file was
+    /// truncated and rewritten.
+    FileOverwritten,
+    /// `PRJ_NOTIFICATION_PRE_DELETE` (16). A delete is about to
+    /// occur; the callback may veto with `ERROR_ACCESS_DENIED`.
+    PreDelete,
+    /// `PRJ_NOTIFICATION_PRE_RENAME` (32). A rename is about to
+    /// occur; the destination is supplied separately.
+    PreRename {
+        /// Future location of the file. May be empty if `ProjFS` did
+        /// not supply one (defensive — the documented contract is
+        /// non-null for rename notifications).
+        destination: String,
+    },
+    /// `PRJ_NOTIFICATION_PRE_SET_HARDLINK` (64). A hardlink is about
+    /// to be created.
+    PreSetHardlink {
+        /// Future location of the hardlink.
+        destination: String,
+    },
+    /// `PRJ_NOTIFICATION_FILE_RENAMED` (128). A rename completed.
+    FileRenamed {
+        /// Final location of the file.
+        destination: String,
+    },
+    /// `PRJ_NOTIFICATION_HARDLINK_CREATED` (256). A hardlink was
+    /// created.
+    HardlinkCreated {
+        /// Location of the new hardlink.
+        destination: String,
+    },
+    /// `PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_NO_MODIFICATION` (512).
+    FileHandleClosedNoModification,
+    /// `PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_MODIFIED` (1024).
+    FileHandleClosedFileModified,
+    /// `PRJ_NOTIFICATION_FILE_HANDLE_CLOSED_FILE_DELETED` (2048).
+    FileHandleClosedFileDeleted,
+    /// `PRJ_NOTIFICATION_FILE_PRE_CONVERT_TO_FULL` (4096). The OS is
+    /// about to convert the placeholder to a full file.
+    FilePreConvertToFull,
+}
+
+impl NotificationEvent {
+    /// Map a raw `PRJ_NOTIFICATION` value to the typed enum. Returns
+    /// `None` for codes the presenter does not recognise — callers
+    /// should log and continue rather than fail. `destination` is the
+    /// path `ProjFS` hands in for rename/hardlink events; ignored for
+    /// every other variant.
+    #[must_use]
+    pub fn from_i32(value: i32, destination: Option<String>) -> Option<Self> {
+        let dest = destination.unwrap_or_default();
+        match value {
+            2 => Some(Self::FileOpened),
+            4 => Some(Self::NewFileCreated),
+            8 => Some(Self::FileOverwritten),
+            16 => Some(Self::PreDelete),
+            32 => Some(Self::PreRename { destination: dest }),
+            64 => Some(Self::PreSetHardlink { destination: dest }),
+            128 => Some(Self::FileRenamed { destination: dest }),
+            256 => Some(Self::HardlinkCreated { destination: dest }),
+            512 => Some(Self::FileHandleClosedNoModification),
+            1024 => Some(Self::FileHandleClosedFileModified),
+            2048 => Some(Self::FileHandleClosedFileDeleted),
+            4096 => Some(Self::FilePreConvertToFull),
+            _ => None,
+        }
+    }
+
+    /// Short human-readable tag for tracing. Matches the
+    /// `PRJ_NOTIFICATION_*` flag name with the prefix stripped.
+    #[must_use]
+    pub const fn tag(&self) -> &'static str {
+        match self {
+            Self::FileOpened => "FILE_OPENED",
+            Self::NewFileCreated => "NEW_FILE_CREATED",
+            Self::FileOverwritten => "FILE_OVERWRITTEN",
+            Self::PreDelete => "PRE_DELETE",
+            Self::PreRename { .. } => "PRE_RENAME",
+            Self::PreSetHardlink { .. } => "PRE_SET_HARDLINK",
+            Self::FileRenamed { .. } => "FILE_RENAMED",
+            Self::HardlinkCreated { .. } => "HARDLINK_CREATED",
+            Self::FileHandleClosedNoModification => "FILE_HANDLE_CLOSED_NO_MODIFICATION",
+            Self::FileHandleClosedFileModified => "FILE_HANDLE_CLOSED_FILE_MODIFIED",
+            Self::FileHandleClosedFileDeleted => "FILE_HANDLE_CLOSED_FILE_DELETED",
+            Self::FilePreConvertToFull => "FILE_PRE_CONVERT_TO_FULL",
+        }
+    }
+}
+
+/// Policy hook for `PRJ_NOTIFICATION_PRE_DELETE`. Returning `false`
+/// vetoes the delete with `ERROR_ACCESS_DENIED`. The current stub
+/// always allows — the in-memory items map is read-only as far as
+/// this presenter is concerned and the engine handles its own
+/// write-protection rules. Kept as a discrete function so future
+/// policy work has an obvious extension point.
+///
+/// `const` today only because the body is trivial; real policy work
+/// will inspect `items` and drop the modifier.
+#[cfg_attr(
+    not(any(target_os = "windows", test)),
+    allow(
+        dead_code,
+        reason = "consumed only by Windows callbacks and unit tests"
+    )
+)]
+const fn allow_delete(_path: &str, _items: &HashMap<String, VfsItem>) -> bool {
+    true
+}
+
 /// Source of file bytes consulted by the `ProjFS` `GetFileData`
 /// callback when the OS asks for the contents of a virtualised file.
 ///
@@ -670,8 +806,11 @@ mod windows_impl {
     //! byte range from the installed [`ContentProvider`] (when one is
     //! present) and forwards it via `PrjWriteFileData`; without a
     //! provider it returns `ERROR_CALL_NOT_IMPLEMENTED`.
-    //! `Notification` and `CancelCommand` remain stubbed pending the
-    //! follow-up commits.
+    //! `NotificationCallback` decodes the event via
+    //! [`super::NotificationEvent`], logs at `debug`, and vetoes
+    //! deletes via [`super::allow_delete`] when the policy says no.
+    //! `CancelCommandCallback` remains stubbed pending the follow-up
+    //! commit.
 
     use std::collections::HashMap;
     use std::ffi::c_void;
@@ -1142,16 +1281,75 @@ mod windows_impl {
         }
     }
 
-    /// Stub callback for `PRJ_NOTIFICATION_CB`. Write-back hooks
-    /// follow in a later commit.
+    /// `PRJ_NOTIFICATION_CB` — log user-driven filesystem events and
+    /// veto deletes the presenter does not allow.
+    ///
+    /// The full set of `PRJ_NOTIFICATION_*` flags is mapped via
+    /// [`super::NotificationEvent::from_i32`]; unrecognised codes are
+    /// logged at `warn` and produce `S_OK` so ProjFS does not retry.
+    /// For `PRE_DELETE` the presenter consults [`super::allow_delete`]
+    /// (currently always-allow) and returns `ERROR_ACCESS_DENIED`
+    /// when the policy says no.
+    ///
+    /// The `destination_file_name` PCWSTR is only meaningful for
+    /// rename and hardlink notifications. We decode it for those
+    /// variants and ignore it elsewhere.
     #[allow(unsafe_code)]
-    const unsafe extern "system" fn notification(
-        _callback_data: *const PRJ_CALLBACK_DATA,
-        _is_directory: bool,
-        _notification: PRJ_NOTIFICATION,
-        _destination_file_name: PCWSTR,
+    unsafe extern "system" fn notification(
+        callback_data: *const PRJ_CALLBACK_DATA,
+        is_directory: bool,
+        notification_kind: PRJ_NOTIFICATION,
+        destination_file_name: PCWSTR,
         _operation_parameters: *mut PRJ_NOTIFICATION_PARAMETERS,
     ) -> HRESULT {
+        // SAFETY: ProjFS holds `callback_data` alive for the duration
+        // of the call.
+        let Some(ctx) = (unsafe { context_from_callback_data(callback_data) }) else {
+            return S_OK;
+        };
+        let path = unsafe { pcwstr_to_string((*callback_data).FilePathName) }.unwrap_or_default();
+
+        // Only decode the destination for the variants where ProjFS
+        // documents a non-null pointer. For everything else the
+        // pointer is undefined and decoding would be incorrect.
+        let raw = notification_kind.0;
+        let destination = if matches!(raw, 32 | 64 | 128 | 256) {
+            // SAFETY: ProjFS documents `destination_file_name` as a
+            // valid null-terminated wide string for these notification
+            // codes. pcwstr_to_string handles null/decode failure.
+            unsafe { pcwstr_to_string(destination_file_name) }
+        } else {
+            None
+        };
+
+        let Some(event) = super::NotificationEvent::from_i32(raw, destination) else {
+            tracing::warn!(
+                path = %path,
+                is_directory,
+                notification_code = raw,
+                "ProjFS notification with unrecognised code; treating as no-op"
+            );
+            return S_OK;
+        };
+
+        tracing::debug!(
+            path = %path,
+            is_directory,
+            event = event.tag(),
+            "ProjFS notification"
+        );
+
+        if matches!(event, super::NotificationEvent::PreDelete) {
+            let items = ctx.items.blocking_read();
+            if !super::allow_delete(&path, &items) {
+                tracing::info!(
+                    path = %path,
+                    "ProjFS PRE_DELETE vetoed by allow_delete policy"
+                );
+                return hresult_from_win32(windows::Win32::Foundation::ERROR_ACCESS_DENIED.0);
+            }
+        }
+
         S_OK
     }
 
@@ -1673,6 +1871,76 @@ mod tests {
         let presenter = presenter.with_content_provider(Arc::clone(&provider));
         let installed = presenter.content_provider().unwrap();
         assert!(Arc::ptr_eq(installed, &provider));
+    }
+
+    /// Every `PRJ_NOTIFICATION_*` flag maps to a distinct
+    /// `NotificationEvent`, the destination is threaded through for
+    /// the rename/hardlink variants, and unknown codes yield `None`.
+    #[test]
+    fn notification_event_from_prj_notification_round_trip() {
+        // The integer codes here are the values of the
+        // `PRJ_NOTIFICATION_*` constants in
+        // windows::Win32::Storage::ProjectedFileSystem. Keeping them
+        // as literals lets the test compile cross-platform.
+        let cases: &[(i32, NotificationEvent)] = &[
+            (2, NotificationEvent::FileOpened),
+            (4, NotificationEvent::NewFileCreated),
+            (8, NotificationEvent::FileOverwritten),
+            (16, NotificationEvent::PreDelete),
+            (
+                32,
+                NotificationEvent::PreRename {
+                    destination: "dst".to_string(),
+                },
+            ),
+            (
+                64,
+                NotificationEvent::PreSetHardlink {
+                    destination: "dst".to_string(),
+                },
+            ),
+            (
+                128,
+                NotificationEvent::FileRenamed {
+                    destination: "dst".to_string(),
+                },
+            ),
+            (
+                256,
+                NotificationEvent::HardlinkCreated {
+                    destination: "dst".to_string(),
+                },
+            ),
+            (512, NotificationEvent::FileHandleClosedNoModification),
+            (1024, NotificationEvent::FileHandleClosedFileModified),
+            (2048, NotificationEvent::FileHandleClosedFileDeleted),
+            (4096, NotificationEvent::FilePreConvertToFull),
+        ];
+        for (code, expected) in cases {
+            let got =
+                NotificationEvent::from_i32(*code, Some("dst".to_string())).unwrap_or_else(|| {
+                    panic!("notification code {code} should map to a variant");
+                });
+            assert_eq!(&got, expected, "code {code}");
+        }
+
+        // Unknown codes do not map.
+        assert!(NotificationEvent::from_i32(0, None).is_none());
+        assert!(NotificationEvent::from_i32(9999, None).is_none());
+
+        // For variants that do not carry a destination, an empty
+        // string is harmless because the variant ignores the field.
+        let opened = NotificationEvent::from_i32(2, None).unwrap();
+        assert_eq!(opened.tag(), "FILE_OPENED");
+    }
+
+    /// The default `allow_delete` policy permits every delete —
+    /// future write-protection work hangs off this hook.
+    #[test]
+    fn allow_delete_default_returns_true() {
+        let items: HashMap<String, VfsItem> = HashMap::new();
+        assert!(allow_delete("any/path.txt", &items));
+        assert!(allow_delete("", &items));
     }
 
     /// `MockContentProvider` returns the byte range it was asked for
