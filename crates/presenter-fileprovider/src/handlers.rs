@@ -31,6 +31,12 @@ pub enum ErrorCode {
     PermissionDenied,
     /// A name collision prevents the operation. Maps to `.filenameCollision`.
     AlreadyExists,
+    /// The operation is recognised but not implemented for this combination
+    /// of inputs (for example, cross-backend moves). Maps to
+    /// `.featureUnsupported` on the Swift side — distinct from
+    /// `PermissionDenied`, which the system treats as an auth failure the
+    /// user can resolve by re-authenticating.
+    NotSupported,
     /// Any other engine error. Maps to a generic error on Swift's side;
     /// the message is intended for logging only.
     Internal,
@@ -44,6 +50,7 @@ impl ErrorCode {
             Self::NotFound => "not_found",
             Self::PermissionDenied => "permission_denied",
             Self::AlreadyExists => "already_exists",
+            Self::NotSupported => "not_supported",
             Self::Internal => "internal",
         }
     }
@@ -82,6 +89,11 @@ impl HandlerError {
     #[must_use]
     pub fn already_exists(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::AlreadyExists, message)
+    }
+
+    #[must_use]
+    pub fn not_supported(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::NotSupported, message)
     }
 
     #[must_use]
@@ -194,6 +206,7 @@ mod tests {
         assert_eq!(ErrorCode::NotFound.as_str(), "not_found");
         assert_eq!(ErrorCode::PermissionDenied.as_str(), "permission_denied");
         assert_eq!(ErrorCode::AlreadyExists.as_str(), "already_exists");
+        assert_eq!(ErrorCode::NotSupported.as_str(), "not_supported");
         assert_eq!(ErrorCode::Internal.as_str(), "internal");
     }
 
