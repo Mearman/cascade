@@ -377,9 +377,12 @@ pub trait ContentProvider: Send + Sync + std::fmt::Debug {
 ///
 /// Extracting this classification keeps the EOF and error-handling
 /// branches testable cross-platform; the Windows-only callback maps
-/// each variant to the appropriate HRESULT (`S_OK` for `Eof`,
-/// `ERROR_CALL_NOT_IMPLEMENTED` for `Failed`, `PrjWriteFileData` for
-/// `Bytes`).
+/// each variant to the appropriate `HRESULT` (`S_OK` for `Eof`, the
+/// carried [`HResultCode`] for `Failed`, `PrjWriteFileData` for
+/// `Bytes`). The carried code is produced by
+/// [`hresult_for_io_error`], which translates [`std::io::ErrorKind`]
+/// into a kind-aware Win32 `HRESULT` so the OS sees a meaningful
+/// failure code instead of a generic "not implemented".
 #[cfg_attr(
     not(any(target_os = "windows", test)),
     allow(
@@ -396,15 +399,18 @@ pub(crate) enum ProviderReadOutcome {
     /// this to `S_OK`, which `ProjFS` accepts as a legitimate short
     /// read.
     Eof,
-    /// Provider read failed. The callback maps this to
-    /// `ERROR_CALL_NOT_IMPLEMENTED`; richer per-error mapping is a
-    /// follow-up.
-    Failed,
+    /// Provider read failed. The callback forwards the carried
+    /// [`HResultCode`] to `ProjFS`. See [`hresult_for_io_error`] for
+    /// the `io::ErrorKind` → Win32 mapping.
+    Failed(HResultCode),
 }
 
 /// Map a [`ContentProvider::read_range`] result to a
 /// [`ProviderReadOutcome`]. Pure function; tested directly without
-/// `ProjFS` involvement.
+/// `ProjFS` involvement. Failures route through
+/// [`hresult_for_io_error`] so the carried [`HResultCode`] reflects
+/// the underlying [`std::io::ErrorKind`] instead of a generic
+/// fallback.
 #[cfg_attr(
     not(any(target_os = "windows", test)),
     allow(
@@ -416,7 +422,7 @@ pub(crate) fn classify_read(result: std::io::Result<Vec<u8>>) -> ProviderReadOut
     match result {
         Ok(bytes) if bytes.is_empty() => ProviderReadOutcome::Eof,
         Ok(bytes) => ProviderReadOutcome::Bytes(bytes),
-        Err(_) => ProviderReadOutcome::Failed,
+        Err(err) => ProviderReadOutcome::Failed(hresult_for_io_error(&err)),
     }
 }
 
@@ -1374,11 +1380,14 @@ mod windows_impl {
     /// 6. Remove the cancellation token from the map on every exit
     ///    path via [`TokenGuard`].
     ///
-    /// I/O errors from the provider currently fall through as
-    /// `ERROR_CALL_NOT_IMPLEMENTED` — a richer mapping (network vs.
-    /// permission vs. transient) is follow-up work once the engine's
-    /// error taxonomy is settled. Cancellation returns
-    /// `ERROR_OPERATION_ABORTED`.
+    /// I/O errors from the provider are mapped to a kind-aware Win32
+    /// `HRESULT` via [`super::hresult_for_io_error`] — `NotFound` →
+    /// `ERROR_FILE_NOT_FOUND`, `PermissionDenied` →
+    /// `ERROR_ACCESS_DENIED`, `Interrupted` → `ERROR_OPERATION_ABORTED`,
+    /// `TimedOut` → `ERROR_TIMEOUT`, and so on. Every other
+    /// `io::ErrorKind` falls through to `ERROR_GEN_FAILURE` rather
+    /// than the historic `ERROR_CALL_NOT_IMPLEMENTED`. Cancellation
+    /// returns `ERROR_OPERATION_ABORTED`.
     #[allow(unsafe_code)]
     unsafe extern "system" fn get_file_data(
         callback_data: *const PRJ_CALLBACK_DATA,
@@ -1446,13 +1455,17 @@ mod windows_impl {
                 id = %item_id,
                 offset = byte_offset,
                 length,
+                kind = ?err.kind(),
                 error = %err,
-                "ContentProvider::read_range failed; returning ERROR_CALL_NOT_IMPLEMENTED"
+                "ContentProvider::read_range failed; mapping io::ErrorKind to HRESULT"
             );
         }
         // Classifying the read result here keeps the EOF and failure
         // branches independently testable cross-platform — see
-        // `classify_read` and the `classify_read_*` unit tests.
+        // `classify_read` and the `classify_read_*` unit tests. The
+        // `Failed` arm carries a typed `HResultCode` already in the
+        // `FACILITY_WIN32` space, so we forward it directly without
+        // re-deriving via `hresult_from_win32`.
         let bytes = match super::classify_read(read_result) {
             super::ProviderReadOutcome::Bytes(bytes) => bytes,
             super::ProviderReadOutcome::Eof => {
@@ -1460,8 +1473,8 @@ mod windows_impl {
                 // a legitimate short read.
                 return S_OK;
             }
-            super::ProviderReadOutcome::Failed => {
-                return hresult_from_win32(ERROR_CALL_NOT_IMPLEMENTED.0);
+            super::ProviderReadOutcome::Failed(code) => {
+                return HRESULT(code.get());
             }
         };
 
@@ -2377,9 +2390,9 @@ mod tests {
     /// `classify_read` collapses a `ContentProvider::read_range` result
     /// to the three outcomes `GetFileData` cares about. This is the
     /// platform-independent stand-in for end-to-end testing the
-    /// callback's HRESULT decision: `S_OK` for `Eof`,
-    /// `ERROR_CALL_NOT_IMPLEMENTED` for `Failed`, and `PrjWriteFileData`
-    /// for `Bytes`. Exercised against the real `MockContentProvider` so
+    /// callback's `HRESULT` decision: `S_OK` for `Eof`, the carried
+    /// [`HResultCode`] for `Failed`, and `PrjWriteFileData` for
+    /// `Bytes`. Exercised against the real `MockContentProvider` so
     /// regressions in the EOF threshold surface here rather than only
     /// on Windows CI.
     #[test]
@@ -2405,10 +2418,21 @@ mod tests {
             ProviderReadOutcome::Eof
         ));
 
-        // I/O error → Failed (the callback returns
-        // `ERROR_CALL_NOT_IMPLEMENTED`).
+        // I/O error → Failed carrying the mapped HRESULT. A synthetic
+        // `Error::other(_)` has `ErrorKind::Other`, which falls
+        // through to `ERROR_GEN_FAILURE` (Win32 31). Assert the
+        // carried code matches that mapping exactly.
         let failed: std::io::Result<Vec<u8>> = Err(std::io::Error::other("synthetic failure"));
-        assert!(matches!(classify_read(failed), ProviderReadOutcome::Failed));
+        match classify_read(failed) {
+            ProviderReadOutcome::Failed(code) => {
+                assert_eq!(
+                    code,
+                    HResultCode::from_win32(31),
+                    "Error::other should map to ERROR_GEN_FAILURE (31)"
+                );
+            }
+            other => panic!("expected Failed(ERROR_GEN_FAILURE), got {other:?}"),
+        }
 
         // A zero-byte read that happens to be exactly at end of file
         // (length 0, offset == file end) is still `Eof`; the provider
