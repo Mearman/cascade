@@ -216,7 +216,10 @@ impl P2pBackend {
             blocks.clone(),
             identity,
         )
-        .with_local_device_name(cfg.device_name.clone());
+        .with_local_device_name(cfg.device_name.clone())
+        .with_relay_endpoints(cfg.relay_endpoints.clone())
+        .with_relay_shared_secret(cfg.relay_shared_secret)
+        .with_hole_punch_enabled(cfg.enable_hole_punch);
 
         // Cancellation channel for all background tasks. `false` =
         // run, `true` = stop. The `Sender` lives on `P2pBackend`; its
@@ -284,12 +287,23 @@ impl P2pBackend {
                 });
             }
 
-            // NAT detection runs before the listener so the operator sees
-            // the diagnostic next to the listen log. Logged for diagnostics
-            // only today — future work could pick relay vs direct based on
-            // the detected type, but the current SyncEngine does not expose
-            // a hook to influence connection behaviour from this signal.
-            detect_nat_with_logging(&cfg_instance_id, &cfg_stun_servers).await;
+            // NAT detection runs in the background so a slow STUN
+            // round-trip doesn't delay listener bind-up. The result is
+            // published onto the engine (`SyncEngine::set_local_nat_type`)
+            // and read by `connect_to_with_strategy` whenever a peer
+            // connection attempt consults `decide_connectivity`. Local
+            // NAT type stays `Unknown` until the task completes — that's
+            // the conservative reading: the table routes Unknown
+            // through Relay (with a punch fallback) until the real
+            // classification arrives.
+            if !cfg_stun_servers.is_empty() {
+                let nat_sync = sync_for_listener.clone();
+                let nat_instance = cfg_instance_id.clone();
+                let nat_servers = cfg_stun_servers.clone();
+                tokio::spawn(async move {
+                    detect_nat_and_publish(&nat_instance, &nat_servers, &nat_sync).await;
+                });
+            }
 
             // Bind the listener first so subsequent announce loops can
             // advertise the actual bound port (important when
@@ -763,16 +777,105 @@ async fn keep_peer_connected(
     }
 }
 
-/// Walk the configured STUN servers and log the first successfully
-/// detected NAT type. Failures fall through to the next server; if no
-/// server responds, the function returns without logging at info level
-/// — the per-server debug logs are sufficient for diagnostics.
+/// Detect the local `NAT` type via STUN and persist it on `sync`.
 ///
-/// Today this is purely informational. Future work could route this
-/// signal into connection-strategy decisions (e.g. prefer relay when
-/// `Symmetric` is detected) but the current `SyncEngine` does not
-/// expose a hook for that.
-async fn detect_nat_with_logging(instance_id: &str, stun_servers: &[String]) {
+/// When two or more STUN servers are configured, runs the RFC 5780
+/// two-server detection on a freshly bound UDP socket — that path
+/// distinguishes the full taxonomy (`Open` / `FullCone` /
+/// `RestrictedCone` / `PortRestrictedCone` / `Symmetric`) the
+/// connectivity strategy table depends on. With a single server,
+/// falls back to the single-server detection that only distinguishes
+/// `Open` from `Symmetric` — better than nothing, but the table will
+/// route most cases through `Relay` or best-effort punch. With no
+/// servers, leaves the engine at `NatType::Unknown`.
+///
+/// Failures log at `warn` and leave the local NAT type unchanged
+/// (default `NatType::Unknown` — conservative).
+async fn detect_nat_and_publish(
+    instance_id: &str,
+    stun_servers: &[String],
+    sync: &crate::sync::SyncEngine,
+) {
+    // Resolve `host:port` strings to socket addresses up-front so the
+    // RFC 5780 path has concrete `primary`/`secondary` to work with.
+    let resolved: Vec<std::net::SocketAddr> = {
+        let mut out = Vec::with_capacity(stun_servers.len());
+        for raw in stun_servers {
+            match resolve_first(raw).await {
+                Ok(addr) => out.push(addr),
+                Err(e) => tracing::debug!(
+                    target: "cascade::backend::p2p",
+                    stun = %raw,
+                    error = %e,
+                    "could not resolve STUN server",
+                ),
+            }
+        }
+        out
+    };
+
+    if resolved.len() >= 2 {
+        // RFC 5780 path. Need a bound UDP socket so the detection
+        // reuses the same source for all four probes.
+        let socket = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    target: "cascade::backend::p2p",
+                    instance = %instance_id,
+                    error = %e,
+                    "binding STUN socket failed; leaving local NAT type as Unknown",
+                );
+                return;
+            }
+        };
+        let Some(primary) = resolved.first().copied() else {
+            // Unreachable — `len() >= 2` implies at least one entry.
+            // Logged at warn so a future refactor that violates the
+            // invariant surfaces visibly rather than silently
+            // skipping detection.
+            tracing::warn!(
+                target: "cascade::backend::p2p",
+                instance = %instance_id,
+                "RFC 5780 path entered with empty STUN list — leaving local NAT type as Unknown",
+            );
+            return;
+        };
+        let Some(secondary) = resolved.get(1).copied() else {
+            tracing::warn!(
+                target: "cascade::backend::p2p",
+                instance = %instance_id,
+                "RFC 5780 path entered without a secondary STUN server — leaving local NAT type as Unknown",
+            );
+            return;
+        };
+        let cfg = cascade_p2p::nat::NatDetectionConfig {
+            primary,
+            secondary,
+            per_request_timeout: std::time::Duration::from_secs(3),
+            retries: 2,
+        };
+        match cascade_p2p::nat::detect_nat_type_rfc5780(&socket, &cfg).await {
+            Ok(nat_type) => {
+                tracing::info!(
+                    target: "cascade::backend::p2p",
+                    instance = %instance_id,
+                    nat = ?nat_type,
+                    "RFC 5780 NAT type detected",
+                );
+                sync.set_local_nat_type(nat_type).await;
+            }
+            Err(e) => tracing::warn!(
+                target: "cascade::backend::p2p",
+                instance = %instance_id,
+                error = %e,
+                "RFC 5780 NAT detection failed; leaving local NAT type as Unknown",
+            ),
+        }
+        return;
+    }
+
+    // Single-server path — only distinguishes Open from Symmetric.
     for stun in stun_servers {
         match cascade_p2p::nat::NatTraversal::detect_nat_type(stun).await {
             Ok(nat_type) => {
@@ -781,8 +884,9 @@ async fn detect_nat_with_logging(instance_id: &str, stun_servers: &[String]) {
                     instance = %instance_id,
                     stun = %stun,
                     nat = ?nat_type,
-                    "NAT type detected",
+                    "single-server NAT type detected",
                 );
+                sync.set_local_nat_type(nat_type).await;
                 return;
             }
             Err(e) => {
