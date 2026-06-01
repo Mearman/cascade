@@ -687,7 +687,248 @@ fn transaction_id() -> Result<[u8; STUN_TRANSACTION_ID_LEN]> {
 mod tests {
     use super::*;
 
+    use std::sync::Arc;
+
     use tokio::net::UdpSocket;
+
+    /// How a mock STUN server should react to a single Binding Request.
+    #[derive(Debug, Clone, Copy)]
+    enum MockAction {
+        /// Reply with the given mapped/origin/other attributes.
+        Reply {
+            mapped: SocketAddr,
+            response_origin: Option<SocketAddr>,
+            other_address: Option<SocketAddr>,
+        },
+        /// Drop the request — do not reply.
+        Drop,
+    }
+
+    /// A mock STUN server bound on `127.0.0.1`. The server runs as a
+    /// background task that invokes the caller-supplied handler for
+    /// every incoming Binding Request.
+    #[derive(Debug)]
+    struct MockStun {
+        socket: Arc<UdpSocket>,
+        address: SocketAddr,
+    }
+
+    impl MockStun {
+        async fn bind() -> Self {
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let address = socket.local_addr().unwrap();
+            Self {
+                socket: Arc::new(socket),
+                address,
+            }
+        }
+
+        fn addr(&self) -> SocketAddr {
+            self.address
+        }
+
+        /// Run a per-request handler in a background task. The server
+        /// runs until the handler returns `None` or the test ends.
+        fn spawn<H>(&self, mut handler: H)
+        where
+            H: FnMut(BindingRequestInfo) -> Option<MockAction> + Send + 'static,
+        {
+            let socket = self.socket.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; STUN_RESPONSE_MAX_LEN];
+                loop {
+                    let (len, peer) = match socket.recv_from(&mut buf).await {
+                        Ok(pair) => pair,
+                        Err(_) => return,
+                    };
+                    let Some(slice) = buf.get(..len) else {
+                        continue;
+                    };
+                    let Some(info) = parse_request(slice) else {
+                        continue;
+                    };
+                    let Some(action) = handler(info) else {
+                        return;
+                    };
+                    match action {
+                        MockAction::Reply {
+                            mapped,
+                            response_origin,
+                            other_address,
+                        } => {
+                            let response = encode_binding_response(
+                                &info.transaction_id,
+                                mapped,
+                                response_origin,
+                                other_address,
+                            );
+                            // On loopback we cannot bind from arbitrary
+                            // source IPs, so the response_origin is
+                            // signalled via the attribute payload.
+                            let _ = socket.send_to(&response, peer).await;
+                        }
+                        MockAction::Drop => {}
+                    }
+                }
+            });
+        }
+    }
+
+    /// Parsed metadata about an incoming Binding Request.
+    #[derive(Debug, Clone, Copy)]
+    struct BindingRequestInfo {
+        transaction_id: [u8; STUN_TRANSACTION_ID_LEN],
+        change_request_flags: u32,
+    }
+
+    /// Parse a Binding Request and extract the transaction ID and any
+    /// CHANGE-REQUEST flags.
+    fn parse_request(packet: &[u8]) -> Option<BindingRequestInfo> {
+        if packet.len() < STUN_HEADER_LEN {
+            return None;
+        }
+        let mtype = u16::from_be_bytes([*packet.first()?, *packet.get(1)?]);
+        if mtype != BINDING_REQUEST {
+            return None;
+        }
+        let cookie = u32::from_be_bytes(packet.get(4..8)?.try_into().ok()?);
+        if cookie != STUN_MAGIC_COOKIE {
+            return None;
+        }
+        let transaction_id: [u8; STUN_TRANSACTION_ID_LEN] =
+            packet.get(8..STUN_HEADER_LEN)?.try_into().ok()?;
+
+        let mlen = usize::from(u16::from_be_bytes(packet.get(2..4)?.try_into().ok()?));
+        let attrs_end = STUN_HEADER_LEN.checked_add(mlen)?;
+        let mut offset = STUN_HEADER_LEN;
+        let mut change_request_flags = 0u32;
+        while offset + STUN_ATTRIBUTE_HEADER_LEN <= attrs_end
+            && offset + STUN_ATTRIBUTE_HEADER_LEN <= packet.len()
+        {
+            let header = packet.get(offset..offset + STUN_ATTRIBUTE_HEADER_LEN)?;
+            let attr_type = u16::from_be_bytes([*header.first()?, *header.get(1)?]);
+            let attr_len = usize::from(u16::from_be_bytes([*header.get(2)?, *header.get(3)?]));
+            let value_start = offset + STUN_ATTRIBUTE_HEADER_LEN;
+            let value_end = value_start.checked_add(attr_len)?;
+            if value_end > attrs_end {
+                return None;
+            }
+            if attr_type == CHANGE_REQUEST && attr_len == usize::from(STUN_CHANGE_REQUEST_VALUE_LEN)
+            {
+                let raw: [u8; 4] = packet.get(value_start..value_end)?.try_into().ok()?;
+                change_request_flags = u32::from_be_bytes(raw);
+            }
+            offset = value_end + padding_for(attr_len);
+        }
+        Some(BindingRequestInfo {
+            transaction_id,
+            change_request_flags,
+        })
+    }
+
+    /// Build an XOR-MAPPED-ADDRESS attribute value for the given socket.
+    fn encode_xor_mapped(
+        mapped: SocketAddr,
+        transaction_id: &[u8; STUN_TRANSACTION_ID_LEN],
+    ) -> Vec<u8> {
+        let mut value = Vec::new();
+        value.push(0); // reserved
+        let cookie_high = (STUN_MAGIC_COOKIE >> 16) as u16;
+        match mapped {
+            SocketAddr::V4(addr) => {
+                value.push(STUN_FAMILY_IPV4);
+                let port = addr.port() ^ cookie_high;
+                value.extend_from_slice(&port.to_be_bytes());
+                let ip = u32::from(*addr.ip()) ^ STUN_MAGIC_COOKIE;
+                value.extend_from_slice(&ip.to_be_bytes());
+            }
+            SocketAddr::V6(addr) => {
+                value.push(STUN_FAMILY_IPV6);
+                let port = addr.port() ^ cookie_high;
+                value.extend_from_slice(&port.to_be_bytes());
+                let mut xor_key = [0u8; STUN_IPV6_ADDR_LEN];
+                xor_key[..4].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+                xor_key[4..].copy_from_slice(transaction_id);
+                for (idx, byte) in addr.ip().octets().iter().enumerate() {
+                    value.push(byte ^ xor_key[idx]);
+                }
+            }
+        }
+        value
+    }
+
+    /// Build a plain MAPPED-ADDRESS-style attribute value (used by
+    /// RESPONSE-ORIGIN and OTHER-ADDRESS).
+    fn encode_plain(mapped: SocketAddr) -> Vec<u8> {
+        let mut value = Vec::new();
+        value.push(0);
+        match mapped {
+            SocketAddr::V4(addr) => {
+                value.push(STUN_FAMILY_IPV4);
+                value.extend_from_slice(&addr.port().to_be_bytes());
+                value.extend_from_slice(&addr.ip().octets());
+            }
+            SocketAddr::V6(addr) => {
+                value.push(STUN_FAMILY_IPV6);
+                value.extend_from_slice(&addr.port().to_be_bytes());
+                value.extend_from_slice(&addr.ip().octets());
+            }
+        }
+        value
+    }
+
+    /// Append a single STUN attribute to `out`.
+    fn push_attribute(out: &mut Vec<u8>, attr_type: u16, value: &[u8]) {
+        out.extend_from_slice(&attr_type.to_be_bytes());
+        out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        out.extend_from_slice(value);
+        let pad = padding_for(value.len());
+        for _ in 0..pad {
+            out.push(0);
+        }
+    }
+
+    /// Build a Binding Success Response with the given attributes.
+    fn encode_binding_response(
+        transaction_id: &[u8; STUN_TRANSACTION_ID_LEN],
+        mapped: SocketAddr,
+        response_origin: Option<SocketAddr>,
+        other_address: Option<SocketAddr>,
+    ) -> Vec<u8> {
+        let mut attributes = Vec::new();
+        push_attribute(
+            &mut attributes,
+            XOR_MAPPED_ADDRESS,
+            &encode_xor_mapped(mapped, transaction_id),
+        );
+        if let Some(origin) = response_origin {
+            push_attribute(&mut attributes, RESPONSE_ORIGIN, &encode_plain(origin));
+        }
+        if let Some(other) = other_address {
+            push_attribute(&mut attributes, OTHER_ADDRESS, &encode_plain(other));
+        }
+
+        let mut packet = Vec::with_capacity(STUN_HEADER_LEN + attributes.len());
+        packet.extend_from_slice(&BINDING_SUCCESS_RESPONSE.to_be_bytes());
+        packet.extend_from_slice(&(attributes.len() as u16).to_be_bytes());
+        packet.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+        packet.extend_from_slice(transaction_id);
+        packet.extend(attributes);
+        packet
+    }
+
+    /// Build a detection config with short timeouts so retry-exhausted
+    /// tests run quickly.
+    fn quick_config(primary: SocketAddr, secondary: SocketAddr) -> NatDetectionConfig {
+        NatDetectionConfig {
+            primary,
+            secondary,
+            per_request_timeout: Duration::from_millis(150),
+            retries: 1,
+        }
+    }
+
+    // ---------- legacy single-server tests ----------
 
     #[tokio::test]
     async fn external_address_reads_xor_mapped_address_from_stun_response() {
@@ -700,7 +941,7 @@ mod tests {
             let (received, peer) = server.recv_from(&mut request).await.unwrap();
             let transaction_id: [u8; STUN_TRANSACTION_ID_LEN] =
                 request[8..STUN_HEADER_LEN].try_into().unwrap();
-            let response = encode_binding_response(&transaction_id, external_address);
+            let response = encode_binding_response(&transaction_id, external_address, None, None);
             assert_eq!(
                 u16::from_be_bytes([request[0], request[1]]),
                 BINDING_REQUEST
@@ -717,7 +958,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detect_nat_type_reports_public_when_mapping_matches_socket() {
+    async fn detect_nat_type_reports_open_when_mapping_matches_socket() {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_address = server.local_addr().unwrap();
 
@@ -726,7 +967,7 @@ mod tests {
             let (_received, peer) = server.recv_from(&mut request).await.unwrap();
             let transaction_id: [u8; STUN_TRANSACTION_ID_LEN] =
                 request[8..STUN_HEADER_LEN].try_into().unwrap();
-            let response = encode_binding_response(&transaction_id, peer);
+            let response = encode_binding_response(&transaction_id, peer, None, None);
             server.send_to(&response, peer).await.unwrap();
         });
 
@@ -743,6 +984,8 @@ mod tests {
         let response = encode_binding_response(
             &transaction_id,
             SocketAddr::from(([198, 51, 100, 7], 22000)),
+            None,
+            None,
         );
         let wrong_transaction_id = [0xBB; STUN_TRANSACTION_ID_LEN];
 
@@ -751,42 +994,283 @@ mod tests {
         assert!(result.is_err());
     }
 
-    fn encode_binding_response(
-        transaction_id: &[u8; STUN_TRANSACTION_ID_LEN],
-        mapped_address: SocketAddr,
-    ) -> Vec<u8> {
-        let mut attribute_value = Vec::new();
-        attribute_value.push(0);
-        match mapped_address {
-            SocketAddr::V4(address) => {
-                attribute_value.push(STUN_FAMILY_IPV4);
-                let port = address.port() ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
-                attribute_value.extend_from_slice(&port.to_be_bytes());
-                let ip = u32::from(*address.ip()) ^ STUN_MAGIC_COOKIE;
-                attribute_value.extend_from_slice(&ip.to_be_bytes());
-            }
-            SocketAddr::V6(address) => {
-                attribute_value.push(STUN_FAMILY_IPV6);
-                let port = address.port() ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
-                attribute_value.extend_from_slice(&port.to_be_bytes());
-                let mut xor_key = [0u8; STUN_IPV6_ADDR_LEN];
-                xor_key[..4].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
-                xor_key[4..].copy_from_slice(transaction_id);
-                for (index, byte) in address.ip().octets().iter().enumerate() {
-                    attribute_value.push(byte ^ xor_key[index]);
-                }
-            }
-        }
+    #[test]
+    fn decode_binding_response_extracts_response_origin_and_other_address() {
+        let transaction_id = [0xCC; STUN_TRANSACTION_ID_LEN];
+        let mapped = SocketAddr::from(([198, 51, 100, 7], 22000));
+        let origin = SocketAddr::from(([198, 51, 100, 1], 3478));
+        let other = SocketAddr::from(([198, 51, 100, 2], 3479));
+        let response = encode_binding_response(&transaction_id, mapped, Some(origin), Some(other));
 
-        let message_len = STUN_ATTRIBUTE_HEADER_LEN + attribute_value.len();
-        let mut response = Vec::with_capacity(STUN_HEADER_LEN + message_len);
-        response.extend_from_slice(&BINDING_SUCCESS_RESPONSE.to_be_bytes());
-        response.extend_from_slice(&(message_len as u16).to_be_bytes());
-        response.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
-        response.extend_from_slice(transaction_id);
-        response.extend_from_slice(&XOR_MAPPED_ADDRESS.to_be_bytes());
-        response.extend_from_slice(&(attribute_value.len() as u16).to_be_bytes());
-        response.extend_from_slice(&attribute_value);
-        response
+        let parsed = decode_binding_response(&response, &transaction_id).unwrap();
+
+        assert_eq!(parsed.mapped, mapped);
+        assert_eq!(parsed.response_origin, Some(origin));
+        assert_eq!(parsed.other_address, Some(other));
+    }
+
+    // ---------- RFC 5780 two-server detection tests ----------
+
+    #[tokio::test]
+    async fn detects_open_internet_when_xmapped_matches_socket_addr() {
+        let primary = MockStun::bind().await;
+        let secondary = MockStun::bind().await;
+        let probe_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let local = probe_socket.local_addr().unwrap();
+
+        let primary_addr = primary.addr();
+        primary.spawn(move |_info| {
+            Some(MockAction::Reply {
+                mapped: local,
+                response_origin: Some(primary_addr),
+                other_address: None,
+            })
+        });
+        let secondary_addr = secondary.addr();
+        secondary.spawn(move |_info| {
+            Some(MockAction::Reply {
+                mapped: local,
+                response_origin: Some(secondary_addr),
+                other_address: None,
+            })
+        });
+
+        let result =
+            detect_nat_type_rfc5780(&probe_socket, &quick_config(primary_addr, secondary_addr))
+                .await
+                .unwrap();
+        assert_eq!(result, NatType::Open);
+    }
+
+    #[tokio::test]
+    async fn detects_full_cone_when_change_request_succeeds() {
+        let primary = MockStun::bind().await;
+        let secondary = MockStun::bind().await;
+        let probe_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let primary_addr = primary.addr();
+        let secondary_addr = secondary.addr();
+        // The primary advertises its alternate as the secondary's address
+        // — that's where Test II will appear to come from.
+        let alternate = secondary_addr;
+        // Externally-mapped address, deliberately different from the
+        // socket's local address so the algorithm does not short-circuit
+        // to `Open`.
+        let mapped = SocketAddr::from(([203, 0, 113, 50], 60001));
+
+        primary.spawn(move |info| {
+            if info.change_request_flags == 0 {
+                Some(MockAction::Reply {
+                    mapped,
+                    response_origin: Some(primary_addr),
+                    other_address: Some(alternate),
+                })
+            } else {
+                // Test II — pretend we replied from the alternate address.
+                Some(MockAction::Reply {
+                    mapped,
+                    response_origin: Some(alternate),
+                    other_address: Some(primary_addr),
+                })
+            }
+        });
+        secondary.spawn(move |_info| {
+            Some(MockAction::Reply {
+                mapped,
+                response_origin: Some(secondary_addr),
+                other_address: None,
+            })
+        });
+
+        let result =
+            detect_nat_type_rfc5780(&probe_socket, &quick_config(primary_addr, secondary_addr))
+                .await
+                .unwrap();
+        assert_eq!(result, NatType::FullCone);
+    }
+
+    #[tokio::test]
+    async fn detects_symmetric_when_xmapped_differs_between_servers() {
+        let primary = MockStun::bind().await;
+        let secondary = MockStun::bind().await;
+        let probe_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let primary_addr = primary.addr();
+        let secondary_addr = secondary.addr();
+        let alternate = SocketAddr::from(([127, 0, 0, 9], 3479));
+
+        // Test I and Test III mapped addresses differ — the NAT is
+        // creating a fresh mapping per destination.
+        let mapped_primary = SocketAddr::from(([203, 0, 113, 50], 60001));
+        let mapped_secondary = SocketAddr::from(([203, 0, 113, 50], 60002));
+
+        primary.spawn(move |info| {
+            if info.change_request_flags == 0 {
+                Some(MockAction::Reply {
+                    mapped: mapped_primary,
+                    response_origin: Some(primary_addr),
+                    other_address: Some(alternate),
+                })
+            } else {
+                // Test II — drop, simulating the NAT filtering the
+                // unsolicited response from a new IP+port.
+                Some(MockAction::Drop)
+            }
+        });
+        secondary.spawn(move |_info| {
+            Some(MockAction::Reply {
+                mapped: mapped_secondary,
+                response_origin: Some(secondary_addr),
+                other_address: None,
+            })
+        });
+
+        let result =
+            detect_nat_type_rfc5780(&probe_socket, &quick_config(primary_addr, secondary_addr))
+                .await
+                .unwrap();
+        assert_eq!(result, NatType::Symmetric);
+    }
+
+    #[tokio::test]
+    async fn detects_restricted_cone_when_test_iv_succeeds() {
+        let primary = MockStun::bind().await;
+        let secondary = MockStun::bind().await;
+        let probe_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let primary_addr = primary.addr();
+        let secondary_addr = secondary.addr();
+        let alternate = SocketAddr::from(([127, 0, 0, 9], 3479));
+        let mapped = SocketAddr::from(([203, 0, 113, 50], 60001));
+
+        primary.spawn(move |info| match info.change_request_flags {
+            0 => Some(MockAction::Reply {
+                mapped,
+                response_origin: Some(primary_addr),
+                other_address: Some(alternate),
+            }),
+            // Test II (change IP + port) — drop. NAT does not let
+            // unsolicited traffic from a new IP through.
+            flags if flags & CHANGE_REQUEST_FLAG_CHANGE_IP != 0 => Some(MockAction::Drop),
+            // Test IV (change port only) — reply. Filtering is
+            // address-restricted but not port-restricted.
+            _ => Some(MockAction::Reply {
+                mapped,
+                response_origin: Some(primary_addr),
+                other_address: Some(alternate),
+            }),
+        });
+        secondary.spawn(move |_info| {
+            Some(MockAction::Reply {
+                mapped,
+                response_origin: Some(secondary_addr),
+                other_address: None,
+            })
+        });
+
+        let result =
+            detect_nat_type_rfc5780(&probe_socket, &quick_config(primary_addr, secondary_addr))
+                .await
+                .unwrap();
+        assert_eq!(result, NatType::RestrictedCone);
+    }
+
+    #[tokio::test]
+    async fn detects_port_restricted_cone_when_test_iv_times_out() {
+        let primary = MockStun::bind().await;
+        let secondary = MockStun::bind().await;
+        let probe_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let primary_addr = primary.addr();
+        let secondary_addr = secondary.addr();
+        let alternate = SocketAddr::from(([127, 0, 0, 9], 3479));
+        let mapped = SocketAddr::from(([203, 0, 113, 50], 60001));
+
+        primary.spawn(move |info| {
+            if info.change_request_flags == 0 {
+                Some(MockAction::Reply {
+                    mapped,
+                    response_origin: Some(primary_addr),
+                    other_address: Some(alternate),
+                })
+            } else {
+                // Any CHANGE-REQUEST drops. Test II and Test IV both
+                // time out — the NAT requires both IP and port to
+                // match: port-restricted.
+                Some(MockAction::Drop)
+            }
+        });
+        secondary.spawn(move |_info| {
+            Some(MockAction::Reply {
+                mapped,
+                response_origin: Some(secondary_addr),
+                other_address: None,
+            })
+        });
+
+        let result =
+            detect_nat_type_rfc5780(&probe_socket, &quick_config(primary_addr, secondary_addr))
+                .await
+                .unwrap();
+        assert_eq!(result, NatType::PortRestrictedCone);
+    }
+
+    #[tokio::test]
+    async fn times_out_when_primary_server_unreachable() {
+        let probe_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // Bind sockets, capture their addresses, then drop so the ports
+        // are closed. Sending to them yields ICMP unreachable on some
+        // platforms and silent drop on others — both surface as a
+        // timeout from the probe's perspective.
+        let dead_primary = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dead_primary_addr = dead_primary.local_addr().unwrap();
+        drop(dead_primary);
+        let dead_secondary = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dead_secondary_addr = dead_secondary.local_addr().unwrap();
+        drop(dead_secondary);
+
+        let result = detect_nat_type_rfc5780(
+            &probe_socket,
+            &quick_config(dead_primary_addr, dead_secondary_addr),
+        )
+        .await;
+        assert!(matches!(result, Err(NatDetectionError::Timeout)));
+    }
+
+    #[tokio::test]
+    async fn flags_no_change_request_support_when_origin_matches_primary() {
+        let primary = MockStun::bind().await;
+        let secondary = MockStun::bind().await;
+        let probe_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let primary_addr = primary.addr();
+        let secondary_addr = secondary.addr();
+        let alternate = SocketAddr::from(([127, 0, 0, 9], 3479));
+        let mapped = SocketAddr::from(([203, 0, 113, 50], 60001));
+
+        // Primary replies to both Test I and Test II from the same
+        // address — CHANGE-REQUEST was ignored.
+        primary.spawn(move |_info| {
+            Some(MockAction::Reply {
+                mapped,
+                response_origin: Some(primary_addr),
+                other_address: Some(alternate),
+            })
+        });
+        secondary.spawn(move |_info| {
+            Some(MockAction::Reply {
+                mapped,
+                response_origin: Some(secondary_addr),
+                other_address: None,
+            })
+        });
+
+        let result =
+            detect_nat_type_rfc5780(&probe_socket, &quick_config(primary_addr, secondary_addr))
+                .await;
+        assert!(matches!(
+            result,
+            Err(NatDetectionError::NoChangeRequestSupport)
+        ));
     }
 }
