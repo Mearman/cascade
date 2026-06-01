@@ -1210,4 +1210,100 @@ mod tests {
         assert_eq!(cfg.max_bursts, 3);
         assert_eq!(cfg.total_deadline, Duration::from_secs(10));
     }
+
+    // ── UdpPunchTransport (real socket, loopback) ──
+
+    fn loopback_bind_addr() -> SocketAddr {
+        // Bind to port 0 so the OS picks a free ephemeral port; both
+        // sides of every test discover their actual ports via
+        // `local_addr()`.
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0)
+    }
+
+    #[tokio::test]
+    async fn udp_transport_round_trips_probe_on_loopback() {
+        let a = UdpPunchTransport::bind(loopback_bind_addr()).await.unwrap();
+        let b = UdpPunchTransport::bind(loopback_bind_addr()).await.unwrap();
+        let a_addr = a.local_addr().unwrap();
+        let b_addr = b.local_addr().unwrap();
+
+        let nonce = 0xCAFE_F00D_DEAD_BEEF_u64;
+        let deadline = Instant::now() + Duration::from_secs(2);
+
+        a.send_probe(b_addr, nonce).await.unwrap();
+        let received = b.recv_probe(deadline).await.unwrap();
+
+        assert_eq!(received.from, a_addr);
+        assert_eq!(received.nonce, nonce);
+    }
+
+    #[tokio::test]
+    async fn udp_transport_recv_times_out_when_deadline_passes() {
+        let transport = UdpPunchTransport::bind(loopback_bind_addr()).await.unwrap();
+        let deadline = Instant::now() + Duration::from_millis(100);
+
+        let err = transport.recv_probe(deadline).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn udp_transport_short_packet_returns_timed_out() {
+        let a = UdpPunchTransport::bind(loopback_bind_addr()).await.unwrap();
+        let b = UdpPunchTransport::bind(loopback_bind_addr()).await.unwrap();
+        let b_addr = b.local_addr().unwrap();
+
+        // Send a 4-byte payload directly via the underlying socket so
+        // the recv side has to discard a non-probe datagram.
+        let stub_payload = [1u8, 2, 3, 4];
+        let sent = a.socket.send_to(&stub_payload, b_addr).await.unwrap();
+        assert_eq!(sent, stub_payload.len());
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let err = b.recv_probe(deadline).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn udp_transport_full_e2e_with_run_hole_punch() {
+        // Both sides bind real sockets, agree on a nonce and deadline,
+        // and drive `run_hole_punch` concurrently. The synchronised
+        // burst from each side should be received by the other before
+        // the per-burst gap expires.
+        let alice = UdpPunchTransport::bind(loopback_bind_addr()).await.unwrap();
+        let bob = UdpPunchTransport::bind(loopback_bind_addr()).await.unwrap();
+        let alice_addr = alice.local_addr().unwrap();
+        let bob_addr = bob.local_addr().unwrap();
+
+        let nonce = 0x1234_5678_9ABC_DEF0_u64;
+        let clock = SystemClock;
+        let sync = SyncPunchAgreement {
+            nonce,
+            deadline_unix_ms: clock.now_unix_ms() + 60_000,
+        };
+        let config =
+            PunchConfig::new(3, Duration::from_millis(200), 5, Duration::from_secs(5)).unwrap();
+
+        let alice_pair = CandidatePair {
+            local: alice_addr,
+            remote: bob_addr,
+        };
+        let bob_pair = CandidatePair {
+            local: bob_addr,
+            remote: alice_addr,
+        };
+
+        let alice_task =
+            async { run_hole_punch(&alice, &alice_pair, &sync, &config, &SystemClock).await };
+        let bob_task =
+            async { run_hole_punch(&bob, &bob_pair, &sync, &config, &SystemClock).await };
+
+        let (alice_flow, bob_flow) = tokio::join!(alice_task, bob_task);
+        let alice_flow = alice_flow.unwrap();
+        let bob_flow = bob_flow.unwrap();
+
+        assert_eq!(alice_flow.local, alice_addr);
+        assert_eq!(alice_flow.remote, bob_addr);
+        assert_eq!(bob_flow.local, bob_addr);
+        assert_eq!(bob_flow.remote, alice_addr);
+    }
 }
