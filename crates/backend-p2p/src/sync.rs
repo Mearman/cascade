@@ -52,6 +52,7 @@ use cascade_p2p::connection::ConnectionManager;
 use cascade_p2p::discovery::DiscoveredPeer;
 use cascade_p2p::framed::FramedPeer;
 use cascade_p2p::identity::DeviceIdentity;
+use cascade_p2p::nat::{enumerate_host_candidates, server_reflexive_candidate_from_addr};
 use cascade_p2p::protocol::{BepMessage, FileInfo, Folder, GossipPeer, Version};
 use cascade_p2p::store::BlockStore;
 use cascade_p2p::traversal::{
@@ -98,19 +99,83 @@ fn unix_now_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
+/// `local_preference` assigned to the single `ServerReflexive` candidate
+/// derived from the STUN external mapping. Set below the worst-case host
+/// `local_preference` so any host candidate outranks the reflexive one
+/// when both reach the same peer.
+const SERVER_REFLEXIVE_LOCAL_PREFERENCE: u16 = 0;
+
+/// Aggregate, deduplicate, and sort a local candidate set for gossip.
+///
+/// Inputs are the per-interface host candidates (typically from
+/// [`enumerate_host_candidates`]), the STUN-derived external
+/// `SocketAddr` (when [`cascade_p2p::nat::detect_nat_type_rfc5780`] has
+/// produced one), and any extra candidates the caller has on hand —
+/// `PeerReflexive` discovered during an earlier punch, or `Relayed`
+/// allocated against a TURN-style relay. Today the engine has no source
+/// for either, so the `extras` slice is empty in production, but the
+/// helper is designed to fold them in without restructuring.
+///
+/// The output is deduplicated by `(address, kind)` and sorted by
+/// descending `priority` so the receiving peer's
+/// [`decide_connectivity`] picks the highest-priority pair first.
+/// Duplicate inputs that share both an address and a kind collapse to
+/// the first entry seen at that address+kind — priorities for repeats
+/// are identical because [`Candidate::new`] is deterministic for a given
+/// kind and local preference.
+#[must_use]
+fn aggregate_candidates(
+    host_candidates: Vec<Candidate>,
+    external: Option<SocketAddr>,
+    extras: Vec<Candidate>,
+) -> Vec<Candidate> {
+    let mut combined = host_candidates;
+    if let Some(external_addr) = external {
+        combined.push(server_reflexive_candidate_from_addr(
+            external_addr,
+            SERVER_REFLEXIVE_LOCAL_PREFERENCE,
+        ));
+    }
+    combined.extend(extras);
+
+    // Sort by priority descending so the highest-ranked candidate sits
+    // first. `sort_by_key` with `Reverse` is stable, so ties retain the
+    // insertion order host-then-srflx-then-extras and the dedupe pass
+    // below preserves that ordering when collapsing duplicates.
+    combined.sort_by_key(|c| std::cmp::Reverse(c.priority));
+
+    // Deduplicate by (address, kind). A `HashSet` would lose the sort
+    // order; a linear scan keeps the priority-descending output stable.
+    let mut seen: std::collections::HashSet<(SocketAddr, CandidateKind)> =
+        std::collections::HashSet::new();
+    combined.retain(|c| seen.insert((c.address, c.kind)));
+    combined
+}
+
 /// Build the local candidate set advertised over `BepMessage::Candidates`.
 ///
-/// For v1, the only candidate emitted is the bound `SocketAddr` of the
-/// supplied listening socket — that's the host candidate any peer on the
-/// same LAN can reach. `ServerReflexive` candidates require feeding the
-/// STUN-derived externally-mapped address through here, which is a
-/// follow-up alongside per-interface enumeration.
-fn gather_local_candidates(bound_addr: SocketAddr) -> Vec<Candidate> {
-    // RFC 8445 §5.1.2.2 reserves `type_preference = 126` for host
-    // candidates; we pass `u16::MAX` for `local_preference` so any
-    // future SRflx/Relayed entries added to this list outrank the
-    // worst-case host but still lose to the best-case host.
-    vec![Candidate::new(bound_addr, CandidateKind::Host, u16::MAX)]
+/// Folds three sources together:
+///
+/// 1. Per-interface host candidates from [`enumerate_host_candidates`]
+///    — every non-loopback, non-link-local address the OS knows about.
+/// 2. The STUN-derived `ServerReflexive` candidate (when one is
+///    available), giving peers on the public Internet a reachable
+///    address through this host's `NAT`.
+/// 3. Any extras the caller supplies — `PeerReflexive` candidates
+///    discovered during a prior punch attempt or `Relayed` candidates
+///    allocated against a TURN-style relay. Empty today.
+///
+/// The bound `SocketAddr` is used only to seed the port — its IP is
+/// always the wildcard `0.0.0.0` or `::` when the listener binds to
+/// `0`, which is not a useful candidate. The per-interface walk in
+/// [`enumerate_host_candidates`] supplies the concrete addresses.
+fn gather_local_candidates(
+    bound_addr: SocketAddr,
+    external: Option<SocketAddr>,
+    extras: Vec<Candidate>,
+) -> Vec<Candidate> {
+    let host = enumerate_host_candidates(bound_addr.port());
+    aggregate_candidates(host, external, extras)
 }
 
 /// Identity information for a connected peer.
@@ -218,6 +283,15 @@ pub struct SyncEngine {
     /// background detection task update the value without taking
     /// ownership of the engine.
     local_nat_type: Arc<RwLock<NatType>>,
+    /// Most recent STUN-derived external `SocketAddr` observed for this
+    /// host. Populated by the same background detection task that
+    /// publishes `local_nat_type`. `None` until detection runs (or when
+    /// the host is on a public address, in which case the external
+    /// address equals one of the host candidates and is redundant).
+    /// Consumed by [`gather_local_candidates`] to emit a
+    /// [`CandidateKind::ServerReflexive`] candidate alongside the host
+    /// set.
+    local_external_addr: Arc<RwLock<Option<SocketAddr>>>,
     /// Known relay endpoints, in preference order. Fed verbatim into
     /// [`decide_connectivity`]. Empty means the relay strategy is
     /// unavailable — the traversal logic falls through to a best-effort
@@ -261,6 +335,7 @@ impl SyncEngine {
             peers: Arc::new(Mutex::new(HashMap::new())),
             peer_book: Arc::new(RwLock::new(PeerBook::new())),
             local_nat_type: Arc::new(RwLock::new(NatType::Unknown)),
+            local_external_addr: Arc::new(RwLock::new(None)),
             relay_endpoints: Arc::new(Vec::new()),
             relay_shared_secret: None,
             enable_hole_punch: true,
@@ -307,6 +382,27 @@ impl SyncEngine {
     /// publishes a real reading.
     pub async fn local_nat_type(&self) -> NatType {
         *self.local_nat_type.read().await
+    }
+
+    /// Update the STUN-derived external `SocketAddr` observed by the
+    /// most recent detection round. Used by the background task spawned
+    /// in `P2pBackend::open` after [`detect_nat_type_rfc5780`] returns a
+    /// non-`None` `external_socket_addr`. The recorded value seeds the
+    /// `ServerReflexive` candidate emitted by the local candidate
+    /// gathering path.
+    ///
+    /// [`detect_nat_type_rfc5780`]: cascade_p2p::nat::detect_nat_type_rfc5780
+    pub async fn set_local_external_addr(&self, external: Option<SocketAddr>) {
+        *self.local_external_addr.write().await = external;
+    }
+
+    /// Most recent STUN-derived external `SocketAddr` for this host.
+    /// Returns `None` until the background detection task publishes a
+    /// reading. The local candidate gathering path reads this value to
+    /// decide whether to emit a `ServerReflexive` candidate alongside
+    /// the host set.
+    pub async fn local_external_addr(&self) -> Option<SocketAddr> {
+        *self.local_external_addr.read().await
     }
 
     /// Known relay endpoints, in preference order. Returned as a slice
@@ -909,14 +1005,20 @@ impl SyncEngine {
         // the BEP listener is bound — outbound-only deployments have no
         // host candidate worth advertising, and the receiver tolerates
         // a connection that never produces one (it falls through to
-        // direct or relay). The lock guard is dropped before the
-        // `tx.send` to avoid holding it across an await on the
+        // direct or relay). The lock guards are dropped before the
+        // `tx.send` to avoid holding them across an await on the
         // unbounded channel (no actual await today, but the explicit
         // drop also satisfies clippy::significant_drop_in_scrutinee).
+        // The external addr lookup is best-effort: if NAT detection has
+        // not run yet (or has not yet observed an external mapping),
+        // the gathered set falls back to host candidates only.
         let local_listen = *self.local_listen_addr.read().await;
         if let Some(local_addr) = local_listen {
-            let candidates = gather_local_candidates(local_addr);
-            tx.send(BepMessage::Candidates { candidates }).ok();
+            let external = *self.local_external_addr.read().await;
+            let candidates = gather_local_candidates(local_addr, external, Vec::new());
+            if !candidates.is_empty() {
+                tx.send(BepMessage::Candidates { candidates }).ok();
+            }
         }
 
         // Read loop.
@@ -2769,31 +2871,146 @@ mod tests {
 
     // ── NAT traversal wiring ──
 
+    /// Synthesise a host candidate for tests that need a concrete
+    /// address+port without depending on the machine's real network
+    /// interface list.
+    fn fake_host_candidate(addr: SocketAddr, local_preference: u16) -> Candidate {
+        Candidate::new(addr, CandidateKind::Host, local_preference)
+    }
+
     #[test]
-    fn gather_local_candidates_emits_host_candidate_for_bound_addr() {
-        // The host candidate must carry the bound `SocketAddr` verbatim
-        // — the receiving peer dials this address back when
-        // `decide_connectivity` chooses the direct path.
-        let bound: SocketAddr = "127.0.0.1:22000".parse().unwrap();
-        let candidates = gather_local_candidates(bound);
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].address, bound);
-        assert_eq!(candidates[0].kind, CandidateKind::Host);
+    fn aggregate_candidates_folds_host_set_and_external_addr() {
+        // A typical run: two host candidates from the interface walk
+        // plus one server-reflexive candidate derived from the STUN
+        // mapping. All three should be present in the output, sorted
+        // by descending priority.
+        let host_a = fake_host_candidate("192.0.2.1:22000".parse().unwrap(), u16::MAX);
+        let host_b = fake_host_candidate("192.0.2.2:22000".parse().unwrap(), u16::MAX - 1);
+        let external: SocketAddr = "203.0.113.5:42000".parse().unwrap();
+
+        let aggregated = aggregate_candidates(vec![host_a, host_b], Some(external), Vec::new());
+
+        assert_eq!(
+            aggregated.len(),
+            3,
+            "host + host + srflx survives the merge"
+        );
+        // Host candidates outrank server-reflexive by type preference
+        // (126 vs 100) — both hosts must come before the srflx.
+        assert_eq!(aggregated[0].kind, CandidateKind::Host);
+        assert_eq!(aggregated[1].kind, CandidateKind::Host);
+        assert_eq!(aggregated[2].kind, CandidateKind::ServerReflexive);
+        assert_eq!(aggregated[2].address, external);
+    }
+
+    #[test]
+    fn aggregate_candidates_sorts_by_descending_priority() {
+        // The decision tree on the receiving end picks the highest
+        // priority pair first; the gossiped order must reflect that so
+        // a naïve scan does not have to re-sort.
+        let host_high = fake_host_candidate("192.0.2.1:22000".parse().unwrap(), u16::MAX);
+        let host_low = fake_host_candidate("192.0.2.2:22000".parse().unwrap(), 0);
+        let external: SocketAddr = "203.0.113.5:42000".parse().unwrap();
+
+        let aggregated = aggregate_candidates(
+            vec![host_low, host_high], // Deliberately reversed input.
+            Some(external),
+            Vec::new(),
+        );
+
+        // The output must be priority-descending regardless of input
+        // order — the highest-preference host first, the lowest host
+        // second, and the server-reflexive last.
+        assert!(aggregated[0].priority >= aggregated[1].priority);
+        assert!(aggregated[1].priority >= aggregated[2].priority);
+        assert_eq!(aggregated[0].address.ip().to_string(), "192.0.2.1");
+        assert_eq!(aggregated[2].kind, CandidateKind::ServerReflexive);
+    }
+
+    #[test]
+    fn aggregate_candidates_dedupes_by_address_and_kind() {
+        // Two host inputs at the same address+kind collapse to one;
+        // a server-reflexive at the same address but different kind
+        // survives because the dedupe key is the pair, not the address
+        // alone.
+        let addr: SocketAddr = "192.0.2.1:22000".parse().unwrap();
+        let host_a = fake_host_candidate(addr, u16::MAX);
+        let host_a_dup = fake_host_candidate(addr, u16::MAX);
+
+        let aggregated = aggregate_candidates(vec![host_a, host_a_dup], Some(addr), Vec::new());
+
+        assert_eq!(
+            aggregated.len(),
+            2,
+            "duplicate host collapses but the srflx at the same address survives"
+        );
+        let kinds: Vec<_> = aggregated.iter().map(|c| c.kind).collect();
+        assert!(kinds.contains(&CandidateKind::Host));
+        assert!(kinds.contains(&CandidateKind::ServerReflexive));
+    }
+
+    #[test]
+    fn aggregate_candidates_handles_missing_external_addr() {
+        // When NAT detection has not produced an external mapping yet
+        // (or the host is on a public address), the aggregated set
+        // contains only the host candidates and nothing else.
+        let host = fake_host_candidate("192.0.2.1:22000".parse().unwrap(), u16::MAX);
+        let aggregated = aggregate_candidates(vec![host], None, Vec::new());
+        assert_eq!(aggregated.len(), 1);
+        assert_eq!(aggregated[0].kind, CandidateKind::Host);
+    }
+
+    #[test]
+    fn aggregate_candidates_folds_extras_into_output() {
+        // PeerReflexive / Relayed entries supplied via `extras` must
+        // appear alongside the host + srflx set, sorted into the
+        // priority order. No extras flow in production yet, but the
+        // helper must honour them so a future round can wire them up
+        // without changing the aggregation contract.
+        let host = fake_host_candidate("192.0.2.1:22000".parse().unwrap(), u16::MAX);
+        let relay_addr: SocketAddr = "198.51.100.7:3478".parse().unwrap();
+        let relayed = Candidate::new(relay_addr, CandidateKind::Relayed, 0);
+
+        let aggregated = aggregate_candidates(vec![host], None, vec![relayed]);
+
+        assert_eq!(aggregated.len(), 2);
+        assert_eq!(aggregated[0].kind, CandidateKind::Host);
+        assert_eq!(aggregated[1].kind, CandidateKind::Relayed);
+        assert_eq!(aggregated[1].address, relay_addr);
     }
 
     #[tokio::test]
     async fn decide_connectivity_chooses_direct_when_both_peers_open() {
-        // Two Open peers must end up Direct. Feeding the bound address
-        // back through as a host candidate proves the decision tree
-        // honours the priority sort: the dialler targets that address
-        // rather than (say) a relay endpoint.
+        // Two Open peers must end up Direct. Feeding a synthetic host
+        // candidate through `aggregate_candidates` proves the decision
+        // tree honours the priority sort: the dialler targets that
+        // address rather than (say) a relay endpoint.
         let host_addr: SocketAddr = "127.0.0.1:22000".parse().unwrap();
-        let candidates = gather_local_candidates(host_addr);
+        let candidates = aggregate_candidates(
+            vec![fake_host_candidate(host_addr, u16::MAX)],
+            None,
+            Vec::new(),
+        );
         let strategy = decide_connectivity(NatType::Open, NatType::Open, &candidates, &[]);
         match strategy {
             ConnectivityStrategy::Direct { addr } => assert_eq!(addr, host_addr),
             other => panic!("expected Direct, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn local_external_addr_round_trips_via_setter() {
+        // The background detection task calls `set_local_external_addr`
+        // and the connection-time `gather_local_candidates` reads it
+        // back. The round-trip is the contract under test here.
+        let (_dir, engine) = make_engine("f").await;
+        assert!(
+            engine.local_external_addr().await.is_none(),
+            "default is None until detection publishes a reading"
+        );
+        let external: SocketAddr = "203.0.113.5:42000".parse().unwrap();
+        engine.set_local_external_addr(Some(external)).await;
+        assert_eq!(engine.local_external_addr().await, Some(external));
     }
 
     #[test]
