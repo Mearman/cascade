@@ -23,6 +23,27 @@ pub struct KnownPeer {
     pub addresses: Vec<SocketAddr>,
     /// Device IDs that introduced this peer (empty if manually added).
     pub introduced_by: Vec<String>,
+    /// Unix-seconds timestamp when this peer was last reached (outbound)
+    /// or accepted from (inbound). `0` means "never confirmed reachable"
+    /// — applies to peers introduced via gossip but never contacted
+    /// directly.
+    pub last_seen: i64,
+}
+
+impl KnownPeer {
+    /// Construct a `KnownPeer` with the given `last_seen` for tests.
+    /// Production code should call [`PeerBook::add_peer`] or
+    /// [`PeerBook::merge_gossip`] and rely on [`PeerBook::mark_seen`] to
+    /// update the timestamp.
+    #[must_use]
+    pub fn manual(device_id: String, addresses: Vec<SocketAddr>, last_seen: i64) -> Self {
+        Self {
+            device_id,
+            addresses,
+            introduced_by: Vec::new(),
+            last_seen,
+        }
+    }
 }
 
 /// Gossip message exchanged between connected peers.
@@ -59,6 +80,11 @@ impl PeerBook {
     }
 
     /// Manually add a trusted peer. Not introduced by anyone.
+    ///
+    /// The new entry is recorded with `last_seen = 0` ("never confirmed
+    /// reachable"). Callers that have just completed a successful
+    /// outbound connect (or accepted an inbound one) should follow this
+    /// with [`PeerBook::mark_seen`] to stamp the contact time.
     pub fn add_peer(&mut self, device_id: String, addresses: Vec<SocketAddr>) {
         self.peers.insert(
             device_id.clone(),
@@ -66,8 +92,25 @@ impl PeerBook {
                 device_id,
                 addresses,
                 introduced_by: Vec::new(),
+                last_seen: 0,
             },
         );
+    }
+
+    /// Stamp `device_id` as just-seen with `now_unix_seconds`. Used
+    /// after a successful outbound connect or accepted inbound session,
+    /// and on receipt of any frame from the peer.
+    ///
+    /// The stored value is `max(prior, now_unix_seconds)` — older
+    /// snapshots can never regress a fresher contact time. A call for
+    /// an unknown peer is a silent no-op (we don't speculatively insert
+    /// an addressless entry).
+    pub fn mark_seen(&mut self, device_id: &str, now_unix_seconds: i64) {
+        if let Some(entry) = self.peers.get_mut(device_id) {
+            if now_unix_seconds > entry.last_seen {
+                entry.last_seen = now_unix_seconds;
+            }
+        }
     }
 
     /// Merge gossip from an introducer. Peers not already known are
@@ -97,12 +140,18 @@ impl PeerBook {
                     }
                 }
             } else {
+                // Peer is new to us. The introducer's gossip frame may
+                // carry a snapshot of when *they* last reached this
+                // peer, but we have not confirmed reachability
+                // ourselves — record `last_seen = 0` and let a future
+                // direct contact stamp the real value via `mark_seen`.
                 self.peers.insert(
                     gossip_peer.device_id.clone(),
                     KnownPeer {
                         device_id: gossip_peer.device_id.clone(),
                         addresses: gossip_peer.addresses.clone(),
                         introduced_by: vec![introducer_id.to_string()],
+                        last_seen: 0,
                     },
                 );
             }
@@ -191,6 +240,57 @@ mod tests {
         assert_eq!(peer.device_id, "DEVICE-A");
         assert_eq!(peer.addresses, vec![addr(22000)]);
         assert!(peer.introduced_by.is_empty());
+        assert_eq!(
+            peer.last_seen, 0,
+            "freshly-added peers have no confirmed contact time yet",
+        );
+    }
+
+    #[test]
+    fn mark_seen_advances_timestamp_monotonically() {
+        let mut book = PeerBook::new();
+        book.add_peer("DEVICE-A".to_string(), vec![addr(22000)]);
+        book.mark_seen("DEVICE-A", 1000);
+        assert_eq!(book.get("DEVICE-A").unwrap().last_seen, 1000);
+        // Older snapshot must not regress the cursor.
+        book.mark_seen("DEVICE-A", 500);
+        assert_eq!(book.get("DEVICE-A").unwrap().last_seen, 1000);
+        // Newer snapshot moves it forward.
+        book.mark_seen("DEVICE-A", 2000);
+        assert_eq!(book.get("DEVICE-A").unwrap().last_seen, 2000);
+    }
+
+    #[test]
+    fn mark_seen_on_unknown_peer_is_noop() {
+        let mut book = PeerBook::new();
+        book.mark_seen("UNKNOWN", 1000);
+        assert!(book.get("UNKNOWN").is_none());
+    }
+
+    #[test]
+    fn merge_gossip_records_zero_last_seen_for_new_peers() {
+        // A peer learned via gossip has not been confirmed reachable
+        // by us, so its `last_seen` must start at 0 regardless of any
+        // wire snapshot the introducer carries.
+        let mut book = PeerBook::new();
+        let gossip = GossipMessage {
+            peers: vec![GossipPeer {
+                device_id: "DEVICE-B".to_string(),
+                addresses: vec![addr(22001)],
+            }],
+        };
+        book.merge_gossip("INTRODUCER", "SELF", &gossip);
+        let peer = book.get("DEVICE-B").unwrap();
+        assert_eq!(peer.last_seen, 0);
+    }
+
+    #[test]
+    fn known_peer_manual_constructor_sets_fields() {
+        let peer = KnownPeer::manual("DEVICE-A".to_string(), vec![addr(22000)], 1234);
+        assert_eq!(peer.device_id, "DEVICE-A");
+        assert_eq!(peer.addresses, vec![addr(22000)]);
+        assert!(peer.introduced_by.is_empty());
+        assert_eq!(peer.last_seen, 1234);
     }
 
     #[test]
