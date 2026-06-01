@@ -1964,6 +1964,10 @@ mod tests {
             recorded.introduced_by.is_empty(),
             "manual contact should record no introducer"
         );
+        assert!(
+            recorded.last_seen > 0,
+            "outbound connect should stamp last_seen with the contact time",
+        );
     }
 
     /// `handle_inbound` should record the accepted peer in our `PeerBook`.
@@ -1990,17 +1994,85 @@ mod tests {
 
         // The inbound handler records the peer asynchronously inside the
         // listener task; poll the peer book until A appears (or fail).
-        let mut found = false;
+        let mut found_last_seen: Option<i64> = None;
         for _ in 0..40 {
             let book = engine_b.peer_book().read().await;
-            if book.get(engine_a.device_id()).is_some() {
-                found = true;
+            if let Some(entry) = book.get(engine_a.device_id()) {
+                found_last_seen = Some(entry.last_seen);
                 break;
             }
             drop(book);
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(found, "A should be recorded in B's peer book");
+        let last_seen = found_last_seen.expect("A should be recorded in B's peer book");
+        assert!(
+            last_seen > 0,
+            "inbound accept should stamp last_seen with the contact time",
+        );
+    }
+
+    /// `current_gossip_snapshot` must carry the per-peer `last_seen`
+    /// stamped on each `KnownPeer`, not a single broadcast-time
+    /// timestamp. Build a book with two peers at known timestamps and
+    /// confirm both come back through the snapshot.
+    #[tokio::test]
+    async fn broadcast_gossip_uses_per_peer_last_seen() {
+        let (_dir, engine) = make_engine("f").await;
+        {
+            let mut book = engine.peer_book.write().await;
+            book.add_peer(
+                "DEVICE-A".to_string(),
+                vec!["127.0.0.1:22000".parse().unwrap()],
+            );
+            book.mark_seen("DEVICE-A", 1_700_000_000);
+            book.add_peer(
+                "DEVICE-B".to_string(),
+                vec!["127.0.0.1:22001".parse().unwrap()],
+            );
+            book.mark_seen("DEVICE-B", 1_700_005_000);
+        }
+        let snapshot = engine.current_gossip_snapshot().await;
+        assert_eq!(snapshot.len(), 2);
+        let by_id: HashMap<&str, &GossipPeer> =
+            snapshot.iter().map(|p| (p.device_id.as_str(), p)).collect();
+        assert_eq!(
+            by_id.get("DEVICE-A").unwrap().snapshot_unix_seconds,
+            1_700_000_000,
+            "snapshot must carry the per-peer last_seen, not a global stamp",
+        );
+        assert_eq!(
+            by_id.get("DEVICE-B").unwrap().snapshot_unix_seconds,
+            1_700_005_000,
+        );
+    }
+
+    /// A peer learned via gossip but never directly contacted has a
+    /// `last_seen` of `0` and must be broadcast that way — we must not
+    /// fabricate a contact time we cannot vouch for.
+    #[tokio::test]
+    async fn gossip_introduced_peers_broadcast_with_zero_last_seen() {
+        let (_dir, engine) = make_engine("f").await;
+        {
+            let mut book = engine.peer_book.write().await;
+            // Simulate a peer learned solely through gossip — never
+            // confirmed reachable by us.
+            let message = cascade_p2p::wan::GossipMessage {
+                peers: vec![cascade_p2p::wan::GossipPeer {
+                    device_id: "DEVICE-C".to_string(),
+                    addresses: vec!["127.0.0.1:22002".parse().unwrap()],
+                }],
+            };
+            book.merge_gossip("INTRODUCER", engine.device_id(), &message);
+        }
+        let snapshot = engine.current_gossip_snapshot().await;
+        let entry = snapshot
+            .iter()
+            .find(|p| p.device_id == "DEVICE-C")
+            .expect("gossip-introduced peer should appear in snapshot");
+        assert_eq!(
+            entry.snapshot_unix_seconds, 0,
+            "uncontacted peers must broadcast last_seen = 0",
+        );
     }
 
     #[tokio::test]
