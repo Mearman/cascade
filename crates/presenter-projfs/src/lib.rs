@@ -666,9 +666,12 @@ mod windows_impl {
     //!
     //! Browse callbacks (`QueryFileName`, `GetPlaceholderInfo`,
     //! `Start/Get/End` directory enumeration) consult the in-memory
-    //! items map shared with the presenter. `GetFileData`,
+    //! items map shared with the presenter. `GetFileData` reads a
+    //! byte range from the installed [`ContentProvider`] (when one is
+    //! present) and forwards it via `PrjWriteFileData`; without a
+    //! provider it returns `ERROR_CALL_NOT_IMPLEMENTED`.
     //! `Notification` and `CancelCommand` remain stubbed pending the
-    //! read/write follow-up callbacks.
+    //! follow-up commits.
 
     use std::collections::HashMap;
     use std::ffi::c_void;
@@ -684,9 +687,9 @@ mod windows_impl {
     use windows::Win32::Storage::ProjectedFileSystem::{
         PRJ_CALLBACK_DATA, PRJ_CALLBACKS, PRJ_CB_DATA_FLAG_ENUM_RESTART_SCAN,
         PRJ_DIR_ENTRY_BUFFER_HANDLE, PRJ_FILE_BASIC_INFO, PRJ_NOTIFICATION,
-        PRJ_NOTIFICATION_PARAMETERS, PRJ_PLACEHOLDER_INFO, PrjFillDirEntryBuffer,
-        PrjMarkDirectoryAsPlaceholder, PrjStartVirtualizing, PrjStopVirtualizing,
-        PrjWritePlaceholderInfo,
+        PRJ_NOTIFICATION_PARAMETERS, PRJ_PLACEHOLDER_INFO, PrjAllocateAlignedBuffer,
+        PrjFillDirEntryBuffer, PrjFreeAlignedBuffer, PrjMarkDirectoryAsPlaceholder,
+        PrjStartVirtualizing, PrjStopVirtualizing, PrjWriteFileData, PrjWritePlaceholderInfo,
     };
     use windows::core::{GUID, HRESULT, HSTRING, PCWSTR};
 
@@ -1002,15 +1005,141 @@ mod windows_impl {
         S_OK
     }
 
-    /// Stub callback for `PRJ_GET_FILE_DATA_CB`. Read implementation
-    /// follows in a later commit.
+    /// `PRJ_GET_FILE_DATA_CB` — stream the requested byte range of a
+    /// virtualised file back to `ProjFS`.
+    ///
+    /// Flow:
+    /// 1. Recover the [`CallbackContextInner`] and bail with
+    ///    `ERROR_CALL_NOT_IMPLEMENTED` if no [`ContentProvider`] is
+    ///    installed (browse-only mode).
+    /// 2. Resolve the relative path to a [`VfsItem`] via
+    ///    [`resolve_path`]; a directory or unknown path returns
+    ///    `ERROR_FILE_NOT_FOUND`.
+    /// 3. Ask the provider for `[byte_offset, byte_offset + length)`.
+    /// 4. Allocate an aligned buffer via `PrjAllocateAlignedBuffer`,
+    ///    copy the bytes in, hand it to `PrjWriteFileData`, then free
+    ///    the buffer regardless of the outcome.
+    ///
+    /// I/O errors from the provider currently fall through as
+    /// `ERROR_CALL_NOT_IMPLEMENTED` — a richer mapping (network vs.
+    /// permission vs. transient) is follow-up work once the engine's
+    /// error taxonomy is settled.
     #[allow(unsafe_code)]
-    const unsafe extern "system" fn get_file_data(
-        _callback_data: *const PRJ_CALLBACK_DATA,
-        _byte_offset: u64,
-        _length: u32,
+    unsafe extern "system" fn get_file_data(
+        callback_data: *const PRJ_CALLBACK_DATA,
+        byte_offset: u64,
+        length: u32,
     ) -> HRESULT {
-        hresult_from_win32(ERROR_CALL_NOT_IMPLEMENTED.0)
+        // SAFETY: ProjFS holds `callback_data` alive for the duration
+        // of the call. See `query_file_name` for the broader contract.
+        let Some(ctx) = (unsafe { context_from_callback_data(callback_data) }) else {
+            return hresult_from_win32(ERROR_FILE_NOT_FOUND.0);
+        };
+        let Some(provider) = ctx.content_provider.as_ref() else {
+            // No backend wired in; stay browse-only.
+            return hresult_from_win32(ERROR_CALL_NOT_IMPLEMENTED.0);
+        };
+        let Some(path) = (unsafe { pcwstr_to_string((*callback_data).FilePathName) }) else {
+            return hresult_from_win32(ERROR_FILE_NOT_FOUND.0);
+        };
+
+        // SAFETY: see context recovery above. ProjFS keeps the struct
+        // alive across the entire call.
+        let namespace_ctx = unsafe { (*callback_data).NamespaceVirtualizationContext };
+        let data_stream_id = unsafe { (*callback_data).DataStreamId };
+
+        // Resolve the item under the read lock and drop the guards
+        // before invoking the provider so a slow read does not block
+        // browse callbacks. The provider takes an `ItemId`, so we
+        // clone it out and release the lock first.
+        let item_id = {
+            let items = ctx.items.blocking_read();
+            let root = ctx.root_id.blocking_read();
+            let Some(item) = resolve_path(&path, &items, root.as_ref()) else {
+                return hresult_from_win32(ERROR_FILE_NOT_FOUND.0);
+            };
+            if item.is_dir {
+                return hresult_from_win32(ERROR_FILE_NOT_FOUND.0);
+            }
+            item.id.clone()
+        };
+
+        let bytes = match provider.read_range(&item_id, byte_offset, length) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::warn!(
+                    id = %item_id,
+                    offset = byte_offset,
+                    length,
+                    error = %err,
+                    "ContentProvider::read_range failed; returning ERROR_CALL_NOT_IMPLEMENTED"
+                );
+                return hresult_from_win32(ERROR_CALL_NOT_IMPLEMENTED.0);
+            }
+        };
+
+        if bytes.is_empty() {
+            // End of file — ProjFS treats S_OK with zero bytes as a
+            // legitimate short read.
+            return S_OK;
+        }
+        // Cap to u32 so the ProjFS length argument fits. ProjFS reads
+        // are bounded by what the kernel asked us for (`length` is
+        // u32), so in practice `bytes.len() <= length` here, but we
+        // still guard against a misbehaving provider returning more.
+        let cap = usize::try_from(u32::MAX).unwrap_or(usize::MAX);
+        let usable_usize = bytes.len().min(cap);
+        let usable = u32::try_from(usable_usize).unwrap_or(u32::MAX);
+
+        // Allocate an aligned buffer. ProjFS requires unbuffered I/O
+        // alignment; PrjAllocateAlignedBuffer is the documented way to
+        // get a buffer that satisfies it for the active namespace.
+        //
+        // SAFETY: `namespace_ctx` is the live namespace handle ProjFS
+        // gave us. `PrjAllocateAlignedBuffer` returns null on failure;
+        // we check before dereferencing.
+        let buffer = unsafe { PrjAllocateAlignedBuffer(namespace_ctx, usable_usize) };
+        if buffer.is_null() {
+            return hresult_from_win32(ERROR_CALL_NOT_IMPLEMENTED.0);
+        }
+
+        // SAFETY: `buffer` points to at least `usable_usize` writable
+        // bytes (we just asked PrjAllocateAlignedBuffer for that many).
+        // `bytes` is at least `usable_usize` bytes long because
+        // `usable_usize <= bytes.len()`. The two regions cannot overlap
+        // because the aligned buffer was just freshly allocated and is
+        // distinct from `bytes`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.cast::<u8>(), usable_usize);
+        }
+
+        // SAFETY: `data_stream_id` is the GUID ProjFS gave us;
+        // `PrjWriteFileData` reads it for the duration of the call.
+        // The buffer is alive until `PrjFreeAlignedBuffer` below runs,
+        // which is after PrjWriteFileData has returned.
+        let result = unsafe {
+            PrjWriteFileData(
+                namespace_ctx,
+                &raw const data_stream_id,
+                buffer.cast_const(),
+                byte_offset,
+                usable,
+            )
+        };
+
+        // SAFETY: `buffer` came from PrjAllocateAlignedBuffer above and
+        // has not been freed yet. PrjFreeAlignedBuffer is the matching
+        // deallocator. We free here regardless of the PrjWriteFileData
+        // outcome — the buffer is no longer needed and ProjFS has
+        // copied the bytes it cared about by the time the call returns.
+        unsafe {
+            PrjFreeAlignedBuffer(buffer.cast_const());
+        }
+
+        match result {
+            Ok(()) => S_OK,
+            Err(err) => err.code(),
+        }
     }
 
     /// Stub callback for `PRJ_NOTIFICATION_CB`. Write-back hooks
