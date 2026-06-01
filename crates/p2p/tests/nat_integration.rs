@@ -352,10 +352,31 @@ impl NetNsHarness {
 
         // Spawn the relay subprocess inside cascade-internet. The relay binary
         // is the current test binary re-invoked with CASCADE_NETNS_ROLE=relay.
+        //
+        // The subprocess is a test binary, so the test harness emits its own
+        // header lines to stdout (e.g. "running 1 test") before the relay
+        // address appears. Two things are required to get the address on the
+        // pipe:
+        //
+        //   1. `--nocapture` — without this the test harness captures
+        //      `println!` output internally and never forwards it to the
+        //      process's stdout, so the address is swallowed.
+        //   2. Line-skipping — the harness header ("running 1 test",
+        //      "test nat_relay_end_to_end ...") must be discarded before
+        //      accepting the `<host>:<port>` line as the bound address.
         let current_exe = std::env::current_exe().expect("current_exe");
         let mut relay_proc = Command::new("ip")
             .args(["netns", "exec", NS_INTERNET])
             .arg(&current_exe)
+            // Limit to our test so the harness doesn't try to run others, and
+            // pass --nocapture so that `println!` in the test body reaches the
+            // process's real stdout (which is piped to us).
+            .args([
+                "--",
+                "nat_relay_end_to_end",
+                "--nocapture",
+                "--test-threads=1",
+            ])
             .env("CASCADE_NETNS_ROLE", "relay")
             // Inherit stderr for debugging; capture stdout to read the bound port.
             .stdin(Stdio::piped())
@@ -364,20 +385,37 @@ impl NetNsHarness {
             .spawn()
             .expect("spawning relay subprocess");
 
-        // Read the relay's bound address from its stdout (one line).
+        // Read the relay's bound address from its stdout.
+        //
+        // The test harness emits header lines before the relay address, so we
+        // scan lines until we find one that looks like `<host>:<port>` (a
+        // non-empty port suffix after the last `:`). Lines that don't match
+        // — such as "running 1 test" or "test nat_relay_end_to_end ..." — are
+        // skipped.
         let relay_bound_port = {
             let stdout = relay_proc.stdout.take().expect("relay stdout");
             let mut reader = BufReader::new(stdout);
-            let mut line = String::new();
-            reader
-                .read_line(&mut line)
-                .expect("reading relay bound address");
-            let line = line.trim();
-            // The relay prints `0.0.0.0:<port>` or `127.0.0.1:<port>`.
-            // Extract the port and pair it with GW_A (the relay's address
-            // as seen from the peer namespaces).
-            let port = line.rsplit(':').next().expect("port in relay address");
-            port.trim().to_owned()
+            // The relay prints `0.0.0.0:<port>` or `127.0.0.1:<port>`, but the
+            // test harness emits its own header lines first ("running 1 test",
+            // "test nat_relay_end_to_end ..."). Skip lines that don't end in an
+            // all-digit port suffix.
+            loop {
+                let mut line = String::new();
+                let n = reader
+                    .read_line(&mut line)
+                    .expect("reading relay subprocess stdout");
+                if n == 0 {
+                    // EOF — relay exited before printing an address.
+                    panic!("relay subprocess closed stdout without printing a bound address");
+                }
+                let trimmed = line.trim();
+                if let Some(port) = trimmed.rsplit(':').next() {
+                    let port = port.trim();
+                    if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) {
+                        break port.to_owned();
+                    }
+                }
+            }
         };
 
         let relay_addr = format!("{GW_A}:{relay_bound_port}");
