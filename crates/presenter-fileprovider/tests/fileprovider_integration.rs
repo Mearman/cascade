@@ -202,6 +202,60 @@ fn enumerate_request_builds_correct_protocol_message() {
 }
 
 #[test]
+fn enumerate_changes_request_builds_correct_protocol_message() {
+    let bridge = FileProviderBridge::new("/tmp/cascade-test.sock");
+    let request = bridge.build_request(
+        "enumerateChanges",
+        json!({
+            "parent_id": "gdrive:root",
+            "since_cursor": "EjQ",
+        }),
+    );
+
+    assert_eq!(request.method, "enumerateChanges");
+    assert_eq!(
+        request.params,
+        json!({"parent_id": "gdrive:root", "since_cursor": "EjQ"}),
+    );
+}
+
+#[test]
+fn enumerate_changes_response_decodes_full_envelope() {
+    // Simulate the JSON shape the Rust server emits for a populated
+    // delta and verify both directions of the wire decode.
+    let response = Response::ok(
+        17,
+        json!({
+            "added_or_modified": [
+                {
+                    "id": "gdrive:file2",
+                    "parent_id": "gdrive:root",
+                    "filename": "new.txt",
+                    "is_directory": false,
+                    "size": 12,
+                    "content_type": "text/plain",
+                    "last_modified": null,
+                    "cache_state": "online",
+                }
+            ],
+            "deleted": ["gdrive:gone"],
+            "new_cursor": "EjQ",
+        }),
+    );
+
+    let encoded = encode_message(&response).unwrap();
+    let (_, decoded): (usize, Response) = decode_message(&encoded).unwrap().unwrap();
+
+    let result = decoded.result.unwrap();
+    assert_eq!(result["new_cursor"], "EjQ");
+    let added = result["added_or_modified"].as_array().unwrap();
+    assert_eq!(added.len(), 1);
+    assert_eq!(added[0]["filename"], "new.txt");
+    let deleted = result["deleted"].as_array().unwrap();
+    assert_eq!(deleted[0], "gdrive:gone");
+}
+
+#[test]
 fn enumerate_response_decodes_children() {
     let response = Response::ok(
         1,
