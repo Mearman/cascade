@@ -203,6 +203,81 @@ final class ActionHandler {
         return try FileProviderItem(item: CascadeVfsItem(json: json))
     }
 
+    /// Replicated File Provider create-item entry point.
+    ///
+    /// The system calls this for both new files (with `contents` set
+    /// to a sandboxed source URL) and new folders (with `contents`
+    /// nil). The Rust bridge already exposes `importDocument` and
+    /// `createDirectory`; we choose between them on whether the
+    /// system handed us a content URL.
+    func createItem(
+        template: NSFileProviderItem,
+        contents url: URL?
+    ) async throws -> FileProviderItem {
+        let parent = template.parentItemIdentifier
+        let name = template.filename
+
+        if let url {
+            let result = try await engine.send(method: "importDocument", params: [
+                "source_url": url.path,
+                "parent_id": engineID(for: parent),
+                "name": name,
+            ])
+            guard let json = result as? [String: Any] else {
+                throw CascadeFileProviderError.invalidResponse("importDocument result was not an object")
+            }
+            return try FileProviderItem(item: CascadeVfsItem(json: json))
+        }
+
+        return try await createDirectory(named: name, parentIdentifier: parent)
+    }
+
+    /// Replicated File Provider modify-item entry point.
+    ///
+    /// The Rust bridge does not yet expose a single `modifyItem` RPC;
+    /// instead it has `moveItem` for renames/reparents and
+    /// `importDocument` for content updates. We decompose the
+    /// `changedFields` set into the bridge calls that match, applying
+    /// them in a deterministic order so the engine sees the same end
+    /// state regardless of which fields the system bundled together.
+    func modifyItem(
+        item: NSFileProviderItem,
+        changedFields: NSFileProviderItemFields,
+        newContents: URL?
+    ) async throws -> FileProviderItem {
+        let identifier = item.itemIdentifier
+        var latest: FileProviderItem?
+
+        let renameOrReparent = changedFields.contains(.filename) || changedFields.contains(.parentItemIdentifier)
+        if renameOrReparent {
+            latest = try await moveItem(
+                identifier: identifier,
+                newParentIdentifier: item.parentItemIdentifier,
+                newName: item.filename
+            )
+        }
+
+        if changedFields.contains(.contents), let url = newContents {
+            _ = try await engine.send(method: "importDocument", params: [
+                "source_url": url.path,
+                "parent_id": engineID(for: item.parentItemIdentifier),
+                "existing_id": engineID(for: identifier),
+            ])
+            latest = try await self.item(for: identifier)
+        }
+
+        if let latest {
+            return latest
+        }
+
+        // TODO(fileprovider): the Rust bridge needs an explicit
+        //   `setAttributes` RPC to round-trip changes to capabilities,
+        //   favourite rank, or last-used date. Until then we re-read
+        //   the item so the system gets a fresh metadata snapshot
+        //   even when no field we recognise was actually changed.
+        return try await self.item(for: identifier)
+    }
+
     private func engineID(for identifier: NSFileProviderItemIdentifier) -> String {
         identifier == .rootContainer ? rootIdentifier : identifier.rawValue
     }

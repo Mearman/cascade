@@ -1,3 +1,18 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Cascade File Provider enumerator.
+//
+// The replicated File Provider API enumerates two things separately:
+// the current items inside a container (`enumerateItems`) and the
+// stream of changes since a sync anchor (`enumerateChanges`).
+//
+// Cascade's bridge protocol does not yet model sync anchors; the
+// engine pushes individual notifications over the socket instead.
+// Until that side grows a real cursor, this enumerator returns the
+// engine's current view for `enumerateItems` and reports no further
+// changes for `enumerateChanges`. The replicated API tolerates that:
+// the system will simply re-enumerate when it next needs a refresh.
+
 import FileProvider
 import Foundation
 
@@ -25,6 +40,11 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
     }
 
     func enumerateChanges(for observer: NSFileProviderChangeObserver, from syncAnchor: NSFileProviderSyncAnchor) {
+        // TODO(fileprovider): the Rust bridge needs an `enumerateChanges`
+        //   method that returns a delta keyed on a server cursor before
+        //   this implementation can do anything useful. Until then we
+        //   acknowledge the anchor unchanged and let the system fall
+        //   back to a full re-enumeration when it chooses.
         observer.finishEnumeratingChanges(upTo: syncAnchor, moreComing: false)
     }
 
