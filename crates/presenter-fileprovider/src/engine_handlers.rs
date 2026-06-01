@@ -1292,6 +1292,441 @@ mod tests {
         );
     }
 
+    /// Insert a directory `FileEntry` into both the source backend and
+    /// the state DB so a cross-backend directory move can use it.
+    fn seed_src_directory(
+        backend: &InMemoryBackend,
+        db: &StateDb,
+        native_id: &str,
+        parent_native: &str,
+        name: &str,
+    ) -> FileEntry {
+        let entry = FileEntry {
+            id: ItemId::new(backend.id(), native_id),
+            parent_id: ItemId::new(backend.id(), parent_native),
+            name: name.to_string(),
+            is_dir: true,
+            size: None,
+            mod_time: Some(Utc::now()),
+            mime_type: None,
+            hash: None,
+        };
+        backend.insert(entry.clone());
+        db.upsert_file(&entry).unwrap();
+        entry
+    }
+
+    /// Insert a file `FileEntry` plus content into the source backend
+    /// and persist it in the state DB.
+    fn seed_src_file(
+        backend: &InMemoryBackend,
+        db: &StateDb,
+        native_id: &str,
+        parent_native: &str,
+        name: &str,
+        bytes: &[u8],
+    ) -> FileEntry {
+        let entry = FileEntry {
+            id: ItemId::new(backend.id(), native_id),
+            parent_id: ItemId::new(backend.id(), parent_native),
+            name: name.to_string(),
+            is_dir: false,
+            size: Some(bytes.len() as u64),
+            mod_time: Some(Utc::now()),
+            mime_type: Some("text/plain".to_string()),
+            hash: None,
+        };
+        backend.insert(entry.clone());
+        db.upsert_file(&entry).unwrap();
+        backend
+            .content
+            .lock()
+            .unwrap()
+            .insert(entry.id.0.clone(), bytes.to_vec());
+        entry
+    }
+
+    /// Count the entries under `dst_native_parent` in `backend` with
+    /// the given `name`. Used to assert that a recursive directory
+    /// copy landed where it was supposed to.
+    fn find_child(
+        backend: &InMemoryBackend,
+        parent_full_id: &str,
+        name: &str,
+    ) -> Option<FileEntry> {
+        backend
+            .files
+            .lock()
+            .unwrap()
+            .values()
+            .find(|entry| entry.parent_id.0 == parent_full_id && entry.name == name)
+            .cloned()
+    }
+
+    #[tokio::test]
+    async fn move_item_cross_backend_empty_directory_succeeds() {
+        let (handlers, src, dst, _tempdir) = make_cross_backend_handlers();
+
+        // Source: a single empty directory directly under the root.
+        seed_src_directory(&src, &handlers.db, "subdir", "root", "subdir");
+
+        let moved = handlers
+            .move_item("src:subdir", "dst:root", "subdir")
+            .await
+            .unwrap();
+
+        assert!(moved.is_directory);
+        assert_eq!(moved.parent_id, "dst:root");
+        assert_eq!(moved.filename, "subdir");
+
+        // Destination has a directory of the expected name; source
+        // does not.
+        assert!(
+            find_child(&dst, "dst:root", "subdir").is_some(),
+            "destination should contain the moved directory"
+        );
+        assert!(
+            !src.files.lock().unwrap().contains_key("src:subdir"),
+            "source backend must no longer hold the moved directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_item_cross_backend_flat_directory_with_files_succeeds() {
+        let (handlers, src, dst, _tempdir) = make_cross_backend_handlers();
+
+        // Source layout: /subdir/{a.txt, b.txt}.
+        seed_src_directory(&src, &handlers.db, "subdir", "root", "subdir");
+        seed_src_file(&src, &handlers.db, "a", "subdir", "a.txt", b"alpha");
+        seed_src_file(&src, &handlers.db, "b", "subdir", "b.txt", b"bravo");
+
+        let moved = handlers
+            .move_item("src:subdir", "dst:root", "subdir")
+            .await
+            .unwrap();
+        assert!(moved.is_directory);
+
+        // Destination directory exists and holds both children with
+        // their original bytes.
+        let dst_dir = find_child(&dst, "dst:root", "subdir")
+            .expect("destination should contain the moved directory");
+        let dst_a =
+            find_child(&dst, &dst_dir.id.0, "a.txt").expect("destination should contain a.txt");
+        let dst_b =
+            find_child(&dst, &dst_dir.id.0, "b.txt").expect("destination should contain b.txt");
+        let dst_content = dst.content.lock().unwrap();
+        assert_eq!(
+            dst_content.get(&dst_a.id.0).map(Vec::as_slice),
+            Some(b"alpha".as_slice())
+        );
+        assert_eq!(
+            dst_content.get(&dst_b.id.0).map(Vec::as_slice),
+            Some(b"bravo".as_slice())
+        );
+
+        // Source no longer holds the directory or its children.
+        let src_files = src.files.lock().unwrap();
+        assert!(!src_files.contains_key("src:subdir"));
+        assert!(!src_files.contains_key("src:a"));
+        assert!(!src_files.contains_key("src:b"));
+    }
+
+    #[tokio::test]
+    async fn move_item_cross_backend_nested_directory_succeeds() {
+        let (handlers, src, dst, _tempdir) = make_cross_backend_handlers();
+
+        // Source layout:
+        //   /outer/
+        //     top.txt
+        //     /inner/
+        //       deep.txt
+        //       /innermost/
+        //         leaf.txt
+        seed_src_directory(&src, &handlers.db, "outer", "root", "outer");
+        seed_src_file(&src, &handlers.db, "top", "outer", "top.txt", b"top-bytes");
+        seed_src_directory(&src, &handlers.db, "inner", "outer", "inner");
+        seed_src_file(
+            &src,
+            &handlers.db,
+            "deep",
+            "inner",
+            "deep.txt",
+            b"deep-bytes",
+        );
+        seed_src_directory(&src, &handlers.db, "innermost", "inner", "innermost");
+        seed_src_file(
+            &src,
+            &handlers.db,
+            "leaf",
+            "innermost",
+            "leaf.txt",
+            b"leaf-bytes",
+        );
+
+        let moved = handlers
+            .move_item("src:outer", "dst:root", "outer")
+            .await
+            .unwrap();
+        assert!(moved.is_directory);
+
+        // Walk the destination tree mirror by mirror and confirm
+        // every node materialised in the right place with the right
+        // bytes.
+        let dst_outer = find_child(&dst, "dst:root", "outer").expect("dst/outer");
+        let dst_top = find_child(&dst, &dst_outer.id.0, "top.txt").expect("dst/outer/top.txt");
+        let dst_inner = find_child(&dst, &dst_outer.id.0, "inner").expect("dst/outer/inner");
+        let dst_deep =
+            find_child(&dst, &dst_inner.id.0, "deep.txt").expect("dst/outer/inner/deep.txt");
+        let dst_innermost =
+            find_child(&dst, &dst_inner.id.0, "innermost").expect("dst/outer/inner/innermost");
+        let dst_leaf = find_child(&dst, &dst_innermost.id.0, "leaf.txt")
+            .expect("dst/outer/inner/innermost/leaf.txt");
+
+        let dst_content = dst.content.lock().unwrap();
+        assert_eq!(
+            dst_content.get(&dst_top.id.0).map(Vec::as_slice),
+            Some(b"top-bytes".as_slice())
+        );
+        assert_eq!(
+            dst_content.get(&dst_deep.id.0).map(Vec::as_slice),
+            Some(b"deep-bytes".as_slice())
+        );
+        assert_eq!(
+            dst_content.get(&dst_leaf.id.0).map(Vec::as_slice),
+            Some(b"leaf-bytes".as_slice())
+        );
+
+        // Source subtree gone in its entirety.
+        let src_files = src.files.lock().unwrap();
+        for native in ["outer", "top", "inner", "deep", "innermost", "leaf"] {
+            let id = format!("src:{native}");
+            assert!(
+                !src_files.contains_key(&id),
+                "source backend still holds {id} after directory move"
+            );
+        }
+    }
+
+    /// A backend that wraps `InMemoryBackend` but fails the Nth call
+    /// to `upload` (1-indexed), letting tests trigger a partial
+    /// failure halfway through a recursive directory move.
+    #[derive(Debug)]
+    struct UploadFailingBackend {
+        inner: InMemoryBackend,
+        calls: Mutex<usize>,
+        fail_on: usize,
+    }
+
+    impl UploadFailingBackend {
+        fn new(id: &str, fail_on: usize) -> Self {
+            Self {
+                inner: InMemoryBackend::new(id),
+                calls: Mutex::new(0),
+                fail_on,
+            }
+        }
+
+        fn insert(&self, entry: FileEntry) {
+            self.inner.insert(entry);
+        }
+    }
+
+    #[async_trait]
+    impl Backend for UploadFailingBackend {
+        fn id(&self) -> &str {
+            self.inner.id()
+        }
+
+        fn display_name(&self) -> &str {
+            self.inner.display_name()
+        }
+
+        async fn quota(&self) -> anyhow::Result<Option<Quota>> {
+            self.inner.quota().await
+        }
+
+        async fn changes(&self, cursor: Option<&Cursor>) -> anyhow::Result<(Vec<Change>, Cursor)> {
+            self.inner.changes(cursor).await
+        }
+
+        async fn metadata(&self, path: &Path) -> anyhow::Result<FileEntry> {
+            self.inner.metadata(path).await
+        }
+
+        async fn download(
+            &self,
+            file: &FileEntry,
+            writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
+        ) -> anyhow::Result<()> {
+            self.inner.download(file, writer).await
+        }
+
+        async fn upload(
+            &self,
+            path: &Path,
+            reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+            parent_id: &FileId,
+        ) -> anyhow::Result<FileEntry> {
+            let call = {
+                let mut counter = self
+                    .calls
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *counter += 1;
+                *counter
+            };
+            if call == self.fail_on {
+                anyhow::bail!("simulated upload failure on call {call}");
+            }
+            self.inner.upload(path, reader, parent_id).await
+        }
+
+        async fn update(
+            &self,
+            file_id: &FileId,
+            reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+        ) -> anyhow::Result<FileEntry> {
+            self.inner.update(file_id, reader).await
+        }
+
+        async fn create_dir(&self, path: &Path) -> anyhow::Result<FileEntry> {
+            self.inner.create_dir(path).await
+        }
+
+        async fn create_dir_with_parent(
+            &self,
+            name: &str,
+            parent_id: &FileId,
+        ) -> anyhow::Result<FileEntry> {
+            self.inner.create_dir_with_parent(name, parent_id).await
+        }
+
+        async fn delete(&self, file: &FileEntry) -> anyhow::Result<()> {
+            self.inner.delete(file).await
+        }
+
+        async fn move_entry(&self, src: &Path, dst: &Path) -> anyhow::Result<FileEntry> {
+            self.inner.move_entry(src, dst).await
+        }
+
+        async fn move_by_id(
+            &self,
+            src_id: &FileId,
+            dst_parent_id: &FileId,
+            new_name: &str,
+        ) -> anyhow::Result<FileEntry> {
+            self.inner.move_by_id(src_id, dst_parent_id, new_name).await
+        }
+
+        async fn list_children(&self, parent_native_id: &str) -> anyhow::Result<Vec<FileEntry>> {
+            self.inner.list_children(parent_native_id).await
+        }
+
+        async fn poll_interval(&self) -> Option<Duration> {
+            self.inner.poll_interval().await
+        }
+    }
+
+    #[tokio::test]
+    async fn move_item_cross_backend_directory_partial_failure_leaves_source_intact() {
+        // Destination upload fails on the second call (i.e. after the
+        // first child file has uploaded). The handler must surface an
+        // error and leave the source subtree completely untouched.
+        let src = Arc::new(InMemoryBackend::new("src"));
+        let dst = Arc::new(UploadFailingBackend::new("dst", 2));
+
+        let src_dyn: Arc<dyn Backend> = src.clone();
+        let dst_dyn: Arc<dyn Backend> = dst.clone();
+        let mut tree = VfsTree::new(src_dyn);
+        tree.mount(PathBuf::from("/dst"), dst_dyn);
+        let vfs = Arc::new(RwLock::new(tree));
+        let cache_dir = tempfile::tempdir().unwrap();
+
+        let db = Arc::new(StateDb::open_in_memory().unwrap());
+        db.register_backend("src", "stub", "Src", None, None)
+            .unwrap();
+        db.register_backend("dst", "stub", "Dst", Some("/dst"), None)
+            .unwrap();
+
+        // Seed the source root.
+        let src_root = FileEntry {
+            id: ItemId::new("src", "root"),
+            parent_id: ItemId::new("src", ""),
+            name: "root".to_string(),
+            is_dir: true,
+            size: None,
+            mod_time: Some(Utc::now()),
+            mime_type: None,
+            hash: None,
+        };
+        src.insert(src_root.clone());
+        db.upsert_file(&src_root).unwrap();
+
+        // Seed the destination root via the wrapper's inner backend.
+        let dst_root = FileEntry {
+            id: ItemId::new("dst", "root"),
+            parent_id: ItemId::new("dst", ""),
+            name: "root".to_string(),
+            is_dir: true,
+            size: None,
+            mod_time: Some(Utc::now()),
+            mime_type: None,
+            hash: None,
+        };
+        dst.insert(dst_root.clone());
+        db.upsert_file(&dst_root).unwrap();
+
+        // Source layout: /subdir/{a.txt, b.txt}. The first upload
+        // succeeds (a.txt) and the second fails (b.txt), leaving a
+        // partial destination tree.
+        seed_src_directory(&src, &db, "subdir", "root", "subdir");
+        seed_src_file(&src, &db, "a", "subdir", "a.txt", b"alpha");
+        seed_src_file(&src, &db, "b", "subdir", "b.txt", b"bravo");
+
+        let handlers = EngineHandlers::new(vfs, db.clone(), cache_dir.path().to_path_buf());
+
+        let err = handlers
+            .move_item("src:subdir", "dst:root", "subdir")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Internal);
+
+        // Source subtree is completely intact — neither the directory
+        // nor any child file was deleted.
+        let src_files = src.files.lock().unwrap();
+        assert!(
+            src_files.contains_key("src:subdir"),
+            "source directory must still exist after partial failure"
+        );
+        assert!(
+            src_files.contains_key("src:a"),
+            "source child a.txt must still exist after partial failure"
+        );
+        assert!(
+            src_files.contains_key("src:b"),
+            "source child b.txt must still exist after partial failure"
+        );
+
+        // Source bytes intact too.
+        let src_content = src.content.lock().unwrap();
+        assert_eq!(
+            src_content.get("src:a").map(Vec::as_slice),
+            Some(b"alpha".as_slice())
+        );
+        assert_eq!(
+            src_content.get("src:b").map(Vec::as_slice),
+            Some(b"bravo".as_slice())
+        );
+
+        // State DB still knows about the source subtree.
+        assert!(
+            db.get_file(&ItemId::new("src", "subdir"))
+                .unwrap()
+                .is_some(),
+            "state DB must still hold the source directory after partial failure"
+        );
+    }
+
     #[tokio::test]
     async fn move_item_cross_backend_name_collision_returns_already_exists() {
         let (handlers, _src, dst, _tempdir) = make_cross_backend_handlers();
