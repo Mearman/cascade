@@ -7,6 +7,7 @@ use tokio::sync::watch;
 
 use crate::backend::Backend;
 use crate::cache::pin::PinMatcher;
+use crate::changefeed::ChangeFeed;
 use crate::config::ConfigResolver;
 use crate::db::StateDb;
 use crate::p2p_bridge::P2pBridge;
@@ -28,6 +29,10 @@ pub struct SyncRunner {
     presenter: Arc<dyn VfsPresenter>,
     config: Arc<ConfigResolver>,
     p2p: Option<P2pBridge>,
+    /// Optional engine-side change index. When present, every applied
+    /// batch is also filed here so presenters can serve per-parent
+    /// `enumerateChanges` deltas without running a second poll loop.
+    change_feed: Option<Arc<ChangeFeed>>,
     cancel_tx: watch::Sender<bool>,
     cancel_rx: watch::Receiver<bool>,
 }
@@ -56,6 +61,7 @@ impl SyncRunner {
             presenter,
             config,
             p2p: None,
+            change_feed: None,
             cancel_tx,
             cancel_rx,
         }
@@ -65,6 +71,18 @@ impl SyncRunner {
     #[must_use]
     pub fn with_p2p(mut self, p2p: P2pBridge) -> Self {
         self.p2p = Some(p2p);
+        self
+    }
+
+    /// Attach the engine-side change feed.
+    ///
+    /// Once attached, each applied poll batch is filed into the feed so
+    /// presenters (e.g. the File Provider bridge's `enumerateChanges`) can
+    /// serve per-parent deltas from the same poll loop the runner already
+    /// drives.
+    #[must_use]
+    pub fn with_change_feed(mut self, change_feed: Arc<ChangeFeed>) -> Self {
+        self.change_feed = Some(change_feed);
         self
     }
 
@@ -150,17 +168,32 @@ impl SyncRunner {
         let cursor = self.db.get_cursor(backend_id)?;
         let (changes, new_cursor) = backend.changes(cursor.as_ref()).await?;
 
-        let count = self.apply_changes(backend_id, &changes).await?;
+        let applied = self.apply_changes(backend_id, &changes).await?;
 
         self.db.set_cursor(backend_id, &new_cursor)?;
 
-        Ok(count)
+        // File the applied (post-ignore-filter) changes into the engine's
+        // per-parent change index, if one is attached. This is the single
+        // canonical poll loop — the feed never polls backends itself.
+        if let Some(feed) = &self.change_feed {
+            feed.record(backend_id, &applied).await;
+        }
+
+        Ok(applied.len())
     }
 
     /// Apply a batch of changes to the state database and notify the presenter.
     /// Files matching `.cascade` ignore rules are skipped.
-    async fn apply_changes(&self, _backend_id: &str, changes: &[Change]) -> anyhow::Result<usize> {
-        let mut count = 0;
+    ///
+    /// Returns the changes that were actually applied (i.e. survived the
+    /// `.cascade` ignore filter), in application order, so the caller can
+    /// file the same set into the change feed.
+    async fn apply_changes(
+        &self,
+        _backend_id: &str,
+        changes: &[Change],
+    ) -> anyhow::Result<Vec<Change>> {
+        let mut applied = Vec::new();
 
         for change in changes {
             match change {
@@ -186,7 +219,7 @@ impl SyncRunner {
                     }
                     let item: VfsItem = entry.clone().into();
                     self.presenter.upsert_item(item).await?;
-                    count += 1;
+                    applied.push(change.clone());
                 }
                 Change::Updated { new, .. } => {
                     if self.is_ignored_entry(new) {
@@ -216,12 +249,12 @@ impl SyncRunner {
                     self.db.upsert_file(new)?;
                     let item: VfsItem = new.clone().into();
                     self.presenter.upsert_item(item).await?;
-                    count += 1;
+                    applied.push(change.clone());
                 }
                 Change::Deleted(entry) => {
                     self.db.delete_file(&entry.id)?;
                     self.presenter.delete_item(&entry.id).await?;
-                    count += 1;
+                    applied.push(change.clone());
                 }
                 Change::Moved { to, .. } => {
                     if self.is_ignored_entry(to) {
@@ -230,12 +263,12 @@ impl SyncRunner {
                     self.db.upsert_file(to)?;
                     let item: VfsItem = to.clone().into();
                     self.presenter.upsert_item(item).await?;
-                    count += 1;
+                    applied.push(change.clone());
                 }
             }
         }
 
-        Ok(count)
+        Ok(applied)
     }
 
     /// Check if a file entry matches any pin rule.

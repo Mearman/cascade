@@ -18,6 +18,7 @@ use tracing::info;
 
 use crate::backend::Backend;
 use crate::cache::manager::{CacheManager, CacheManagerConfig};
+use crate::changefeed::ChangeFeed;
 use crate::config::ConfigResolver;
 use crate::db::{PinRuleRecord, StateDb};
 use crate::p2p_bridge::P2pBridge;
@@ -62,6 +63,9 @@ pub struct Engine {
     cache: CacheManager,
     config: Arc<ConfigResolver>,
     p2p: Option<P2pBridge>,
+    /// Engine-side per-parent change index. Fed by the sync runner and
+    /// read by presenters that serve `enumerateChanges`-style deltas.
+    change_feed: Arc<ChangeFeed>,
     cancel: watch::Sender<bool>,
     cancel_rx: watch::Receiver<bool>,
 }
@@ -136,9 +140,21 @@ impl Engine {
             cache,
             config: config_resolver,
             p2p,
+            change_feed: Arc::new(ChangeFeed::new()),
             cancel,
             cancel_rx,
         })
+    }
+
+    /// The engine's shared per-parent change index.
+    ///
+    /// Presenters that serve `enumerateChanges`-style deltas (the macOS
+    /// File Provider bridge today) read per-parent change events from this
+    /// feed. It is populated by the sync runner created via
+    /// [`Engine::create_sync_runner`].
+    #[must_use]
+    pub fn change_feed(&self) -> Arc<ChangeFeed> {
+        self.change_feed.clone()
     }
 
     /// Mount a backend at a VFS prefix.
@@ -177,6 +193,7 @@ impl Engine {
         drop(tree);
 
         SyncRunner::new(self.db.clone(), backends, presenter, self.config.clone())
+            .with_change_feed(self.change_feed.clone())
     }
 
     /// Start the engine's background tasks (cache manager).

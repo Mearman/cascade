@@ -1527,12 +1527,13 @@ mod tests {
         }
     }
 
-    /// Build a [`ChangeFeed`] over the given backends. Tests pass
-    /// `InMemoryBackend` (or wrapping fakes) directly; the helper does
-    /// the `Arc<dyn Backend>` coercion that the strict-lints workspace
-    /// rejects as a `trivial_casts` violation when written inline.
-    fn make_feed(backends: Vec<Arc<dyn Backend>>) -> Arc<ChangeFeed> {
-        Arc::new(ChangeFeed::start(backends))
+    /// Build an empty [`ChangeFeed`]. The feed is a passive index fed by
+    /// the sync runner in production; tests that exercise the feed-delta
+    /// path call [`ChangeFeed::record`] directly, and tests that exercise
+    /// the snapshot fallback simply leave it empty (every query returns
+    /// `Unknown`).
+    fn make_feed() -> Arc<ChangeFeed> {
+        Arc::new(ChangeFeed::new())
     }
 
     fn make_handlers() -> (EngineHandlers, Arc<InMemoryBackend>, tempfile::TempDir) {
@@ -1578,8 +1579,7 @@ mod tests {
             .unwrap()
             .insert(child_id.0.clone(), b"hello world".to_vec());
 
-        let backend_dyn: Arc<dyn Backend> = backend.clone();
-        let feed = make_feed(vec![backend_dyn]);
+        let feed = make_feed();
         let handlers = EngineHandlers::new(vfs, db, cache_dir.path().to_path_buf(), feed);
         (handlers, backend, cache_dir)
     }
@@ -1813,9 +1813,7 @@ mod tests {
             .unwrap()
             .insert(src_file_id.0.clone(), b"hello world".to_vec());
 
-        let src_dyn: Arc<dyn Backend> = src.clone();
-        let dst_dyn: Arc<dyn Backend> = dst.clone();
-        let feed = make_feed(vec![src_dyn, dst_dyn]);
+        let feed = make_feed();
         let handlers = EngineHandlers::new(vfs, db, cache_dir.path().to_path_buf(), feed);
         (handlers, src, dst, cache_dir)
     }
@@ -2250,9 +2248,7 @@ mod tests {
         seed_src_file(&src, &db, "a", "subdir", "a.txt", b"alpha");
         seed_src_file(&src, &db, "b", "subdir", "b.txt", b"bravo");
 
-        let src_dyn: Arc<dyn Backend> = src.clone();
-        let dst_dyn: Arc<dyn Backend> = dst.clone();
-        let feed = make_feed(vec![src_dyn, dst_dyn]);
+        let feed = make_feed();
         let handlers = EngineHandlers::new(vfs, db.clone(), cache_dir.path().to_path_buf(), feed);
 
         let err = handlers
@@ -2496,9 +2492,7 @@ mod tests {
             .unwrap()
             .insert(src_file_id.0.clone(), b"hello world".to_vec());
 
-        let src_dyn: Arc<dyn Backend> = src.clone();
-        let dst_dyn: Arc<dyn Backend> = dst.clone();
-        let feed = make_feed(vec![src_dyn, dst_dyn]);
+        let feed = make_feed();
         let handlers = EngineHandlers::new(vfs, db.clone(), cache_dir.path().to_path_buf(), feed);
 
         let err = handlers
@@ -2684,6 +2678,76 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("V2 cursor must be present"))?;
         assert_eq!(decoded.backend_id, "stub");
         assert_eq!(decoded.parent_id, ItemId::new("stub", "root"));
+        Ok(())
+    }
+
+    /// When the change feed has recorded events for the parent, the
+    /// feed-delta path serves them directly rather than falling back to
+    /// the snapshot diff. Proven by recording events that the backend
+    /// does not reflect: the snapshot path could not surface them, so a
+    /// result that contains them must have come from the feed.
+    #[tokio::test]
+    async fn enumerate_changes_uses_feed_delta_when_recorded() -> anyhow::Result<()> {
+        let (handlers, _backend, _tempdir) = make_handlers();
+        let parent = ItemId::new("stub", "root");
+
+        // Record two events into the feed without touching the backend.
+        let ghost1 = FileEntry {
+            id: ItemId::new("stub", "ghost1"),
+            parent_id: parent.clone(),
+            name: "g1.txt".to_string(),
+            is_dir: false,
+            size: Some(1),
+            mod_time: Some(Utc::now()),
+            mime_type: None,
+            hash: None,
+        };
+        let ghost2 = FileEntry {
+            id: ItemId::new("stub", "ghost2"),
+            parent_id: parent.clone(),
+            name: "g2.txt".to_string(),
+            is_dir: false,
+            size: Some(2),
+            mod_time: Some(Utc::now()),
+            mime_type: None,
+            hash: None,
+        };
+        handlers
+            .change_feed
+            .record("stub", &[Change::Created(ghost1), Change::Created(ghost2)])
+            .await;
+
+        // A V2 cursor naming (stub, root) with feed_seq=0 queries the feed
+        // for events strictly after seq 0 — i.e. the second recorded
+        // event (seq 1).
+        let cursor = SyncCursorV2 {
+            backend_id: "stub".to_string(),
+            parent_id: parent.clone(),
+            feed_seq: 0,
+            snapshot_hash: Vec::new(),
+        }
+        .encode();
+
+        let out = handlers
+            .enumerate_changes("stub:root", Some(&cursor))
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e.message))?;
+
+        let ids: Vec<&str> = out
+            .added_or_modified
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect();
+        assert!(
+            ids.contains(&"stub:ghost2"),
+            "feed-path delta must surface the recorded event the backend does not have; got {ids:?}"
+        );
+
+        // The returned cursor must advance to the feed head (seq 1).
+        let decoded = SyncCursorV2::decode(&out.new_cursor)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .ok_or_else(|| anyhow::anyhow!("V2 cursor expected"))?;
+        assert_eq!(decoded.feed_seq, 1);
         Ok(())
     }
 

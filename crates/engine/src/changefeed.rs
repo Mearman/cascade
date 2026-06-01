@@ -9,16 +9,21 @@
 //! per-parent ring buffers so each presenter can serve incremental deltas
 //! without keeping its own snapshot table.
 //!
-//! ## Polling cadence
+//! [`Backend::changes`]: crate::backend::Backend::changes
 //!
-//! Each registered backend is polled every [`POLL_INTERVAL`] using
-//! [`tokio::time::interval`], which coalesces missed ticks rather than
-//! drifting under load. A small deterministic offset derived from the backend
-//! ID hash (see the `BackendChangeState::initial_offset` private helper)
-//! spreads concurrent
-//! polls so a daemon with many backends does not stampede the network on
-//! startup. The first tick fires immediately so a freshly-opened presenter
-//! receives data within one poll round-trip.
+//! ## Feeding
+//!
+//! The feed does **not** poll backends. The [`SyncRunner`] already owns the
+//! single canonical poll loop — it calls `Backend::changes(cursor)` per
+//! backend, persists the cursor, applies changes to the state database, and
+//! notifies the presenter. After it has applied a batch it hands the same
+//! (post-ignore-filter) changes to [`ChangeFeed::record`], which files them
+//! into the per-parent index. Running a second poll loop here would double
+//! the backend API load (a real cost against the Google Drive quota) and
+//! split the change stream across two independent cursors, so the feed is a
+//! passive sink instead.
+//!
+//! [`SyncRunner`]: crate::sync::runner::SyncRunner
 //!
 //! ## Per-parent eviction
 //!
@@ -43,30 +48,16 @@
 //!   fresh enumeration this round; the next call carrying the updated
 //!   cursor will resume the delta path.
 //! - [`ChangeQueryResult::Unknown`] — the feed has never observed this
-//!   parent. Either the parent contains no children yet, or the change
-//!   stream has not run its first poll cycle. Same fallback as
+//!   parent. Either the parent contains no children yet, or the sync runner
+//!   has not yet recorded its first batch. Same fallback as
 //!   [`ChangeQueryResult::Evicted`].
 
 use std::collections::{HashMap, VecDeque};
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
-use std::sync::Weak;
-use std::time::Duration;
 
 use tokio::sync::RwLock;
-use tokio::task::JoinHandle;
-use tokio::time::{Instant, MissedTickBehavior};
 
-use crate::backend::Backend;
-use crate::types::{Change, Cursor, FileEntry, ItemId};
-
-/// How often each backend is polled for new changes.
-///
-/// Picked to match the existing daemon refresh cadence for the read-only
-/// VFS — 30s is short enough that Finder feels responsive when files
-/// appear in another client, and long enough that we do not burn a token
-/// bucket call per backend per minute.
-pub const POLL_INTERVAL: Duration = Duration::from_secs(30);
+use crate::types::{Change, FileEntry, ItemId};
 
 /// Maximum number of events retained per parent directory.
 ///
@@ -95,15 +86,11 @@ pub struct StampedChange {
 
 /// Per-backend bookkeeping owned by a [`ChangeFeed`].
 ///
-/// One instance per registered backend. The cursor anchors the next
-/// `Backend::changes` call; `next_seq` allocates the monotonic stamp; and
-/// `by_parent` partitions the events into ring buffers keyed by the
+/// One instance per recorded backend. `next_seq` allocates the monotonic
+/// stamp; `by_parent` partitions the events into ring buffers keyed by the
 /// owning directory's [`ItemId`].
 #[derive(Debug, Default)]
 struct BackendChangeState {
-    /// Last seen cursor from `Backend::changes`. `None` until the first
-    /// poll cycle completes.
-    cursor: Option<Cursor>,
     /// Next sequence number to allocate for this backend.
     next_seq: u64,
     /// Per-parent ring buffers, keyed by the parent's [`ItemId`].
@@ -111,31 +98,6 @@ struct BackendChangeState {
 }
 
 impl BackendChangeState {
-    /// Deterministic startup offset for this backend's polling task.
-    ///
-    /// Derived from the SHA-cheap [`DefaultHasher`] applied to the
-    /// backend ID and rounded to a fraction of [`POLL_INTERVAL`]. Using
-    /// a hash rather than randomness keeps the offset stable across
-    /// restarts, which makes test runs deterministic and avoids needing
-    /// a `rand` dependency in the engine.
-    fn initial_offset(backend_id: &str) -> Duration {
-        let mut hasher = DefaultHasher::new();
-        backend_id.hash(&mut hasher);
-        // Map the hash into [0, POLL_INTERVAL/4) so concurrent polls
-        // never stampede but the first poll still completes well inside
-        // one interval.
-        let span_millis = POLL_INTERVAL.as_millis().saturating_div(4);
-        // span_millis fits in u64 because POLL_INTERVAL is small; the
-        // saturating cast keeps clippy happy without an `as` lint.
-        let span_u64 = u64::try_from(span_millis).unwrap_or(u64::MAX);
-        let offset_millis = if span_u64 == 0 {
-            0
-        } else {
-            hasher.finish().rem_euclid(span_u64)
-        };
-        Duration::from_millis(offset_millis)
-    }
-
     /// File a single change into the per-parent ring buffer.
     ///
     /// A `Moved` event is partitioned into a synthetic delete on the old
@@ -246,61 +208,68 @@ pub enum ChangeQueryResult {
     /// with the cursor returned by the fresh enumeration.
     Evicted,
     /// This parent has never been observed by the change feed (e.g. the
-    /// parent contains no children yet, or the change stream has not
-    /// run a poll cycle yet). Caller should fall back to a fresh
-    /// enumeration.
+    /// parent contains no children yet, or the sync runner has not yet
+    /// recorded a batch). Caller should fall back to a fresh enumeration.
     Unknown,
 }
 
-/// Shared state owned by both the [`ChangeFeed`] handle and its polling
-/// tasks. Stored behind an `Arc<RwLock<...>>` so the polling task can
-/// update without contention with reads from `parent_changes_since`.
+/// Shared per-backend index. Stored behind an `Arc<RwLock<...>>` so the
+/// sync runner's [`ChangeFeed::record`] writes do not contend with reads
+/// from [`ChangeFeed::parent_changes_since`] beyond the lock itself.
 type FeedState = Arc<RwLock<HashMap<String, BackendChangeState>>>;
 
 /// Engine-side per-parent change index.
 ///
-/// Spawns one polling task per backend; each task drives the backend's
-/// [`Backend::changes`] global stream into a shared per-parent index
-/// available via [`ChangeFeed::parent_changes_since`]. Dropping the
-/// feed aborts every polling task.
+/// A passive sink: the [`SyncRunner`](crate::sync::runner::SyncRunner)
+/// feeds applied changes in via [`ChangeFeed::record`], and presenters read
+/// per-parent deltas out via [`ChangeFeed::parent_changes_since`]. The feed
+/// holds no background tasks and owns no poll loop of its own.
+#[derive(Default)]
 pub struct ChangeFeed {
     state: FeedState,
-    tasks: Vec<JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for ChangeFeed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ChangeFeed")
-            .field("task_count", &self.tasks.len())
-            .finish_non_exhaustive()
+        f.debug_struct("ChangeFeed").finish_non_exhaustive()
     }
 }
 
 impl ChangeFeed {
-    /// Start a feed over the given backends, spawning one polling task
-    /// per backend. The tasks run for as long as the returned handle is
-    /// alive; dropping the handle aborts them.
+    /// Create an empty change feed.
+    ///
+    /// The feed starts knowing about no backends; every parent query
+    /// returns [`ChangeQueryResult::Unknown`] until the sync runner records
+    /// its first batch.
     #[must_use]
-    pub fn start(backends: Vec<Arc<dyn Backend>>) -> Self {
-        let state: FeedState = Arc::new(RwLock::new(HashMap::new()));
-        let mut tasks = Vec::with_capacity(backends.len());
-        for backend in backends {
-            let id = backend.id().to_string();
-            // Insert an empty state for this backend so reads before
-            // the first poll cycle return Unknown rather than failing.
-            {
-                let state_for_init = state.clone();
-                let id_for_init = id.clone();
-                tasks.push(tokio::spawn(async move {
-                    let mut guard = state_for_init.write().await;
-                    guard.entry(id_for_init).or_default();
-                }));
-            }
-            let task_state = Arc::downgrade(&state);
-            let handle = tokio::spawn(poll_backend_loop(backend, id, task_state));
-            tasks.push(handle);
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(RwLock::new(HashMap::new())),
         }
-        Self { state, tasks }
+    }
+
+    /// File a batch of applied changes for `backend_id` into the index.
+    ///
+    /// Called by the sync runner after it has applied a poll batch to the
+    /// state database and notified the presenter, with the same
+    /// (post-ignore-filter) changes. Sequences are allocated in iteration
+    /// order and persist across calls, so the cursor a presenter holds
+    /// stays monotonic from one poll cycle to the next.
+    pub async fn record(&self, backend_id: &str, changes: &[Change]) {
+        if changes.is_empty() {
+            // Still register the backend so a parent query can distinguish
+            // "backend known, parent empty" from "backend never seen". A
+            // backend with no changes yet should not block the delta path
+            // once changes do arrive.
+            let mut guard = self.state.write().await;
+            guard.entry(backend_id.to_string()).or_default();
+            return;
+        }
+        let mut guard = self.state.write().await;
+        let entry = guard.entry(backend_id.to_string()).or_default();
+        for change in changes {
+            entry.file_change(change.clone());
+        }
     }
 
     /// Query the events filed under `parent_id` strictly after `since`.
@@ -348,187 +317,13 @@ impl ChangeFeed {
             .map_or_else(|| since.unwrap_or(0), |stamped| stamped.seq);
         ChangeQueryResult::Delta { events, new_seq }
     }
-
-    /// Abort every polling task and await their completion.
-    ///
-    /// Tests use this to deterministically drain pending work before
-    /// asserting on feed state. Production callers can simply drop the
-    /// feed.
-    pub async fn shutdown(&mut self) {
-        for handle in self.tasks.drain(..) {
-            handle.abort();
-            // Awaiting a JoinHandle after abort returns a JoinError, but
-            // we only care that the task is no longer running.
-            let _ = handle.await;
-        }
-    }
-}
-
-impl Drop for ChangeFeed {
-    fn drop(&mut self) {
-        for handle in &self.tasks {
-            handle.abort();
-        }
-    }
-}
-
-/// Per-backend polling loop. Runs until the weak reference to the shared
-/// state can no longer be upgraded (i.e. the owning [`ChangeFeed`] was
-/// dropped).
-async fn poll_backend_loop(
-    backend: Arc<dyn Backend>,
-    backend_id: String,
-    state: Weak<RwLock<HashMap<String, BackendChangeState>>>,
-) {
-    let offset = BackendChangeState::initial_offset(&backend_id);
-    let mut interval = tokio::time::interval_at(Instant::now() + offset, POLL_INTERVAL);
-    // Coalesce missed ticks so a slow poll cycle does not produce a
-    // burst of catch-up calls on the next backend round-trip.
-    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-
-    loop {
-        interval.tick().await;
-        let Some(state) = state.upgrade() else {
-            // ChangeFeed handle was dropped — exit the polling loop so
-            // the spawned task does not outlive its owner.
-            return;
-        };
-
-        // Snapshot the current cursor, then drop the read lock before
-        // the network round-trip so concurrent `parent_changes_since`
-        // calls can still run while we wait for the backend.
-        let cursor_before = {
-            let guard = state.read().await;
-            guard.get(&backend_id).and_then(|s| s.cursor.clone())
-        };
-
-        let result = backend.changes(cursor_before.as_ref()).await;
-        match result {
-            Ok((changes, new_cursor)) => {
-                let mut guard = state.write().await;
-                let entry = guard.entry(backend_id.clone()).or_default();
-                for change in changes {
-                    entry.file_change(change);
-                }
-                entry.cursor = Some(new_cursor);
-            }
-            Err(err) => {
-                tracing::warn!(
-                    backend_id = %backend_id,
-                    error = %err,
-                    "change feed: backend changes() poll failed; will retry on next tick",
-                );
-            }
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Cursor, FileEntry, FileId, ItemId, Quota};
-    use async_trait::async_trait;
+    use crate::types::{FileEntry, ItemId};
     use chrono::Utc;
-    use std::path::Path;
-    use std::sync::Mutex;
-    use tokio::sync::Notify;
-
-    /// Backend that hands out scripted change batches in order. Each
-    /// `changes` call pops one batch off the script.
-    #[derive(Debug)]
-    struct ScriptedBackend {
-        id: String,
-        script: Mutex<Vec<Vec<Change>>>,
-        notify: Arc<Notify>,
-    }
-
-    impl ScriptedBackend {
-        fn new(id: &str, script: Vec<Vec<Change>>) -> (Arc<Self>, Arc<Notify>) {
-            let notify = Arc::new(Notify::new());
-            let backend = Arc::new(Self {
-                id: id.to_string(),
-                script: Mutex::new(script),
-                notify: notify.clone(),
-            });
-            (backend, notify)
-        }
-    }
-
-    #[async_trait]
-    impl Backend for ScriptedBackend {
-        fn id(&self) -> &str {
-            &self.id
-        }
-
-        fn display_name(&self) -> &str {
-            &self.id
-        }
-
-        async fn quota(&self) -> anyhow::Result<Option<Quota>> {
-            Ok(None)
-        }
-
-        async fn changes(&self, _cursor: Option<&Cursor>) -> anyhow::Result<(Vec<Change>, Cursor)> {
-            let batch = {
-                let mut script = self
-                    .script
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if script.is_empty() {
-                    Vec::new()
-                } else {
-                    script.remove(0)
-                }
-            };
-            self.notify.notify_one();
-            Ok((batch, Cursor("scripted".to_string())))
-        }
-
-        async fn metadata(&self, _path: &Path) -> anyhow::Result<FileEntry> {
-            anyhow::bail!("not used in change feed tests")
-        }
-
-        async fn download(
-            &self,
-            _file: &FileEntry,
-            _writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
-        ) -> anyhow::Result<()> {
-            anyhow::bail!("not used in change feed tests")
-        }
-
-        async fn upload(
-            &self,
-            _path: &Path,
-            _reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
-            _parent_id: &FileId,
-        ) -> anyhow::Result<FileEntry> {
-            anyhow::bail!("not used in change feed tests")
-        }
-
-        async fn update(
-            &self,
-            _file_id: &FileId,
-            _reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
-        ) -> anyhow::Result<FileEntry> {
-            anyhow::bail!("not used in change feed tests")
-        }
-
-        async fn create_dir(&self, _path: &Path) -> anyhow::Result<FileEntry> {
-            anyhow::bail!("not used in change feed tests")
-        }
-
-        async fn delete(&self, _file: &FileEntry) -> anyhow::Result<()> {
-            anyhow::bail!("not used in change feed tests")
-        }
-
-        async fn move_entry(&self, _src: &Path, _dst: &Path) -> anyhow::Result<FileEntry> {
-            anyhow::bail!("not used in change feed tests")
-        }
-
-        async fn poll_interval(&self) -> Option<Duration> {
-            None
-        }
-    }
 
     /// Build a file entry under the given parent.
     fn make_entry(backend: &str, native_id: &str, parent_native: &str, name: &str) -> FileEntry {
@@ -544,36 +339,18 @@ mod tests {
         }
     }
 
-    /// Drive the change feed forward by directly calling `file_change`
-    /// on the per-backend state. Avoids the polling timer.
-    async fn file_directly(feed: &ChangeFeed, backend_id: &str, change: Change) {
-        let mut guard = feed.state.write().await;
-        let entry = guard.entry(backend_id.to_string()).or_default();
-        entry.file_change(change);
-    }
-
     #[tokio::test]
     async fn delta_returns_events_strictly_after_since() {
-        let (backend, _notify) = ScriptedBackend::new("scripted", vec![]);
-        let mut feed = ChangeFeed::start(vec![backend.clone()]);
+        let feed = ChangeFeed::new();
         let parent = ItemId::new("scripted", "root");
 
-        file_directly(
-            &feed,
+        feed.record(
             "scripted",
-            Change::Created(make_entry("scripted", "a", "root", "a.txt")),
-        )
-        .await;
-        file_directly(
-            &feed,
-            "scripted",
-            Change::Created(make_entry("scripted", "b", "root", "b.txt")),
-        )
-        .await;
-        file_directly(
-            &feed,
-            "scripted",
-            Change::Created(make_entry("scripted", "c", "root", "c.txt")),
+            &[
+                Change::Created(make_entry("scripted", "a", "root", "a.txt")),
+                Change::Created(make_entry("scripted", "b", "root", "b.txt")),
+                Change::Created(make_entry("scripted", "c", "root", "c.txt")),
+            ],
         )
         .await;
 
@@ -597,14 +374,45 @@ mod tests {
             }
             other => panic!("expected Delta, got {other:?}"),
         }
+    }
 
-        feed.shutdown().await;
+    #[tokio::test]
+    async fn sequences_persist_across_record_calls() {
+        let feed = ChangeFeed::new();
+        let parent = ItemId::new("scripted", "root");
+
+        feed.record(
+            "scripted",
+            &[Change::Created(make_entry(
+                "scripted", "a", "root", "a.txt",
+            ))],
+        )
+        .await;
+        feed.record(
+            "scripted",
+            &[Change::Created(make_entry(
+                "scripted", "b", "root", "b.txt",
+            ))],
+        )
+        .await;
+
+        // The second batch must continue the sequence (0 then 1), so a
+        // caller that saw seq=0 only gets the second event back.
+        match feed
+            .parent_changes_since("scripted", &parent, Some(0))
+            .await
+        {
+            ChangeQueryResult::Delta { events, new_seq } => {
+                assert_eq!(events.len(), 1);
+                assert_eq!(new_seq, 1);
+            }
+            other => panic!("expected Delta, got {other:?}"),
+        }
     }
 
     #[tokio::test]
     async fn evicted_fires_when_buffer_overflows() {
-        let (backend, _notify) = ScriptedBackend::new("scripted", vec![]);
-        let mut feed = ChangeFeed::start(vec![backend.clone()]);
+        let feed = ChangeFeed::new();
         let parent = ItemId::new("scripted", "root");
 
         // Push two more than the cap so the head (seq=0 and seq=1) is
@@ -613,10 +421,11 @@ mod tests {
         // be missing seq=1 (dropped), which triggers the Evicted path.
         for index in 0..=PER_PARENT_CAPACITY.saturating_add(1) {
             let name = format!("file-{index}.txt");
-            file_directly(
-                &feed,
+            feed.record(
                 "scripted",
-                Change::Created(make_entry("scripted", &name, "root", &name)),
+                &[Change::Created(make_entry(
+                    "scripted", &name, "root", &name,
+                ))],
             )
             .await;
         }
@@ -639,16 +448,18 @@ mod tests {
             ChangeQueryResult::Delta { .. } => {}
             other => panic!("expected Delta for in-range since, got {other:?}"),
         }
-
-        feed.shutdown().await;
     }
 
     #[tokio::test]
     async fn unknown_fires_for_never_seen_parent() {
-        let (backend, _notify) = ScriptedBackend::new("scripted", vec![]);
-        let mut feed = ChangeFeed::start(vec![backend.clone()]);
-        // Give the spawned init task a chance to populate the state map.
-        tokio::task::yield_now().await;
+        let feed = ChangeFeed::new();
+        feed.record(
+            "scripted",
+            &[Change::Created(make_entry(
+                "scripted", "a", "root", "a.txt",
+            ))],
+        )
+        .await;
 
         let ghost_parent = ItemId::new("scripted", "ghost");
         match feed
@@ -659,7 +470,7 @@ mod tests {
             other => panic!("expected Unknown, got {other:?}"),
         }
 
-        // Backend that the feed has not even heard about also returns Unknown.
+        // Backend that the feed has never recorded also returns Unknown.
         match feed
             .parent_changes_since("nonexistent", &ghost_parent, None)
             .await
@@ -667,14 +478,25 @@ mod tests {
             ChangeQueryResult::Unknown => {}
             other => panic!("expected Unknown, got {other:?}"),
         }
+    }
 
-        feed.shutdown().await;
+    #[tokio::test]
+    async fn empty_batch_registers_backend_without_events() {
+        let feed = ChangeFeed::new();
+        // Recording an empty batch registers the backend but files no
+        // events; a known parent therefore still reports Unknown because
+        // it has no buffer, but the backend itself is recognised.
+        feed.record("scripted", &[]).await;
+        let parent = ItemId::new("scripted", "root");
+        match feed.parent_changes_since("scripted", &parent, None).await {
+            ChangeQueryResult::Unknown => {}
+            other => panic!("expected Unknown for parent with no events, got {other:?}"),
+        }
     }
 
     #[tokio::test]
     async fn moved_partitions_into_old_and_new_parents() {
-        let (backend, _notify) = ScriptedBackend::new("scripted", vec![]);
-        let mut feed = ChangeFeed::start(vec![backend.clone()]);
+        let feed = ChangeFeed::new();
 
         let from = make_entry("scripted", "x", "old", "x.txt");
         let to = FileEntry {
@@ -687,7 +509,7 @@ mod tests {
             mime_type: None,
             hash: None,
         };
-        file_directly(&feed, "scripted", Change::Moved { from, to }).await;
+        feed.record("scripted", &[Change::Moved { from, to }]).await;
 
         let old_parent = ItemId::new("scripted", "old");
         let new_parent = ItemId::new("scripted", "new");
@@ -712,50 +534,5 @@ mod tests {
             },
             other => panic!("expected Delta on new parent, got {other:?}"),
         }
-
-        feed.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn polling_loop_drains_backend_into_feed() -> anyhow::Result<()> {
-        // A single batch is scripted; the poll task should pick it up
-        // within one POLL_INTERVAL.
-        let entry = make_entry("scripted", "f", "root", "f.txt");
-        let (backend, notify) =
-            ScriptedBackend::new("scripted", vec![vec![Change::Created(entry.clone())]]);
-        let mut feed = ChangeFeed::start(vec![backend.clone()]);
-
-        // Wait for the first poll to complete.
-        tokio::time::timeout(Duration::from_secs(2), notify.notified())
-            .await
-            .map_err(|_| anyhow::anyhow!("backend was not polled within the test timeout"))?;
-        // Give the feed a moment to file the event after the notify.
-        tokio::task::yield_now().await;
-        // Drain any remaining file work; the polling task writes after
-        // the notify, so yield until the buffer is populated or we time
-        // out the test.
-        for _ in 0..32_u8 {
-            let guard = feed.state.read().await;
-            let observed = guard
-                .get("scripted")
-                .and_then(|s| s.by_parent.get(&ItemId::new("scripted", "root")))
-                .map_or(0, VecDeque::len);
-            drop(guard);
-            if observed > 0 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-
-        let parent = ItemId::new("scripted", "root");
-        match feed.parent_changes_since("scripted", &parent, None).await {
-            ChangeQueryResult::Delta { events, .. } => {
-                assert_eq!(events.len(), 1);
-            }
-            other => panic!("expected Delta after poll, got {other:?}"),
-        }
-
-        feed.shutdown().await;
-        Ok(())
     }
 }
