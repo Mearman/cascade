@@ -442,7 +442,9 @@ impl Drop for ProjFsPresenter {
             // started) so no callbacks can still dereference it.
             #[allow(unsafe_code)]
             unsafe {
-                drop(Box::from_raw(raw_ptr as *mut handle::CallbackContextInner));
+                drop(Box::from_raw(
+                    raw_ptr as *mut windows_impl::CallbackContextInner,
+                ));
             }
         }
     }
@@ -627,7 +629,7 @@ mod windows_impl {
     use cascade_engine::types::{ItemId, VfsItem};
     use tokio::sync::RwLock;
     use windows::Win32::Foundation::{
-        ERROR_CALL_NOT_IMPLEMENTED, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, HRESULT, S_OK,
+        ERROR_CALL_NOT_IMPLEMENTED, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, S_OK,
     };
     use windows::Win32::Storage::ProjectedFileSystem::{
         PRJ_CALLBACK_DATA, PRJ_CALLBACKS, PRJ_CB_DATA_FLAG_ENUM_RESTART_SCAN,
@@ -636,7 +638,7 @@ mod windows_impl {
         PrjMarkDirectoryAsPlaceholder, PrjStartVirtualizing, PrjStopVirtualizing,
         PrjWritePlaceholderInfo,
     };
-    use windows::core::{GUID, HSTRING, PCWSTR};
+    use windows::core::{GUID, HRESULT, HSTRING, PCWSTR};
 
     use super::handle::NamespaceHandle;
     use super::{
@@ -1013,6 +1015,15 @@ mod windows_impl {
         root_id: Arc<RwLock<Option<ItemId>>>,
         enumerations: Arc<Mutex<HashMap<u128, EnumerationState>>>,
     ) -> Result<()> {
+        // Acquire both presenter-side locks before any FFI work. The
+        // raw pointers and ProjFS namespace handle produced below are
+        // `!Send`, so they must not be held across an `.await`. By
+        // taking both locks up front, the entire FFI region — Box
+        // allocation, PrjMarkDirectoryAsPlaceholder, PrjStartVirtualizing,
+        // and slot assignment — runs without crossing any await.
+        let mut handle_slot_guard = handle_slot.lock().await;
+        let mut ctx_slot_guard = callback_ctx_slot.lock().await;
+
         let mount_hstring = HSTRING::from(mount_point.as_os_str());
         let mount_pcwstr = PCWSTR(mount_hstring.as_ptr());
 
@@ -1074,11 +1085,8 @@ mod windows_impl {
             }
         };
 
-        let mut handle_slot_guard = handle_slot.lock().await;
         *handle_slot_guard = Some(NamespaceHandle(ctx));
-
-        let mut ctx_slot = callback_ctx_slot.lock().await;
-        *ctx_slot = Some(CallbackContext {
+        *ctx_slot_guard = Some(CallbackContext {
             items,
             root_id,
             enumerations,
