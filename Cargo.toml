@@ -67,6 +67,9 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 
+# Binary encodings (base32/base64 for opaque cursors and device IDs)
+data-encoding = "2"
+
 # OS process management (Unix-only)
 nix = { version = "0.29", features = ["signal", "process"] }
 

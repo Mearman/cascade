@@ -16,7 +16,7 @@ tracing.workspace = true
 chrono.workspace = true
 rusqlite.workspace = true
 cascade-p2p = { path = "../p2p" }
-data-encoding = "2"
+data-encoding.workspace = true
 sha2 = { workspace = true }
 
 [dev-dependencies]

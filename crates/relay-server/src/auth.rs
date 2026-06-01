@@ -5,6 +5,27 @@
 //! `HMAC-SHA256` tag over `device_id || session_id` keyed by the shared
 //! secret. The server verifies the tag in constant time and admits the
 //! client into the rendezvous pool only on success.
+//!
+//! # Wire format (version 1)
+//!
+//! ```text
+//! ┌────────┬──────────────┬─────────────┬───────────────┬───────────────┬─────────────┐
+//! │ ver:u8 │ dev_id_len:u16│  dev_id     │ sess_id_len:u16 │  session_id  │ HMAC-SHA256 │
+//! │  = 1   │   big-endian │  (≤ 128 B)  │   big-endian   │  (≤ 256 B)   │  (32 bytes) │
+//! └────────┴──────────────┴─────────────┴───────────────┴───────────────┴─────────────┘
+//! ```
+//!
+//! `dev_id_len` and `sess_id_len` are `u16` big-endian (NOT `u32`). The
+//! capped maxima [`MAX_DEVICE_ID_LEN`] (128) and [`MAX_SESSION_ID_LEN`]
+//! (256) both fit in `u16`; using a wider width would only waste bytes
+//! on every handshake. Receivers must reject frames whose declared
+//! lengths exceed the maxima.
+//!
+//! The tag is `HMAC-SHA256(shared_secret, device_id_bytes || session_id_bytes)`.
+//! Verification uses [`hmac::Mac::verify_slice`] which compares in constant
+//! time. The session ID is bound to the URL path (`/join/<session_id>`)
+//! so a forged tag against a different session cannot be replayed across
+//! the rendezvous fabric.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
