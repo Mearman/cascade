@@ -148,7 +148,8 @@ impl SessionRegistry {
         let expired: Vec<SessionId> = inner
             .parked
             .iter()
-            .filter_map(|(id, peer)| (peer.expires_at <= now).then(|| id.clone()))
+            .filter(|(_, peer)| peer.expires_at <= now)
+            .map(|(id, _)| id.clone())
             .collect();
         let count = expired.len();
         for id in expired {
