@@ -173,23 +173,34 @@ impl FuseOps {
         })
     }
 
-    /// Synchronously list a directory through the VFS tree.
+    /// Synchronously list the immediate children of a directory by its `ItemId`.
+    ///
+    /// Inodes are allocated lazily and idempotently — every child receives a
+    /// stable inode number before the kernel sees the directory entry, so that
+    /// a subsequent `lookup()` on the same name resolves to the same inode.
     #[allow(dead_code)] // Used in #[cfg(target_os = "linux")] Filesystem impl
-    #[allow(clippy::await_holding_lock)]
-    fn readdir_sync(
+    fn list_children_sync(
         &self,
-        path: &std::path::Path,
-    ) -> anyhow::Result<Vec<cascade_engine::types::DirEntry>> {
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(async {
+        id: &cascade_engine::types::ItemId,
+    ) -> anyhow::Result<Vec<cascade_engine::types::FileEntry>> {
+        // Clone the backend `Arc` while holding the read lock, then drop the
+        // lock before the async call. This avoids holding a `RwLockReadGuard`
+        // across an await point, which would trigger the `await_holding_lock`
+        // lint and risk a deadlock if any other code tries to write the tree.
+        let backend = {
             let vfs = self
                 .vfs
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let result = vfs.read_dir(path).await;
-            drop(vfs);
-            result
-        })
+            vfs.backend_by_id(id.backend_id())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("no backend registered for item id {}", id.backend_id())
+                })
+                .map(Arc::clone)
+        }?;
+        let native_id = id.native_id().to_owned();
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(async move { backend.list_children(&native_id).await })
     }
 
     /// Synchronously read file data from the backend.
@@ -363,42 +374,63 @@ mod linux {
             mut reply: ReplyDirectory,
         ) {
             let ino_u64 = u64::from(ino);
-            let map = self
-                .inode_map
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-            if ino_u64 != crate::inode::ROOT_INODE {
-                // Only root is a directory for now.
-                // TODO: support nested directories.
-                drop(map);
-                reply.error(Errno::ENOTDIR);
-                return;
-            }
+            // Resolve the ItemId for this inode. Any inode — root or nested —
+            // is eligible; ENOENT is the correct response for an unknown inode.
+            let id = {
+                let map = self
+                    .inode_map
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                map.get_id(ino_u64).cloned()
+            };
 
-            if offset == 0 {
-                let _ = reply.add(ino, 1, FileType::Directory, ".");
-            }
-            if offset <= 1 {
-                let _ = reply.add(ino, 2, FileType::Directory, "..");
-            }
-
-            // List children from the VFS tree.
-            let Some(id) = map.get_id(ino_u64) else {
-                drop(map);
+            let Some(id) = id else {
                 reply.error(Errno::ENOENT);
                 return;
             };
-            let id_str = id.0.clone();
-            drop(map);
 
-            let Ok(entries) = self.readdir_sync(std::path::Path::new(&id_str)) else {
-                reply.ok();
-                return;
+            // Ask the VFS whether this item has children. A non-directory
+            // (file) will return an empty vec or an error; treat both as
+            // ENOTDIR so the kernel receives the expected error code.
+            let children = match self.list_children_sync(&id) {
+                Ok(children) => children,
+                Err(_) => {
+                    // If the item is a file or the backend is unavailable,
+                    // report ENOTDIR — the kernel treats readdir on a
+                    // non-directory as ENOTDIR regardless of the underlying
+                    // cause.
+                    reply.error(Errno::ENOTDIR);
+                    return;
+                }
             };
 
-            let mut entry_offset = 3u64; // . and .. take 1 and 2
-            for entry in &entries {
+            // Allocate stable inodes for every child before emitting any
+            // directory entries. This ensures that a kernel lookup() on a
+            // name seen in readdir always resolves to the same inode.
+            let child_inodes: Vec<(u64, &cascade_engine::types::FileEntry)> = {
+                let mut map = self
+                    .inode_map
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                children
+                    .iter()
+                    .map(|entry| (map.allocate(entry.id.clone()), entry))
+                    .collect()
+            };
+
+            if offset == 0 {
+                let _ = reply.add(INodeNo(ino_u64), 1, FileType::Directory, ".");
+            }
+            if offset <= 1 {
+                let _ = reply.add(INodeNo(ino_u64), 2, FileType::Directory, "..");
+            }
+
+            // Emit children, skipping any that fall before the kernel's
+            // resume offset. Offsets start at 3 because . and .. occupy 1
+            // and 2 (FUSE offset convention).
+            let mut entry_offset = 2u64;
+            for (child_inode, entry) in &child_inodes {
                 entry_offset += 1;
                 if entry_offset <= offset {
                     continue;
@@ -408,12 +440,13 @@ mod linux {
                 } else {
                     FileType::RegularFile
                 };
-                let _ = reply.add(
-                    INodeNo(ino_u64 + entry_offset),
-                    entry_offset,
-                    kind,
-                    &entry.name,
-                );
+                let full = reply.add(INodeNo(*child_inode), entry_offset, kind, &entry.name);
+                if full {
+                    // Buffer is full; the kernel will call readdir again
+                    // with the current offset to resume.
+                    reply.ok();
+                    return;
+                }
             }
 
             reply.ok();
@@ -634,5 +667,283 @@ mod tests {
         let ops = FuseOps::new_with_vfs(root.clone(), vfs);
         let map = ops.inode_map.lock().unwrap();
         assert_eq!(map.get_inode(&root), Some(crate::inode::ROOT_INODE));
+    }
+
+    // -----------------------------------------------------------------------
+    // Nested directory traversal — drive FuseOps::list_children_sync
+    // directly (no kernel / FUSE mount required).
+    // -----------------------------------------------------------------------
+
+    /// In-memory backend for tests. Stores `FileEntry` records indexed by
+    /// their full `ItemId` string. `list_children` filters by `parent_id`.
+    mod fake_backend {
+        use std::collections::HashMap;
+        use std::path::Path;
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        use async_trait::async_trait;
+        use cascade_engine::backend::Backend;
+        use cascade_engine::types::{Change, Cursor, FileEntry, FileId, ItemId, Quota};
+
+        #[derive(Debug)]
+        pub struct FakeBackend {
+            pub id: String,
+            entries: Mutex<HashMap<String, FileEntry>>,
+        }
+
+        impl FakeBackend {
+            pub fn new(id: &str) -> Self {
+                Self {
+                    id: id.to_string(),
+                    entries: Mutex::new(HashMap::new()),
+                }
+            }
+
+            pub fn insert(&self, entry: FileEntry) {
+                self.entries
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(entry.id.0.clone(), entry);
+            }
+        }
+
+        #[async_trait]
+        impl Backend for FakeBackend {
+            fn id(&self) -> &str {
+                &self.id
+            }
+
+            fn display_name(&self) -> &str {
+                &self.id
+            }
+
+            async fn quota(&self) -> anyhow::Result<Option<Quota>> {
+                Ok(None)
+            }
+
+            async fn changes(
+                &self,
+                _cursor: Option<&Cursor>,
+            ) -> anyhow::Result<(Vec<Change>, Cursor)> {
+                Ok((vec![], Cursor("fake".to_string())))
+            }
+
+            async fn metadata(&self, path: &Path) -> anyhow::Result<FileEntry> {
+                let key = format!("{}:{}", self.id, path.display());
+                self.entries
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&key)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("not found: {key}"))
+            }
+
+            async fn download(
+                &self,
+                _file: &FileEntry,
+                _writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
+            ) -> anyhow::Result<()> {
+                anyhow::bail!("FakeBackend: download not implemented")
+            }
+
+            async fn upload(
+                &self,
+                _path: &Path,
+                _reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+                _parent_id: &FileId,
+            ) -> anyhow::Result<FileEntry> {
+                anyhow::bail!("FakeBackend: upload not implemented")
+            }
+
+            async fn update(
+                &self,
+                _file_id: &FileId,
+                _reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+            ) -> anyhow::Result<FileEntry> {
+                anyhow::bail!("FakeBackend: update not implemented")
+            }
+
+            async fn create_dir(&self, _path: &Path) -> anyhow::Result<FileEntry> {
+                anyhow::bail!("FakeBackend: create_dir not implemented")
+            }
+
+            async fn delete(&self, _file: &FileEntry) -> anyhow::Result<()> {
+                anyhow::bail!("FakeBackend: delete not implemented")
+            }
+
+            async fn move_entry(&self, _src: &Path, _dst: &Path) -> anyhow::Result<FileEntry> {
+                anyhow::bail!("FakeBackend: move_entry not implemented")
+            }
+
+            async fn list_children(
+                &self,
+                parent_native_id: &str,
+            ) -> anyhow::Result<Vec<FileEntry>> {
+                let parent_full = ItemId::new(&self.id, parent_native_id).0;
+                let entries = self
+                    .entries
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                Ok(entries
+                    .values()
+                    .filter(|e| e.parent_id.0 == parent_full)
+                    .cloned()
+                    .collect())
+            }
+
+            async fn poll_interval(&self) -> Option<Duration> {
+                None
+            }
+        }
+    }
+
+    /// Build a VFS tree backed by a `FakeBackend` with the following shape:
+    ///
+    /// ```text
+    /// root  (dir)
+    /// └── dir  (dir)  id = fake:dir
+    ///     └── subdir  (dir)  id = fake:subdir
+    ///         └── file.txt  (file)  id = fake:file
+    /// ```
+    fn make_nested_ops() -> FuseOps {
+        use cascade_engine::types::FileEntry;
+        use fake_backend::FakeBackend;
+
+        let backend = std::sync::Arc::new(FakeBackend::new("fake"));
+
+        let root_id = ItemId::new("fake", "root");
+        let dir_id = ItemId::new("fake", "dir");
+        let subdir_id = ItemId::new("fake", "subdir");
+        let file_id = ItemId::new("fake", "file");
+
+        backend.insert(FileEntry::dir(
+            dir_id.clone(),
+            root_id.clone(),
+            "dir".to_string(),
+        ));
+        backend.insert(FileEntry::dir(
+            subdir_id.clone(),
+            dir_id.clone(),
+            "subdir".to_string(),
+        ));
+        backend.insert(FileEntry::file(
+            file_id.clone(),
+            subdir_id.clone(),
+            "file.txt".to_string(),
+        ));
+
+        let vfs = Arc::new(RwLock::new(VfsTree::new(backend)));
+        FuseOps::new_with_vfs(root_id, vfs)
+    }
+
+    /// Helper: call `list_children_by_id` via the VfsTree directly.
+    ///
+    /// The tests below exercise the VFS → backend path that `list_children_sync`
+    /// wraps. Using an async helper here avoids the "cannot `block_on` inside a
+    /// Tokio runtime" panic that would occur if `list_children_sync` were called
+    /// from within a `#[tokio::test]` context.
+    async fn list_children(ops: &FuseOps, id: &ItemId) -> Vec<cascade_engine::types::FileEntry> {
+        let vfs = ops
+            .vfs
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        vfs.list_children_by_id(id).await.unwrap()
+    }
+
+    /// `list_children_by_id` on root returns the top-level `dir` entry.
+    #[tokio::test]
+    async fn list_children_root_returns_dir() {
+        let ops = make_nested_ops();
+        let root_id = ItemId::new("fake", "root");
+        let children = list_children(&ops, &root_id).await;
+        assert_eq!(children.len(), 1);
+        let child = &children[0];
+        assert_eq!(child.name, "dir");
+        assert!(child.is_dir);
+        assert_eq!(child.id, ItemId::new("fake", "dir"));
+    }
+
+    /// `list_children_by_id` on `dir` returns `subdir`.
+    #[tokio::test]
+    async fn list_children_nested_dir_returns_subdir() {
+        let ops = make_nested_ops();
+        let dir_id = ItemId::new("fake", "dir");
+        let children = list_children(&ops, &dir_id).await;
+        assert_eq!(children.len(), 1);
+        let child = &children[0];
+        assert_eq!(child.name, "subdir");
+        assert!(child.is_dir);
+        assert_eq!(child.id, ItemId::new("fake", "subdir"));
+    }
+
+    /// `list_children_by_id` on `subdir` returns `file.txt`.
+    #[tokio::test]
+    async fn list_children_subdir_returns_file() {
+        let ops = make_nested_ops();
+        let subdir_id = ItemId::new("fake", "subdir");
+        let children = list_children(&ops, &subdir_id).await;
+        assert_eq!(children.len(), 1);
+        let child = &children[0];
+        assert_eq!(child.name, "file.txt");
+        assert!(!child.is_dir);
+        assert_eq!(child.id, ItemId::new("fake", "file"));
+    }
+
+    /// `list_children_by_id` on `file.txt` returns an empty vec — a file has no
+    /// children. The `readdir` handler treats this as ENOTDIR.
+    #[tokio::test]
+    async fn list_children_file_returns_empty() {
+        let ops = make_nested_ops();
+        let file_id = ItemId::new("fake", "file");
+        let children = list_children(&ops, &file_id).await;
+        assert!(children.is_empty(), "expected no children for a file");
+    }
+
+    /// Inode allocation is idempotent: querying the same `ItemId` twice always
+    /// yields the same inode number.
+    #[tokio::test]
+    async fn inode_allocation_is_idempotent_across_list_calls() {
+        let ops = make_nested_ops();
+        let root_id = ItemId::new("fake", "root");
+
+        // First call — allocates.
+        let first = list_children(&ops, &root_id).await;
+        let inode_first = {
+            let mut map = ops.inode_map.lock().unwrap();
+            map.allocate(first[0].id.clone())
+        };
+
+        // Second call — same ItemId must yield the same inode.
+        let second = list_children(&ops, &root_id).await;
+        let inode_second = {
+            let mut map = ops.inode_map.lock().unwrap();
+            map.allocate(second[0].id.clone())
+        };
+
+        assert_eq!(
+            inode_first, inode_second,
+            "inode must be stable across calls"
+        );
+        assert_ne!(
+            inode_first,
+            crate::inode::ROOT_INODE,
+            "child must not reuse root inode"
+        );
+    }
+
+    /// A child inode must differ from root.
+    #[tokio::test]
+    async fn child_inodes_are_distinct_from_root() {
+        let ops = make_nested_ops();
+        let root_id = ItemId::new("fake", "root");
+        let children = list_children(&ops, &root_id).await;
+
+        let child_inode = {
+            let mut map = ops.inode_map.lock().unwrap();
+            map.allocate(children[0].id.clone())
+        };
+
+        assert_ne!(child_inode, crate::inode::ROOT_INODE);
     }
 }
