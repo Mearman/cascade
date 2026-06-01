@@ -608,6 +608,32 @@ impl SyncEngine {
                 self.merge_gossip(peer_device_id, peers).await;
                 Ok(())
             }
+            // TODO(nat): wire `Candidates` / `SyncPunch` into the
+            // traversal coordinator once the state machine lands. The
+            // wire types are accepted now so peers running a newer
+            // build do not tear down the connection on an unknown
+            // message type, but the foundation round deliberately
+            // stops at frame decode.
+            BepMessage::Candidates { candidates } => {
+                debug!(
+                    peer = %peer_device_id,
+                    count = candidates.len(),
+                    "received candidates frame; traversal not yet wired",
+                );
+                Ok(())
+            }
+            BepMessage::SyncPunch {
+                nonce,
+                deadline_unix_ms,
+            } => {
+                debug!(
+                    peer = %peer_device_id,
+                    nonce,
+                    deadline_unix_ms,
+                    "received sync-punch frame; traversal not yet wired",
+                );
+                Ok(())
+            }
         }
     }
 

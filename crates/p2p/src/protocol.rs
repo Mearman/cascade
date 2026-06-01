@@ -5,8 +5,11 @@
 //! body, allowing the decoder to dispatch to the correct deserialiser.
 
 use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use anyhow::Result;
+
+use crate::candidate::{Candidate, CandidateKind};
 
 // ── Message type constants ──
 
@@ -18,6 +21,21 @@ const MSG_RESPONSE: u32 = 4;
 const MSG_PING: u32 = 5;
 const MSG_CLOSE: u32 = 6;
 const MSG_GOSSIP: u32 = 7;
+const MSG_CANDIDATES: u32 = 8;
+const MSG_SYNC_PUNCH: u32 = 9;
+
+/// Maximum number of candidates carried in a single
+/// [`BepMessage::Candidates`] frame. Bounds the receiver's allocation
+/// when a malicious or buggy peer sends a huge list. A device with
+/// more than a handful of host, server-reflexive and relayed
+/// addresses is unrealistic in practice; the cap leaves headroom
+/// without being lavish.
+const MAX_CANDIDATES_PER_FRAME: u32 = 64;
+
+/// Address-family tag for [`encode_socket_addr`] / [`decode_socket_addr`].
+const ADDR_FAMILY_IPV4: u8 = 4;
+/// Address-family tag for [`encode_socket_addr`] / [`decode_socket_addr`].
+const ADDR_FAMILY_IPV6: u8 = 6;
 
 /// Maximum number of peers carried in a single `Gossip` frame. Caps the
 /// receiver's memory cost when a malicious or buggy peer sends a huge
@@ -324,6 +342,42 @@ pub enum BepMessage {
     /// their local peer book; unresolved address entries are silently
     /// dropped.
     Gossip { peers: Vec<GossipPeer> },
+    /// Advertise reachable addresses to a remote peer before any data
+    /// exchange. The recipient pairs these against its own local
+    /// candidates and selects the highest-scoring pair to probe (see
+    /// `Candidate::pairing_score` in `cascade-p2p`'s `candidate`
+    /// module).
+    ///
+    /// Sent during connection setup, after the TLS handshake but before
+    /// the first `BepMessage::Index`. Frame size is bounded by
+    /// `MAX_CANDIDATES_PER_FRAME` to cap allocation cost on receive.
+    Candidates {
+        /// Reachable addresses, in arbitrary order. The priority field
+        /// on each candidate determines the local ordering — receivers
+        /// must NOT trust the wire order.
+        candidates: Vec<Candidate>,
+    },
+    /// Synchronisation message exchanged by both peers immediately
+    /// before a hole-punch probe burst. Both ends issue the same
+    /// `nonce` and `deadline_unix_ms`; the second peer to receive the
+    /// frame echoes its partner's values, then both schedule their
+    /// probe bursts for `deadline_unix_ms`.
+    ///
+    /// This is the "sync" step of libp2p `DCUtR` (§3.2 of the `DCUtR`
+    /// spec): the round-trip lets each peer estimate `RTT/2` and time
+    /// its probes so they arrive at the remote `NAT` at approximately
+    /// the same instant.
+    SyncPunch {
+        /// Random `64`-bit value chosen by the sender. The remote
+        /// echoes it back unchanged so each side can correlate
+        /// concurrent punch attempts on the same connection.
+        nonce: u64,
+        /// Wall-clock target for the probe burst, in milliseconds
+        /// since the Unix epoch. Senders pick a deadline far enough
+        /// in the future to cover `RTT/2`; receivers ignore the frame
+        /// if the deadline has already passed.
+        deadline_unix_ms: u64,
+    },
 }
 
 impl BepMessage {
@@ -337,6 +391,8 @@ impl BepMessage {
             Self::Ping => MSG_PING,
             Self::Close { .. } => MSG_CLOSE,
             Self::Gossip { .. } => MSG_GOSSIP,
+            Self::Candidates { .. } => MSG_CANDIDATES,
+            Self::SyncPunch { .. } => MSG_SYNC_PUNCH,
         }
     }
 }
@@ -407,6 +463,24 @@ pub fn encode_message(msg: &BepMessage) -> Result<Vec<u8>> {
                 encode_i64(&mut body, peer.snapshot_unix_seconds);
             }
         }
+        BepMessage::Candidates { candidates } => {
+            let count = u32::try_from(candidates.len())
+                .map_err(|_| anyhow::anyhow!("too many candidates"))?;
+            if count > MAX_CANDIDATES_PER_FRAME {
+                anyhow::bail!("candidate count {count} exceeds maximum {MAX_CANDIDATES_PER_FRAME}",);
+            }
+            encode_u32(&mut body, count);
+            for candidate in candidates {
+                encode_candidate(&mut body, candidate)?;
+            }
+        }
+        BepMessage::SyncPunch {
+            nonce,
+            deadline_unix_ms,
+        } => {
+            encode_u64(&mut body, *nonce);
+            encode_u64(&mut body, *deadline_unix_ms);
+        }
     }
 
     let body_len = u32::try_from(body.len())
@@ -439,6 +513,82 @@ fn encode_file_infos(buf: &mut Vec<u8>, files: &[FileInfo]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn encode_socket_addr(buf: &mut Vec<u8>, addr: SocketAddr) -> Result<()> {
+    // Wire layout:
+    //   [4 bytes family tag][4-byte port][opaque address bytes]
+    // The address bytes are length-prefixed via `encode_opaque`, so
+    // IPv4 and IPv6 are distinguished by both the family tag and the
+    // opaque-length prefix — defence in depth against truncated frames.
+    match addr.ip() {
+        IpAddr::V4(v4) => {
+            encode_u32(buf, u32::from(ADDR_FAMILY_IPV4));
+            encode_u32(buf, u32::from(addr.port()));
+            encode_opaque(buf, &v4.octets())?;
+        }
+        IpAddr::V6(v6) => {
+            encode_u32(buf, u32::from(ADDR_FAMILY_IPV6));
+            encode_u32(buf, u32::from(addr.port()));
+            encode_opaque(buf, &v6.octets())?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_socket_addr(data: &[u8]) -> Result<(SocketAddr, &[u8])> {
+    let (family_u32, rest) = decode_u32(data)?;
+    let family = u8::try_from(family_u32).map_err(|_| anyhow::anyhow!("invalid address family"))?;
+    let (port_u32, rest) = decode_u32(rest)?;
+    let port = u16::try_from(port_u32).map_err(|_| anyhow::anyhow!("port out of range"))?;
+    let (octets, rest) = decode_opaque(rest)?;
+    match family {
+        ADDR_FAMILY_IPV4 => {
+            let bytes: [u8; 4] = octets
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("IPv4 address must be 4 bytes"))?;
+            Ok((
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::from(bytes)), port),
+                rest,
+            ))
+        }
+        ADDR_FAMILY_IPV6 => {
+            let bytes: [u8; 16] = octets
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("IPv6 address must be 16 bytes"))?;
+            Ok((
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::from(bytes)), port),
+                rest,
+            ))
+        }
+        other => anyhow::bail!("unknown address family {other}"),
+    }
+}
+
+fn encode_candidate(buf: &mut Vec<u8>, candidate: &Candidate) -> Result<()> {
+    // Wire layout:
+    //   [4 bytes kind tag][4 bytes priority][socket address]
+    encode_u32(buf, u32::from(candidate.kind.wire_tag()));
+    encode_u32(buf, candidate.priority);
+    encode_socket_addr(buf, candidate.address)
+}
+
+fn decode_candidate(data: &[u8]) -> Result<(Candidate, &[u8])> {
+    let (kind_u32, rest) = decode_u32(data)?;
+    let kind_tag =
+        u8::try_from(kind_u32).map_err(|_| anyhow::anyhow!("invalid candidate kind tag"))?;
+    let kind = CandidateKind::from_wire_tag(kind_tag)
+        .ok_or_else(|| anyhow::anyhow!("unknown candidate kind {kind_tag}"))?;
+    let (priority, rest) = decode_u32(rest)?;
+    let (address, rest) = decode_socket_addr(rest)?;
+    Ok((
+        Candidate {
+            address,
+            kind,
+            priority,
+        },
+        rest,
+    ))
 }
 
 fn encode_version(buf: &mut Vec<u8>, version: &Version) -> Result<()> {
@@ -486,8 +636,33 @@ pub fn decode_message(frame: &[u8]) -> Result<BepMessage> {
         MSG_PING => Ok(BepMessage::Ping),
         MSG_CLOSE => decode_close(rest),
         MSG_GOSSIP => decode_gossip(rest),
+        MSG_CANDIDATES => decode_candidates(rest),
+        MSG_SYNC_PUNCH => decode_sync_punch(rest),
         _ => anyhow::bail!("unknown message type: {msg_type}"),
     }
+}
+
+fn decode_candidates(data: &[u8]) -> Result<BepMessage> {
+    let (count, mut rest) = decode_u32(data)?;
+    if count > MAX_CANDIDATES_PER_FRAME {
+        anyhow::bail!("candidate count {count} exceeds maximum {MAX_CANDIDATES_PER_FRAME}",);
+    }
+    let mut candidates = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let (candidate, next) = decode_candidate(rest)?;
+        candidates.push(candidate);
+        rest = next;
+    }
+    Ok(BepMessage::Candidates { candidates })
+}
+
+fn decode_sync_punch(data: &[u8]) -> Result<BepMessage> {
+    let (nonce, rest) = decode_u64(data)?;
+    let (deadline_unix_ms, _) = decode_u64(rest)?;
+    Ok(BepMessage::SyncPunch {
+        nonce,
+        deadline_unix_ms,
+    })
 }
 
 fn decode_cluster_config(data: &[u8]) -> Result<BepMessage> {
@@ -1039,5 +1214,174 @@ mod tests {
         v.bump(50);
         let ids: Vec<u64> = v.counters.iter().map(|(id, _)| *id).collect();
         assert_eq!(ids, vec![5, 50, 100]);
+    }
+
+    // ── Candidate / SyncPunch wire format ──
+
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    use crate::candidate::{Candidate, CandidateKind, compute_priority};
+
+    fn v4(port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)), port)
+    }
+
+    fn v6(port: u16) -> SocketAddr {
+        SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            port,
+        )
+    }
+
+    #[test]
+    fn encode_decode_candidates_empty() {
+        round_trip(BepMessage::Candidates { candidates: vec![] });
+    }
+
+    #[test]
+    fn encode_decode_candidates_single_ipv4_host() {
+        round_trip(BepMessage::Candidates {
+            candidates: vec![Candidate::new(v4(22000), CandidateKind::Host, 65_535)],
+        });
+    }
+
+    #[test]
+    fn encode_decode_candidates_mixed_kinds_and_families() {
+        round_trip(BepMessage::Candidates {
+            candidates: vec![
+                Candidate::new(v4(22000), CandidateKind::Host, 65_535),
+                Candidate::new(v6(22000), CandidateKind::Host, 65_534),
+                Candidate::new(v4(54321), CandidateKind::ServerReflexive, 0),
+                Candidate::new(v6(54321), CandidateKind::ServerReflexive, 0),
+                Candidate::new(v4(3478), CandidateKind::Relayed, 0),
+            ],
+        });
+    }
+
+    #[test]
+    fn encode_decode_candidates_at_cap() {
+        // Exactly MAX_CANDIDATES_PER_FRAME entries must encode and
+        // decode cleanly; one above the cap is exercised separately.
+        let mut candidates = Vec::with_capacity(MAX_CANDIDATES_PER_FRAME as usize);
+        for i in 0..MAX_CANDIDATES_PER_FRAME {
+            let port = u16::try_from(20_000 + i).unwrap_or(u16::MAX);
+            candidates.push(Candidate::new(v4(port), CandidateKind::Host, 65_535));
+        }
+        round_trip(BepMessage::Candidates { candidates });
+    }
+
+    #[test]
+    fn encode_candidates_rejects_overflow() {
+        // Build a frame with one more candidate than allowed and verify
+        // the encoder refuses it. Catches over-eager local code paths
+        // (the decoder cap is tested separately below).
+        let cap_plus_one = (MAX_CANDIDATES_PER_FRAME + 1) as usize;
+        let candidates: Vec<Candidate> = (0..cap_plus_one)
+            .map(|i| {
+                let port = u16::try_from(20_000 + i).unwrap_or(u16::MAX);
+                Candidate::new(v4(port), CandidateKind::Host, 0)
+            })
+            .collect();
+        let err = encode_message(&BepMessage::Candidates { candidates })
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(err.contains("exceeds maximum"), "got: {err}");
+    }
+
+    #[test]
+    fn decode_candidates_rejects_excessive_count() {
+        // Hand-build a frame whose declared candidate count exceeds the
+        // cap so the receiver does not allocate an attacker-chosen
+        // amount of memory.
+        let mut body = Vec::new();
+        encode_u32(&mut body, MSG_CANDIDATES);
+        encode_u32(&mut body, MAX_CANDIDATES_PER_FRAME + 1);
+        let mut frame = Vec::new();
+        let body_len = u32::try_from(body.len()).unwrap_or(0);
+        encode_u32(&mut frame, body_len);
+        frame.extend_from_slice(&body);
+        let result = decode_message(&frame);
+        assert!(result.is_err(), "excessive candidate count must fail");
+        assert!(
+            result
+                .err()
+                .map(|e| e.to_string())
+                .is_some_and(|msg| msg.contains("exceeds maximum")),
+            "error should mention the cap",
+        );
+    }
+
+    #[test]
+    fn decode_candidate_rejects_unknown_kind_tag() {
+        // Build a candidates frame with a single entry whose kind tag
+        // does not match any known `CandidateKind`. The decoder must
+        // refuse rather than fall back to a default.
+        let mut body = Vec::new();
+        encode_u32(&mut body, MSG_CANDIDATES);
+        encode_u32(&mut body, 1);
+        encode_u32(&mut body, 9); // unknown kind tag
+        encode_u32(&mut body, 0); // priority
+        encode_u32(&mut body, u32::from(ADDR_FAMILY_IPV4));
+        encode_u32(&mut body, 22_000);
+        let _ = encode_opaque(&mut body, &[127, 0, 0, 1]);
+        let mut frame = Vec::new();
+        let body_len = u32::try_from(body.len()).unwrap_or(0);
+        encode_u32(&mut frame, body_len);
+        frame.extend_from_slice(&body);
+        let result = decode_message(&frame);
+        assert!(result.is_err(), "unknown kind tag must fail");
+    }
+
+    #[test]
+    fn encode_decode_sync_punch_round_trip() {
+        round_trip(BepMessage::SyncPunch {
+            nonce: 0xDEAD_BEEF_CAFE_F00D,
+            deadline_unix_ms: 1_700_000_000_000,
+        });
+    }
+
+    #[test]
+    fn encode_decode_sync_punch_zero_values() {
+        round_trip(BepMessage::SyncPunch {
+            nonce: 0,
+            deadline_unix_ms: 0,
+        });
+    }
+
+    #[test]
+    fn encode_decode_sync_punch_extremes() {
+        round_trip(BepMessage::SyncPunch {
+            nonce: u64::MAX,
+            deadline_unix_ms: u64::MAX,
+        });
+    }
+
+    #[test]
+    fn candidate_priority_preserved_through_wire() {
+        // The wire encodes the precomputed priority. A round-trip
+        // through `encode_message` / `decode_message` must preserve
+        // the exact value so the recipient can sort pair candidates
+        // without recomputing.
+        let priority = compute_priority(CandidateKind::ServerReflexive, 42);
+        let candidate = Candidate {
+            address: v4(22_001),
+            kind: CandidateKind::ServerReflexive,
+            priority,
+        };
+        let msg = BepMessage::Candidates {
+            candidates: vec![candidate],
+        };
+        let decoded = decode_message(&encode_message(&msg).unwrap()).unwrap();
+        match decoded {
+            BepMessage::Candidates { candidates } => {
+                assert_eq!(candidates.len(), 1);
+                let got = candidates.first().unwrap();
+                assert_eq!(got.priority, priority);
+                assert_eq!(got.kind, CandidateKind::ServerReflexive);
+                assert_eq!(got.address, v4(22_001));
+            }
+            other => panic!("decoded wrong variant: {other:?}"),
+        }
     }
 }
