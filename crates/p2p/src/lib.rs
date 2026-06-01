@@ -39,6 +39,11 @@ pub mod store;
 pub mod traversal;
 pub mod wan;
 
+pub use traversal::{
+    CandidatePair, Clock, ConnectivityStrategy, EstablishedFlow, NatType, PunchConfig, PunchError,
+    PunchTransport, ReceivedProbe, SyncPunchAgreement, SystemClock, decide_connectivity,
+};
+
 use std::path::Path;
 
 use anyhow::{Context, Result};

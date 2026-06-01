@@ -1,4 +1,5 @@
-//! Connectivity strategy selection for `NAT` traversal.
+//! Connectivity strategy selection and hole-punch state machine for
+//! `NAT` traversal.
 //!
 //! Given the local and remote `NAT` types plus the remote's advertised
 //! candidates, [`decide_connectivity`] picks one of three strategies
@@ -12,18 +13,28 @@
 //! 3. `Relay` — at least one side is `Symmetric` and the partner is
 //!    not `FullCone`. Tunnel traffic through a known relay endpoint.
 //!
-//! This module declares only the pure decision function. The probe
-//! loop, candidate gathering and reconnect machinery land in a follow-up
-//! round (see `run_hole_punch` placeholder in `TODO(nat)` below).
+//! When `HolePunch` is the chosen strategy the caller drives
+//! `run_hole_punch` over a [`PunchTransport`] — a thin trait abstraction
+//! over the UDP socket — and a [`Clock`]. Both are injectable so the
+//! state machine is exercised without touching the network or wall-clock
+//! time. The production implementations sit alongside the trait
+//! definitions and the deterministic mocks live behind `#[cfg(test)]`.
 //!
 //! Sources:
 //! - RFC 4787 — `NAT` Behavioral Requirements for Unicast UDP.
 //!   <https://datatracker.ietf.org/doc/html/rfc4787>
 //! - RFC 5780 — `NAT` Behavior Discovery Using STUN.
 //!   <https://datatracker.ietf.org/doc/html/rfc5780>
+//! - RFC 8445 — Interactive Connectivity Establishment.
+//!   <https://datatracker.ietf.org/doc/html/rfc8445>
+//! - libp2p `DCUtR` specification.
+//!   <https://github.com/libp2p/specs/blob/master/relay/DCUtR.md>
 
+use std::io;
 use std::net::SocketAddr;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::candidate::Candidate;
@@ -174,10 +185,228 @@ const fn is_punchable(local: NatType, remote: NatType) -> bool {
     )
 }
 
-// TODO(nat): add `run_hole_punch(local: &[Candidate], remote: &[Candidate],
-// signal: &mut SignalChannel) -> Result<SocketAddr>` in the next round.
-// It will own the probe-burst state machine described in
-// `docs/nat-hole-punching.md` §"Hole-punching protocol".
+/// A UDP probe received from a remote endpoint.
+///
+/// Returned by [`PunchTransport::recv_probe`]. The state machine
+/// compares `nonce` against the negotiated [`SyncPunchAgreement::nonce`]
+/// to decide whether the probe belongs to the current attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceivedProbe {
+    /// Source address the probe arrived from.
+    pub from: SocketAddr,
+    /// `64`-bit nonce carried in the probe payload.
+    pub nonce: u64,
+}
+
+/// Transport abstraction the hole-punch state machine drives.
+///
+/// Implementations send and receive UDP probes carrying the negotiated
+/// nonce. The production implementation wraps a `UdpSocket`; tests use
+/// the deterministic in-memory mock in this module's `#[cfg(test)]`
+/// section. Keeping the surface this narrow means the state machine
+/// performs no socket I/O directly and is fully exercised without a real
+/// network stack.
+///
+/// `send_probe` is best-effort: the state machine never retries an
+/// individual send. If the socket reports an error the state machine
+/// surfaces it as [`PunchError::Transport`] rather than continuing.
+///
+/// `recv_probe` blocks until either a probe arrives or `deadline`
+/// elapses. On deadline elapse the implementation returns an
+/// [`io::ErrorKind::TimedOut`] error so the state machine can treat it
+/// as "no receipt for this burst" without conflating timeouts with
+/// transport faults.
+#[async_trait]
+pub trait PunchTransport: Send + Sync {
+    /// Send one probe to `dst` carrying `nonce`.
+    async fn send_probe(&self, dst: SocketAddr, nonce: u64) -> io::Result<()>;
+
+    /// Receive one probe, blocking until `deadline`.
+    ///
+    /// Returns [`io::ErrorKind::TimedOut`] when the deadline elapses
+    /// before a probe arrives.
+    async fn recv_probe(&self, deadline: Instant) -> io::Result<ReceivedProbe>;
+}
+
+/// Clock abstraction so the state machine can be exercised against
+/// virtualised time.
+///
+/// Production code uses [`SystemClock`]. Tests inject a `MockClock`
+/// that returns whatever instant the test sets, so deadlines fire
+/// deterministically.
+pub trait Clock: Send + Sync {
+    /// Monotonic instant used for deadlines and elapsed-time checks.
+    fn now(&self) -> Instant;
+
+    /// Wall-clock milliseconds since the Unix epoch.
+    ///
+    /// Used to stamp the resulting [`EstablishedFlow`] and to compare
+    /// against the agreement's `deadline_unix_ms`.
+    fn now_unix_ms(&self) -> u64;
+}
+
+/// Production [`Clock`] backed by [`Instant::now`] and [`SystemTime::now`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn now_unix_ms(&self) -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+    }
+}
+
+/// Configuration for `run_hole_punch`.
+///
+/// All fields have defaults that match the protocol described in
+/// `docs/nat-hole-punching.md` §"Hole-punching protocol": three probes
+/// per burst, `50 ms` between bursts, three bursts before giving up,
+/// and a `10 s` overall deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PunchConfig {
+    /// Number of probes emitted back-to-back inside a single burst.
+    ///
+    /// Sending several probes in quick succession increases the chance
+    /// that at least one passes the remote `NAT`'s filtering. Must be
+    /// strictly positive.
+    pub burst_size: u32,
+    /// Time the state machine waits after a burst for a return probe
+    /// before counting the burst as failed.
+    pub per_burst_gap: Duration,
+    /// Maximum number of bursts before `run_hole_punch` returns
+    /// [`PunchError::Timeout`]. Must be strictly positive.
+    pub max_bursts: u32,
+    /// Cumulative deadline measured from the start of the call. If the
+    /// clock crosses this point during a burst the state machine
+    /// returns [`PunchError::Timeout`] without scheduling further
+    /// bursts.
+    pub total_deadline: Duration,
+}
+
+impl Default for PunchConfig {
+    fn default() -> Self {
+        Self {
+            burst_size: 3,
+            per_burst_gap: Duration::from_millis(50),
+            max_bursts: 3,
+            total_deadline: Duration::from_secs(10),
+        }
+    }
+}
+
+impl PunchConfig {
+    /// Construct a validated [`PunchConfig`].
+    ///
+    /// # Errors
+    /// Returns [`PunchError::InvalidConfig`] when `burst_size` or
+    /// `max_bursts` is zero. Both must be strictly positive — a burst
+    /// with no probes never opens a `NAT` mapping, and a run with no
+    /// bursts can never succeed.
+    pub const fn new(
+        burst_size: u32,
+        per_burst_gap: Duration,
+        max_bursts: u32,
+        total_deadline: Duration,
+    ) -> Result<Self, PunchError> {
+        if burst_size == 0 {
+            return Err(PunchError::InvalidConfig("burst_size must be positive"));
+        }
+        if max_bursts == 0 {
+            return Err(PunchError::InvalidConfig("max_bursts must be positive"));
+        }
+        Ok(Self {
+            burst_size,
+            per_burst_gap,
+            max_bursts,
+            total_deadline,
+        })
+    }
+}
+
+/// Synchronisation payload exchanged via `BepMessage::SyncPunch`.
+///
+/// Both peers agree on the same `nonce` and `deadline_unix_ms` before
+/// invoking `run_hole_punch`. The state machine refuses to start when
+/// the agreed deadline has already passed — the partner cannot still be
+/// listening, and emitting probes into a closed mapping wastes a slot
+/// in the punch budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncPunchAgreement {
+    /// Random `64`-bit value both peers stamp into outgoing probes.
+    pub nonce: u64,
+    /// Wall-clock deadline (milliseconds since the Unix epoch) by which
+    /// each peer must have begun emitting probes.
+    pub deadline_unix_ms: u64,
+}
+
+/// One candidate pair selected by the caller before the punch begins.
+///
+/// `decide_connectivity` produces a list of remote candidates; the
+/// caller pairs each with one of the local candidates using
+/// [`Candidate::pairing_score`] and feeds the highest-scoring pair to
+/// `run_hole_punch`. The state machine itself is single-pair — a
+/// caller wanting multi-pair concurrency runs several invocations in
+/// parallel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CandidatePair {
+    /// The local socket the probes are emitted from.
+    pub local: SocketAddr,
+    /// The remote socket the probes target.
+    pub remote: SocketAddr,
+}
+
+/// Result of a successful punch: a confirmed bidirectional flow.
+///
+/// The engine persists `established_at_unix_ms` on the peer record so a
+/// stale flow can be torn down after a configurable idle period.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EstablishedFlow {
+    /// Local endpoint of the established flow.
+    pub local: SocketAddr,
+    /// Remote endpoint of the established flow.
+    pub remote: SocketAddr,
+    /// Wall-clock instant the matching probe arrived, in milliseconds
+    /// since the Unix epoch.
+    pub established_at_unix_ms: u64,
+}
+
+/// Errors returned by `run_hole_punch`.
+#[derive(Debug, thiserror::Error)]
+pub enum PunchError {
+    /// The state machine exhausted [`PunchConfig::max_bursts`] (or hit
+    /// [`PunchConfig::total_deadline`]) without receiving a matching
+    /// probe.
+    #[error("hole-punch timed out without receiving a matching probe")]
+    Timeout,
+    /// The agreement's wall-clock deadline was already in the past at
+    /// the moment `run_hole_punch` was invoked. The state machine
+    /// returns this without sending any probe.
+    #[error("sync-punch deadline already passed (now {now_ms} ms, deadline {deadline_ms} ms unix)")]
+    DeadlinePassed {
+        /// Clock reading at the moment of the check (Unix milliseconds).
+        now_ms: u64,
+        /// Agreed deadline that was already in the past (Unix
+        /// milliseconds).
+        deadline_ms: u64,
+    },
+    /// The underlying transport reported an I/O error other than the
+    /// expected per-burst deadline elapse. Surfaced verbatim so the
+    /// caller can log the original cause.
+    #[error("transport error: {0}")]
+    Transport(#[from] io::Error),
+    /// [`PunchConfig::new`] rejected its arguments. Static message
+    /// names the offending field.
+    #[error("invalid punch config: {0}")]
+    InvalidConfig(&'static str),
+}
+
+// `run_hole_punch` lives in a follow-up commit so the types and traits
+// land independently.
 
 fn highest_priority_addr(candidates: &[Candidate]) -> Option<SocketAddr> {
     candidates
