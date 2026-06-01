@@ -1241,9 +1241,12 @@ mod tests {
     async fn times_out_when_primary_server_unreachable() {
         let probe_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         // Bind sockets, capture their addresses, then drop so the ports
-        // are closed. Sending to them yields ICMP unreachable on some
-        // platforms and silent drop on others — both surface as a
-        // timeout from the probe's perspective.
+        // are closed. Linux/macOS silently drop UDP packets to a closed
+        // port — the probe surfaces as a recv timeout. Windows surfaces
+        // the ICMP "port unreachable" reply as `ConnectionReset` (or
+        // `ConnectionRefused`) on the next recv, which our wrapper
+        // forwards as `NatDetectionError::Io`. Both outcomes mean "no
+        // STUN server reachable here"; accept either.
         let dead_primary = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let dead_primary_addr = dead_primary.local_addr().unwrap();
         drop(dead_primary);
@@ -1256,7 +1259,18 @@ mod tests {
             &quick_config(dead_primary_addr, dead_secondary_addr),
         )
         .await;
-        assert!(matches!(result, Err(NatDetectionError::Timeout)));
+        match result {
+            Err(NatDetectionError::Timeout) => {}
+            Err(NatDetectionError::Io(err))
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::HostUnreachable
+                        | std::io::ErrorKind::NetworkUnreachable
+                ) => {}
+            other => panic!("expected Timeout or unreachable-host I/O error, got {other:?}"),
+        }
     }
 
     #[tokio::test]
