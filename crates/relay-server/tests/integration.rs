@@ -22,6 +22,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use cascade_p2p::relay::RelayClient;
 use cascade_relay_server::auth::encode_handshake;
 use cascade_relay_server::config::{RelayConfig, SHARED_SECRET_LEN};
 use cascade_relay_server::server::{RelayHandle, spawn};
@@ -396,6 +397,145 @@ async fn relay_pairs_under_concurrent_sessions() {
         handle
             .counters
             .sessions_rejected_total
+            .load(Ordering::Relaxed),
+        0
+    );
+}
+
+/// End-to-end pairing test driven through the real `RelayClient` path.
+///
+/// The earlier tests scaffold the handshake by hand to keep the relay
+/// server's wire format honest. This test exercises the production
+/// client (`cascade_p2p::relay::RelayClient::connect_with_secret`)
+/// instead, proving the HMAC authentication wired into the p2p crate
+/// actually meets the relay server on the wire — without this case a
+/// future tweak to either side's encoding could pass each crate's
+/// own unit tests while breaking the cross-crate handshake.
+#[tokio::test]
+async fn relay_pairs_two_real_relay_clients_through_handshake() {
+    let secret = known_secret();
+    let handle = spawn_relay(config_for_test(secret, Duration::from_secs(30), 8)).await;
+
+    let session_id = "real-client-pair";
+
+    // A connects first and parks awaiting B. Drop the `RelayConnection`
+    // returns nothing useful to assert until B arrives; we just hold it
+    // so the server keeps the socket open.
+    let secret_for_a = secret;
+    let session_a = session_id.to_owned();
+    let addr = handle.local_addr;
+    let task_a = tokio::spawn(async move {
+        let url = format!("ws://{addr}");
+        let connection =
+            RelayClient::connect_with_secret(&url, &session_a, "device-A", &secret_for_a)
+                .await
+                .expect("device A handshake");
+        // A sends a payload then reads B's reply.
+        connection.send(b"hello from A").await.expect("A sends");
+        let received = connection.recv().await.expect("A recv");
+        assert_eq!(received, b"world from B".to_vec(), "A received B's payload");
+    });
+
+    // Tiny pause so A is parked before B arrives. Without it the server
+    // can momentarily see B before A's registry entry exists.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let secret_for_b = secret;
+    let session_b = session_id.to_owned();
+    let addr_b = handle.local_addr;
+    let task_b = tokio::spawn(async move {
+        let url = format!("ws://{addr_b}");
+        let connection =
+            RelayClient::connect_with_secret(&url, &session_b, "device-B", &secret_for_b)
+                .await
+                .expect("device B handshake");
+        let received = connection.recv().await.expect("B recv");
+        assert_eq!(received, b"hello from A".to_vec(), "B received A's payload");
+        connection.send(b"world from B").await.expect("B sends");
+    });
+
+    // Wait for both clients to finish exchanging payloads.
+    let timeout = Duration::from_secs(5);
+    tokio::time::timeout(timeout, async {
+        task_a.await.expect("A task");
+        task_b.await.expect("B task");
+    })
+    .await
+    .expect("pairing completed within timeout");
+
+    // Counters: one pair, no rejections.
+    wait_until(
+        || {
+            handle
+                .counters
+                .sessions_paired_total
+                .load(Ordering::Relaxed)
+                == 1
+        },
+        Duration::from_secs(1),
+        "sessions_paired_total reaches 1",
+    )
+    .await;
+    assert_eq!(
+        handle.counters.auth_failures_total.load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        handle
+            .counters
+            .sessions_rejected_total
+            .load(Ordering::Relaxed),
+        0
+    );
+}
+
+/// Reject path: a `RelayClient` with the wrong shared secret authenticates
+/// against the server and the server closes the socket. The current
+/// client API surfaces this asynchronously — `connect_with_secret`
+/// returns `Ok` (the WebSocket upgrade and handshake send succeed) and
+/// the next `recv` reports the close. We pin that behaviour here so
+/// future changes that try to detect a synchronous reject have a
+/// regression to point at.
+#[tokio::test]
+async fn relay_real_client_with_wrong_secret_is_closed_by_server() {
+    let server_secret = known_secret();
+    let handle = spawn_relay(config_for_test(server_secret, Duration::from_secs(5), 8)).await;
+
+    let mut wrong_secret = server_secret;
+    for byte in &mut wrong_secret {
+        *byte ^= 0x5A;
+    }
+
+    let url = format!("ws://{}", handle.local_addr);
+    let connection =
+        RelayClient::connect_with_secret(&url, "rejected-session", "device-x", &wrong_secret)
+            .await
+            .expect("connect_with_secret returns Ok even when the server later rejects");
+
+    // The server closes the socket on bad HMAC; the client surfaces
+    // that on the first `recv`.
+    let err = connection
+        .recv()
+        .await
+        .expect_err("server should close the socket after bad handshake");
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("closed")
+            || rendered.contains("ended before")
+            || rendered.contains("Close"),
+        "expected reject-as-close, got: {rendered}"
+    );
+
+    wait_until(
+        || handle.counters.auth_failures_total.load(Ordering::Relaxed) >= 1,
+        Duration::from_secs(1),
+        "auth_failures_total >= 1",
+    )
+    .await;
+    assert_eq!(
+        handle
+            .counters
+            .sessions_paired_total
             .load(Ordering::Relaxed),
         0
     );
