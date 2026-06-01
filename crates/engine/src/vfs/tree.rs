@@ -3,8 +3,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use sha2::{Digest, Sha256};
+
 use crate::backend::Backend;
-use crate::types::{Change, DirEntry, FileId};
+use crate::types::{Change, DirEntry, FileId, ItemId, SyncCursor};
 
 /// VFS tree that routes operations to the correct backend by longest-prefix match.
 pub struct VfsTree {
@@ -140,16 +142,185 @@ impl VfsTree {
             .find(|(_, backend)| backend.id() == id)
             .map(|(_, backend)| backend)
     }
+
+    /// Return the cursor representing the current state of all items
+    /// under `parent_id`.
+    ///
+    /// Used by presenters (e.g. the File Provider extension) to decide
+    /// whether the system's last-known anchor is still current or a
+    /// full re-enumeration is needed.
+    ///
+    /// The cursor is derived from a SHA-256 over the sorted `(id, name,
+    /// is_dir, size, mod_time)` tuples of the parent's immediate
+    /// children, as returned by the owning backend. Any create,
+    /// rename, size change, or delete changes the hash; the empty
+    /// directory hashes to a stable non-empty value (the hash of an
+    /// empty input).
+    ///
+    /// This is a v1 derivation — the engine may move to an incremental
+    /// scheme in future, but consumers must keep treating the cursor as
+    /// opaque bytes.
+    pub async fn current_sync_cursor(&self, parent_id: &ItemId) -> anyhow::Result<SyncCursor> {
+        let backend = self.backend_by_id(parent_id.backend_id()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no backend registered for parent id {}",
+                parent_id.backend_id()
+            )
+        })?;
+        let mut entries = backend.list_children(parent_id.native_id()).await?;
+        entries.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+
+        let mut hasher = Sha256::new();
+        for entry in &entries {
+            hasher.update(entry.id.0.as_bytes());
+            hasher.update([0u8]);
+            hasher.update(entry.name.as_bytes());
+            hasher.update([0u8]);
+            hasher.update([u8::from(entry.is_dir)]);
+            hasher.update(entry.size.unwrap_or(0).to_be_bytes());
+            hasher.update(entry.mod_time.map_or(0i64, |t| t.timestamp()).to_be_bytes());
+        }
+        Ok(SyncCursor::new(hasher.finalize().to_vec()))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::backend::NullBackend;
+    use crate::types::{Cursor, FileEntry, Quota};
+    use async_trait::async_trait;
+    use chrono::{TimeZone, Utc};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// Minimal in-memory backend that supports `list_children` so the
+    /// VFS-level cursor derivation can be exercised without a real
+    /// cloud backend.
+    #[derive(Debug)]
+    struct StubBackend {
+        id: String,
+        files: Mutex<HashMap<String, FileEntry>>,
+    }
+
+    impl StubBackend {
+        fn new(id: &str) -> Self {
+            Self {
+                id: id.to_string(),
+                files: Mutex::new(HashMap::new()),
+            }
+        }
+
+        fn upsert(&self, entry: FileEntry) {
+            self.files
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(entry.id.0.clone(), entry);
+        }
+
+        fn remove(&self, id: &ItemId) {
+            self.files
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&id.0);
+        }
+    }
+
+    #[async_trait]
+    impl Backend for StubBackend {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn display_name(&self) -> &str {
+            &self.id
+        }
+
+        async fn quota(&self) -> anyhow::Result<Option<Quota>> {
+            Ok(None)
+        }
+
+        async fn changes(&self, _cursor: Option<&Cursor>) -> anyhow::Result<(Vec<Change>, Cursor)> {
+            Ok((vec![], Cursor("stub".to_string())))
+        }
+
+        async fn metadata(&self, _path: &Path) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("metadata not implemented")
+        }
+
+        async fn download(
+            &self,
+            _file: &FileEntry,
+            _writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("download not implemented")
+        }
+
+        async fn upload(
+            &self,
+            _path: &Path,
+            _reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+            _parent_id: &FileId,
+        ) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("upload not implemented")
+        }
+
+        async fn update(
+            &self,
+            _file_id: &FileId,
+            _reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+        ) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("update not implemented")
+        }
+
+        async fn create_dir(&self, _path: &Path) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("create_dir not implemented")
+        }
+
+        async fn delete(&self, _file: &FileEntry) -> anyhow::Result<()> {
+            anyhow::bail!("delete not implemented")
+        }
+
+        async fn move_entry(&self, _src: &Path, _dst: &Path) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("move_entry not implemented")
+        }
+
+        async fn list_children(&self, parent_native_id: &str) -> anyhow::Result<Vec<FileEntry>> {
+            let files = self
+                .files
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let prefix = format!("{}:", self.id);
+            let parent_full = format!("{prefix}{parent_native_id}");
+            Ok(files
+                .values()
+                .filter(|entry| entry.parent_id.0 == parent_full)
+                .cloned()
+                .collect())
+        }
+
+        async fn poll_interval(&self) -> Option<Duration> {
+            None
+        }
+    }
 
     fn make_tree() -> VfsTree {
         let root = Arc::new(NullBackend::new("root"));
         VfsTree::new(root)
+    }
+
+    fn make_entry(backend: &str, native: &str, parent_native: &str, name: &str) -> FileEntry {
+        FileEntry {
+            id: ItemId::new(backend, native),
+            parent_id: ItemId::new(backend, parent_native),
+            name: name.to_string(),
+            is_dir: false,
+            size: Some(name.len() as u64),
+            mod_time: Some(Utc.timestamp_opt(1_000_000, 0).unwrap()),
+            mime_type: None,
+            hash: None,
+        }
     }
 
     #[test]
@@ -210,5 +381,83 @@ mod tests {
         assert_eq!(tree.backend_by_id("work").map(|b| b.id()), Some("work"));
         assert_eq!(tree.backend_by_id("assets").map(|b| b.id()), Some("assets"));
         assert!(tree.backend_by_id("missing").is_none());
+    }
+
+    #[tokio::test]
+    async fn current_sync_cursor_is_stable_when_no_changes() {
+        let backend = Arc::new(StubBackend::new("stub"));
+        backend.upsert(make_entry("stub", "f1", "root", "a.txt"));
+        backend.upsert(make_entry("stub", "f2", "root", "b.txt"));
+        let tree = VfsTree::new(backend);
+        let parent = ItemId::new("stub", "root");
+
+        let first = tree.current_sync_cursor(&parent).await.unwrap();
+        let second = tree.current_sync_cursor(&parent).await.unwrap();
+        assert_eq!(first, second);
+        assert!(!first.is_empty());
+    }
+
+    #[tokio::test]
+    async fn current_sync_cursor_changes_after_upsert() {
+        let backend = Arc::new(StubBackend::new("stub"));
+        backend.upsert(make_entry("stub", "f1", "root", "a.txt"));
+        let tree = VfsTree::new(backend.clone());
+        let parent = ItemId::new("stub", "root");
+
+        let before = tree.current_sync_cursor(&parent).await.unwrap();
+        backend.upsert(make_entry("stub", "f2", "root", "b.txt"));
+        let after = tree.current_sync_cursor(&parent).await.unwrap();
+        assert_ne!(before, after);
+    }
+
+    #[tokio::test]
+    async fn current_sync_cursor_changes_after_modification() {
+        let backend = Arc::new(StubBackend::new("stub"));
+        backend.upsert(make_entry("stub", "f1", "root", "a.txt"));
+        let tree = VfsTree::new(backend.clone());
+        let parent = ItemId::new("stub", "root");
+
+        let before = tree.current_sync_cursor(&parent).await.unwrap();
+        let mut updated = make_entry("stub", "f1", "root", "a.txt");
+        updated.size = Some(9999);
+        backend.upsert(updated);
+        let after = tree.current_sync_cursor(&parent).await.unwrap();
+        assert_ne!(before, after);
+    }
+
+    #[tokio::test]
+    async fn current_sync_cursor_changes_after_delete() {
+        let backend = Arc::new(StubBackend::new("stub"));
+        backend.upsert(make_entry("stub", "f1", "root", "a.txt"));
+        backend.upsert(make_entry("stub", "f2", "root", "b.txt"));
+        let tree = VfsTree::new(backend.clone());
+        let parent = ItemId::new("stub", "root");
+
+        let before = tree.current_sync_cursor(&parent).await.unwrap();
+        backend.remove(&ItemId::new("stub", "f2"));
+        let after = tree.current_sync_cursor(&parent).await.unwrap();
+        assert_ne!(before, after);
+    }
+
+    #[tokio::test]
+    async fn current_sync_cursor_for_empty_directory_is_non_empty() {
+        let backend = Arc::new(StubBackend::new("stub"));
+        let tree = VfsTree::new(backend);
+        let parent = ItemId::new("stub", "empty");
+
+        let cursor = tree.current_sync_cursor(&parent).await.unwrap();
+        // SHA-256 of an empty input is a 32-byte non-empty digest.
+        assert!(!cursor.is_empty());
+        assert_eq!(cursor.as_bytes().len(), 32);
+    }
+
+    #[tokio::test]
+    async fn current_sync_cursor_fails_for_unknown_backend() {
+        let backend = Arc::new(StubBackend::new("stub"));
+        let tree = VfsTree::new(backend);
+        let parent = ItemId::new("ghost", "root");
+
+        let err = tree.current_sync_cursor(&parent).await.unwrap_err();
+        assert!(err.to_string().contains("ghost"));
     }
 }
