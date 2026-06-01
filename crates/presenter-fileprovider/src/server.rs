@@ -10,6 +10,7 @@
 //! The server task is spawned with [`FileProviderServer::serve`]. It runs
 //! until the cancel signal fires or the listener is dropped.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -18,6 +19,15 @@ use cascade_engine::protocol::{Request, encode_message};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
+
+/// File mode applied to the RPC socket after binding.
+///
+/// `0o600` — owner read/write only. The socket carries privileged engine
+/// RPCs (full filesystem read/write); anyone with connect access can issue
+/// them, so the socket must never be readable by other local users. The
+/// daemon's process umask is not relied upon — we set the mode explicitly
+/// after `bind`.
+const SOCKET_MODE: u32 = 0o600;
 
 use crate::handlers::{FileProviderHandlers, HandlerError, HandlerResult};
 use crate::items::FileProviderItem;
@@ -55,6 +65,15 @@ impl FileProviderServer {
     /// The socket path is removed before binding if a stale file exists, so
     /// the daemon can restart cleanly after a crash. The parent directory is
     /// created on demand.
+    ///
+    /// # Security
+    ///
+    /// The socket file is chmoded to `0o600` (owner read/write only)
+    /// immediately after binding. The socket carries privileged engine RPCs
+    /// — any connecting client can issue filesystem operations — so the
+    /// permissions must restrict access to the owning user. Any future
+    /// change to the bind sequence must preserve this invariant; rely on
+    /// explicit `set_permissions`, not the process umask.
     pub async fn serve(&self, mut cancel: watch::Receiver<bool>) -> Result<()> {
         if let Some(parent) = self.socket_path.parent() {
             tokio::fs::create_dir_all(parent)
@@ -69,6 +88,17 @@ impl FileProviderServer {
 
         let listener = UnixListener::bind(&self.socket_path)
             .with_context(|| format!("bind socket {}", self.socket_path.display()))?;
+        tokio::fs::set_permissions(
+            &self.socket_path,
+            std::fs::Permissions::from_mode(SOCKET_MODE),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "chmod socket {} to {SOCKET_MODE:#o}",
+                self.socket_path.display()
+            )
+        })?;
         tracing::info!(socket = %self.socket_path.display(), "file provider server listening");
 
         loop {
@@ -535,6 +565,39 @@ mod tests {
         let error = response.error.unwrap();
         assert_eq!(error.code, ErrorCode::Internal.as_str());
         assert!(error.message.contains("invalid params"));
+    }
+
+    #[tokio::test]
+    async fn server_chmods_socket_to_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("perms.sock");
+
+        let handlers: Arc<dyn FileProviderHandlers> = Arc::new(StubHandlers::default());
+        let server = FileProviderServer::new(&socket_path, handlers);
+
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let probe_path = socket_path.clone();
+        let handle = tokio::spawn(async move { server.serve(cancel_rx).await });
+
+        // Wait for the socket to appear.
+        for _ in 0..50 {
+            if probe_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(probe_path.exists(), "server failed to bind socket");
+
+        let metadata = tokio::fs::metadata(&probe_path).await.unwrap();
+        let mode = metadata.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "socket permission bits {mode:#o} should be 0o600 (owner read/write only)"
+        );
+
+        cancel_tx.send(true).unwrap();
+        handle.abort();
+        let _ = handle.await;
     }
 
     #[tokio::test]
