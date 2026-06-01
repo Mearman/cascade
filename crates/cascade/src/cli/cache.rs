@@ -245,6 +245,9 @@ pub fn backend_add(
 
             let initial_listen_addr = read_input("Listen address (host:port, blank to disable)")?;
             let display_name = read_input("Display name (blank for backend name)")?;
+            let device_name = read_input(
+                "Device name (friendly name for THIS device, blank to use the 8-char device ID)",
+            )?;
             let data_dir =
                 read_input("Data directory (blank for default ~/.config/cascade/p2p-<name>)")?;
             let enable_discovery_raw = read_input("Enable LAN discovery? (y/N)")?;
@@ -274,7 +277,7 @@ pub fn backend_add(
                 eprintln!("Discovery disabled (no listen address provided).");
             }
 
-            let mut peers: Vec<(String, String)> = Vec::new();
+            let mut peers: Vec<(String, String, Option<String>)> = Vec::new();
             loop {
                 let add_peer = read_input("Add a peer? (y/N)")?;
                 if !matches!(add_peer.to_ascii_lowercase().as_str(), "y" | "yes") {
@@ -296,7 +299,13 @@ pub fn backend_add(
                     }
                     break addr;
                 };
-                peers.push((device_id, address));
+                let peer_name_input = read_input("  Friendly name for this peer (blank for none)")?;
+                let peer_name = if peer_name_input.is_empty() {
+                    None
+                } else {
+                    Some(peer_name_input)
+                };
+                peers.push((device_id, address, peer_name));
             }
 
             let mut full_config = toml::Table::new();
@@ -316,6 +325,9 @@ pub fn backend_add(
                     "display_name".to_string(),
                     toml::Value::String(display_name),
                 );
+            }
+            if !device_name.is_empty() {
+                full_config.insert("device_name".to_string(), toml::Value::String(device_name));
             }
             if !data_dir.is_empty() {
                 full_config.insert("data_dir".to_string(), toml::Value::String(data_dir));
@@ -502,9 +514,12 @@ fn reconcile_discovery(
 /// as its own `[[peers]]` table, with the per-peer body serialised through
 /// `toml::to_string` so string values are escaped according to the TOML
 /// grammar.
-fn render_p2p_config(scalar_config: &toml::Table, peers: &[(String, String)]) -> Result<String> {
+fn render_p2p_config(
+    scalar_config: &toml::Table,
+    peers: &[(String, String, Option<String>)],
+) -> Result<String> {
     let mut out = toml::to_string_pretty(scalar_config)?;
-    for (device_id, address) in peers {
+    for (device_id, address, name) in peers {
         if !out.ends_with("\n\n") {
             if out.ends_with('\n') {
                 out.push('\n');
@@ -519,6 +534,9 @@ fn render_p2p_config(scalar_config: &toml::Table, peers: &[(String, String)]) ->
             toml::Value::String(device_id.clone()),
         );
         peer.insert("address".to_string(), toml::Value::String(address.clone()));
+        if let Some(name) = name {
+            peer.insert("name".to_string(), toml::Value::String(name.clone()));
+        }
         out.push_str(&toml::to_string(&peer)?);
     }
     Ok(out)
@@ -810,6 +828,10 @@ mod tests {
             toml::Value::String("shared".to_string()),
         );
         config.insert(
+            "device_name".to_string(),
+            toml::Value::String("work-laptop".to_string()),
+        );
+        config.insert(
             "listen_addr".to_string(),
             toml::Value::String("0.0.0.0:22000".to_string()),
         );
@@ -818,18 +840,57 @@ mod tests {
             toml::Value::String(dir.path().to_string_lossy().into_owned()),
         );
 
-        let peers = vec![("PEER-DEVICE-ID".to_string(), "192.0.2.1:22000".to_string())];
+        let peers = vec![(
+            "PEER-DEVICE-ID".to_string(),
+            "192.0.2.1:22000".to_string(),
+            Some("home-laptop".to_string()),
+        )];
         let rendered = render_p2p_config(&config, &peers).unwrap();
 
         assert!(
             rendered.contains("[[peers]]"),
             "wizard output must use array-of-tables for peers, got:\n{rendered}",
         );
+        assert!(
+            rendered.contains("device_name = \"work-laptop\""),
+            "wizard output must emit the local device_name, got:\n{rendered}",
+        );
+        assert!(
+            rendered.contains("name = \"home-laptop\""),
+            "wizard output must emit the per-peer friendly name, got:\n{rendered}",
+        );
 
         let parsed: toml::Value = toml::from_str(&rendered).unwrap();
         if let Err(err) = cascade_backend_p2p::create_backend(&parsed) {
             panic!("create_backend rejected wizard output: {err:#}\nrendered:\n{rendered}");
         }
+    }
+
+    /// `render_p2p_config` must serialise the local `device_name` as a scalar
+    /// and each peer's friendly `name` inside its `[[peers]]` table when set.
+    /// Smaller than the round-trip test above — exercises just the rendering
+    /// shape without touching `create_backend`.
+    #[test]
+    fn render_p2p_config_with_device_and_peer_names() {
+        let mut scalar = toml::Table::new();
+        scalar.insert("type".to_string(), toml::Value::String("p2p".to_string()));
+        scalar.insert(
+            "name".to_string(),
+            toml::Value::String("shared".to_string()),
+        );
+        scalar.insert(
+            "device_name".to_string(),
+            toml::Value::String("work-laptop".to_string()),
+        );
+        let peers = vec![(
+            "AAAA".to_string(),
+            "node-b:22000".to_string(),
+            Some("home-laptop".to_string()),
+        )];
+        let rendered = render_p2p_config(&scalar, &peers).unwrap();
+        assert!(rendered.contains("device_name = \"work-laptop\""));
+        assert!(rendered.contains("[[peers]]"));
+        assert!(rendered.contains("name = \"home-laptop\""));
     }
 
     /// `render_p2p_config` with no peers must emit nothing peer-related — no
@@ -840,7 +901,8 @@ mod tests {
         config.insert("type".to_string(), toml::Value::String("p2p".to_string()));
         config.insert("name".to_string(), toml::Value::String("solo".to_string()));
 
-        let rendered = render_p2p_config(&config, &[]).unwrap();
+        let peers: Vec<(String, String, Option<String>)> = Vec::new();
+        let rendered = render_p2p_config(&config, &peers).unwrap();
         assert!(
             !rendered.contains("peers"),
             "unexpected peers content: {rendered}"
@@ -859,6 +921,7 @@ mod tests {
         let peers = vec![(
             "dev with \"quotes\" and \\backslash".to_string(),
             "[::1]:22000".to_string(),
+            None,
         )];
         let rendered = render_p2p_config(&config, &peers).unwrap();
         let parsed: toml::Value = toml::from_str(&rendered).unwrap();
