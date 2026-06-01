@@ -50,10 +50,13 @@ use cascade_p2p::block::BlockHash;
 use cascade_p2p::candidate::{Candidate, CandidateKind};
 use cascade_p2p::connection::ConnectionManager;
 use cascade_p2p::discovery::DiscoveredPeer;
-use cascade_p2p::framed::FramedPeer;
+use cascade_p2p::framed::{FramedPeer, FramedSession, SessionReader, SessionWriter};
 use cascade_p2p::identity::DeviceIdentity;
 use cascade_p2p::protocol::{BepMessage, FileInfo, Folder, GossipPeer, Version};
 use cascade_p2p::store::BlockStore;
+use cascade_p2p::transport::{
+    RelayTransport, Transport, TransportReader, TransportWriter, UdpFlowTransport,
+};
 use cascade_p2p::traversal::{
     CandidatePair, ConnectivityStrategy, NatType, PunchConfig, SyncPunchAgreement, SystemClock,
     UdpPunchTransport, decide_connectivity, run_hole_punch,
@@ -64,6 +67,113 @@ use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 use crate::index::{FolderIndex, IndexEntry};
+
+/// Erased reader half used by the shared session loop.
+///
+/// `run_session_loop` is the single implementation behind both the
+/// direct-TLS path (via [`FramedPeer`]) and the unified
+/// [`FramedSession<T>`] path used after a successful hole punch or
+/// relay handshake. Each transport has a different concrete reader
+/// type, so the enum collapses them into one runtime-dispatched
+/// surface — no monomorphisation explosion in the session loop, and
+/// no `dyn Trait` for the TLS hot path either.
+enum FramedHalfReader {
+    /// Direct TLS reader produced by [`FramedPeer::split`].
+    Tls(cascade_p2p::framed::FramedReader),
+    /// Generic transport reader produced by [`FramedSession::split`].
+    Session(Box<dyn AsyncBepReader>),
+}
+
+impl FramedHalfReader {
+    async fn recv(&mut self) -> Result<Option<BepMessage>> {
+        match self {
+            Self::Tls(r) => r.recv().await,
+            Self::Session(r) => r.recv_boxed().await,
+        }
+    }
+}
+
+/// Erased writer half used by the shared session loop. See
+/// [`FramedHalfReader`] for the design rationale.
+enum FramedHalfWriter {
+    /// Direct TLS writer produced by [`FramedPeer::split`].
+    Tls(cascade_p2p::framed::FramedWriter),
+    /// Generic transport writer produced by [`FramedSession::split`].
+    Session(Box<dyn AsyncBepWriter>),
+}
+
+impl FramedHalfWriter {
+    async fn send(&mut self, msg: &BepMessage) -> Result<()> {
+        match self {
+            Self::Tls(w) => w.send(msg).await,
+            Self::Session(w) => w.send_boxed(msg).await,
+        }
+    }
+
+    async fn shutdown(&mut self) -> Result<()> {
+        match self {
+            Self::Tls(w) => w.shutdown().await,
+            Self::Session(w) => w.shutdown_boxed().await,
+        }
+    }
+}
+
+/// Object-safe trait the boxed reader half implements.
+///
+/// `SessionReader<R>` is generic over the underlying transport
+/// reader; the session loop wants a single trait object so the enum
+/// above stays narrow. The boxed wrapper below implements this trait
+/// for every concrete reader the workspace ships.
+#[async_trait::async_trait]
+trait AsyncBepReader: Send {
+    async fn recv_boxed(&mut self) -> Result<Option<BepMessage>>;
+}
+
+/// Object-safe trait the boxed writer half implements. See
+/// [`AsyncBepReader`] for the rationale.
+#[async_trait::async_trait]
+trait AsyncBepWriter: Send {
+    async fn send_boxed(&mut self, msg: &BepMessage) -> Result<()>;
+    async fn shutdown_boxed(&mut self) -> Result<()>;
+}
+
+struct SessionReaderBoxed<R: TransportReader> {
+    inner: SessionReader<R>,
+}
+
+impl<R: TransportReader> SessionReaderBoxed<R> {
+    const fn new(inner: SessionReader<R>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait::async_trait]
+impl<R: TransportReader + Send> AsyncBepReader for SessionReaderBoxed<R> {
+    async fn recv_boxed(&mut self) -> Result<Option<BepMessage>> {
+        self.inner.recv().await
+    }
+}
+
+struct SessionWriterBoxed<W: TransportWriter> {
+    inner: SessionWriter<W>,
+}
+
+impl<W: TransportWriter> SessionWriterBoxed<W> {
+    const fn new(inner: SessionWriter<W>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait::async_trait]
+impl<W: TransportWriter + Send> AsyncBepWriter for SessionWriterBoxed<W> {
+    async fn send_boxed(&mut self, msg: &BepMessage) -> Result<()> {
+        self.inner.send(msg).await
+    }
+
+    async fn shutdown_boxed(&mut self) -> Result<()> {
+        self.inner.shutdown().await
+    }
+}
 
 /// File-type code for regular files in BEP `FileInfo.file_type`.
 const FILE_TYPE_FILE: u32 = 0;
@@ -502,7 +612,7 @@ impl SyncEngine {
         let engine = self.clone();
         let device_id = peer.device_id.clone();
         tokio::spawn(async move {
-            if let Err(e) = engine.run_session(device_id.clone(), framed).await {
+            if let Err(e) = engine.run_framed_session(device_id.clone(), framed).await {
                 debug!("outbound session to {device_id} ended: {e:#}");
             }
         });
@@ -689,8 +799,29 @@ impl SyncEngine {
                     local = %flow.local,
                     remote = %flow.remote,
                     established_at_unix_ms = flow.established_at_unix_ms,
-                    "hole-punch succeeded — post-punch BEP transport upgrade is the next round"
+                    "hole-punch succeeded — upgrading to BEP transport"
                 );
+                // Capture the bound socket from the punch transport
+                // so the BEP-over-UDP adapter can reuse it without
+                // reopening the binding. The peer is the confirmed
+                // remote endpoint reported by the state machine.
+                let udp_transport = UdpFlowTransport::new(transport.socket(), flow.remote);
+                self.record_peer(&peer.device_id, flow.remote).await;
+                let engine = self.clone();
+                let device_id = peer.device_id.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = engine
+                        .run_transport_session(device_id.clone(), udp_transport)
+                        .await
+                    {
+                        debug!(
+                            target: "cascade::backend::p2p",
+                            peer = %device_id,
+                            error = %e,
+                            "post-punch BEP session ended",
+                        );
+                    }
+                });
                 Ok(())
             }
             Err(e) => {
@@ -790,7 +921,7 @@ impl SyncEngine {
             target: "cascade::backend::p2p",
             peer = %peer.device_id,
             %relay,
-            "opening relay connection — post-relay BEP transport upgrade is the next round"
+            "opening relay connection — upgrading to BEP transport on success"
         );
         match cascade_p2p::relay::RelayClient::connect_with_secret(
             &relay_url,
@@ -800,7 +931,26 @@ impl SyncEngine {
         )
         .await
         {
-            Ok(_conn) => Ok(()),
+            Ok(conn) => {
+                self.record_peer(&peer.device_id, relay).await;
+                let relay_transport = RelayTransport::new(conn);
+                let engine = self.clone();
+                let device_id = peer.device_id.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = engine
+                        .run_transport_session(device_id.clone(), relay_transport)
+                        .await
+                    {
+                        debug!(
+                            target: "cascade::backend::p2p",
+                            peer = %device_id,
+                            error = %e,
+                            "post-relay BEP session ended",
+                        );
+                    }
+                });
+                Ok(())
+            }
             Err(e) => {
                 debug!(
                     target: "cascade::backend::p2p",
@@ -829,7 +979,7 @@ impl SyncEngine {
         info!("inbound P2P connection accepted from device {device_id}");
         self.record_peer(&device_id, peer_addr).await;
         let framed = FramedPeer::from_tls(tls);
-        self.run_session(device_id, framed).await
+        self.run_framed_session(device_id, framed).await
     }
 
     /// Record a successful peer contact in the local `PeerBook`. A
@@ -845,11 +995,56 @@ impl SyncEngine {
         book.mark_seen(device_id, unix_timestamp_seconds());
     }
 
-    /// Drive a peer session: send our handshake, then read frames and
-    /// respond. Returns when the read loop terminates.
-    async fn run_session(&self, device_id: String, framed: FramedPeer) -> Result<()> {
-        let (mut reader, mut writer) = framed.split();
+    /// Drive a peer session over the direct TLS [`FramedPeer`].
+    ///
+    /// Kept as the primary entry point for TLS-direct sessions because
+    /// `FramedPeer` predates the unified [`Transport`] abstraction and
+    /// every existing caller passes one. Internally this routes
+    /// through [`Self::run_session_loop`] so the post-punch UDP and
+    /// post-relay WebSocket paths share the same handshake +
+    /// read/write loop.
+    async fn run_framed_session(&self, device_id: String, framed: FramedPeer) -> Result<()> {
+        let (reader, writer) = framed.split();
+        self.run_session_loop(
+            device_id,
+            FramedHalfReader::Tls(reader),
+            FramedHalfWriter::Tls(writer),
+        )
+        .await
+    }
 
+    /// Drive a peer session over an arbitrary [`Transport`].
+    ///
+    /// Used after a successful hole-punch (UDP) or relay handshake
+    /// (WebSocket). Funnels the transport's read/write halves into
+    /// the same handshake + dispatch loop as [`Self::run_framed_session`].
+    async fn run_transport_session<T>(&self, device_id: String, transport: T) -> Result<()>
+    where
+        T: Transport + 'static,
+    {
+        let (reader, writer) = FramedSession::new(transport).split();
+        self.run_session_loop(
+            device_id,
+            FramedHalfReader::Session(Box::new(SessionReaderBoxed::new(reader))),
+            FramedHalfWriter::Session(Box::new(SessionWriterBoxed::new(writer))),
+        )
+        .await
+    }
+
+    /// Inner loop shared by every session entry point.
+    ///
+    /// Owns the handshake, the outbound writer task, the read loop and
+    /// the cleanup. The reader/writer halves are erased behind
+    /// [`FramedHalfReader`] / [`FramedHalfWriter`] enums so a single
+    /// implementation can serve both the TLS and the
+    /// `FramedSession<T>` paths without monomorphising the whole
+    /// function body for every transport variant.
+    async fn run_session_loop(
+        &self,
+        device_id: String,
+        mut reader: FramedHalfReader,
+        mut writer: FramedHalfWriter,
+    ) -> Result<()> {
         // Outbound channel — the writer task drains this.
         let (tx, mut rx) = mpsc::unbounded_channel::<BepMessage>();
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<u8>>>>> =
