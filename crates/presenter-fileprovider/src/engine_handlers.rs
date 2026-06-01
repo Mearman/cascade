@@ -11,8 +11,9 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use cascade_engine::backend::Backend;
+use cascade_engine::changefeed::{ChangeFeed, ChangeQueryResult};
 use cascade_engine::db::StateDb;
-use cascade_engine::types::{CacheState, FileEntry, FileId, ItemId, SyncCursor, VfsItem};
+use cascade_engine::types::{CacheState, Change, FileEntry, FileId, ItemId, SyncCursor, VfsItem};
 use cascade_engine::vfs::{VfsTree, derive_sync_cursor};
 use chrono::{DateTime, Utc};
 use data_encoding::BASE64URL_NOPAD;
@@ -40,22 +41,16 @@ const CACHE_SUBDIR: &str = "file-provider";
 /// keeps each round-trip response well under macOS's XPC payload limit.
 const ENUMERATE_PAGE_SIZE: usize = 256;
 
-/// Snapshot of the child set under a parent directory at the moment the
-/// engine last emitted a cursor for that parent.
+/// Snapshot of the child set under a parent directory.
 ///
-/// Keyed by item ID (`stub:file1`); the value carries the metadata tuple
-/// the cursor is derived from. The `cursor` field is the cursor the
-/// engine returned alongside this snapshot — a caller's `since_cursor`
-/// must equal this for the engine to compute an incremental delta;
-/// otherwise the handler treats the call as a fresh enumeration.
-///
-/// TODO(fileprovider): replace this snapshot-based diff with a real
-/// event log driven by the backend's native change stream. The engine
-/// already exposes `Backend::changes(cursor)`, but the File Provider
-/// bridge has no per-parent fan-out for those events yet. Once the
-/// engine gains a `(parent_id, since_event)` -> `Vec<Change>` query that
-/// holds across the entire VFS tree, this in-memory snapshot table can
-/// be retired in favour of the authoritative log.
+/// The primary path through `enumerateChanges` reads from the engine's
+/// [`ChangeFeed`], which serves real per-parent change events derived
+/// from `Backend::changes`. The snapshot here is retained as a fallback
+/// for the first observation of a parent and for callers that present
+/// an evicted or version-mismatched cursor — the only times the feed
+/// cannot answer a delta query. Keying the snapshot by item ID lets
+/// the fallback diff the current child set against the prior one
+/// without consulting the feed.
 #[derive(Debug, Clone)]
 struct ParentSnapshot {
     cursor: SyncCursor,
@@ -87,6 +82,168 @@ impl SnapshotEntry {
     }
 }
 
+/// Magic prefix marking a [`SyncCursorV2`]-encoded `SyncCursor`.
+///
+/// V1 cursors are bare SHA-256 hashes (always 32 bytes, no prefix).
+/// V2 cursors carry this three-byte ASCII tag so the handler can tell
+/// them apart on the wire and fall back to a fresh enumeration when a
+/// legacy V1 cursor arrives after a daemon upgrade.
+const SYNC_CURSOR_V2_MAGIC: &[u8] = b"CF2";
+
+/// Wire-stable cursor handed to the File Provider extension for
+/// `enumerateChanges` resumption.
+///
+/// Carries the tuple `(backend_id, parent_id, feed_seq,
+/// snapshot_hash)` that the `enumerateChanges` handler hands back to
+/// resume an incremental delta. The bytes are not opaque to the
+/// engine — they encode the exact resume key — but Apple's File
+/// Provider framework treats them as a black box and round-trips them
+/// unchanged.
+///
+/// `feed_seq` anchors the engine-side [`ChangeFeed`] query: events
+/// strictly after `feed_seq` are translated into the
+/// added-or-modified/deleted sets. `snapshot_hash` mirrors the V1
+/// SHA-256 content hash so that callers see a fresh cursor whenever
+/// the snapshot store advances, even when the change feed has
+/// observed no events (e.g. a test backend that does not stream
+/// changes through `Backend::changes`).
+///
+/// Encoding layout (little-endian throughout):
+///
+/// ```text
+///   "CF2" (3 bytes) | backend_id_len: u16 | backend_id bytes |
+///                   | parent_id_len: u16  | parent_id bytes  |
+///                   | feed_seq: u64       | snapshot_hash_len: u16 |
+///                   | snapshot_hash bytes
+/// ```
+///
+/// A future round of the cursor format can lift the version byte
+/// implied by the `CF2` magic and rev it to `CF3`; the V2 decoder
+/// treats anything that does not start with `CF2` as a legacy cursor
+/// and signals a fresh-enumeration fallback to the caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SyncCursorV2 {
+    backend_id: String,
+    parent_id: ItemId,
+    feed_seq: u64,
+    snapshot_hash: Vec<u8>,
+}
+
+impl SyncCursorV2 {
+    /// Serialise the cursor into a [`SyncCursor`] for transport.
+    fn encode(&self) -> SyncCursor {
+        let backend_bytes = self.backend_id.as_bytes();
+        let parent_bytes = self.parent_id.0.as_bytes();
+        // Reject ID strings that overflow the u16 length prefix. In
+        // practice every ItemId we mint is a short colon-prefixed
+        // string, but the bound is part of the wire contract.
+        let backend_len = u16::try_from(backend_bytes.len()).unwrap_or(u16::MAX);
+        let parent_len = u16::try_from(parent_bytes.len()).unwrap_or(u16::MAX);
+        let hash_len = u16::try_from(self.snapshot_hash.len()).unwrap_or(u16::MAX);
+
+        let mut out = Vec::with_capacity(
+            SYNC_CURSOR_V2_MAGIC
+                .len()
+                .saturating_add(2)
+                .saturating_add(backend_bytes.len())
+                .saturating_add(2)
+                .saturating_add(parent_bytes.len())
+                .saturating_add(8)
+                .saturating_add(2)
+                .saturating_add(self.snapshot_hash.len()),
+        );
+        out.extend_from_slice(SYNC_CURSOR_V2_MAGIC);
+        out.extend_from_slice(&backend_len.to_le_bytes());
+        out.extend_from_slice(
+            backend_bytes
+                .get(..usize::from(backend_len))
+                .unwrap_or(backend_bytes),
+        );
+        out.extend_from_slice(&parent_len.to_le_bytes());
+        out.extend_from_slice(
+            parent_bytes
+                .get(..usize::from(parent_len))
+                .unwrap_or(parent_bytes),
+        );
+        out.extend_from_slice(&self.feed_seq.to_le_bytes());
+        out.extend_from_slice(&hash_len.to_le_bytes());
+        out.extend_from_slice(
+            self.snapshot_hash
+                .get(..usize::from(hash_len))
+                .unwrap_or(&self.snapshot_hash),
+        );
+        SyncCursor::new(out)
+    }
+
+    /// Parse a cursor previously emitted by [`Self::encode`].
+    ///
+    /// Returns `Ok(None)` if the cursor is empty, missing the V2 magic,
+    /// or otherwise refers to a different version — callers fall back
+    /// to a fresh enumeration in that case. Returns `Err` only when
+    /// the magic matches but the framing is corrupt; that is an engine
+    /// bug rather than a legacy-cursor situation.
+    fn decode(cursor: &SyncCursor) -> Result<Option<Self>, String> {
+        let bytes = cursor.as_bytes();
+        if bytes.len() < SYNC_CURSOR_V2_MAGIC.len() {
+            return Ok(None);
+        }
+        let Some((magic, rest)) = bytes.split_at_checked(SYNC_CURSOR_V2_MAGIC.len()) else {
+            return Ok(None);
+        };
+        if magic != SYNC_CURSOR_V2_MAGIC {
+            return Ok(None);
+        }
+
+        let (backend_id, rest) = take_lp_string(rest, "backend_id")?;
+        let (parent_id_raw, rest) = take_lp_string(rest, "parent_id")?;
+        let Some((seq_bytes, rest)) = rest.split_at_checked(8) else {
+            return Err("V2 cursor truncated before feed_seq".to_string());
+        };
+        let mut seq_arr = [0u8; 8];
+        seq_arr.copy_from_slice(seq_bytes);
+
+        let Some((hash_len_bytes, rest)) = rest.split_at_checked(2) else {
+            return Err("V2 cursor truncated before snapshot_hash length".to_string());
+        };
+        let mut hash_len_arr = [0u8; 2];
+        hash_len_arr.copy_from_slice(hash_len_bytes);
+        let hash_len = usize::from(u16::from_le_bytes(hash_len_arr));
+        let Some((hash_payload, tail)) = rest.split_at_checked(hash_len) else {
+            return Err("V2 cursor truncated reading snapshot_hash payload".to_string());
+        };
+        if !tail.is_empty() {
+            return Err("V2 cursor has trailing bytes after snapshot_hash".to_string());
+        }
+        Ok(Some(Self {
+            backend_id,
+            parent_id: ItemId(parent_id_raw),
+            feed_seq: u64::from_le_bytes(seq_arr),
+            snapshot_hash: hash_payload.to_vec(),
+        }))
+    }
+}
+
+/// Pull a length-prefixed UTF-8 string off the front of a slice.
+///
+/// Returns the decoded string and the remaining bytes. Used by
+/// [`SyncCursorV2::decode`] to parse the backend ID and parent ID
+/// fields in turn.
+fn take_lp_string<'a>(bytes: &'a [u8], field: &str) -> Result<(String, &'a [u8]), String> {
+    let Some((len_bytes, rest)) = bytes.split_at_checked(2) else {
+        return Err(format!("V2 cursor truncated before {field} length"));
+    };
+    let mut len_arr = [0u8; 2];
+    len_arr.copy_from_slice(len_bytes);
+    let len = usize::from(u16::from_le_bytes(len_arr));
+    let Some((payload, tail)) = rest.split_at_checked(len) else {
+        return Err(format!("V2 cursor truncated reading {field} payload"));
+    };
+    let decoded = std::str::from_utf8(payload)
+        .map_err(|err| format!("V2 cursor {field} is not valid UTF-8: {err}"))?
+        .to_string();
+    Ok((decoded, tail))
+}
+
 /// Production handler implementation.
 ///
 /// Construction takes:
@@ -100,7 +257,17 @@ pub struct EngineHandlers {
     vfs: Arc<RwLock<VfsTree>>,
     db: Arc<StateDb>,
     cache_dir: PathBuf,
-    /// In-memory per-parent snapshot store used by `enumerateChanges`.
+    /// Engine-side per-parent change index.
+    ///
+    /// Primary source for `enumerateChanges` deltas. When the feed can
+    /// answer a `(backend_id, parent_id, seq)` query the handler
+    /// translates its events directly into added-or-modified entries
+    /// plus deleted IDs. When it cannot (`Unknown` or `Evicted`, or
+    /// when the caller's cursor is a legacy V1) the handler falls back
+    /// to the snapshot diff below.
+    change_feed: Arc<ChangeFeed>,
+    /// In-memory per-parent snapshot store used as the fallback path
+    /// for `enumerateChanges` when the change feed cannot resume.
     ///
     /// Keyed by parent `ItemId` string. Bounded by the number of parent
     /// directories the File Provider extension has observed — typically
@@ -122,12 +289,20 @@ impl EngineHandlers {
     ///
     /// `cache_dir` is the directory under which fetched file contents are
     /// materialised. The handler creates `cache_dir/file-provider/` on
-    /// demand.
-    pub fn new(vfs: Arc<RwLock<VfsTree>>, db: Arc<StateDb>, cache_dir: PathBuf) -> Self {
+    /// demand. `change_feed` is the engine's shared per-parent change
+    /// index — see the `cascade_engine::changefeed` module for the
+    /// polling contract and eviction semantics.
+    pub fn new(
+        vfs: Arc<RwLock<VfsTree>>,
+        db: Arc<StateDb>,
+        cache_dir: PathBuf,
+        change_feed: Arc<ChangeFeed>,
+    ) -> Self {
         Self {
             vfs,
             db,
             cache_dir,
+            change_feed,
             snapshots: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -466,6 +641,139 @@ impl EngineHandlers {
         })
     }
 
+    /// Snapshot-based fallback for `enumerate_changes`.
+    ///
+    /// Used when the change feed cannot resume — either the caller's
+    /// cursor is a legacy V1 SHA-256 hash, it names a different
+    /// `(backend, parent)` from the requested one, or the feed reports
+    /// `Unknown`/`Evicted` for the requested key. In every case the
+    /// fallback computes a fresh per-parent diff against the most
+    /// recent stored snapshot and emits a V2 cursor anchored to the
+    /// feed's current high-water mark for this parent plus the hash
+    /// of the new snapshot. The next call carrying that cursor will
+    /// resume the feed path; if the feed still has no events, the
+    /// snapshot hash on the cursor lets callers detect content-only
+    /// changes without consulting the feed at all.
+    async fn enumerate_changes_via_snapshot(
+        &self,
+        parent: &ItemId,
+        since_cursor: Option<&SyncCursor>,
+        decoded_v2: Option<&SyncCursorV2>,
+    ) -> HandlerResult<EnumerateChangesOutput> {
+        let backend = self.backend_for(parent)?;
+        let mut entries = backend
+            .list_children(parent.native_id())
+            .await
+            .map_err(HandlerError::from)?;
+        entries.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+
+        let legacy_v1_cursor = derive_cursor_from_sorted(&entries);
+        let snapshot_hash = legacy_v1_cursor.as_bytes().to_vec();
+        let current: HashMap<String, SnapshotEntry> = entries
+            .iter()
+            .map(|entry| (entry.id.0.clone(), SnapshotEntry::from_entry(entry)))
+            .collect();
+
+        // Pull the feed's current head so the cursor we emit can resume
+        // the delta path immediately on the next call. Querying with
+        // `since=None` returns the max seq the feed has observed for
+        // this parent so far; if the feed is unaware of the parent the
+        // cursor starts at 0 and the first real event will land at seq=0.
+        let backend_id = parent.backend_id().to_string();
+        let feed_head_seq = match self
+            .change_feed
+            .parent_changes_since(&backend_id, parent, None)
+            .await
+        {
+            ChangeQueryResult::Delta { new_seq, .. } => new_seq,
+            ChangeQueryResult::Evicted | ChangeQueryResult::Unknown => 0,
+        };
+        let new_cursor = SyncCursorV2 {
+            backend_id,
+            parent_id: parent.clone(),
+            feed_seq: feed_head_seq,
+            snapshot_hash,
+        }
+        .encode();
+
+        let mut snapshots = self.snapshots.lock().await;
+        let parent_key = parent.0.clone();
+        let previous = snapshots.get(&parent_key);
+
+        // Decide whether to diff against the stored snapshot. We diff
+        // when the caller's cursor matches either the prior V1 hash or
+        // the V2 cursor's snapshot_hash; otherwise the call is a first
+        // observation and every child is "added".
+        let use_incremental = match (since_cursor, decoded_v2, previous) {
+            (Some(cursor), None, Some(snapshot)) => snapshot.cursor == *cursor,
+            (_, Some(v2), Some(snapshot)) => snapshot.cursor.as_bytes() == v2.snapshot_hash,
+            _ => false,
+        };
+
+        let output = if use_incremental {
+            let previous_children = &previous
+                .ok_or_else(|| {
+                    HandlerError::internal(
+                        "snapshot disappeared between lookup and diff".to_string(),
+                    )
+                })?
+                .children;
+            diff_snapshots(previous_children, &current, &entries, new_cursor.clone())
+        } else {
+            EnumerateChangesOutput {
+                added_or_modified: entries
+                    .iter()
+                    .cloned()
+                    .map(|entry| FileProviderItem::from(VfsItem::from(entry)))
+                    .collect(),
+                deleted: Vec::new(),
+                new_cursor: new_cursor.clone(),
+            }
+        };
+
+        snapshots.insert(
+            parent_key,
+            ParentSnapshot {
+                cursor: legacy_v1_cursor,
+                children: current,
+            },
+        );
+        Ok(output)
+    }
+
+    /// Refresh the stored snapshot for a parent and return its V1
+    /// SHA-256 hash for embedding in a V2 cursor.
+    ///
+    /// Called from the change-feed path after a successful `Delta` so
+    /// later snapshot-fallback calls (e.g. after an eviction) can still
+    /// produce a coherent diff against the most recent observed state.
+    async fn refresh_snapshot(
+        &self,
+        parent: &ItemId,
+        backend: &dyn Backend,
+    ) -> HandlerResult<Vec<u8>> {
+        let mut entries = backend
+            .list_children(parent.native_id())
+            .await
+            .map_err(HandlerError::from)?;
+        entries.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+        let legacy_v1_cursor = derive_cursor_from_sorted(&entries);
+        let snapshot_hash = legacy_v1_cursor.as_bytes().to_vec();
+        let current: HashMap<String, SnapshotEntry> = entries
+            .iter()
+            .map(|entry| (entry.id.0.clone(), SnapshotEntry::from_entry(entry)))
+            .collect();
+        let mut snapshots = self.snapshots.lock().await;
+        snapshots.insert(
+            parent.0.clone(),
+            ParentSnapshot {
+                cursor: legacy_v1_cursor,
+                children: current,
+            },
+        );
+        Ok(snapshot_hash)
+    }
+
     /// Materialise `src_entry` to a private staging file under the cache
     /// directory and return its path.
     ///
@@ -728,80 +1036,116 @@ impl FileProviderHandlers for EngineHandlers {
         since_cursor: Option<&SyncCursor>,
     ) -> HandlerResult<EnumerateChangesOutput> {
         let parent = ItemId(parent_id.to_string());
-        // Release the std::sync RwLock guard before awaiting the
-        // backend; same pattern as `current_sync_cursor` above.
-        let backend = self.backend_for(&parent)?;
+        let backend_id_owned = parent.backend_id().to_string();
 
-        // Snapshot the parent's current children, ordered the same way
-        // `derive_sync_cursor` orders them so the cursor we compute
-        // matches what `currentSyncCursor` would emit for an unchanged
-        // view.
-        let mut entries = backend
-            .list_children(parent.native_id())
-            .await
-            .map_err(HandlerError::from)?;
-        entries.sort_by(|a, b| a.id.0.cmp(&b.id.0));
-
-        let new_cursor = derive_cursor_from_sorted(&entries);
-        let current: HashMap<String, SnapshotEntry> = entries
-            .iter()
-            .map(|entry| (entry.id.0.clone(), SnapshotEntry::from_entry(entry)))
-            .collect();
-
-        let mut snapshots = self.snapshots.lock().await;
-        let previous = snapshots.get(parent_id);
-
-        // Decide whether to compute an incremental delta or fall back to
-        // the "treat everything as added" path. We fall back when:
-        //   - the caller did not supply a cursor;
-        //   - no snapshot exists for this parent (engine restart, first
-        //     observation);
-        //   - the supplied cursor does not match the stored snapshot's
-        //     cursor (the client is out of date).
-        let use_incremental = match (since_cursor, previous) {
-            (Some(cursor), Some(snapshot)) => snapshot.cursor == *cursor,
-            _ => false,
+        // Decode the caller's cursor. A V2 cursor that names this
+        // backend and parent feeds the change-feed path; anything else
+        // (legacy V1, malformed, mismatched parent, absent) drops to
+        // the snapshot fallback for this call only.
+        let decoded_v2 = match since_cursor {
+            Some(cursor) => SyncCursorV2::decode(cursor).map_err(HandlerError::internal)?,
+            None => None,
         };
-
-        let output = if use_incremental {
-            let previous_children = &previous
-                .ok_or_else(|| {
-                    // Unreachable: we only set use_incremental=true when
-                    // previous is Some, but expressing this with the
-                    // type system would require restructuring the match
-                    // above. The Internal error keeps us within the
-                    // strict-lints subset (no unwrap_used).
-                    HandlerError::internal(
-                        "snapshot disappeared between match and incremental branch".to_string(),
-                    )
-                })?
-                .children;
-            diff_snapshots(previous_children, &current, &entries, new_cursor.clone())
-        } else {
-            // First-call behaviour: every current child is "added", the
-            // deleted list is empty, and the engine takes a fresh
-            // snapshot so the next call carrying `new_cursor` can fall
-            // through to the incremental path.
-            EnumerateChangesOutput {
-                added_or_modified: entries
-                    .iter()
-                    .cloned()
-                    .map(|entry| FileProviderItem::from(VfsItem::from(entry)))
-                    .collect(),
-                deleted: Vec::new(),
-                new_cursor: new_cursor.clone(),
+        let feed_query = decoded_v2.as_ref().and_then(|cursor| {
+            if cursor.backend_id == backend_id_owned && cursor.parent_id == parent {
+                Some(cursor.feed_seq)
+            } else {
+                None
             }
-        };
+        });
 
-        snapshots.insert(
-            parent_id.to_string(),
-            ParentSnapshot {
-                cursor: new_cursor,
-                children: current,
-            },
-        );
-        Ok(output)
+        if let Some(since_seq) = feed_query {
+            let result = self
+                .change_feed
+                .parent_changes_since(&backend_id_owned, &parent, Some(since_seq))
+                .await;
+            if let ChangeQueryResult::Delta { events, new_seq } = result
+                && !events.is_empty()
+            {
+                // The feed has real per-parent events. Translate them
+                // and refresh the snapshot store so a future fallback
+                // call still produces a coherent diff against the
+                // post-event state.
+                let backend = backend_for_self(&self.vfs, &parent)?;
+                let snapshot_hash = self.refresh_snapshot(&parent, backend.as_ref()).await?;
+                let cursor_v2 = SyncCursorV2 {
+                    backend_id: backend_id_owned,
+                    parent_id: parent.clone(),
+                    feed_seq: new_seq,
+                    snapshot_hash,
+                };
+                let (added_or_modified, deleted) = translate_change_events(events);
+                return Ok(EnumerateChangesOutput {
+                    added_or_modified,
+                    deleted,
+                    new_cursor: cursor_v2.encode(),
+                });
+            }
+            // Empty Delta, Evicted, or Unknown — drop to the snapshot
+            // fallback so a stale-feed presenter still sees backend
+            // changes that arrived outside the change stream (e.g.
+            // tests using in-memory backends that mutate state
+            // directly).
+        }
+
+        self.enumerate_changes_via_snapshot(&parent, since_cursor, decoded_v2.as_ref())
+            .await
     }
+}
+
+/// Look up the backend that owns a parent ID without going through
+/// `&self` — useful inside `enumerate_changes` where we need to call
+/// `refresh_snapshot(&self, ..., backend: &dyn Backend)` after we
+/// already released the `std::sync::RwLock` guard once.
+fn backend_for_self(
+    vfs: &Arc<RwLock<VfsTree>>,
+    parent: &ItemId,
+) -> HandlerResult<Arc<dyn Backend>> {
+    let guard = vfs
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard
+        .backend_by_id(parent.backend_id())
+        .cloned()
+        .ok_or_else(|| {
+            HandlerError::not_found(format!(
+                "no backend registered for id {}",
+                parent.backend_id()
+            ))
+        })
+}
+
+/// Convert a vector of `Change` events into the `(added_or_modified,
+/// deleted)` pair the File Provider extension expects.
+///
+/// `Created` and `Updated` events surface as added-or-modified items;
+/// `Deleted` events surface as deleted IDs. The change feed has already
+/// split `Moved` events into a delete on the old parent and a create
+/// on the new parent, so this function does not need to handle them
+/// explicitly.
+fn translate_change_events(events: Vec<Change>) -> (Vec<FileProviderItem>, Vec<String>) {
+    let mut added_or_modified: Vec<FileProviderItem> = Vec::new();
+    let mut deleted: Vec<String> = Vec::new();
+    for event in events {
+        match event {
+            Change::Created(entry) | Change::Updated { new: entry, .. } => {
+                added_or_modified.push(FileProviderItem::from(VfsItem::from(entry)));
+            }
+            Change::Deleted(entry) => {
+                deleted.push(entry.id.0);
+            }
+            Change::Moved { from, to } => {
+                // The change feed partitions Moved events, so by the
+                // time they hit a presenter they should already be
+                // pairs of Deleted/Created. Defensively handle them
+                // anyway so a future feed change cannot break the
+                // presenter silently.
+                deleted.push(from.id.0);
+                added_or_modified.push(FileProviderItem::from(VfsItem::from(to)));
+            }
+        }
+    }
+    (added_or_modified, deleted)
 }
 
 /// Compute the per-parent cursor over an already-sorted child set.
@@ -1183,6 +1527,14 @@ mod tests {
         }
     }
 
+    /// Build a [`ChangeFeed`] over the given backends. Tests pass
+    /// `InMemoryBackend` (or wrapping fakes) directly; the helper does
+    /// the `Arc<dyn Backend>` coercion that the strict-lints workspace
+    /// rejects as a `trivial_casts` violation when written inline.
+    fn make_feed(backends: Vec<Arc<dyn Backend>>) -> Arc<ChangeFeed> {
+        Arc::new(ChangeFeed::start(backends))
+    }
+
     fn make_handlers() -> (EngineHandlers, Arc<InMemoryBackend>, tempfile::TempDir) {
         let backend = Arc::new(InMemoryBackend::new("stub"));
         let vfs = Arc::new(RwLock::new(VfsTree::new(backend.clone())));
@@ -1226,7 +1578,9 @@ mod tests {
             .unwrap()
             .insert(child_id.0.clone(), b"hello world".to_vec());
 
-        let handlers = EngineHandlers::new(vfs, db, cache_dir.path().to_path_buf());
+        let backend_dyn: Arc<dyn Backend> = backend.clone();
+        let feed = make_feed(vec![backend_dyn]);
+        let handlers = EngineHandlers::new(vfs, db, cache_dir.path().to_path_buf(), feed);
         (handlers, backend, cache_dir)
     }
 
@@ -1459,7 +1813,10 @@ mod tests {
             .unwrap()
             .insert(src_file_id.0.clone(), b"hello world".to_vec());
 
-        let handlers = EngineHandlers::new(vfs, db, cache_dir.path().to_path_buf());
+        let src_dyn: Arc<dyn Backend> = src.clone();
+        let dst_dyn: Arc<dyn Backend> = dst.clone();
+        let feed = make_feed(vec![src_dyn, dst_dyn]);
+        let handlers = EngineHandlers::new(vfs, db, cache_dir.path().to_path_buf(), feed);
         (handlers, src, dst, cache_dir)
     }
 
@@ -1893,7 +2250,10 @@ mod tests {
         seed_src_file(&src, &db, "a", "subdir", "a.txt", b"alpha");
         seed_src_file(&src, &db, "b", "subdir", "b.txt", b"bravo");
 
-        let handlers = EngineHandlers::new(vfs, db.clone(), cache_dir.path().to_path_buf());
+        let src_dyn: Arc<dyn Backend> = src.clone();
+        let dst_dyn: Arc<dyn Backend> = dst.clone();
+        let feed = make_feed(vec![src_dyn, dst_dyn]);
+        let handlers = EngineHandlers::new(vfs, db.clone(), cache_dir.path().to_path_buf(), feed);
 
         let err = handlers
             .move_item("src:subdir", "dst:root", "subdir")
@@ -2136,7 +2496,10 @@ mod tests {
             .unwrap()
             .insert(src_file_id.0.clone(), b"hello world".to_vec());
 
-        let handlers = EngineHandlers::new(vfs, db.clone(), cache_dir.path().to_path_buf());
+        let src_dyn: Arc<dyn Backend> = src.clone();
+        let dst_dyn: Arc<dyn Backend> = dst.clone();
+        let feed = make_feed(vec![src_dyn, dst_dyn]);
+        let handlers = EngineHandlers::new(vfs, db.clone(), cache_dir.path().to_path_buf(), feed);
 
         let err = handlers
             .move_item("src:file1", "dst:root", "renamed.txt")
@@ -2308,11 +2671,16 @@ mod tests {
         assert!(output.deleted.is_empty());
         assert!(!output.new_cursor.is_empty());
 
-        // The cursor we just got back must match what
-        // `currentSyncCursor` would emit right now — the two RPCs share
-        // a derivation, so consumers can interchange them freely.
-        let live_cursor = handlers.current_sync_cursor("stub:root").await.unwrap();
-        assert_eq!(live_cursor, output.new_cursor);
+        // The cursor returned by enumerate_changes is now a V2 wire
+        // cursor that names (backend, parent, feed seq); it is no
+        // longer the SHA-256 derivation that current_sync_cursor
+        // returns. Verify the new cursor decodes back to the right
+        // backend/parent pair.
+        let decoded = SyncCursorV2::decode(&output.new_cursor)
+            .expect("V2 cursor decodes")
+            .expect("V2 cursor matched the magic");
+        assert_eq!(decoded.backend_id, "stub");
+        assert_eq!(decoded.parent_id, ItemId::new("stub", "root"));
     }
 
     /// After the snapshot is taken, an unchanged view must yield no
@@ -2500,5 +2868,66 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::NotFound);
+    }
+
+    /// The cursor returned by the first call to `enumerate_changes` must
+    /// decode back to a V2 sync cursor that names the requested backend
+    /// and parent and stores the V1 SHA-256 snapshot hash. Subsequent
+    /// calls carrying that cursor must drive the change-feed path
+    /// rather than the snapshot fallback.
+    #[tokio::test]
+    async fn enumerate_changes_first_call_stores_v2_cursor_and_snapshot() {
+        let (handlers, _backend, _tempdir) = make_handlers();
+        let first = handlers.enumerate_changes("stub:root", None).await.unwrap();
+
+        let decoded = SyncCursorV2::decode(&first.new_cursor)
+            .expect("V2 cursor decodes")
+            .expect("V2 cursor matched the magic");
+        assert_eq!(decoded.backend_id, "stub");
+        assert_eq!(decoded.parent_id, ItemId::new("stub", "root"));
+        // The snapshot hash mirrors derive_sync_cursor for the same
+        // child set.
+        let live = handlers.current_sync_cursor("stub:root").await.unwrap();
+        assert_eq!(decoded.snapshot_hash, live.as_bytes());
+
+        // Replaying the same cursor with no change must return an
+        // empty delta and the same cursor.
+        let again = handlers
+            .enumerate_changes("stub:root", Some(&first.new_cursor))
+            .await
+            .unwrap();
+        assert!(again.added_or_modified.is_empty());
+        assert!(again.deleted.is_empty());
+        assert_eq!(again.new_cursor, first.new_cursor);
+    }
+
+    /// A stale V1 cursor (no `CF2` magic) must drop to the snapshot
+    /// fallback and be treated as a fresh enumeration on the first
+    /// observation, then resume cleanly on the next call.
+    #[tokio::test]
+    async fn enumerate_changes_legacy_v1_cursor_falls_back_to_snapshot() {
+        let (handlers, _backend, _tempdir) = make_handlers();
+        // Seed the snapshot store so the legacy cursor can be matched
+        // against it.
+        let _ = handlers.enumerate_changes("stub:root", None).await.unwrap();
+
+        // Fabricate a V1-shaped cursor that doesn't carry the V2 magic
+        // — this is what an older daemon would have stored on disk.
+        let legacy = handlers.current_sync_cursor("stub:root").await.unwrap();
+        let fallback = handlers
+            .enumerate_changes("stub:root", Some(&legacy))
+            .await
+            .unwrap();
+
+        // Snapshot fallback diffs against the stored snapshot, which
+        // matches the live state, so this is an empty delta.
+        assert!(fallback.added_or_modified.is_empty());
+        assert!(fallback.deleted.is_empty());
+        // But the returned cursor is now V2 so the next call resumes
+        // the feed path.
+        let new_decoded = SyncCursorV2::decode(&fallback.new_cursor)
+            .expect("V2 cursor decodes")
+            .expect("returned cursor must be V2 even after legacy input");
+        assert_eq!(new_decoded.backend_id, "stub");
     }
 }

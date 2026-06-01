@@ -184,7 +184,7 @@ impl FileEntry {
 }
 
 /// A change event from a backend.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Change {
     Created(FileEntry),
     Updated { old: FileEntry, new: FileEntry },
