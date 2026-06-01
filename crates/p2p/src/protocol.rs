@@ -214,9 +214,10 @@ pub struct FileInfo {
     ///
     /// Sequence space is per-INDEX (i.e. per backend instance) on the
     /// sender, not strictly per-DEVICE. Since each device runs exactly
-    /// one [`FolderIndex`] in the current implementation, the two are
-    /// equivalent here, but a future multi-folder-per-device design
-    /// would need a per-(device, folder) tracking key.
+    /// one `FolderIndex` (defined in `cascade-backend-p2p`) in the
+    /// current implementation, the two are equivalent here, but a
+    /// future multi-folder-per-device design would need a per-(device,
+    /// folder) tracking key.
     pub sequence: u64,
     /// Block size used for this file.
     pub block_size: u32,
