@@ -227,7 +227,7 @@ impl P2pBackend {
                 tokio::spawn(async move {
                     loop {
                         tokio::select! {
-                            () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                            () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
                                 gossip_sync.broadcast_gossip().await;
                             }
                             res = gossip_cancel.changed() => {
