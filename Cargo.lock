@@ -371,6 +371,7 @@ version = "0.1.34"
 dependencies = [
  "anyhow",
  "async-trait",
+ "cascade-relay-server",
  "chrono",
  "data-encoding",
  "futures-util",
