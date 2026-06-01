@@ -396,6 +396,7 @@ dependencies = [
  "async-trait",
  "cascade-engine",
  "chrono",
+ "data-encoding",
  "proptest",
  "serde",
  "serde_json",

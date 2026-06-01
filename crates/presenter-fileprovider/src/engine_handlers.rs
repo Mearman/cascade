@@ -13,6 +13,7 @@ use cascade_engine::backend::Backend;
 use cascade_engine::db::StateDb;
 use cascade_engine::types::{CacheState, FileEntry, FileId, ItemId, SyncCursor, VfsItem};
 use cascade_engine::vfs::{VfsTree, derive_sync_cursor};
+use data_encoding::BASE64URL_NOPAD;
 use tokio::io::AsyncWriteExt;
 
 use crate::handlers::{EnumerateOutput, FileProviderHandlers, HandlerError, HandlerResult};
@@ -21,6 +22,17 @@ use crate::items::FileProviderItem;
 /// Subdirectory inside the cache directory where File Provider materialised
 /// contents live. Each item gets its own folder keyed by sanitised ID.
 const CACHE_SUBDIR: &str = "file-provider";
+
+/// Number of children returned per `enumerateItems` request before the
+/// engine emits a `next_page` cursor.
+///
+/// The handler asks the backend for the full child list (the current
+/// `Backend::list_children` contract has no native page parameter) and
+/// slices it locally. A future round will push pagination down into the
+/// backend trait so the slice happens at the source. The size is chosen
+/// to match the default `NSFileProviderEnumerator` batch — 256 — which
+/// keeps each round-trip response well under macOS's XPC payload limit.
+const ENUMERATE_PAGE_SIZE: usize = 256;
 
 /// Production handler implementation.
 ///
@@ -116,24 +128,39 @@ impl FileProviderHandlers for EngineHandlers {
     async fn enumerate_items(
         &self,
         parent_id: &str,
-        _page: Option<&str>,
+        page: Option<&str>,
     ) -> HandlerResult<EnumerateOutput> {
         let parent = ItemId(parent_id.to_string());
         let backend = self.backend_for(&parent)?;
-        let entries = backend.list_children(parent.native_id()).await?;
+        let mut entries = backend.list_children(parent.native_id()).await?;
+
+        // Deterministic ordering — id is the only field guaranteed unique
+        // and stable across calls.
+        entries.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+
+        let after_id = decode_enumerate_page(page)?;
+        let start = after_id.as_deref().map_or(0, |last| {
+            entries
+                .iter()
+                .position(|entry| entry.id.0.as_str() > last)
+                .unwrap_or(entries.len())
+        });
+        let end = start.saturating_add(ENUMERATE_PAGE_SIZE).min(entries.len());
+
+        let next_page = if end < entries.len() {
+            entries
+                .get(end.saturating_sub(1))
+                .map(|entry| encode_enumerate_page(&entry.id.0))
+        } else {
+            None
+        };
 
         let items = entries
-            .into_iter()
-            .map(|entry| {
-                let vfs_item: VfsItem = entry.into();
-                FileProviderItem::from(vfs_item)
-            })
+            .drain(start..end)
+            .map(|entry| FileProviderItem::from(VfsItem::from(entry)))
             .collect();
 
-        Ok(EnumerateOutput {
-            items,
-            next_page: None,
-        })
+        Ok(EnumerateOutput { items, next_page })
     }
 
     async fn fetch_contents(&self, id: &str) -> HandlerResult<PathBuf> {
@@ -288,6 +315,34 @@ impl FileProviderHandlers for EngineHandlers {
         let cursor = derive_sync_cursor(backend.as_ref(), parent.native_id()).await?;
         Ok(cursor)
     }
+}
+
+/// Encode the last item ID of a returned page as the opaque wire cursor.
+///
+/// The wire cursor is base64url-no-pad of the raw ID bytes, which keeps
+/// the cursor JSON-safe (no quoting, no padding) without exposing the
+/// underlying ID format to the Swift side. Consumers must not interpret
+/// the bytes.
+fn encode_enumerate_page(last_id: &str) -> String {
+    BASE64URL_NOPAD.encode(last_id.as_bytes())
+}
+
+/// Decode an opaque wire cursor back into the last item ID it carries.
+///
+/// `None` or an empty string mean "first page". Malformed cursors map to
+/// `Internal` errors — the Swift side should always echo back what the
+/// engine emitted, so a decode failure indicates a protocol bug.
+fn decode_enumerate_page(page: Option<&str>) -> HandlerResult<Option<String>> {
+    let Some(encoded) = page.filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let bytes = BASE64URL_NOPAD
+        .decode(encoded.as_bytes())
+        .map_err(|error| HandlerError::internal(format!("invalid page cursor: {error}")))?;
+    let id = String::from_utf8(bytes).map_err(|error| {
+        HandlerError::internal(format!("page cursor is not valid UTF-8: {error}"))
+    })?;
+    Ok(Some(id))
 }
 
 /// Decode a `file://` URL or a bare path into a `PathBuf`.
@@ -830,5 +885,90 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::NotFound);
+    }
+
+    /// Populate the stub backend with `count` extra files under `stub:root`
+    /// with deterministic names so the sort order is stable and easy to
+    /// reason about across pages.
+    fn seed_children(backend: &InMemoryBackend, count: usize) {
+        let parent = ItemId::new("stub", "root");
+        for index in 0..count {
+            // Zero-pad to 4 digits so lexicographic sort matches numeric order.
+            let native = format!("p{index:04}");
+            let item_id = ItemId::new("stub", &native);
+            let entry = FileEntry {
+                id: item_id,
+                parent_id: parent.clone(),
+                name: format!("file-{index:04}.txt"),
+                is_dir: false,
+                size: Some(1),
+                mod_time: Some(Utc::now()),
+                mime_type: Some("text/plain".to_string()),
+                hash: None,
+            };
+            backend.insert(entry);
+        }
+    }
+
+    #[tokio::test]
+    async fn enumerate_items_returns_null_next_page_when_done() {
+        let (handlers, _backend, _tempdir) = make_handlers();
+        let output = handlers.enumerate_items("stub:root", None).await.unwrap();
+        // Only one seeded child; page size 256, so we're done in one shot.
+        assert_eq!(output.items.len(), 1);
+        assert!(output.next_page.is_none());
+    }
+
+    #[tokio::test]
+    async fn enumerate_items_paginates_when_more_than_one_page_of_children() {
+        let (handlers, backend, _tempdir) = make_handlers();
+        // Replace the seed child with a clean slate plus a known count.
+        backend
+            .files
+            .lock()
+            .unwrap()
+            .retain(|_, entry| entry.is_dir);
+        let total: usize = 600;
+        seed_children(&backend, total);
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut page_cursor: Option<String> = None;
+        loop {
+            let output = handlers
+                .enumerate_items("stub:root", page_cursor.as_deref())
+                .await
+                .unwrap();
+            for item in &output.items {
+                seen.push(item.id.clone());
+            }
+            match output.next_page {
+                Some(cursor) => page_cursor = Some(cursor),
+                None => break,
+            }
+            assert!(
+                seen.len() < total,
+                "consumed all items but engine kept emitting next_page"
+            );
+        }
+
+        assert_eq!(
+            seen.len(),
+            total,
+            "all children must be returned exactly once"
+        );
+        let mut deduped = seen.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(deduped.len(), total, "no duplicates across pages");
+    }
+
+    #[tokio::test]
+    async fn enumerate_items_rejects_malformed_page_cursor() {
+        let (handlers, _backend, _tempdir) = make_handlers();
+        let err = handlers
+            .enumerate_items("stub:root", Some("!!!not-base64!!!"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Internal);
     }
 }
