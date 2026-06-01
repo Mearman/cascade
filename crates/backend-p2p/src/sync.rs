@@ -398,10 +398,14 @@ impl SyncEngine {
     /// Record a successful peer contact in the local `PeerBook`. A
     /// repeat call for the same device ID overwrites the recorded
     /// address with the latest one — that matches the realistic case
-    /// of a peer reconnecting from a new IP.
+    /// of a peer reconnecting from a new IP. The contact time is
+    /// stamped via [`PeerBook::mark_seen`] so subsequent gossip
+    /// broadcasts can carry an accurate per-peer `last_seen` instead of
+    /// falling back to the broadcast time.
     async fn record_peer(&self, device_id: &str, address: SocketAddr) {
         let mut book = self.peer_book.write().await;
         book.add_peer(device_id.to_string(), vec![address]);
+        book.mark_seen(device_id, unix_timestamp_seconds());
     }
 
     /// Drive a peer session: send our handshake, then read frames and
@@ -595,6 +599,12 @@ impl SyncEngine {
                 anyhow::bail!("peer closed: {reason}")
             }
             BepMessage::Gossip { peers } => {
+                // Stamp the sender as just-seen — receiving a gossip
+                // frame from them is direct proof of reachability.
+                {
+                    let mut book = self.peer_book.write().await;
+                    book.mark_seen(peer_device_id, unix_timestamp_seconds());
+                }
                 self.merge_gossip(peer_device_id, peers).await;
                 Ok(())
             }

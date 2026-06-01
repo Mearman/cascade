@@ -36,7 +36,7 @@ impl KnownPeer {
     /// [`PeerBook::merge_gossip`] and rely on [`PeerBook::mark_seen`] to
     /// update the timestamp.
     #[must_use]
-    pub fn manual(device_id: String, addresses: Vec<SocketAddr>, last_seen: i64) -> Self {
+    pub const fn manual(device_id: String, addresses: Vec<SocketAddr>, last_seen: i64) -> Self {
         Self {
             device_id,
             addresses,
@@ -106,10 +106,10 @@ impl PeerBook {
     /// an unknown peer is a silent no-op (we don't speculatively insert
     /// an addressless entry).
     pub fn mark_seen(&mut self, device_id: &str, now_unix_seconds: i64) {
-        if let Some(entry) = self.peers.get_mut(device_id) {
-            if now_unix_seconds > entry.last_seen {
-                entry.last_seen = now_unix_seconds;
-            }
+        if let Some(entry) = self.peers.get_mut(device_id)
+            && now_unix_seconds > entry.last_seen
+        {
+            entry.last_seen = now_unix_seconds;
         }
     }
 
