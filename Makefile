@@ -1,4 +1,4 @@
-.PHONY: start stop build dev debug release
+.PHONY: start stop build dev debug release fileprovider-smoke
 
 BINARY := ./target/release/cascade
 
@@ -22,3 +22,26 @@ dev:
 
 debug: release
 	exec env RUST_LOG="$${RUST_LOG:-debug}" $(BINARY) start
+
+# Build the macOS File Provider host app and extension, then open the host
+# app so the developer can click "Register File Provider" to register the
+# Cascade domain with macOS. No automated registration — that step requires
+# an interactive UI click in the host app window.
+#
+# Prerequisites: macOS 15.4+, Xcode CLT. See docs/fileprovider-smoke-test.md
+# for the full step-by-step guide including backend setup and Finder operations.
+fileprovider-smoke:
+	xcodebuild \
+		-project swift/CascadeFileProvider.xcodeproj \
+		-scheme CascadeFileProviderHost \
+		-configuration Debug \
+		-destination "platform=macOS" \
+		build
+	open "$$(xcodebuild \
+		-project swift/CascadeFileProvider.xcodeproj \
+		-scheme CascadeFileProviderHost \
+		-configuration Debug \
+		-destination "platform=macOS" \
+		-showBuildSettings \
+		2>/dev/null \
+		| awk '/BUILT_PRODUCTS_DIR/{print $$3}')/CascadeFileProviderHost.app"
