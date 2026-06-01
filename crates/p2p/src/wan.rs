@@ -14,6 +14,8 @@ use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
 
+use crate::traversal::NatType;
+
 /// A known peer, potentially learned via introducer gossip.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct KnownPeer {
@@ -28,6 +30,18 @@ pub struct KnownPeer {
     /// — applies to peers introduced via gossip but never contacted
     /// directly.
     pub last_seen: i64,
+    /// Most recent `NAT` classification observed for this peer. `None`
+    /// means we have never received a candidate exchange from them
+    /// (or the field was loaded from an older on-disk record). Used by
+    /// the traversal coordinator to pre-select a strategy without
+    /// repeating STUN detection.
+    #[serde(default)]
+    pub last_known_nat_type: Option<NatType>,
+    /// Relay endpoint the peer advertised as its own (or one it can be
+    /// reached through). `None` if the peer never advertised a relay
+    /// — typical for peers on directly-reachable addresses.
+    #[serde(default)]
+    pub relay_endpoint: Option<SocketAddr>,
 }
 
 impl KnownPeer {
@@ -42,6 +56,8 @@ impl KnownPeer {
             addresses,
             introduced_by: Vec::new(),
             last_seen,
+            last_known_nat_type: None,
+            relay_endpoint: None,
         }
     }
 }
@@ -93,6 +109,8 @@ impl PeerBook {
                 addresses,
                 introduced_by: Vec::new(),
                 last_seen: 0,
+                last_known_nat_type: None,
+                relay_endpoint: None,
             },
         );
     }
@@ -152,6 +170,8 @@ impl PeerBook {
                         addresses: gossip_peer.addresses.clone(),
                         introduced_by: vec![introducer_id.to_string()],
                         last_seen: 0,
+                        last_known_nat_type: None,
+                        relay_endpoint: None,
                     },
                 );
             }
@@ -427,5 +447,44 @@ mod tests {
         let book = PeerBook::new();
         let gossip = book.build_gossip("ANYONE", "SELF");
         assert!(gossip.peers.is_empty());
+    }
+
+    #[test]
+    fn known_peer_round_trips_with_nat_type_and_relay_endpoint() {
+        // Construct a peer with both optional fields populated and
+        // round-trip it through `serde_json` to confirm the wire
+        // shape is stable. The `#[serde(default)]` attributes mean
+        // older records (missing the fields) load with `None`, which
+        // is exercised by the next test.
+        let relay = SocketAddr::from(([198, 51, 100, 7], 3478));
+        let peer = KnownPeer {
+            device_id: "DEVICE-A".to_string(),
+            addresses: vec![addr(22000)],
+            introduced_by: vec!["INTRODUCER".to_string()],
+            last_seen: 1_700_000_000,
+            last_known_nat_type: Some(NatType::PortRestrictedCone),
+            relay_endpoint: Some(relay),
+        };
+        let encoded = serde_json::to_string(&peer).expect("serialise");
+        let decoded: KnownPeer = serde_json::from_str(&encoded).expect("deserialise");
+        assert_eq!(decoded, peer);
+    }
+
+    #[test]
+    fn known_peer_decodes_legacy_records_with_default_none() {
+        // Older on-disk records pre-date the two new fields. The
+        // `#[serde(default)]` attribute makes them load as `None`,
+        // matching the documented "never observed" semantics.
+        let legacy_json = serde_json::json!({
+            "device_id": "DEVICE-LEGACY",
+            "addresses": ["127.0.0.1:22000"],
+            "introduced_by": [],
+            "last_seen": 0
+        })
+        .to_string();
+        let decoded: KnownPeer =
+            serde_json::from_str(&legacy_json).expect("legacy record must load");
+        assert_eq!(decoded.last_known_nat_type, None);
+        assert_eq!(decoded.relay_endpoint, None);
     }
 }

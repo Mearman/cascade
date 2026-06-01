@@ -24,6 +24,8 @@
 
 use std::net::SocketAddr;
 
+use serde::{Deserialize, Serialize};
+
 use crate::candidate::Candidate;
 
 /// Detected `NAT` classification for one peer.
@@ -35,7 +37,7 @@ use crate::candidate::Candidate;
 /// this module and reports only `Public` / `Symmetric` from the
 /// current single-server STUN probe. The two will be reconciled when
 /// the RFC 5780 two-server detection lands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NatType {
     /// Host is directly reachable on a public address (no `NAT`).
     Open,
