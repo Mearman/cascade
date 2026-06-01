@@ -768,11 +768,10 @@ mod tests {
     /// One event the [`MockTransport`] returns from `recv_probe`.
     ///
     /// The state machine consumes one event per burst. The test queues
-    /// events in the order the bursts run. Transport-level errors on
-    /// the receive side are not currently exercised through this enum
-    /// because the propagation path is covered by
-    /// [`MockTransport::with_send_error`] — both paths funnel into
-    /// [`PunchError::Transport`].
+    /// events in the order the bursts run. `Error` exercises the
+    /// recv-side transport-failure path that funnels into
+    /// [`PunchError::Transport`] — distinct from the send-side path,
+    /// which `MockTransport::with_send_error` covers.
     #[derive(Debug, Clone)]
     enum MockRecvEvent {
         /// Return a probe. State machine compares the nonce against the
@@ -781,6 +780,10 @@ mod tests {
         /// Return [`io::ErrorKind::TimedOut`] — the state machine treats
         /// this as "no receipt this burst" and moves on.
         Timeout,
+        /// Return an [`io::Error`] with the supplied kind and message.
+        /// The state machine surfaces this as
+        /// [`PunchError::Transport`] without continuing.
+        Error(io::ErrorKind, &'static str),
     }
 
     /// Deterministic in-memory transport. Sends are recorded; receives
@@ -835,6 +838,7 @@ mod tests {
                 MockRecvEvent::Timeout => {
                     Err(io::Error::new(io::ErrorKind::TimedOut, "mock recv timeout"))
                 }
+                MockRecvEvent::Error(kind, msg) => Err(io::Error::new(kind, msg)),
             }
         }
     }
@@ -1017,6 +1021,33 @@ mod tests {
             }
             other => panic!("expected Transport, got {other:?}"),
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn punch_propagates_recv_transport_error() {
+        let pair = punch_pair();
+        let clock = MockClock::new(Instant::now(), 1_000);
+        let sync = future_agreement(&clock, 123);
+        // First burst's recv fails with a non-`TimedOut` error. The
+        // state machine must surface the failure verbatim instead of
+        // treating it as "no probe, advance burst".
+        let transport = MockTransport::new(vec![MockRecvEvent::Error(
+            io::ErrorKind::ConnectionReset,
+            "synthetic recv failure",
+        )]);
+
+        let err = run_hole_punch(&transport, &pair, &sync, &snug_config(), &clock)
+            .await
+            .unwrap_err();
+
+        match err {
+            PunchError::Transport(e) => {
+                assert_eq!(e.kind(), io::ErrorKind::ConnectionReset);
+            }
+            other => panic!("expected Transport, got {other:?}"),
+        }
+        // Probes for the first burst were sent before the recv failed.
+        assert_eq!(transport.sent_count(), 2);
     }
 
     #[tokio::test(start_paused = true)]
