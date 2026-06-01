@@ -6,7 +6,7 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 
 use crate::backend::Backend;
-use crate::types::{Change, DirEntry, FileId, ItemId, SyncCursor};
+use crate::types::{Change, DirEntry, FileEntry, FileId, ItemId, SyncCursor};
 
 /// VFS tree that routes operations to the correct backend by longest-prefix match.
 pub struct VfsTree {
@@ -141,6 +141,19 @@ impl VfsTree {
             .iter()
             .find(|(_, backend)| backend.id() == id)
             .map(|(_, backend)| backend)
+    }
+
+    /// List the immediate children of a directory identified by its `ItemId`.
+    ///
+    /// Routes to the owning backend via `backend_id`, then calls
+    /// `Backend::list_children` with the native ID portion. Returns
+    /// `BackendError::NotFound` wrapped in `anyhow::Error` when no backend
+    /// is registered for the item's `backend_id`.
+    pub async fn list_children_by_id(&self, id: &ItemId) -> anyhow::Result<Vec<FileEntry>> {
+        let backend = self.backend_by_id(id.backend_id()).ok_or_else(|| {
+            anyhow::anyhow!("no backend registered for item id {}", id.backend_id())
+        })?;
+        backend.list_children(id.native_id()).await
     }
 
     /// Return the cursor representing the current state of all items
