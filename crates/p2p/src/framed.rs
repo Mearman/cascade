@@ -1,8 +1,22 @@
-//! Async BEP message framing over a direct TLS peer connection.
+//! Async BEP message framing.
 //!
-//! Wraps a `TlsStream` and yields a split read/write pair that speak
-//! [`BepMessage`] frames. Each frame is `[4-byte big-endian length][body]`
-//! as produced by [`super::protocol::encode_message`].
+//! Two layers live in this module:
+//!
+//! - [`FramedPeer`] wraps a direct TLS stream and yields a split
+//!   read/write pair. It is the original entry point, predates the
+//!   unified [`crate::transport::Transport`] abstraction, and is
+//!   still used by the sync engine for the direct TCP+TLS path.
+//! - [`FramedSession`] wraps any [`crate::transport::Transport`] —
+//!   relay, punched UDP, or TLS — and yields a single send/recv
+//!   surface speaking [`BepMessage`]. The post-punch and post-relay
+//!   paths produce a `Transport` and drive a [`FramedSession`] over
+//!   it; no second framing layer is needed because the trait already
+//!   carries one BEP frame per call.
+//!
+//! Both layers agree on the same wire format: each frame is
+//! `[4-byte big-endian length][body]` as produced by
+//! [`crate::protocol::encode_message`] and consumed by
+//! [`crate::protocol::decode_message`].
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
@@ -11,6 +25,7 @@ use tokio_rustls::TlsStream;
 
 use crate::connection::PeerConnection;
 use crate::protocol::{BepMessage, decode_message, encode_message};
+use crate::transport::{Transport, TransportReader, TransportWriter};
 
 /// Maximum permitted BEP frame body size (16 MiB).
 ///
@@ -82,6 +97,103 @@ impl FramedReader {
             .context("reading BEP frame body")?;
         let msg = decode_message(&frame).context("decoding BEP frame")?;
         Ok(Some(msg))
+    }
+}
+
+/// BEP-framed session over any [`Transport`].
+///
+/// `FramedSession` is the generic counterpart to [`FramedPeer`]: it
+/// owns a [`Transport`] and exposes a [`SessionReader`] /
+/// [`SessionWriter`] pair speaking [`BepMessage`] rather than raw
+/// bytes. Each underlying [`Transport`] call carries exactly one BEP
+/// frame, so the wrapper is a thin encode/decode layer with no
+/// buffering of its own.
+///
+/// Use this when the underlying connectivity is something other than
+/// the direct TLS path — punched UDP or relay-tunnelled WebSocket —
+/// or when you want a single session API across all three. The TLS
+/// path can still use the original [`FramedPeer`] without change;
+/// both speak the same wire format.
+pub struct FramedSession<T: Transport> {
+    transport: T,
+}
+
+impl<T: Transport> std::fmt::Debug for FramedSession<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FramedSession").finish_non_exhaustive()
+    }
+}
+
+impl<T: Transport> FramedSession<T> {
+    /// Wrap a [`Transport`] for BEP-level send/recv.
+    pub const fn new(transport: T) -> Self {
+        Self { transport }
+    }
+
+    /// Split into independent BEP-level read and write halves.
+    pub fn split(self) -> (SessionReader<T::Reader>, SessionWriter<T::Writer>) {
+        let (reader, writer) = self.transport.split();
+        (
+            SessionReader { inner: reader },
+            SessionWriter { inner: writer },
+        )
+    }
+}
+
+/// Read half of a [`FramedSession`].
+pub struct SessionReader<R: TransportReader> {
+    inner: R,
+}
+
+impl<R: TransportReader> std::fmt::Debug for SessionReader<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionReader").finish_non_exhaustive()
+    }
+}
+
+impl<R: TransportReader> SessionReader<R> {
+    /// Receive one BEP message, or `Ok(None)` on clean EOF.
+    pub async fn recv(&mut self) -> Result<Option<BepMessage>> {
+        let Some(frame) = self
+            .inner
+            .recv_frame()
+            .await
+            .context("receiving BEP frame via transport")?
+        else {
+            return Ok(None);
+        };
+        let msg = decode_message(&frame).context("decoding BEP frame from transport")?;
+        Ok(Some(msg))
+    }
+}
+
+/// Write half of a [`FramedSession`].
+pub struct SessionWriter<W: TransportWriter> {
+    inner: W,
+}
+
+impl<W: TransportWriter> std::fmt::Debug for SessionWriter<W> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionWriter").finish_non_exhaustive()
+    }
+}
+
+impl<W: TransportWriter> SessionWriter<W> {
+    /// Encode and send one BEP message.
+    pub async fn send(&mut self, msg: &BepMessage) -> Result<()> {
+        let frame = encode_message(msg).context("encoding BEP frame for session")?;
+        self.inner
+            .send_frame(&frame)
+            .await
+            .context("sending BEP frame via transport")
+    }
+
+    /// Shut down the underlying transport writer.
+    pub async fn shutdown(&mut self) -> Result<()> {
+        self.inner
+            .shutdown()
+            .await
+            .context("shutting down BEP session transport")
     }
 }
 
@@ -194,6 +306,99 @@ mod tests {
         cw.inner.flush().await.unwrap();
         let err = sr.recv().await.unwrap_err();
         assert!(err.to_string().contains("exceeds limit"));
+    }
+
+    /// A `FramedSession` over the in-memory channel transport must
+    /// round-trip the three BEP frames the M2 milestone needs to
+    /// drive: the cluster handshake (analogous to "Hello"), a block
+    /// `Request`, and the matching `Response`. This is the synthetic
+    /// transport pair the milestone asks for — no real sockets are
+    /// touched, so the test runs in microseconds and exercises only
+    /// the encode/decode + Transport plumbing.
+    #[tokio::test]
+    async fn framed_session_round_trips_hello_request_response() {
+        use crate::protocol::{FileInfo, Folder, Version};
+        use crate::transport::test_support::ChannelTransport;
+
+        let (client_t, server_t) = ChannelTransport::pair();
+        let (mut client_r, mut client_w) = FramedSession::new(client_t).split();
+        let (mut server_r, mut server_w) = FramedSession::new(server_t).split();
+
+        // Hello-equivalent: ClusterConfig naming the shared folder.
+        let hello = BepMessage::ClusterConfig {
+            folders: vec![Folder {
+                id: "shared".into(),
+                label: "Shared".into(),
+            }],
+        };
+        client_w.send(&hello).await.unwrap();
+        let got = server_r.recv().await.unwrap().unwrap();
+        assert_eq!(got, hello);
+
+        // The server replies with an Index naming the file the client
+        // is about to ask for. Keeps the test self-contained: a real
+        // session would not necessarily emit the Index before the
+        // Request, but for the BEP exchange wiring all that matters
+        // is that each frame is parseable on the other side.
+        let index = BepMessage::Index {
+            folder: "shared".into(),
+            files: vec![FileInfo {
+                name: "doc.txt".into(),
+                file_type: 0,
+                size: 11,
+                modified: 1_700_000_000,
+                sequence: 1,
+                block_size: 128 * 1024,
+                deleted: false,
+                invalid: false,
+                no_permissions: false,
+                version: Version {
+                    counters: vec![(7, 1)],
+                },
+                block_hashes: vec![[42u8; 32]],
+            }],
+        };
+        server_w.send(&index).await.unwrap();
+        let got = client_r.recv().await.unwrap().unwrap();
+        assert_eq!(got, index);
+
+        // Request the only block.
+        let request = BepMessage::Request {
+            request_id: 1,
+            folder: "shared".into(),
+            name: "doc.txt".into(),
+            block_offset: 0,
+            block_size: 11,
+            block_hash: [42u8; 32],
+        };
+        client_w.send(&request).await.unwrap();
+        let got = server_r.recv().await.unwrap().unwrap();
+        assert_eq!(got, request);
+
+        // Server echoes the data.
+        let response = BepMessage::Response {
+            request_id: 1,
+            data: b"hello world".to_vec(),
+        };
+        server_w.send(&response).await.unwrap();
+        let got = client_r.recv().await.unwrap().unwrap();
+        assert_eq!(got, response);
+    }
+
+    /// Dropping the peer's session must surface as `Ok(None)` on the
+    /// surviving side — the same contract `FramedPeer` exposes for
+    /// TLS clean close, propagated by the Transport adapter.
+    #[tokio::test]
+    async fn framed_session_recv_returns_none_on_drop() {
+        use crate::transport::test_support::ChannelTransport;
+
+        let (client_t, server_t) = ChannelTransport::pair();
+        // Drop the client side entirely so no sender keeps the channel
+        // alive. The server's recv must then surface `Ok(None)`.
+        drop(client_t);
+        let (mut server_r, _server_w) = FramedSession::new(server_t).split();
+        let got = server_r.recv().await.unwrap();
+        assert!(got.is_none(), "expected None on clean EOF");
     }
 
     /// Truncated mid-body must surface as a read error, not silently as
