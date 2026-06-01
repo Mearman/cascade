@@ -48,6 +48,13 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
         observer.finishEnumeratingChanges(upTo: syncAnchor, moreComing: false)
     }
 
+    // TODO(fileprovider): once the Rust bridge exposes a stable change
+    // cursor (e.g. a `currentSyncCursor` method returning an opaque
+    // byte string the engine increments per write), return its bytes
+    // here. Returning an empty Data tells the system the anchor is
+    // meaningless, which forces a full re-enumeration on every sync
+    // tick. Acceptable while the engine cursor isn't wired through;
+    // not acceptable for steady-state operation.
     func currentSyncAnchor(completionHandler: @escaping (NSFileProviderSyncAnchor?) -> Void) {
         completionHandler(NSFileProviderSyncAnchor(Data()))
     }

@@ -86,12 +86,12 @@ The old `Package.swift` is deleted. SwiftPM cannot describe the host/extension t
 
 - Host:        `io.cascade.CascadeFileProviderHost`        (`.app`)
 - Extension:   `io.cascade.CascadeFileProviderHost.FileProvider` (`.appex`)
-- App Group:   `group.io.cascade.shared` (declared in entitlements; not yet consumed by the bridge — the wire is still the Unix domain socket)
+- App Group:   `group.io.cascade.shared` is *not* declared on the entitlements files at rest. The wire is still the Unix domain socket so an App Group adds no functional value yet; declaring it would require a provisioning profile and break `xcodebuild` on clones without an Apple developer account. The entitlements files carry an inline commented-out block to restore once a team identity is configured.
 - Deployment:  macOS 12.0 for both targets
 - Swift:       `SWIFT_VERSION = 5.0` (the language mode, not the toolchain version — Swift 6.2.3 builds Swift 5 mode by default)
-- Signing:     `CODE_SIGN_IDENTITY = "-"`, `CODE_SIGN_STYLE = Manual`, `DEVELOPMENT_TEAM = ""`, `CODE_SIGNING_ALLOWED = NO`
+- Signing:     `CODE_SIGN_IDENTITY = "-"`, `CODE_SIGN_STYLE = Manual`, `DEVELOPMENT_TEAM = ""`, `CODE_SIGNING_ALLOWED = YES`, `CODE_SIGNING_REQUIRED = NO`
 
-`CODE_SIGNING_ALLOWED = NO` lets the project build out of the box on any machine without a paid developer account. App Group entitlements and App Sandbox both require a real provisioning profile under ad-hoc signing, which a public clone cannot get; disabling signing for unsigned local builds is the conventional escape valve.
+Ad-hoc signing with `CODE_SIGNING_ALLOWED = YES` produces a real (locally-signed) `.appex` so `NSFileProviderManager.add(_:completionHandler:)` will accept it — `CODE_SIGNING_ALLOWED = NO` would emit an unsigned binary that macOS refuses to register. `CODE_SIGNING_REQUIRED = NO` keeps the project building on any clone without a developer account; combined with `CODE_SIGN_IDENTITY = "-"`, every clone gets a signed-but-not-trusted artefact, which is enough for local development and CI but not for distribution.
 
 To produce a signed, distributable build, override these at the command line:
 
@@ -141,7 +141,7 @@ Both sets coexist on the same socket; the engine routes incoming requests to its
 - Wire the inbound RPC handlers on the Rust side so the Swift extension's `getItem`, `enumerateItems`, `importDocument`, `createDirectory`, `deleteItem`, and `moveItem` calls actually reach the engine. The Swift TODO comments name each gap (`Sources/ActionHandler.swift`, `Sources/CascadeFileProvider.swift`, `Sources/FileProviderEnumerator.swift`).
 - Add a real sync anchor cursor to the bridge so `FileProviderEnumerator.enumerateChanges` can return deltas instead of always reporting "no changes since". The replicated API will fall back to full enumeration without it, so this is an optimisation rather than a correctness issue.
 - Add a `setAttributes` RPC for capability and metadata round-trips; `ActionHandler.modifyItem` currently re-reads the item rather than persisting attribute-only changes.
-- Replace `CODE_SIGNING_ALLOWED = NO` with a real signing identity once the project has a team and a provisioned App Group. The four bundle identifiers must match what the team has registered.
+- Replace ad-hoc signing with a real signing identity once the project has a team and a provisioned App Group: flip `CODE_SIGN_STYLE` to `Automatic`, set `DEVELOPMENT_TEAM`, set `CODE_SIGNING_REQUIRED = YES`, and uncomment the `com.apple.security.application-groups` block in both `*.entitlements` files. The four bundle identifiers must match what the team has registered.
 - Decide a distribution mechanism for the host app (Sparkle, App Store, signed `.zip`, embedded in the daemon installer). The host is only useful to register the domain; once registered, it can be quit.
 - Smoke-test by running the host app, clicking "Register File Provider", and observing the Cascade domain appear under Locations in Finder. Listing a directory should round-trip through the engine over the bridge.
 

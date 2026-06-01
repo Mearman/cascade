@@ -359,7 +359,7 @@
 				CODE_SIGN_ENTITLEMENTS = CascadeFileProvider/Resources/CascadeFileProvider.entitlements;
 				CODE_SIGN_IDENTITY = "-";
 				CODE_SIGN_STYLE = Manual;
-				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGNING_ALLOWED = YES;
 				CODE_SIGNING_REQUIRED = NO;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -387,7 +387,7 @@
 				CODE_SIGN_ENTITLEMENTS = CascadeFileProvider/Resources/CascadeFileProvider.entitlements;
 				CODE_SIGN_IDENTITY = "-";
 				CODE_SIGN_STYLE = Manual;
-				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGNING_ALLOWED = YES;
 				CODE_SIGNING_REQUIRED = NO;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -416,7 +416,7 @@
 				CODE_SIGN_ENTITLEMENTS = CascadeFileProvider/Resources/CascadeFileProviderHost.entitlements;
 				CODE_SIGN_IDENTITY = "-";
 				CODE_SIGN_STYLE = Manual;
-				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGNING_ALLOWED = YES;
 				CODE_SIGNING_REQUIRED = NO;
 				COMBINE_HIDPI_IMAGES = YES;
 				DEVELOPMENT_TEAM = "";
@@ -443,7 +443,7 @@
 				CODE_SIGN_ENTITLEMENTS = CascadeFileProvider/Resources/CascadeFileProviderHost.entitlements;
 				CODE_SIGN_IDENTITY = "-";
 				CODE_SIGN_STYLE = Manual;
-				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGNING_ALLOWED = YES;
 				CODE_SIGNING_REQUIRED = NO;
 				COMBINE_HIDPI_IMAGES = YES;
 				DEVELOPMENT_TEAM = "";

@@ -4,9 +4,8 @@
 <dict>
     <key>com.apple.security.app-sandbox</key>
     <true/>
-    <key>com.apple.security.application-groups</key>
-    <array>
-        <string>group.io.cascade.shared</string>
-    </array>
+    <!-- App Group entitlement intentionally omitted while signing is
+         ad-hoc; see CascadeFileProvider.entitlements for the reason and
+         the block to restore once a team identity is configured. -->
 </dict>
 </plist>

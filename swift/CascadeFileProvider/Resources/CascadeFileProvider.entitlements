@@ -4,11 +4,20 @@
 <dict>
     <key>com.apple.security.app-sandbox</key>
     <true/>
-    <key>com.apple.security.application-groups</key>
-    <array>
-        <string>group.io.cascade.shared</string>
-    </array>
     <key>com.apple.security.network.client</key>
     <true/>
+    <!-- App Group entitlement is intentionally omitted while signing is
+         ad-hoc.  com.apple.security.application-groups requires a
+         provisioning profile (a team-issued certificate); adding it
+         breaks `xcodebuild` on clones without an Apple developer
+         account.  Restore the following block when a development team
+         is configured, so the host app and the extension can share a
+         container:
+
+         <key>com.apple.security.application-groups</key>
+         <array>
+             <string>group.io.cascade.shared</string>
+         </array>
+    -->
 </dict>
 </plist>

@@ -268,8 +268,15 @@ const fn allow_delete(_path: &str, _is_directory: bool, _items: &HashMap<String,
         reason = "consumed only by Windows callbacks and unit tests"
     )
 )]
-pub struct HResultCode(i32);
+pub(crate) struct HResultCode(i32);
 
+#[cfg_attr(
+    not(any(target_os = "windows", test)),
+    allow(
+        dead_code,
+        reason = "consumed only by Windows callbacks and unit tests"
+    )
+)]
 impl HResultCode {
     /// Pack a Win32 error number into an `HRESULT` in the
     /// `FACILITY_WIN32` space, matching the `HRESULT_FROM_WIN32` C
@@ -279,7 +286,7 @@ impl HResultCode {
     /// positive `u32` values; the resulting `HRESULT` has the high
     /// bit set and the facility set to `7` (`FACILITY_WIN32`).
     #[must_use]
-    pub const fn from_win32(code: u32) -> Self {
+    pub(crate) const fn from_win32(code: u32) -> Self {
         // FACILITY_WIN32 = 7. The packing is
         // `((code & 0xFFFF) | (FACILITY_WIN32 << 16) | 0x80000000)`,
         // reinterpreted as a signed `i32`.
@@ -292,7 +299,7 @@ impl HResultCode {
     /// of `windows::core::HRESULT` on Windows; safe to feed straight
     /// into `windows::core::HRESULT(_)` at the FFI boundary.
     #[must_use]
-    pub const fn get(self) -> i32 {
+    pub(crate) const fn get(self) -> i32 {
         self.0
     }
 }
@@ -314,7 +321,7 @@ impl HResultCode {
 /// | `TimedOut` | 1460 | `ERROR_TIMEOUT` |
 /// | `BrokenPipe` | 109 | `ERROR_BROKEN_PIPE` |
 /// | `UnexpectedEof` | 38 | `ERROR_HANDLE_EOF` |
-/// | `WouldBlock` | 1237 | `ERROR_RETRY` |
+/// | `WouldBlock` | 997 | `ERROR_IO_PENDING` |
 /// | every other variant | 31 | `ERROR_GEN_FAILURE` |
 ///
 /// The Win32 constants live in `windows::Win32::Foundation::*`; the
@@ -341,7 +348,7 @@ pub(crate) fn hresult_for_io_error(err: &std::io::Error) -> HResultCode {
         std::io::ErrorKind::TimedOut => 1460,      // ERROR_TIMEOUT
         std::io::ErrorKind::BrokenPipe => 109,     // ERROR_BROKEN_PIPE
         std::io::ErrorKind::UnexpectedEof => 38,   // ERROR_HANDLE_EOF
-        std::io::ErrorKind::WouldBlock => 1237,    // ERROR_RETRY
+        std::io::ErrorKind::WouldBlock => 997,     // ERROR_IO_PENDING
         _ => 31,                                   // ERROR_GEN_FAILURE
     };
     HResultCode::from_win32(win32_code)
@@ -2354,7 +2361,7 @@ mod tests {
             (ErrorKind::TimedOut, 1460),
             (ErrorKind::BrokenPipe, 109),
             (ErrorKind::UnexpectedEof, 38),
-            (ErrorKind::WouldBlock, 1237),
+            (ErrorKind::WouldBlock, 997),
             // Variants not in the table fall through to
             // `ERROR_GEN_FAILURE` (31). Cover a representative
             // sample including the catch-all `Other`.
