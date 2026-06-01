@@ -76,6 +76,9 @@ nix = { version = "0.29", features = ["signal", "process"] }
 # Platform config / cache paths
 dirs = "6"
 
+# Network interface enumeration (used by cascade-p2p host candidate gathering)
+if-addrs = "0.15"
+
 [workspace.lints.rust]
 # Denied at workspace level. Per-site #[allow] requires explicit justification
 # (a comment naming the legitimate cross-platform or FFI need).

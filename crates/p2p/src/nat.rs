@@ -9,19 +9,36 @@
 //! * [`detect_nat_type_rfc5780`] — `RFC 5780` two-server detection that
 //!   classifies the full `NAT` taxonomy by issuing four Binding Requests
 //!   against a primary server (supporting `CHANGE-REQUEST`) and a
-//!   secondary server on a different `IP`.
+//!   secondary server on a different `IP`. Returns a
+//!   [`NatDetectionOutcome`] carrying both the [`NatType`] and the
+//!   server-reflexive `XOR-MAPPED-ADDRESS` observed during `Test I`.
 //!
-//! Both interfaces return the canonical [`crate::traversal::NatType`] —
+//! Both interfaces produce the canonical [`crate::traversal::NatType`] —
 //! the same enum the hole-punching decision tree consumes.
+//!
+//! In addition to detection, the module exposes two candidate-gathering
+//! helpers used by `ICE`-style connectivity establishment:
+//!
+//! * [`server_reflexive_candidate_from_addr`] — turn the external
+//!   address discovered by [`detect_nat_type_rfc5780`] into a
+//!   [`Candidate`] tagged as
+//!   [`CandidateKind::ServerReflexive`][crate::candidate::CandidateKind::ServerReflexive].
+//! * [`enumerate_host_candidates`] — walk every non-loopback, non-link-local
+//!   network interface address on the host and emit one
+//!   [`Candidate`] tagged as
+//!   [`CandidateKind::Host`][crate::candidate::CandidateKind::Host] per
+//!   remaining address.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use if_addrs::Interface;
 use thiserror::Error;
 use tokio::net::UdpSocket;
 use tokio::time::{Duration, timeout};
 
+use crate::candidate::{Candidate, CandidateKind};
 use crate::traversal::NatType;
 
 const BINDING_REQUEST: u16 = 0x0001;
@@ -67,6 +84,43 @@ pub enum NatDetectionError {
     /// classification cannot proceed past `Test II`.
     #[error("STUN server does not honour CHANGE-REQUEST")]
     NoChangeRequestSupport,
+}
+
+/// Outcome of an `RFC 5780` `NAT` detection run.
+///
+/// Carries both the classified [`NatType`] and the externally-mapped
+/// `SocketAddr` observed during `Test I`. The mapped address is what a
+/// remote peer would have to dial to reach the host through its `NAT`
+/// — it is the input to the
+/// [`CandidateKind::ServerReflexive`][crate::candidate::CandidateKind::ServerReflexive]
+/// candidate that gets gossiped to peers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NatDetectionOutcome {
+    /// Classified `NAT` taxonomy.
+    pub nat_type: NatType,
+    /// `XOR-MAPPED-ADDRESS` returned by the primary `STUN` server on
+    /// `Test I`. `None` only when `Test I` itself failed; in every
+    /// successful detection (including `Open`) this is populated.
+    external: Option<SocketAddr>,
+}
+
+impl NatDetectionOutcome {
+    /// Classified `NAT` taxonomy.
+    #[must_use]
+    pub const fn nat_type(&self) -> NatType {
+        self.nat_type
+    }
+
+    /// External (server-reflexive) `SocketAddr` observed during `Test I`.
+    ///
+    /// Returns `None` when no `STUN` response was decoded — `Test I`
+    /// must succeed for detection to return a value, so for any
+    /// outcome returned from [`detect_nat_type_rfc5780`] this is
+    /// always `Some`.
+    #[must_use]
+    pub const fn external_socket_addr(&self) -> Option<SocketAddr> {
+        self.external
+    }
 }
 
 /// Configuration for `RFC 5780` `NAT` detection.
@@ -273,15 +327,22 @@ async fn send_with_retries(
 pub async fn detect_nat_type_rfc5780(
     socket: &UdpSocket,
     config: &NatDetectionConfig,
-) -> Result<NatType, NatDetectionError> {
+) -> Result<NatDetectionOutcome, NatDetectionError> {
     // Test I — baseline binding against the primary server.
     let test_i = send_with_retries(socket, config.primary, 0, config).await?;
+    // The XOR-MAPPED-ADDRESS returned by Test I is the server-reflexive
+    // address. Stash it on the outcome regardless of which terminal
+    // branch the classifier reaches.
+    let external = Some(test_i.mapped);
 
     // If the mapped address matches the socket's local address, the host
     // is on a public address; no NAT is in the path.
     let local_address = socket.local_addr()?;
     if address_matches_local(local_address, test_i.mapped) {
-        return Ok(NatType::Open);
+        return Ok(NatDetectionOutcome {
+            nat_type: NatType::Open,
+            external,
+        });
     }
 
     // Record the primary's `OTHER-ADDRESS` (where it claims it can
@@ -328,7 +389,10 @@ pub async fn detect_nat_type_rfc5780(
         // Filtering allows traffic from any external host once a mapping
         // exists — full cone NAT (or open Internet, but we ruled that
         // out above by comparing the mapped address).
-        return Ok(NatType::FullCone);
+        return Ok(NatDetectionOutcome {
+            nat_type: NatType::FullCone,
+            external,
+        });
     }
 
     // Test III — ask the secondary server for its view of the mapped
@@ -336,7 +400,10 @@ pub async fn detect_nat_type_rfc5780(
     // implies the NAT is symmetric (mapping changes per destination).
     let test_iii = send_with_retries(socket, config.secondary, 0, config).await?;
     if test_iii.mapped != test_i.mapped {
-        return Ok(NatType::Symmetric);
+        return Ok(NatDetectionOutcome {
+            nat_type: NatType::Symmetric,
+            external,
+        });
     }
 
     // Test IV — ask the primary to respond from the same IP but a
@@ -351,8 +418,14 @@ pub async fn detect_nat_type_rfc5780(
     )
     .await;
     match test_iv {
-        Ok(_) => Ok(NatType::RestrictedCone),
-        Err(NatDetectionError::Timeout) => Ok(NatType::PortRestrictedCone),
+        Ok(_) => Ok(NatDetectionOutcome {
+            nat_type: NatType::RestrictedCone,
+            external,
+        }),
+        Err(NatDetectionError::Timeout) => Ok(NatDetectionOutcome {
+            nat_type: NatType::PortRestrictedCone,
+            external,
+        }),
         Err(other) => Err(NatDetectionError::MalformedStunResponse(error_label(
             &other,
         ))),
@@ -680,6 +753,105 @@ fn transaction_id() -> Result<[u8; STUN_TRANSACTION_ID_LEN]> {
             .ok_or_else(|| anyhow::anyhow!("transaction ID offset out of range"))?,
     );
     Ok(transaction_id)
+}
+
+/// Convert a `STUN`-derived external `SocketAddr` into a
+/// [`CandidateKind::ServerReflexive`] [`Candidate`].
+///
+/// `RFC 8445 §5.1.2.1` defines the candidate priority as
+/// `(type_pref << 24) + (local_pref << 8) + (256 - component_id)`. The
+/// type preference for server-reflexive is `100` per `RFC 8445 §5.1.2.2`
+/// (also encoded in [`CandidateKind::type_preference`]); the component
+/// id is `1` because Cascade carries exactly one ICE component. The
+/// caller supplies `local_preference`, typically derived from the local
+/// interface index (lower index = higher preference, so the value is
+/// usually computed as `u16::MAX - interface_index` to invert the
+/// ordering).
+#[must_use]
+pub const fn server_reflexive_candidate_from_addr(
+    external: SocketAddr,
+    local_preference: u16,
+) -> Candidate {
+    Candidate::new(external, CandidateKind::ServerReflexive, local_preference)
+}
+
+/// Enumerate one [`CandidateKind::Host`] candidate per non-loopback,
+/// non-IPv6-link-local network interface address on the host.
+///
+/// Walks [`if_addrs::get_if_addrs`] and applies two filters:
+///
+/// 1. Loopback addresses (`127.0.0.0/8`, `::1`) are skipped — they
+///    cannot be reached from any other host.
+/// 2. `IPv6` link-local addresses (`fe80::/10`) are skipped — they
+///    require a zone identifier to be useful and Cascade does not
+///    currently encode zones in [`Candidate::address`].
+///
+/// `IPv4` link-local (`169.254.0.0/16`) is *not* filtered — a peer on
+/// the same broadcast domain can still dial it.
+///
+/// `port` is applied uniformly to every emitted candidate; it is the
+/// BEP listen port of this host. `local_preference` for each candidate
+/// is derived from the interface index — interfaces appearing earlier
+/// in [`if_addrs::get_if_addrs`] (typically the primary physical
+/// interface) get a higher preference.
+///
+/// Returns an empty vector when the OS reports no interfaces or when
+/// the system call itself fails — host enumeration is best-effort and
+/// must never make the candidate-gathering path failable.
+#[must_use]
+pub fn enumerate_host_candidates(port: u16) -> Vec<Candidate> {
+    let interfaces = if_addrs::get_if_addrs().unwrap_or_default();
+    host_candidates_from_interfaces(&interfaces, port)
+}
+
+/// Pure helper consumed by [`enumerate_host_candidates`] and by tests.
+///
+/// Splitting the system call out lets unit tests inject a synthetic
+/// interface list without depending on the host's real network
+/// configuration.
+#[must_use]
+pub(crate) fn host_candidates_from_interfaces(
+    interfaces: &[Interface],
+    port: u16,
+) -> Vec<Candidate> {
+    let mut candidates = Vec::new();
+    for (index, interface) in interfaces.iter().enumerate() {
+        let ip = interface.addr.ip();
+        if ip.is_loopback() {
+            continue;
+        }
+        if let IpAddr::V6(v6) = ip
+            && is_ipv6_link_local(v6)
+        {
+            continue;
+        }
+        // Earlier interfaces get a higher local preference. Saturating
+        // cast keeps the value in `u16` even on systems that expose a
+        // very long interface list.
+        let local_preference = u16::MAX.saturating_sub(u16::try_from(index).unwrap_or(u16::MAX));
+        candidates.push(Candidate::new(
+            SocketAddr::new(ip, port),
+            CandidateKind::Host,
+            local_preference,
+        ));
+    }
+    candidates
+}
+
+/// Is `addr` an `IPv6` link-local address (`fe80::/10`)?
+///
+/// `Ipv6Addr::is_unicast_link_local` is the natural answer but it is
+/// still unstable on the pinned toolchain. Implementing the prefix
+/// check directly keeps the helper available on stable Rust.
+fn is_ipv6_link_local(addr: Ipv6Addr) -> bool {
+    // The first 10 bits of fe80::/10 are 1111111010 — equivalently the
+    // top byte is 0xfe and the upper two bits of the second byte are 10.
+    // `segments()` returns `[u16; 8]`; iterators are the easy way to
+    // pluck the first element without tripping `indexing_slicing`.
+    addr.segments()
+        .into_iter()
+        .next()
+        .is_some_and(|first| (first & 0xffc0) == 0xfe80)
 }
 
 #[cfg(test)]
@@ -1038,7 +1210,9 @@ mod tests {
             detect_nat_type_rfc5780(&probe_socket, &quick_config(primary_addr, secondary_addr))
                 .await
                 .unwrap();
-        assert_eq!(result, NatType::Open);
+        assert_eq!(result.nat_type, NatType::Open);
+        // Test I always populates the external mapped address.
+        assert_eq!(result.external_socket_addr(), Some(local));
     }
 
     #[tokio::test]
@@ -1085,7 +1259,8 @@ mod tests {
             detect_nat_type_rfc5780(&probe_socket, &quick_config(primary_addr, secondary_addr))
                 .await
                 .unwrap();
-        assert_eq!(result, NatType::FullCone);
+        assert_eq!(result.nat_type, NatType::FullCone);
+        assert_eq!(result.external_socket_addr(), Some(mapped));
     }
 
     #[tokio::test]
@@ -1128,7 +1303,11 @@ mod tests {
             detect_nat_type_rfc5780(&probe_socket, &quick_config(primary_addr, secondary_addr))
                 .await
                 .unwrap();
-        assert_eq!(result, NatType::Symmetric);
+        assert_eq!(result.nat_type, NatType::Symmetric);
+        // External mapping is recorded from Test I even when the NAT is
+        // symmetric — Test III's secondary mapping is only used for the
+        // classification, not for the candidate.
+        assert_eq!(result.external_socket_addr(), Some(mapped_primary));
     }
 
     #[tokio::test]
@@ -1171,7 +1350,8 @@ mod tests {
             detect_nat_type_rfc5780(&probe_socket, &quick_config(primary_addr, secondary_addr))
                 .await
                 .unwrap();
-        assert_eq!(result, NatType::RestrictedCone);
+        assert_eq!(result.nat_type, NatType::RestrictedCone);
+        assert_eq!(result.external_socket_addr(), Some(mapped));
     }
 
     #[tokio::test]
@@ -1211,7 +1391,8 @@ mod tests {
             detect_nat_type_rfc5780(&probe_socket, &quick_config(primary_addr, secondary_addr))
                 .await
                 .unwrap();
-        assert_eq!(result, NatType::PortRestrictedCone);
+        assert_eq!(result.nat_type, NatType::PortRestrictedCone);
+        assert_eq!(result.external_socket_addr(), Some(mapped));
     }
 
     #[tokio::test]
