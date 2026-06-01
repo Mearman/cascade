@@ -77,8 +77,9 @@ cargo build --release --features presenter-nfs
 cargo build --release --features presenter-fileprovider  # macOS only
 
 # Including Swift extensions (macOS)
-cargo build --release && cd swift/CascadeFileProvider && xcodebuild
-cargo build --release && cd swift/CascadeFSKit && xcodebuild
+cargo build --release
+xcodebuild -project swift/CascadeFileProvider.xcodeproj -scheme CascadeFileProviderHost -configuration Release -destination "platform=macOS" build
+cd swift/CascadeFSKit && xcodebuild
 ```
 
 The `Makefile` wraps the common workflows:
