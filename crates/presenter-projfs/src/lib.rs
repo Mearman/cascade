@@ -246,6 +246,57 @@ const fn allow_delete(_path: &str, _is_directory: bool, _items: &HashMap<String,
     true
 }
 
+/// Typed `HRESULT` code carried by [`ProviderReadOutcome::Failed`].
+///
+/// Wraps the same `i32` representation `windows::core::HRESULT` uses,
+/// but lives outside the `windows` crate so cross-platform code can
+/// construct, compare, and test these values without dragging the
+/// Win32 bindings into non-Windows builds. The Windows callback path
+/// pulls the inner `i32` out via [`Self::get`] and wraps it back into
+/// `windows::core::HRESULT` at the FFI boundary.
+///
+/// The value follows the `HRESULT_FROM_WIN32` C macro packing for
+/// Win32 facility codes: the low 16 bits hold the Win32 error code,
+/// `FACILITY_WIN32` (`7`) sits in the facility field, and the
+/// severity bit is set. Use [`Self::from_win32`] to construct from a
+/// Win32 error number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(
+    not(any(target_os = "windows", test)),
+    allow(
+        dead_code,
+        reason = "consumed only by Windows callbacks and unit tests"
+    )
+)]
+pub struct HResultCode(i32);
+
+impl HResultCode {
+    /// Pack a Win32 error number into an `HRESULT` in the
+    /// `FACILITY_WIN32` space, matching the `HRESULT_FROM_WIN32` C
+    /// macro for positive Win32 codes.
+    ///
+    /// Win32 error codes (e.g. `ERROR_FILE_NOT_FOUND = 2`) are
+    /// positive `u32` values; the resulting `HRESULT` has the high
+    /// bit set and the facility set to `7` (`FACILITY_WIN32`).
+    #[must_use]
+    pub const fn from_win32(code: u32) -> Self {
+        // FACILITY_WIN32 = 7. The packing is
+        // `((code & 0xFFFF) | (FACILITY_WIN32 << 16) | 0x80000000)`,
+        // reinterpreted as a signed `i32`.
+        #[allow(clippy::cast_possible_wrap)]
+        let value = ((code & 0x0000_FFFF) | (7 << 16) | 0x8000_0000) as i32;
+        Self(value)
+    }
+
+    /// The inner `i32` representation. Equivalent to the `.0` field
+    /// of `windows::core::HRESULT` on Windows; safe to feed straight
+    /// into `windows::core::HRESULT(_)` at the FFI boundary.
+    #[must_use]
+    pub const fn get(self) -> i32 {
+        self.0
+    }
+}
+
 /// Source of file bytes consulted by the `ProjFS` `GetFileData`
 /// callback when the OS asks for the contents of a virtualised file.
 ///
@@ -2170,6 +2221,53 @@ mod tests {
         // Past end of file returns empty, not error.
         let beyond = provider.read_range(&id, 100, 10).unwrap();
         assert!(beyond.is_empty());
+    }
+
+    /// `HResultCode::from_win32` reproduces the `HRESULT_FROM_WIN32` C
+    /// macro packing for positive Win32 codes — low 16 bits carry the
+    /// error number, facility 7 (`FACILITY_WIN32`) sits in the
+    /// facility field, and the severity bit is set. The exact value
+    /// `0x8007_0002` is what `HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)`
+    /// expands to in Win32 headers.
+    #[test]
+    fn hresult_code_packs_win32_error_with_facility_seven() {
+        // ERROR_FILE_NOT_FOUND = 2 → 0x80070002 as a signed i32.
+        let code = HResultCode::from_win32(2);
+        #[allow(clippy::cast_possible_wrap)]
+        let expected = 0x8007_0002_u32 as i32;
+        assert_eq!(code.get(), expected);
+
+        // ERROR_ACCESS_DENIED = 5 → 0x80070005.
+        let code = HResultCode::from_win32(5);
+        #[allow(clippy::cast_possible_wrap)]
+        let expected = 0x8007_0005_u32 as i32;
+        assert_eq!(code.get(), expected);
+
+        // ERROR_GEN_FAILURE = 31 → 0x8007001F.
+        let code = HResultCode::from_win32(31);
+        #[allow(clippy::cast_possible_wrap)]
+        let expected = 0x8007_001F_u32 as i32;
+        assert_eq!(code.get(), expected);
+
+        // ERROR_SUCCESS = 0 packs to 0x80070000 — the constructor does
+        // not special-case the zero code (matching the C macro for the
+        // positive branch).
+        let code = HResultCode::from_win32(0);
+        #[allow(clippy::cast_possible_wrap)]
+        let expected = 0x8007_0000_u32 as i32;
+        assert_eq!(code.get(), expected);
+    }
+
+    /// Only the low 16 bits of the Win32 code participate in the
+    /// packed `HRESULT`. Higher bits are masked off, mirroring the
+    /// `(x) & 0x0000FFFF` clause of `HRESULT_FROM_WIN32`.
+    #[test]
+    fn hresult_code_masks_high_bits_of_win32_code() {
+        // 0x12345 → low 16 bits are 0x2345, which packs to 0x80072345.
+        let code = HResultCode::from_win32(0x0001_2345);
+        #[allow(clippy::cast_possible_wrap)]
+        let expected = 0x8007_2345_u32 as i32;
+        assert_eq!(code.get(), expected);
     }
 
     /// `classify_read` collapses a `ContentProvider::read_range` result
