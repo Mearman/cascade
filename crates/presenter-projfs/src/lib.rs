@@ -71,12 +71,250 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use cascade_engine::presenter::VfsPresenter;
 use cascade_engine::types::{CacheState, ItemId, VfsItem};
 use tokio::sync::RwLock;
+
+/// State tracked for an in-flight directory enumeration session.
+///
+/// `ProjFS` opens an enumeration with `StartDirectoryEnumeration`, pulls
+/// entries one batch at a time through `GetDirectoryEnumeration`, and
+/// closes it with `EndDirectoryEnumeration`. Each session is identified
+/// by a [`windows::core::GUID`] (stored here as the equivalent `u128`
+/// for `cfg`-independent map keys). The session needs a stable, ordered
+/// view of the directory's children plus a cursor into that view so
+/// consecutive calls resume where the previous one left off.
+#[derive(Debug, Clone)]
+#[cfg_attr(
+    not(any(target_os = "windows", test)),
+    allow(
+        dead_code,
+        reason = "consumed only by Windows callbacks and unit tests"
+    )
+)]
+struct EnumerationState {
+    /// Snapshot of `(filename, basic-info)` pairs taken when the
+    /// enumeration was opened. Sorted by `PrjFileNameCompare`-equivalent
+    /// case-insensitive ordering so listings are deterministic.
+    entries: Vec<EnumerationEntry>,
+    /// Cursor into `entries`. The next `GetDirectoryEnumeration` call
+    /// resumes here.
+    position: usize,
+}
+
+/// One entry produced for an enumeration. Stripped of any data the
+/// callbacks do not need so the snapshot is cheap to clone.
+#[derive(Debug, Clone)]
+#[cfg_attr(
+    not(any(target_os = "windows", test)),
+    allow(
+        dead_code,
+        reason = "consumed only by Windows callbacks and unit tests"
+    )
+)]
+struct EnumerationEntry {
+    /// Display name as it appears in the directory listing.
+    name: String,
+    /// `true` for directories, `false` for files.
+    is_dir: bool,
+    /// File size in bytes, or `0` for directories / unknown.
+    size: u64,
+}
+
+/// Characters Windows forbids in filenames. Any item whose `name`
+/// contains one of these is skipped from enumeration with a debug log
+/// — emitting it would either fail at the `ProjFS` layer or produce a
+/// path the OS could not represent.
+const WINDOWS_FORBIDDEN_CHARS: &[char] = &['/', '\\', ':', '*', '?', '"', '<', '>', '|'];
+
+/// Return `true` when `name` is safe to surface through `ProjFS`. The
+/// check is intentionally cheap — it only rejects characters the
+/// Windows filesystem itself rejects. Higher-level filters (hidden
+/// files, reserved DOS names like `CON`/`PRN`) are left to the engine.
+#[cfg_attr(
+    not(any(target_os = "windows", test)),
+    allow(
+        dead_code,
+        reason = "consumed only by Windows callbacks and unit tests"
+    )
+)]
+fn is_safe_windows_filename(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    !name
+        .chars()
+        .any(|c| WINDOWS_FORBIDDEN_CHARS.contains(&c) || c == '\0')
+}
+
+/// Walk the parent chain of `start` until we find an item that does
+/// not exist in `items`. The returned `Vec` is in root-to-leaf order
+/// (i.e. `["dir1", "dir2", "file.txt"]`).
+#[cfg_attr(
+    not(any(target_os = "windows", test)),
+    allow(
+        dead_code,
+        reason = "consumed only by Windows callbacks and unit tests"
+    )
+)]
+fn ancestor_chain(start: &VfsItem, items: &HashMap<String, VfsItem>) -> Vec<String> {
+    let mut parts = vec![start.name.clone()];
+    let mut current_parent = start.parent_id.0.clone();
+    let mut seen = std::collections::HashSet::new();
+    while let Some(parent) = items.get(&current_parent) {
+        if !seen.insert(current_parent.clone()) {
+            break; // cycle defence
+        }
+        parts.push(parent.name.clone());
+        current_parent = parent.parent_id.0.clone();
+    }
+    parts.reverse();
+    parts
+}
+
+/// Normalise a `ProjFS` relative path into a slash-separated
+/// lowercase form for case-insensitive comparison.
+///
+/// `ProjFS` paths use backslashes and are case-insensitive on NTFS;
+/// the items map stores names with their original casing and no path
+/// separators. Comparing in lowercase slash form keeps the lookup
+/// independent of the source's casing.
+#[cfg_attr(
+    not(any(target_os = "windows", test)),
+    allow(
+        dead_code,
+        reason = "consumed only by Windows callbacks and unit tests"
+    )
+)]
+fn normalise_relative_path(raw: &str) -> String {
+    raw.trim_matches(|c: char| c == '/' || c == '\\')
+        .replace('\\', "/")
+        .to_lowercase()
+}
+
+/// Resolve a `ProjFS` relative path (e.g. `"dir1\\file.txt"`) to the
+/// matching item in `items`. Returns `None` if no item has that path.
+///
+/// `root_id` is the parent ID that every top-level item points at.
+/// When `None`, the lookup treats any item whose `parent_id` is not
+/// itself a key in `items` as a root entry — matches the legacy
+/// behaviour of presenters that have not been told their root.
+#[cfg_attr(
+    not(any(target_os = "windows", test)),
+    allow(
+        dead_code,
+        reason = "consumed only by Windows callbacks and unit tests"
+    )
+)]
+fn resolve_path<'a>(
+    relative: &str,
+    items: &'a HashMap<String, VfsItem>,
+    root_id: Option<&ItemId>,
+) -> Option<&'a VfsItem> {
+    let needle = normalise_relative_path(relative);
+    if needle.is_empty() {
+        // The root itself is not a regular item; callers handle it
+        // separately when they need to enumerate root.
+        return None;
+    }
+    items.values().find(|item| {
+        let chain = ancestor_chain(item, items);
+        // Only items rooted under `root_id` (if specified) participate
+        // in the projection. When no root_id is set, every item is
+        // eligible — matches the loose-root fallback documented in
+        // `ProjFsPresenter::with_root`.
+        if let Some(root) = root_id
+            && item_root(item, items).as_ref() != Some(root)
+        {
+            return false;
+        }
+        chain.join("/").to_lowercase() == needle
+    })
+}
+
+/// Compute the root ancestor's `parent_id` for `item`. Used when
+/// matching items against the configured `root_id`. The result is the
+/// `parent_id` of the topmost ancestor; for a top-level item this is
+/// the item's own `parent_id`.
+#[cfg_attr(
+    not(any(target_os = "windows", test)),
+    allow(
+        dead_code,
+        reason = "consumed only by Windows callbacks and unit tests"
+    )
+)]
+fn item_root(item: &VfsItem, items: &HashMap<String, VfsItem>) -> Option<ItemId> {
+    let mut current = item.parent_id.clone();
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        if !seen.insert(current.0.clone()) {
+            return None; // cycle
+        }
+        match items.get(&current.0) {
+            Some(parent) => current = parent.parent_id.clone(),
+            None => return Some(current),
+        }
+    }
+}
+
+/// Build an [`EnumerationState`] for a directory snapshot. Used by
+/// the Windows `StartDirectoryEnumeration` callback and the
+/// cross-platform tests covering enumeration semantics.
+#[cfg_attr(
+    not(any(target_os = "windows", test)),
+    allow(
+        dead_code,
+        reason = "consumed only by Windows callbacks and unit tests"
+    )
+)]
+fn build_enumeration_state(
+    parent_id: &ItemId,
+    items: &HashMap<String, VfsItem>,
+) -> EnumerationState {
+    EnumerationState {
+        entries: collect_children(parent_id, items),
+        position: 0,
+    }
+}
+
+/// Collect the children of `parent_id` from `items`, filter out
+/// anything Windows cannot represent, and return them sorted by name
+/// in case-insensitive order. The sort is what `ProjFS` expects:
+/// `PrjFileNameCompare` orders entries case-insensitively.
+#[cfg_attr(
+    not(any(target_os = "windows", test)),
+    allow(
+        dead_code,
+        reason = "consumed only by Windows callbacks and unit tests"
+    )
+)]
+fn collect_children(parent_id: &ItemId, items: &HashMap<String, VfsItem>) -> Vec<EnumerationEntry> {
+    let mut out: Vec<EnumerationEntry> = items
+        .values()
+        .filter(|item| &item.parent_id == parent_id)
+        .filter_map(|item| {
+            if is_safe_windows_filename(&item.name) {
+                Some(EnumerationEntry {
+                    name: item.name.clone(),
+                    is_dir: item.is_dir,
+                    size: item.size.unwrap_or(0),
+                })
+            } else {
+                tracing::debug!(
+                    name = %item.name,
+                    id = %item.id,
+                    "skipping item with name unsafe for Windows"
+                );
+                None
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out
+}
 
 /// Opaque handle to a running `ProjFS` virtualisation instance.
 ///
@@ -134,12 +372,48 @@ pub struct ProjFsPresenter {
     /// [`Self::upsert_item`] / [`Self::delete_item`] from the engine's
     /// sync runner, and read by the (future) `ProjFS` callbacks.
     items: Arc<RwLock<HashMap<String, VfsItem>>>,
+    /// Optional root `ItemId`. When set, only items whose ancestor
+    /// chain terminates at this id participate in the projection — the
+    /// same pattern used by the FUSE presenter. When unset, the
+    /// presenter treats every item in `items` as eligible.
+    root_id: Arc<RwLock<Option<ItemId>>>,
+    /// In-flight directory enumerations keyed by the `GUID` (stored as
+    /// `u128`) `ProjFS` issues at `StartDirectoryEnumeration`. The
+    /// callbacks are synchronous and called from kernel threads, so a
+    /// `std::sync::Mutex` keeps the access path off the Tokio runtime.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    enumerations: Arc<Mutex<HashMap<u128, EnumerationState>>>,
     /// Live `ProjFS` virtualisation handle. `Some` only between
     /// [`Self::start`] and [`Self::stop`] on Windows; always `None` on
     /// other platforms — but the field is kept on every target so the
     /// struct shape does not vary with `cfg`.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     handle: Arc<tokio::sync::Mutex<Option<NamespaceHandle>>>,
+    /// Heap-allocated callback context handed to `PrjStartVirtualizing`
+    /// via its `instance_context` parameter. The callbacks dereference
+    /// it back to access `items`, `root_id`, and `enumerations`. Held
+    /// here so it outlives the namespace handle and is dropped on
+    /// [`Self::stop`].
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    callback_ctx: Arc<tokio::sync::Mutex<Option<CallbackContext>>>,
+}
+
+/// State the `ProjFS` callbacks need to consult, packaged up so it can
+/// be passed through `PrjStartVirtualizing`'s `instance_context`
+/// pointer. The actual struct lives on the heap behind a `Box`; we
+/// keep the `Box`'s ownership in [`ProjFsPresenter::callback_ctx`] so
+/// it outlives the namespace handle.
+#[derive(Debug)]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+struct CallbackContext {
+    items: Arc<RwLock<HashMap<String, VfsItem>>>,
+    root_id: Arc<RwLock<Option<ItemId>>>,
+    enumerations: Arc<Mutex<HashMap<u128, EnumerationState>>>,
+    /// Owning pointer handed to `ProjFS`, stored as `usize` so the
+    /// field is `Send + Sync`. The pointer originally came from
+    /// `Box::into_raw(Box::new(CallbackContextInner { .. }))` and is
+    /// rebuilt with `Box::from_raw` on stop to free the allocation.
+    raw_ptr: usize,
 }
 
 impl ProjFsPresenter {
@@ -149,7 +423,10 @@ impl ProjFsPresenter {
         Self {
             mount_point: mount_point.into(),
             items: Arc::new(RwLock::new(HashMap::new())),
+            root_id: Arc::new(RwLock::new(None)),
+            enumerations: Arc::new(Mutex::new(HashMap::new())),
             handle: Arc::new(tokio::sync::Mutex::new(None)),
+            callback_ctx: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -158,6 +435,27 @@ impl ProjFsPresenter {
     #[must_use]
     pub fn with_mount_point(mut self, path: impl Into<PathBuf>) -> Self {
         self.mount_point = path.into();
+        self
+    }
+
+    /// Set the root [`ItemId`] for the projection. Builder-style; can
+    /// be called before [`Self::start`]. When not called, the presenter
+    /// treats every item in its in-memory map as eligible — useful for
+    /// tests and the boot-time case where the root isn't known yet.
+    #[must_use]
+    pub fn with_root(self, root: ItemId) -> Self {
+        // Replace the inner value rather than the whole `Arc` so
+        // callers that already cloned the Arc see the update.
+        if let Ok(mut slot) = self.root_id.try_write() {
+            *slot = Some(root);
+        } else {
+            // Fall back to blocking_write — only reachable from a
+            // non-tokio runtime, which is the contract for builder
+            // methods. The unwrap is unreachable in normal use because
+            // a fresh presenter has no contention on its lock.
+            let mut slot = self.root_id.blocking_write();
+            *slot = Some(root);
+        }
         self
     }
 
@@ -172,6 +470,11 @@ impl ProjFsPresenter {
     #[must_use]
     pub const fn items(&self) -> &Arc<RwLock<HashMap<String, VfsItem>>> {
         &self.items
+    }
+
+    /// Read the current root `ItemId`, if one has been set.
+    pub async fn root(&self) -> Option<ItemId> {
+        self.root_id.read().await.clone()
     }
 }
 
@@ -472,7 +775,7 @@ mod windows_impl {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
 
@@ -566,5 +869,207 @@ mod tests {
             .await
             .unwrap();
         presenter.evict_item(&id).await.unwrap();
+    }
+
+    /// Helper used by the path-resolution tests to build a small tree:
+    ///
+    /// ```text
+    /// root (backend:root)
+    /// └── dir1 (backend:dir1)
+    ///     └── file.txt (backend:file)
+    /// ```
+    fn three_node_tree() -> (HashMap<String, VfsItem>, ItemId) {
+        let root = ItemId::new("backend", "root");
+        let dir_id = ItemId::new("backend", "dir1");
+        let file_id = ItemId::new("backend", "file");
+
+        let dir = VfsItem {
+            id: dir_id.clone(),
+            parent_id: root.clone(),
+            name: "dir1".to_string(),
+            is_dir: true,
+            size: None,
+            mod_time: None,
+            cache_state: CacheState::Online,
+            mime_type: None,
+        };
+        let file = VfsItem {
+            id: file_id,
+            parent_id: dir_id,
+            name: "file.txt".to_string(),
+            is_dir: false,
+            size: Some(42),
+            mod_time: None,
+            cache_state: CacheState::Online,
+            mime_type: None,
+        };
+
+        let mut items = HashMap::new();
+        items.insert(dir.id.0.clone(), dir);
+        items.insert(file.id.0.clone(), file);
+        (items, root)
+    }
+
+    /// Walking from a nested item back through the parent chain
+    /// reproduces the full path as `[grandparent, parent, leaf]`.
+    #[test]
+    fn resolve_path_walks_parent_chain() {
+        let (items, root) = three_node_tree();
+        let file = items.values().find(|i| i.name == "file.txt").unwrap();
+
+        let chain = ancestor_chain(file, &items);
+        assert_eq!(chain, vec!["dir1".to_string(), "file.txt".to_string()]);
+
+        let hit = resolve_path("dir1/file.txt", &items, Some(&root)).unwrap();
+        assert_eq!(hit.name, "file.txt");
+
+        // Backslashes are normalised to slashes.
+        let hit = resolve_path("dir1\\file.txt", &items, Some(&root)).unwrap();
+        assert_eq!(hit.name, "file.txt");
+
+        // Case-insensitive on the resolution side.
+        let hit = resolve_path("DIR1/File.TXT", &items, Some(&root)).unwrap();
+        assert_eq!(hit.name, "file.txt");
+    }
+
+    /// Looking up a path that has no matching item yields `None`.
+    #[test]
+    fn resolve_path_unknown_returns_none() {
+        let (items, root) = three_node_tree();
+        assert!(resolve_path("does/not/exist.txt", &items, Some(&root)).is_none());
+        assert!(resolve_path("dir1/other.txt", &items, Some(&root)).is_none());
+    }
+
+    /// Children of a directory are filtered to those Windows can
+    /// safely surface — names containing forbidden characters are
+    /// dropped.
+    #[test]
+    fn enumeration_children_filters_unsafe_filenames() {
+        let parent_id = ItemId::new("backend", "dir1");
+        let good = VfsItem {
+            id: ItemId::new("backend", "good"),
+            parent_id: parent_id.clone(),
+            name: "good.txt".to_string(),
+            is_dir: false,
+            size: Some(10),
+            mod_time: None,
+            cache_state: CacheState::Online,
+            mime_type: None,
+        };
+        let bad = VfsItem {
+            id: ItemId::new("backend", "bad"),
+            parent_id: parent_id.clone(),
+            name: "bad?.txt".to_string(),
+            is_dir: false,
+            size: Some(20),
+            mod_time: None,
+            cache_state: CacheState::Online,
+            mime_type: None,
+        };
+
+        let mut items = HashMap::new();
+        items.insert(good.id.0.clone(), good);
+        items.insert(bad.id.0.clone(), bad);
+
+        let children = collect_children(&parent_id, &items);
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].name, "good.txt");
+        assert_eq!(children[0].size, 10);
+        assert!(!children[0].is_dir);
+    }
+
+    /// `collect_children` returns entries sorted case-insensitively
+    /// so directory listings are deterministic across runs.
+    #[test]
+    fn enumeration_children_sorted_case_insensitive() {
+        let parent_id = ItemId::new("backend", "dir1");
+        let names = ["banana.txt", "Apple.txt", "cherry.txt"];
+        let mut items = HashMap::new();
+        for (idx, name) in names.iter().enumerate() {
+            let id = ItemId::new("backend", &format!("entry-{idx}"));
+            let item = VfsItem {
+                id: id.clone(),
+                parent_id: parent_id.clone(),
+                name: (*name).to_string(),
+                is_dir: false,
+                size: Some(0),
+                mod_time: None,
+                cache_state: CacheState::Online,
+                mime_type: None,
+            };
+            items.insert(id.0, item);
+        }
+
+        let children = collect_children(&parent_id, &items);
+        let sorted_names: Vec<_> = children.iter().map(|e| e.name.clone()).collect();
+        assert_eq!(
+            sorted_names,
+            vec![
+                "Apple.txt".to_string(),
+                "banana.txt".to_string(),
+                "cherry.txt".to_string(),
+            ]
+        );
+    }
+
+    /// `is_safe_windows_filename` is the predicate behind the
+    /// enumeration filter — it must reject every character the
+    /// Windows kernel rejects and accept normal printable names.
+    #[test]
+    fn windows_filename_predicate_matches_kernel_rules() {
+        assert!(is_safe_windows_filename("ordinary.txt"));
+        assert!(is_safe_windows_filename("dir-name"));
+        assert!(is_safe_windows_filename("with spaces.md"));
+        assert!(!is_safe_windows_filename(""));
+        for forbidden in [
+            "bad?.txt", "a/b", "a\\b", "a:b", "a*b", "a\"b", "a<b", "a>b", "a|b",
+        ] {
+            assert!(
+                !is_safe_windows_filename(forbidden),
+                "expected {forbidden} to be rejected"
+            );
+        }
+    }
+
+    /// `build_enumeration_state` snapshots the children at position 0
+    /// and tracks the cursor so consecutive batches resume cleanly.
+    #[test]
+    fn build_enumeration_state_snapshots_children_with_zero_cursor() {
+        let parent_id = ItemId::new("backend", "dir1");
+        let mut items = HashMap::new();
+        for name in ["a.txt", "b.txt"] {
+            let id = ItemId::new("backend", name);
+            items.insert(
+                id.0.clone(),
+                VfsItem {
+                    id,
+                    parent_id: parent_id.clone(),
+                    name: name.to_string(),
+                    is_dir: false,
+                    size: Some(1),
+                    mod_time: None,
+                    cache_state: CacheState::Online,
+                    mime_type: None,
+                },
+            );
+        }
+
+        let state = build_enumeration_state(&parent_id, &items);
+        assert_eq!(state.position, 0);
+        assert_eq!(state.entries.len(), 2);
+        assert_eq!(state.entries[0].name, "a.txt");
+        assert_eq!(state.entries[1].name, "b.txt");
+    }
+
+    /// `with_root` records the supplied id and `root()` reads it
+    /// back, matching the FUSE presenter's builder-style API.
+    #[tokio::test]
+    async fn with_root_round_trips() {
+        let presenter = ProjFsPresenter::new(PathBuf::from("/tmp/cascade-projfs-test"));
+        assert!(presenter.root().await.is_none());
+
+        let root = ItemId::new("backend", "root");
+        let presenter = presenter.with_root(root.clone());
+        assert_eq!(presenter.root().await, Some(root));
     }
 }
