@@ -571,6 +571,19 @@ impl UdpPunchTransport {
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
     }
+
+    /// Shared handle to the underlying [`UdpSocket`].
+    ///
+    /// Exposed so a successful hole-punch attempt can hand the bound
+    /// socket to a higher-layer transport (see
+    /// [`crate::transport::UdpFlowTransport`]) without reopening it.
+    /// Tokio's `UdpSocket` supports concurrent `send_to` and
+    /// `recv_from` on the same handle, so passing the `Arc` is
+    /// preferable to draining the punch transport.
+    #[must_use]
+    pub fn socket(&self) -> Arc<UdpSocket> {
+        Arc::clone(&self.socket)
+    }
 }
 
 #[async_trait]

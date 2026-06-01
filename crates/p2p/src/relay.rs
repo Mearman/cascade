@@ -198,6 +198,21 @@ impl RelayClient {
 }
 
 impl RelayConnection {
+    /// Consume the connection and return ownership of the underlying
+    /// WebSocket.
+    ///
+    /// Used by [`crate::transport::RelayTransport`] to take exclusive
+    /// ownership of the WebSocket so the transport adapter can drive
+    /// reads and writes directly without going through the legacy
+    /// `send`/`recv` wrappers (which add a redundant length prefix
+    /// inside the binary frame). The WebSocket already preserves
+    /// message boundaries, so one binary message is one BEP frame
+    /// when the transport adapter writes it.
+    #[must_use]
+    pub fn into_socket(self) -> WebSocketStream<MaybeTlsStream<TcpStream>> {
+        self.socket.into_inner()
+    }
+
     /// Send a BEP message through the relay.
     pub async fn send(&self, message: &[u8]) -> Result<()> {
         let frame = encode_relay_frame(message)?;
