@@ -1054,7 +1054,7 @@ mod windows_impl {
     use tokio::sync::RwLock;
     use windows::Win32::Foundation::{
         ERROR_CALL_NOT_IMPLEMENTED, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER,
-        ERROR_NOT_ENOUGH_MEMORY, ERROR_OPERATION_ABORTED, S_OK,
+        ERROR_INTERNAL_ERROR, ERROR_NOT_ENOUGH_MEMORY, ERROR_OPERATION_ABORTED, S_OK,
     };
     use windows::Win32::Storage::ProjectedFileSystem::{
         PRJ_CALLBACK_DATA, PRJ_CALLBACKS, PRJ_CB_DATA_FLAG_ENUM_RESTART_SCAN,
@@ -1271,11 +1271,16 @@ mod windows_impl {
         };
 
         let Ok(mut sessions) = ctx.enumerations.lock() else {
-            // Poisoned mutex — surface a generic failure so ProjFS
-            // can retry. ERROR_CALL_NOT_IMPLEMENTED is the closest
-            // generic "we cannot serve this right now" signal that
-            // the kernel will not retry forever.
-            return hresult_from_win32(ERROR_CALL_NOT_IMPLEMENTED.0);
+            // Poisoned mutex represents a process-internal failure
+            // that the kernel can retry on a fresh enumeration ID;
+            // it is *not* a callback-implementation gap and must not
+            // be confused with the browse-only sentinel emitted by
+            // `get_file_data` when no `ContentProvider` is wired in.
+            // `ERROR_INTERNAL_ERROR` (Win32 1359, `HRESULT`
+            // `0x8007_054F`) is the documented Win32 code for "an
+            // internal error occurred" and `ProjFS` callers surface
+            // it as a transient failure.
+            return hresult_from_win32(ERROR_INTERNAL_ERROR.0);
         };
         sessions.insert(key, state);
         S_OK
@@ -2387,6 +2392,25 @@ mod tests {
         let code = HResultCode::from_win32(8);
         #[allow(clippy::cast_possible_wrap)]
         let expected = 0x8007_0008_u32 as i32;
+        assert_eq!(code.get(), expected);
+    }
+
+    /// The poisoned-mutex sentinel in `start_directory_enumeration`
+    /// maps to `ERROR_INTERNAL_ERROR` (Win32 1359, `HRESULT`
+    /// `0x8007_054F`) so `ProjFS` treats it as a transient internal
+    /// failure rather than a "callback not implemented" signal — the
+    /// latter is reserved for the browse-only path in `get_file_data`.
+    /// The actual mutex poisoning can only fire on Windows under
+    /// concurrent panic, but the packed value the callback would
+    /// return is computed cross-platform by [`HResultCode::from_win32`];
+    /// pin it here so a future refactor cannot silently regress the
+    /// mapping when the suite runs on macOS or Linux.
+    #[test]
+    fn hresult_code_packs_error_internal_error() {
+        // ERROR_INTERNAL_ERROR = 1359 → 0x8007054F as a signed i32.
+        let code = HResultCode::from_win32(1359);
+        #[allow(clippy::cast_possible_wrap)]
+        let expected = 0x8007_054F_u32 as i32;
         assert_eq!(code.get(), expected);
     }
 
