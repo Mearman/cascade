@@ -371,8 +371,10 @@ impl NetNsHarness {
             // Limit to our test so the harness doesn't try to run others, and
             // pass --nocapture so that `println!` in the test body reaches the
             // process's real stdout (which is piped to us).
+            //
+            // Note: test binary arguments are test harness arguments directly
+            // (no `--` separator needed when invoking the binary directly).
             .args([
-                "--",
                 "nat_relay_end_to_end",
                 "--nocapture",
                 "--test-threads=1",
