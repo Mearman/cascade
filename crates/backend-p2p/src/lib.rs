@@ -68,7 +68,7 @@ pub struct ConfiguredPeer {
 }
 
 /// Configuration for a P2P backend instance.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct P2pBackendConfig {
     pub instance_id: String,
     pub display_name: String,
@@ -113,6 +113,50 @@ pub struct P2pBackendConfig {
     /// no NAT detection runs. Each entry is a `host:port` string; the
     /// first server that responds wins.
     pub stun_servers: Vec<String>,
+    /// Known relay endpoints, in preference order. Fed into
+    /// [`cascade_p2p::decide_connectivity`] as the relay pool when the
+    /// strategy table calls for relayed transport. Empty disables the
+    /// relay strategy — pairs that would otherwise relay fall through
+    /// to a best-effort hole punch.
+    pub relay_endpoints: Vec<std::net::SocketAddr>,
+    /// Shared secret authenticating this device against the relay
+    /// pool. `None` means the relay path is provisioned but unusable;
+    /// `decide_connectivity` may still pick `Relay` but
+    /// `RelayClient::connect` will fail until a secret is configured.
+    /// The 32-byte width matches the cascade relay's HMAC key length.
+    pub relay_shared_secret: Option<[u8; 32]>,
+    /// Hole-punching opt-out. When `false`, [`cascade_p2p::decide_connectivity`]
+    /// is still consulted but the chosen `HolePunch` strategy is
+    /// downgraded to direct-or-relay before any UDP burst is emitted.
+    /// Defaults to `true` so production deployments get the full path
+    /// out of the box.
+    pub enable_hole_punch: bool,
+}
+
+impl Default for P2pBackendConfig {
+    fn default() -> Self {
+        Self {
+            instance_id: String::new(),
+            display_name: String::new(),
+            index_path: PathBuf::new(),
+            block_store_root: PathBuf::new(),
+            identity_dir: PathBuf::new(),
+            folder_id: String::new(),
+            listen_addr: None,
+            peers: Vec::new(),
+            enable_discovery: false,
+            device_name: None,
+            enable_wan_gossip: false,
+            stun_servers: Vec::new(),
+            relay_endpoints: Vec::new(),
+            relay_shared_secret: None,
+            // Hole-punching is enabled by default — operators opt OUT by
+            // setting `enable_hole_punch = false`, mirroring the way
+            // `enable_discovery` and `enable_wan_gossip` are opt-IN flags
+            // for behaviour with a real operational cost.
+            enable_hole_punch: true,
+        }
+    }
 }
 
 /// A P2P backend instance.
@@ -963,6 +1007,29 @@ pub fn create_backend(config: &toml::Value) -> Result<Box<dyn Backend>> {
                 .collect()
         })
         .unwrap_or_default();
+    let relay_endpoints = config
+        .get("relay_endpoints")
+        .and_then(toml::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(toml::Value::as_str)
+                .map(|s| {
+                    s.parse::<std::net::SocketAddr>()
+                        .with_context(|| format!("invalid relay endpoint `{s}`"))
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let relay_shared_secret = config
+        .get("relay_shared_secret")
+        .and_then(|v| v.as_str())
+        .map(parse_relay_shared_secret)
+        .transpose()?;
+    let enable_hole_punch = config
+        .get("enable_hole_punch")
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(true);
 
     let instance_id = format!("p2p-{name}");
     let cfg = P2pBackendConfig {
@@ -978,6 +1045,9 @@ pub fn create_backend(config: &toml::Value) -> Result<Box<dyn Backend>> {
         device_name,
         enable_wan_gossip,
         stun_servers,
+        relay_endpoints,
+        relay_shared_secret,
+        enable_hole_punch,
     };
 
     let backend = P2pBackend::open(cfg)?;
@@ -1014,6 +1084,35 @@ fn parse_peers(value: Option<&toml::Value>) -> Result<Vec<ConfiguredPeer>> {
         });
     }
     Ok(peers)
+}
+
+/// Parse the relay shared secret from its 64-character hex string form.
+///
+/// The cascade relay HMAC-authenticates clients with a 32-byte key. The
+/// TOML config carries the key as lowercase hex so operators can copy
+/// it from `openssl rand -hex 32` output. Anything other than exactly
+/// 64 hex digits is a configuration error — the field is too sensitive
+/// to silently truncate or pad.
+fn parse_relay_shared_secret(input: &str) -> Result<[u8; 32]> {
+    if input.len() != 64 {
+        anyhow::bail!(
+            "relay_shared_secret must be 64 hex characters (32 bytes), got {}",
+            input.len(),
+        );
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        let pair_start = i.checked_mul(2).with_context(|| "secret index overflow")?;
+        let pair_end = pair_start
+            .checked_add(2)
+            .with_context(|| "secret index overflow")?;
+        let pair = input
+            .get(pair_start..pair_end)
+            .with_context(|| "relay_shared_secret hex slice out of range")?;
+        *byte = u8::from_str_radix(pair, 16)
+            .with_context(|| format!("invalid hex pair `{pair}` in relay_shared_secret"))?;
+    }
+    Ok(out)
 }
 
 fn default_data_dir(name: &str) -> PathBuf {
@@ -1217,6 +1316,46 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         backend_b.download(&entry_b, &mut out).await.unwrap();
         assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn parse_relay_shared_secret_round_trips_32_bytes() {
+        // A 64-char lowercase hex string round-trips to its 32 source
+        // bytes exactly. Anything shorter, longer, or with non-hex
+        // characters is rejected — silent truncation of an HMAC key
+        // would substitute predictable bytes for the missing ones.
+        let secret_hex = "0011223344556677889900aabbccddeeff00112233445566778899aabbccddee";
+        let parsed = parse_relay_shared_secret(secret_hex).unwrap();
+        assert_eq!(parsed[0], 0x00);
+        assert_eq!(parsed[1], 0x11);
+        assert_eq!(parsed[31], 0xee);
+    }
+
+    #[test]
+    fn parse_relay_shared_secret_rejects_wrong_length() {
+        assert!(parse_relay_shared_secret("abcd").is_err());
+        let too_long = "0".repeat(66);
+        assert!(parse_relay_shared_secret(&too_long).is_err());
+    }
+
+    #[test]
+    fn parse_relay_shared_secret_rejects_non_hex() {
+        let bad = "zz".repeat(32);
+        assert!(parse_relay_shared_secret(&bad).is_err());
+    }
+
+    #[test]
+    fn p2p_backend_config_default_enables_hole_punch() {
+        // Hole-punching is the only flag whose default differs from the
+        // derived `Default` — this test guards the manual `Default` impl
+        // against accidental regression to a derived all-false default
+        // if someone re-adds `#[derive(Default)]`.
+        let cfg = P2pBackendConfig::default();
+        assert!(cfg.enable_hole_punch);
+        assert!(!cfg.enable_discovery);
+        assert!(!cfg.enable_wan_gossip);
+        assert!(cfg.relay_endpoints.is_empty());
+        assert!(cfg.relay_shared_secret.is_none());
     }
 
     /// Enabling LAN discovery must not block or panic on backend open.
