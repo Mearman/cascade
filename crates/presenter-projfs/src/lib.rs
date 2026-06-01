@@ -1408,7 +1408,17 @@ mod windows_impl {
         };
         let Some(provider) = ctx.content_provider.as_ref() else {
             // No backend wired in; stay browse-only.
-            return hresult_from_win32(ERROR_CALL_NOT_IMPLEMENTED.0);
+            //
+            // `ERROR_CALL_NOT_IMPLEMENTED` is the documented contract
+            // with `ProjFS`: it tells the kernel the provider has
+            // intentionally not implemented this callback so the
+            // projection should drop into browse-only mode. This is
+            // *not* an internal failure — it is a deliberate signal
+            // distinct from the kind-aware mappings on read failures.
+            // Use the typed `HResultCode` constructor here so every
+            // exit point in `get_file_data` flows through the same
+            // packing helper.
+            return HRESULT(super::HResultCode::from_win32(ERROR_CALL_NOT_IMPLEMENTED.0).get());
         };
         let Some(path) = (unsafe { pcwstr_to_string((*callback_data).FilePathName) }) else {
             return hresult_from_win32(ERROR_FILE_NOT_FOUND.0);
