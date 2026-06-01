@@ -5,7 +5,9 @@
 //! on every platform; operations fail clearly outside macOS.
 
 pub mod bridge;
+pub mod handlers;
 pub mod items;
+pub mod wire;
 
 use std::path::{Path, PathBuf};
 
