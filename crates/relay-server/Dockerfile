@@ -36,7 +36,7 @@ EXPOSE 9998
 #
 # CASCADE_RELAY_LISTEN  — bind address for the peer listener (default 0.0.0.0:9999)
 # CASCADE_RELAY_METRICS — bind address for the /metrics HTTP endpoint (optional)
-# CASCADE_RELAY_SECRET  — 64-char hex shared HMAC secret (required)
+# CASCADE_RELAY_SHARED_SECRET  — 64-char hex shared HMAC secret (required)
 #
 # Generate a secret with: openssl rand -hex 32
 ENV CASCADE_RELAY_LISTEN="0.0.0.0:9999"

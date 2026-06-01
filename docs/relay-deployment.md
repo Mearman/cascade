@@ -78,7 +78,7 @@ docker run -d \
   --restart unless-stopped \
   -p 9999:9999 \
   -p 9998:9998 \
-  -e CASCADE_RELAY_SECRET="$(cat /etc/cascade/relay.secret)" \
+  -e CASCADE_RELAY_SHARED_SECRET="$(cat /etc/cascade/relay.secret)" \
   -e CASCADE_RELAY_LISTEN="0.0.0.0:9999" \
   -e CASCADE_RELAY_METRICS="0.0.0.0:9998" \
   ghcr.io/mearman/cascade-relay:latest
@@ -88,7 +88,7 @@ Environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CASCADE_RELAY_SECRET` | (required) | 64-char hex HMAC secret. |
+| `CASCADE_RELAY_SHARED_SECRET` | (required) | 64-char hex HMAC secret. |
 | `CASCADE_RELAY_LISTEN` | `0.0.0.0:9999` | Bind address for the peer listener. |
 | `CASCADE_RELAY_METRICS` | (disabled) | Bind address for the `/metrics` endpoint. |
 
@@ -111,7 +111,7 @@ services:
       - "9999:9999"
       - "9998:9998"
     environment:
-      CASCADE_RELAY_SECRET: "${CASCADE_RELAY_SECRET}"
+      CASCADE_RELAY_SHARED_SECRET: "${CASCADE_RELAY_SHARED_SECRET}"
       CASCADE_RELAY_LISTEN: "0.0.0.0:9999"
       CASCADE_RELAY_METRICS: "0.0.0.0:9998"
 ```
