@@ -47,12 +47,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use cascade_p2p::block::BlockHash;
+use cascade_p2p::candidate::{Candidate, CandidateKind};
 use cascade_p2p::connection::ConnectionManager;
 use cascade_p2p::discovery::DiscoveredPeer;
 use cascade_p2p::framed::FramedPeer;
 use cascade_p2p::identity::DeviceIdentity;
 use cascade_p2p::protocol::{BepMessage, FileInfo, Folder, GossipPeer, Version};
 use cascade_p2p::store::BlockStore;
+use cascade_p2p::traversal::{
+    CandidatePair, ConnectivityStrategy, NatType, PunchConfig, SyncPunchAgreement, SystemClock,
+    UdpPunchTransport, decide_connectivity, run_hole_punch,
+};
 use cascade_p2p::wan::PeerBook;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
@@ -67,6 +72,46 @@ const FILE_TYPE_DIR: u32 = 1;
 
 /// Wall-clock timeout for a block request to a single peer.
 const BLOCK_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Wall-clock window granted for a hole-punch attempt. Both peers must
+/// have signalled `SyncPunch` and emitted their first burst before the
+/// nonce expires. Five seconds matches the upper bound documented in
+/// `docs/nat-hole-punching.md`.
+const SYNC_PUNCH_WINDOW: Duration = Duration::from_secs(5);
+
+/// Source of fresh per-process `SyncPunch` nonces. The atomic ensures
+/// concurrent connection attempts get distinct nonces without
+/// coordination; the value is opaque to the wire so monotonicity is
+/// not required, only uniqueness within a session pair.
+static SYNC_PUNCH_NONCE_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Allocate a fresh `SyncPunch` nonce.
+fn next_sync_punch_nonce() -> u64 {
+    SYNC_PUNCH_NONCE_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Wall-clock milliseconds since the Unix epoch. Used to stamp
+/// `SyncPunchAgreement::deadline_unix_ms`.
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// Build the local candidate set advertised over `BepMessage::Candidates`.
+///
+/// For v1, the only candidate emitted is the bound `SocketAddr` of the
+/// supplied listening socket — that's the host candidate any peer on the
+/// same LAN can reach. `ServerReflexive` candidates require feeding the
+/// STUN-derived externally-mapped address through here, which is a
+/// follow-up alongside per-interface enumeration.
+fn gather_local_candidates(bound_addr: SocketAddr) -> Vec<Candidate> {
+    // RFC 8445 §5.1.2.2 reserves `type_preference = 126` for host
+    // candidates; we pass `u16::MAX` for `local_preference` so any
+    // future SRflx/Relayed entries added to this list outrank the
+    // worst-case host but still lose to the best-case host.
+    vec![Candidate::new(bound_addr, CandidateKind::Host, u16::MAX)]
+}
 
 /// Identity information for a connected peer.
 #[derive(Debug, Clone)]
@@ -166,6 +211,33 @@ pub struct SyncEngine {
     /// direction), keyed by device ID. Populated as a local artefact for
     /// future gossip work; the transport itself is not wired yet.
     peer_book: Arc<RwLock<PeerBook>>,
+    /// Most recent local `NAT` classification — the value
+    /// [`decide_connectivity`] reads for the local side. Default
+    /// `NatType::Unknown` until startup detection completes
+    /// (see `set_local_nat_type`). The interior mutex lets the
+    /// background detection task update the value without taking
+    /// ownership of the engine.
+    local_nat_type: Arc<RwLock<NatType>>,
+    /// Known relay endpoints, in preference order. Fed verbatim into
+    /// [`decide_connectivity`]. Empty means the relay strategy is
+    /// unavailable — the traversal logic falls through to a best-effort
+    /// hole punch.
+    relay_endpoints: Arc<Vec<SocketAddr>>,
+    /// Pre-shared HMAC secret authenticating against the relay pool.
+    /// `None` means the relay path is provisioned but unusable
+    /// (`decide_connectivity` may still pick `Relay` but
+    /// `RelayClient::connect` will fail loudly).
+    relay_shared_secret: Option<[u8; 32]>,
+    /// Hole-punching opt-out. When `false`, a `ConnectivityStrategy::HolePunch`
+    /// is downgraded to direct-or-relay before any UDP burst is emitted.
+    enable_hole_punch: bool,
+    /// Bound address of the BEP listener once `start_listener` has
+    /// returned successfully. Used as the local host candidate
+    /// advertised in `BepMessage::Candidates`. `None` until the
+    /// listener binds — outbound-only deployments thus advertise no
+    /// host candidate at all, which is correct: they have no inbound
+    /// path a peer could dial.
+    local_listen_addr: Arc<RwLock<Option<SocketAddr>>>,
 }
 
 impl SyncEngine {
@@ -188,7 +260,62 @@ impl SyncEngine {
             trusted: Arc::new(Mutex::new(Vec::new())),
             peers: Arc::new(Mutex::new(HashMap::new())),
             peer_book: Arc::new(RwLock::new(PeerBook::new())),
+            local_nat_type: Arc::new(RwLock::new(NatType::Unknown)),
+            relay_endpoints: Arc::new(Vec::new()),
+            relay_shared_secret: None,
+            enable_hole_punch: true,
+            local_listen_addr: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Builder-style setter for the known relay endpoint pool. Threaded
+    /// through `P2pBackend::open` from `P2pBackendConfig::relay_endpoints`.
+    #[must_use]
+    pub fn with_relay_endpoints(mut self, relays: Vec<SocketAddr>) -> Self {
+        self.relay_endpoints = Arc::new(relays);
+        self
+    }
+
+    /// Builder-style setter for the relay HMAC shared secret. `None`
+    /// disables outbound relay connection attempts even when the relay
+    /// pool is non-empty.
+    #[must_use]
+    pub const fn with_relay_shared_secret(mut self, secret: Option<[u8; 32]>) -> Self {
+        self.relay_shared_secret = secret;
+        self
+    }
+
+    /// Builder-style toggle for the `HolePunch` strategy. `false`
+    /// downgrades `ConnectivityStrategy::HolePunch` to direct-or-relay
+    /// before any UDP burst is emitted.
+    #[must_use]
+    pub const fn with_hole_punch_enabled(mut self, enabled: bool) -> Self {
+        self.enable_hole_punch = enabled;
+        self
+    }
+
+    /// Update the local `NAT` classification observed by the most
+    /// recent detection round. Used by the background task spawned in
+    /// `P2pBackend::open`. Async because the underlying store is
+    /// guarded by an async `RwLock`.
+    pub async fn set_local_nat_type(&self, nat_type: NatType) {
+        *self.local_nat_type.write().await = nat_type;
+    }
+
+    /// Most recent local `NAT` classification observed via STUN. Falls
+    /// back to `NatType::Unknown` until the background detection task
+    /// publishes a real reading.
+    pub async fn local_nat_type(&self) -> NatType {
+        *self.local_nat_type.read().await
+    }
+
+    /// Known relay endpoints, in preference order. Returned as a slice
+    /// over the shared `Arc` so callers can hand it to
+    /// [`decide_connectivity`] without cloning. Empty when relay is
+    /// not configured.
+    #[must_use]
+    pub fn relay_endpoints(&self) -> &[SocketAddr] {
+        &self.relay_endpoints
     }
 
     /// Set the friendly name for the LOCAL device. Used by
@@ -301,6 +428,11 @@ impl SyncEngine {
         let bound = listener
             .local_addr()
             .context("reading listener bound address")?;
+        // Stash the bound address so subsequent sessions can advertise
+        // it as the local host candidate via `BepMessage::Candidates`.
+        // Overwrites any prior value — only one listener runs per
+        // engine in production.
+        *self.local_listen_addr.write().await = Some(bound);
         let engine = self.clone();
         let handle = tokio::spawn(async move {
             loop {
@@ -375,6 +507,274 @@ impl SyncEngine {
             }
         });
         Ok(())
+    }
+
+    /// Establish a peer connection using the [`ConnectivityStrategy`]
+    /// chosen by [`decide_connectivity`] from the local and remote
+    /// `NAT` classifications, the remote candidate list, and the
+    /// configured relay pool.
+    ///
+    /// `Direct` uses the same TCP+TLS path as [`Self::connect_to`].
+    /// `HolePunch` emits a `SyncPunch` frame, waits for the matching
+    /// agreement from the peer (or builds a fresh one if our own peer
+    /// book already carries one), then drives [`run_hole_punch`] over a
+    /// freshly bound UDP socket. `Relay` opens a relay connection via
+    /// [`cascade_p2p::relay::RelayClient`]. For v1 the post-punch and
+    /// post-relay BEP transport upgrade is a stub log message — the
+    /// goal here is to prove the wiring, not to drive a full session
+    /// over the new transport.
+    ///
+    /// `enable_hole_punch = false` downgrades a chosen `HolePunch`
+    /// strategy to direct-or-relay before any UDP burst is emitted, so
+    /// privacy-conscious deployments can take that path out of the
+    /// equation without removing `decide_connectivity` from the loop.
+    pub async fn connect_to_with_strategy(&self, peer: Peer) -> Result<()> {
+        let trusted = self.trusted.lock().await.clone();
+        if !trusted.contains(&peer.device_id) {
+            anyhow::bail!("device {} is not trusted", peer.device_id);
+        }
+
+        let local_nat = self.local_nat_type().await;
+        let (remote_nat, remote_candidates) = {
+            let book = self.peer_book.read().await;
+            let remote = book
+                .last_known_nat_type(&peer.device_id)
+                .unwrap_or(NatType::Unknown);
+            let candidates = book
+                .remote_candidates(&peer.device_id)
+                .map(<[Candidate]>::to_vec)
+                .unwrap_or_default();
+            (remote, candidates)
+        };
+
+        let mut strategy = decide_connectivity(
+            local_nat,
+            remote_nat,
+            &remote_candidates,
+            &self.relay_endpoints,
+        );
+
+        // Honour the opt-out: a chosen HolePunch is downgraded to the
+        // most reasonable fallback so the rest of the wiring runs as
+        // normal. Falling back to relay when one is configured matches
+        // the precedence the table already uses for symmetric pairs.
+        if !self.enable_hole_punch && matches!(strategy, ConnectivityStrategy::HolePunch { .. }) {
+            strategy = self.relay_endpoints.first().map_or_else(
+                || ConnectivityStrategy::Direct { addr: peer.address },
+                |relay| ConnectivityStrategy::Relay { relay: *relay },
+            );
+            debug!(
+                target: "cascade::backend::p2p",
+                peer = %peer.device_id,
+                "hole-punch disabled — downgraded strategy"
+            );
+        }
+
+        match strategy {
+            ConnectivityStrategy::Direct { addr } => {
+                debug!(
+                    target: "cascade::backend::p2p",
+                    peer = %peer.device_id,
+                    %addr,
+                    "connectivity strategy: direct"
+                );
+                self.connect_to(Peer {
+                    device_id: peer.device_id,
+                    address: addr,
+                })
+                .await
+            }
+            ConnectivityStrategy::HolePunch {
+                remote_candidates: chosen_remote,
+            } => self.attempt_hole_punch(&peer, &chosen_remote).await,
+            ConnectivityStrategy::Relay { relay } => self.attempt_relay(&peer, relay).await,
+        }
+    }
+
+    /// Negotiate a `SyncPunch` agreement with `peer` and drive
+    /// [`run_hole_punch`] over a freshly bound UDP socket.
+    ///
+    /// For v1 the post-punch BEP transport upgrade is a stub log
+    /// message — the goal is to prove the wiring (nonce exchange, UDP
+    /// socket bind, state-machine invocation) without yet plumbing the
+    /// resulting flow into the full BEP session. A successful
+    /// `EstablishedFlow` is recorded at info; failures log the
+    /// underlying `PunchError` and return `Ok(())` so the caller can
+    /// move on to the next peer rather than tearing down its loop.
+    async fn attempt_hole_punch(&self, peer: &Peer, remote_candidates: &[Candidate]) -> Result<()> {
+        // Pick a remote candidate the punch state machine should
+        // target. Highest priority wins — the same selection
+        // `decide_connectivity` does for `Direct`. Empty means
+        // `decide_connectivity` fell through with no remote candidates
+        // and there's nothing punchable, which we surface as a debug
+        // log rather than an error.
+        let Some(remote_target) = remote_candidates.iter().max_by_key(|c| c.priority) else {
+            debug!(
+                target: "cascade::backend::p2p",
+                peer = %peer.device_id,
+                "hole-punch strategy chosen but no remote candidates known — skipping"
+            );
+            return Ok(());
+        };
+
+        // Build or read back the SyncPunch agreement. If we have
+        // already received one from the peer (they signalled first),
+        // honour their nonce so both sides probe with the same value.
+        // Otherwise issue a fresh agreement and broadcast it so the
+        // peer can match it on their side.
+        let agreement = self
+            .ensure_sync_punch_agreement(&peer.device_id)
+            .await
+            .with_context(|| format!("negotiating sync-punch with {}", peer.device_id))?;
+
+        // Bind a UDP socket for the punch attempt. Port `0` lets the
+        // OS pick an ephemeral port — the local-host candidate
+        // emitted via gather_local_candidates lives on the BEP TCP
+        // listener, but the UDP punch needs its own socket because
+        // host candidates and punch transports do not share their
+        // wire format.
+        let transport = UdpPunchTransport::bind("0.0.0.0:0".parse()?)
+            .await
+            .context("binding UDP socket for hole punch")?;
+        let local = transport
+            .local_addr()
+            .context("reading hole-punch socket local address")?;
+        let pair = CandidatePair {
+            local,
+            remote: remote_target.address,
+        };
+
+        info!(
+            target: "cascade::backend::p2p",
+            peer = %peer.device_id,
+            %local,
+            remote = %remote_target.address,
+            nonce = agreement.nonce,
+            "driving hole-punch attempt"
+        );
+        match run_hole_punch(
+            &transport,
+            &pair,
+            &agreement,
+            &PunchConfig::default(),
+            &SystemClock,
+        )
+        .await
+        {
+            Ok(flow) => {
+                info!(
+                    target: "cascade::backend::p2p",
+                    peer = %peer.device_id,
+                    local = %flow.local,
+                    remote = %flow.remote,
+                    established_at_unix_ms = flow.established_at_unix_ms,
+                    "hole-punch succeeded — post-punch BEP transport upgrade is the next round"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                debug!(
+                    target: "cascade::backend::p2p",
+                    peer = %peer.device_id,
+                    error = %e,
+                    "hole-punch attempt failed"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Ensure a `SyncPunch` agreement exists for `peer_device_id` and
+    /// broadcast it via `BepMessage::SyncPunch`.
+    ///
+    /// When the peer book already carries a fresh agreement (the peer
+    /// signalled first), reuse it. Otherwise allocate a new nonce,
+    /// stamp a `SYNC_PUNCH_WINDOW`-second deadline, persist it, and
+    /// send the frame so the peer can match it. Returns the agreement
+    /// the caller should feed to `run_hole_punch`.
+    async fn ensure_sync_punch_agreement(
+        &self,
+        peer_device_id: &str,
+    ) -> Result<SyncPunchAgreement> {
+        // Read-only check first to avoid taking the write lock when
+        // the agreement is already in place. The deadline guard
+        // mirrors `run_hole_punch`'s own check: an expired agreement
+        // cannot succeed, so we treat it as absent and replace it.
+        let now_ms = unix_now_ms();
+        if let Some(existing) = self
+            .peer_book
+            .read()
+            .await
+            .current_punch_agreement(peer_device_id)
+            && existing.deadline_unix_ms > now_ms
+        {
+            return Ok(existing);
+        }
+
+        // Allocate a fresh agreement and persist it. The deadline is
+        // SYNC_PUNCH_WINDOW from now — long enough for the round trip
+        // to the peer plus the punch state machine's bursts.
+        let agreement = SyncPunchAgreement {
+            nonce: next_sync_punch_nonce(),
+            deadline_unix_ms: now_ms
+                .saturating_add(u64::try_from(SYNC_PUNCH_WINDOW.as_millis()).unwrap_or(u64::MAX)),
+        };
+        {
+            let mut book = self.peer_book.write().await;
+            book.start_punch_with(peer_device_id, agreement);
+        }
+
+        // Broadcast on the existing peer session if one is up; the
+        // peer matches the nonce on their side. If no session is
+        // open the agreement still sits in our peer book so the next
+        // connection setup carries it.
+        let peers = self.peers.lock().await;
+        if let Some(handle) = peers.get(peer_device_id) {
+            let _ = handle.outbound.send(BepMessage::SyncPunch {
+                nonce: agreement.nonce,
+                deadline_unix_ms: agreement.deadline_unix_ms,
+            });
+        }
+
+        Ok(agreement)
+    }
+
+    /// Open a relay-backed connection to `peer` via `relay`.
+    ///
+    /// For v1 we connect through the relay (proving the relay address
+    /// is reachable and the device id is acceptable) and immediately
+    /// log success — the post-relay BEP transport upgrade lives with
+    /// the post-punch upgrade in the next round.
+    async fn attempt_relay(&self, peer: &Peer, relay: SocketAddr) -> Result<()> {
+        if self.relay_shared_secret.is_none() {
+            debug!(
+                target: "cascade::backend::p2p",
+                peer = %peer.device_id,
+                %relay,
+                "relay strategy chosen but no shared secret configured — skipping"
+            );
+            return Ok(());
+        }
+        let relay_url = format!("ws://{relay}");
+        info!(
+            target: "cascade::backend::p2p",
+            peer = %peer.device_id,
+            %relay,
+            "opening relay connection — post-relay BEP transport upgrade is the next round"
+        );
+        match cascade_p2p::relay::RelayClient::connect(&relay_url, &peer.device_id).await {
+            Ok(_conn) => Ok(()),
+            Err(e) => {
+                debug!(
+                    target: "cascade::backend::p2p",
+                    peer = %peer.device_id,
+                    %relay,
+                    error = ?e,
+                    "relay connection attempt failed"
+                );
+                Ok(())
+            }
+        }
     }
 
     /// Inbound handler — completes the TLS handshake then runs a session.
@@ -466,6 +866,21 @@ impl SyncEngine {
             files: snapshot,
         })
         .ok();
+
+        // Advertise our reachable candidates so the peer can pair them
+        // against its own set in `decide_connectivity`. Only sent when
+        // the BEP listener is bound — outbound-only deployments have no
+        // host candidate worth advertising, and the receiver tolerates
+        // a connection that never produces one (it falls through to
+        // direct or relay). The lock guard is dropped before the
+        // `tx.send` to avoid holding it across an await on the
+        // unbounded channel (no actual await today, but the explicit
+        // drop also satisfies clippy::significant_drop_in_scrutinee).
+        let local_listen = *self.local_listen_addr.read().await;
+        if let Some(local_addr) = local_listen {
+            let candidates = gather_local_candidates(local_addr);
+            tx.send(BepMessage::Candidates { candidates }).ok();
+        }
 
         // Read loop.
         let result = loop {
@@ -608,17 +1023,20 @@ impl SyncEngine {
                 self.merge_gossip(peer_device_id, peers).await;
                 Ok(())
             }
-            // TODO(nat): wire `Candidates` / `SyncPunch` into the
-            // traversal coordinator once the state machine lands. The
-            // wire types are accepted now so peers running a newer
-            // build do not tear down the connection on an unknown
-            // message type, but the foundation round deliberately
-            // stops at frame decode.
             BepMessage::Candidates { candidates } => {
+                // Cache the remote candidate set on the peer book so
+                // `decide_connectivity` can pair them against the
+                // local set in any subsequent traversal attempt. Peers
+                // send the complete set in every frame; no delta
+                // protocol is needed.
+                let mut book = self.peer_book.write().await;
+                let count = candidates.len();
+                book.set_remote_candidates(peer_device_id, candidates);
                 debug!(
+                    target: "cascade::backend::p2p",
                     peer = %peer_device_id,
-                    count = candidates.len(),
-                    "received candidates frame; traversal not yet wired",
+                    count,
+                    "stored remote candidates",
                 );
                 Ok(())
             }
@@ -626,11 +1044,24 @@ impl SyncEngine {
                 nonce,
                 deadline_unix_ms,
             } => {
+                // Record the peer's agreement so a subsequent
+                // `run_hole_punch` call reads back the negotiated
+                // nonce. Mutual agreement is implicit: each side
+                // records the other's frame; whichever side initiates
+                // the punch reads the matched nonce out of its own
+                // peer book.
+                let agreement = SyncPunchAgreement {
+                    nonce,
+                    deadline_unix_ms,
+                };
+                let mut book = self.peer_book.write().await;
+                book.start_punch_with(peer_device_id, agreement);
                 debug!(
+                    target: "cascade::backend::p2p",
                     peer = %peer_device_id,
                     nonce,
                     deadline_unix_ms,
-                    "received sync-punch frame; traversal not yet wired",
+                    "stored sync-punch agreement",
                 );
                 Ok(())
             }
@@ -2297,5 +2728,186 @@ mod tests {
             .await
             .expect("listener should exit within 2s of cancel")
             .expect("listener task should not panic");
+    }
+
+    // ── NAT traversal wiring ──
+
+    #[test]
+    fn gather_local_candidates_emits_host_candidate_for_bound_addr() {
+        // The host candidate must carry the bound `SocketAddr` verbatim
+        // — the receiving peer dials this address back when
+        // `decide_connectivity` chooses the direct path.
+        let bound: SocketAddr = "127.0.0.1:22000".parse().unwrap();
+        let candidates = gather_local_candidates(bound);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].address, bound);
+        assert_eq!(candidates[0].kind, CandidateKind::Host);
+    }
+
+    #[tokio::test]
+    async fn decide_connectivity_chooses_direct_when_both_peers_open() {
+        // Two Open peers must end up Direct. Feeding the bound address
+        // back through as a host candidate proves the decision tree
+        // honours the priority sort: the dialler targets that address
+        // rather than (say) a relay endpoint.
+        let host_addr: SocketAddr = "127.0.0.1:22000".parse().unwrap();
+        let candidates = gather_local_candidates(host_addr);
+        let strategy = decide_connectivity(NatType::Open, NatType::Open, &candidates, &[]);
+        match strategy {
+            ConnectivityStrategy::Direct { addr } => assert_eq!(addr, host_addr),
+            other => panic!("expected Direct, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decide_connectivity_chooses_relay_when_both_symmetric_with_relay() {
+        // Symmetric ↔ Symmetric is doomed for direct punch — the table
+        // routes through Relay when one is configured. Without a
+        // relay, falls back to a best-effort punch (covered by the
+        // upstream `cascade_p2p::traversal` tests).
+        let relay: SocketAddr = "198.51.100.7:3478".parse().unwrap();
+        let strategy = decide_connectivity(NatType::Symmetric, NatType::Symmetric, &[], &[relay]);
+        assert_eq!(strategy, ConnectivityStrategy::Relay { relay });
+    }
+
+    #[tokio::test]
+    async fn candidates_frame_updates_peer_book() {
+        // Receiving a `BepMessage::Candidates` must store the wire
+        // candidates on the peer book so the next traversal decision
+        // can pair them against the local set.
+        let (_dir, engine) = make_engine("f").await;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<u8>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let remote_addr: SocketAddr = "203.0.113.1:22001".parse().unwrap();
+        let candidates = vec![Candidate::new(remote_addr, CandidateKind::Host, 1024)];
+        engine
+            .handle_message(
+                "PEER-A",
+                BepMessage::Candidates {
+                    candidates: candidates.clone(),
+                },
+                &tx,
+                &pending,
+            )
+            .await
+            .unwrap();
+
+        let book = engine.peer_book.read().await;
+        let stored = book
+            .remote_candidates("PEER-A")
+            .expect("candidates should be stored under PEER-A");
+        assert_eq!(stored, candidates.as_slice());
+    }
+
+    #[tokio::test]
+    async fn sync_punch_frame_records_agreement_on_peer_book() {
+        // Inbound `SyncPunch` must record the peer's nonce and
+        // deadline. The matching `run_hole_punch` call reads them back
+        // via `PeerBook::current_punch_agreement`.
+        let (_dir, engine) = make_engine("f").await;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<u8>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        engine
+            .handle_message(
+                "PEER-A",
+                BepMessage::SyncPunch {
+                    nonce: 0xCAFE_BABE,
+                    deadline_unix_ms: 1_700_000_000_000,
+                },
+                &tx,
+                &pending,
+            )
+            .await
+            .unwrap();
+
+        let book = engine.peer_book.read().await;
+        let agreement = book
+            .current_punch_agreement("PEER-A")
+            .expect("agreement should be stored under PEER-A");
+        assert_eq!(agreement.nonce, 0xCAFE_BABE);
+        assert_eq!(agreement.deadline_unix_ms, 1_700_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn local_nat_type_defaults_to_unknown_until_detection_publishes() {
+        // No detection has run yet — the engine must report Unknown.
+        // This is the conservative reading the strategy table treats
+        // as "route through Relay (or best-effort punch)" rather than
+        // a brittle optimistic Direct.
+        let (_dir, engine) = make_engine("f").await;
+        assert_eq!(engine.local_nat_type().await, NatType::Unknown);
+    }
+
+    #[tokio::test]
+    async fn set_local_nat_type_publishes_to_strategy_input() {
+        // The background detection task calls `set_local_nat_type` and
+        // the connection-time `decide_connectivity` reads it back. The
+        // round-trip is the contract under test here.
+        let (_dir, engine) = make_engine("f").await;
+        engine.set_local_nat_type(NatType::FullCone).await;
+        assert_eq!(engine.local_nat_type().await, NatType::FullCone);
+    }
+
+    #[tokio::test]
+    async fn ensure_sync_punch_agreement_reuses_fresh_peer_agreement() {
+        // When the peer signals first, we honour their nonce instead
+        // of allocating a new one — both sides must probe with the
+        // same value or `run_hole_punch` will treat the matched probe
+        // as a wrong-nonce stray and time out.
+        let (_dir, engine) = make_engine("f").await;
+        let peer_agreement = SyncPunchAgreement {
+            nonce: 0xDEAD_BEEF,
+            deadline_unix_ms: unix_now_ms() + 10_000,
+        };
+        {
+            let mut book = engine.peer_book.write().await;
+            book.start_punch_with("PEER-A", peer_agreement);
+        }
+        let got = engine.ensure_sync_punch_agreement("PEER-A").await.unwrap();
+        assert_eq!(got.nonce, 0xDEAD_BEEF);
+    }
+
+    #[tokio::test]
+    async fn ensure_sync_punch_agreement_replaces_expired() {
+        // An expired agreement is treated as absent: a fresh nonce
+        // and deadline are minted. Otherwise `run_hole_punch` would
+        // reject the call with `DeadlinePassed` and burn a punch
+        // budget on a doomed attempt. We stamp the stored nonce with
+        // `u64::MAX` so the freshly-allocated one (drawn from the
+        // monotonic process counter) cannot collide.
+        let (_dir, engine) = make_engine("f").await;
+        {
+            let mut book = engine.peer_book.write().await;
+            book.start_punch_with(
+                "PEER-A",
+                SyncPunchAgreement {
+                    nonce: u64::MAX,
+                    deadline_unix_ms: 0,
+                },
+            );
+        }
+        let got = engine.ensure_sync_punch_agreement("PEER-A").await.unwrap();
+        assert!(got.deadline_unix_ms > unix_now_ms());
+        assert_ne!(got.nonce, u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn connect_to_with_strategy_rejects_untrusted_peer() {
+        // The trust check runs before any traversal logic — an
+        // untrusted device must not get as far as candidate selection
+        // or UDP socket binding.
+        let (_dir, engine) = make_engine("f").await;
+        let err = engine
+            .connect_to_with_strategy(Peer {
+                device_id: "STRANGER".to_string(),
+                address: "127.0.0.1:1".parse().unwrap(),
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not trusted"));
     }
 }
