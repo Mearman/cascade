@@ -488,6 +488,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "cascade-relay-server"
+version = "0.1.29"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "futures-util",
+ "hex",
+ "hmac",
+ "http",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.63"
 source = "registry+https://github.com/rust-lang/crates.io-index"
