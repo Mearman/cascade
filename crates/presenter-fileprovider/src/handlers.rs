@@ -195,6 +195,26 @@ pub trait FileProviderHandlers: Send + Sync + std::fmt::Debug {
     ///
     /// The cursor is opaque bytes; consumers must not interpret them.
     async fn current_sync_cursor(&self, parent_id: &str) -> HandlerResult<SyncCursor>;
+
+    /// Return the delta between the caller's last-known cursor and the
+    /// current state of `parent_id`.
+    ///
+    /// `since_cursor` is the opaque cursor previously emitted by the
+    /// engine. When `None`, when no snapshot exists for `parent_id`, or
+    /// when the supplied cursor no longer matches the stored snapshot,
+    /// the engine treats this as a first call: every current child is
+    /// returned in `added_or_modified`, `deleted` is empty, and a fresh
+    /// snapshot is taken.
+    ///
+    /// Otherwise the engine diffs the current child set against the
+    /// stored snapshot and returns the differences. The returned
+    /// `new_cursor` must be echoed back on the next call to receive an
+    /// incremental delta.
+    async fn enumerate_changes(
+        &self,
+        parent_id: &str,
+        since_cursor: Option<&SyncCursor>,
+    ) -> HandlerResult<EnumerateChangesOutput>;
 }
 
 /// Return value for [`FileProviderHandlers::enumerate_items`].
@@ -202,6 +222,20 @@ pub trait FileProviderHandlers: Send + Sync + std::fmt::Debug {
 pub struct EnumerateOutput {
     pub items: Vec<FileProviderItem>,
     pub next_page: Option<String>,
+}
+
+/// Return value for [`FileProviderHandlers::enumerate_changes`].
+///
+/// `added_or_modified` covers items that are present in the current view
+/// but absent from (or different in) the prior snapshot. `deleted`
+/// carries the engine `ItemId` strings of items that no longer exist.
+/// `new_cursor` describes the snapshot the engine just took and must be
+/// passed back on the next call to receive an incremental delta.
+#[derive(Debug, Clone)]
+pub struct EnumerateChangesOutput {
+    pub added_or_modified: Vec<FileProviderItem>,
+    pub deleted: Vec<String>,
+    pub new_cursor: SyncCursor,
 }
 
 #[cfg(test)]

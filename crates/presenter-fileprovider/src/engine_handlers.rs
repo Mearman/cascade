@@ -5,6 +5,7 @@
 //! the [`Backend`] trait for the actual operation. The seven handlers below
 //! map one-to-one onto the seven [`FileProviderHandlers`] methods.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -13,10 +14,15 @@ use cascade_engine::backend::Backend;
 use cascade_engine::db::StateDb;
 use cascade_engine::types::{CacheState, FileEntry, FileId, ItemId, SyncCursor, VfsItem};
 use cascade_engine::vfs::{VfsTree, derive_sync_cursor};
+use chrono::{DateTime, Utc};
 use data_encoding::BASE64URL_NOPAD;
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex;
 
-use crate::handlers::{EnumerateOutput, FileProviderHandlers, HandlerError, HandlerResult};
+use crate::handlers::{
+    EnumerateChangesOutput, EnumerateOutput, FileProviderHandlers, HandlerError, HandlerResult,
+};
 use crate::items::FileProviderItem;
 
 /// Subdirectory inside the cache directory where File Provider materialised
@@ -34,6 +40,53 @@ const CACHE_SUBDIR: &str = "file-provider";
 /// keeps each round-trip response well under macOS's XPC payload limit.
 const ENUMERATE_PAGE_SIZE: usize = 256;
 
+/// Snapshot of the child set under a parent directory at the moment the
+/// engine last emitted a cursor for that parent.
+///
+/// Keyed by item ID (`stub:file1`); the value carries the metadata tuple
+/// the cursor is derived from. The `cursor` field is the cursor the
+/// engine returned alongside this snapshot — a caller's `since_cursor`
+/// must equal this for the engine to compute an incremental delta;
+/// otherwise the handler treats the call as a fresh enumeration.
+///
+/// TODO(fileprovider): replace this snapshot-based diff with a real
+/// event log driven by the backend's native change stream. The engine
+/// already exposes `Backend::changes(cursor)`, but the File Provider
+/// bridge has no per-parent fan-out for those events yet. Once the
+/// engine gains a `(parent_id, since_event)` -> `Vec<Change>` query that
+/// holds across the entire VFS tree, this in-memory snapshot table can
+/// be retired in favour of the authoritative log.
+#[derive(Debug, Clone)]
+struct ParentSnapshot {
+    cursor: SyncCursor,
+    children: HashMap<String, SnapshotEntry>,
+}
+
+/// Metadata tuple captured for each child in a [`ParentSnapshot`].
+///
+/// Mirrors the fields hashed into the cursor by [`derive_sync_cursor`]
+/// (`name`, `is_dir`, `size`, `mod_time`) so that "did this entry
+/// change?" is a structural comparison rather than a hash check, while
+/// remaining cheap enough to keep in memory for every observed parent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotEntry {
+    name: String,
+    is_dir: bool,
+    size: Option<u64>,
+    mod_time: Option<DateTime<Utc>>,
+}
+
+impl SnapshotEntry {
+    fn from_entry(entry: &FileEntry) -> Self {
+        Self {
+            name: entry.name.clone(),
+            is_dir: entry.is_dir,
+            size: entry.size,
+            mod_time: entry.mod_time,
+        }
+    }
+}
+
 /// Production handler implementation.
 ///
 /// Construction takes:
@@ -47,6 +100,13 @@ pub struct EngineHandlers {
     vfs: Arc<RwLock<VfsTree>>,
     db: Arc<StateDb>,
     cache_dir: PathBuf,
+    /// In-memory per-parent snapshot store used by `enumerateChanges`.
+    ///
+    /// Keyed by parent `ItemId` string. Bounded by the number of parent
+    /// directories the File Provider extension has observed — typically
+    /// one per visible Finder window — and rebuilt on demand whenever
+    /// the caller's cursor goes stale.
+    snapshots: Arc<Mutex<HashMap<String, ParentSnapshot>>>,
 }
 
 impl std::fmt::Debug for EngineHandlers {
@@ -63,8 +123,13 @@ impl EngineHandlers {
     /// `cache_dir` is the directory under which fetched file contents are
     /// materialised. The handler creates `cache_dir/file-provider/` on
     /// demand.
-    pub const fn new(vfs: Arc<RwLock<VfsTree>>, db: Arc<StateDb>, cache_dir: PathBuf) -> Self {
-        Self { vfs, db, cache_dir }
+    pub fn new(vfs: Arc<RwLock<VfsTree>>, db: Arc<StateDb>, cache_dir: PathBuf) -> Self {
+        Self {
+            vfs,
+            db,
+            cache_dir,
+            snapshots: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     /// Look up the backend that owns an `ItemId`.
@@ -473,6 +538,151 @@ impl FileProviderHandlers for EngineHandlers {
         let backend = self.backend_for(&parent)?;
         let cursor = derive_sync_cursor(backend.as_ref(), parent.native_id()).await?;
         Ok(cursor)
+    }
+
+    async fn enumerate_changes(
+        &self,
+        parent_id: &str,
+        since_cursor: Option<&SyncCursor>,
+    ) -> HandlerResult<EnumerateChangesOutput> {
+        let parent = ItemId(parent_id.to_string());
+        // Release the std::sync RwLock guard before awaiting the
+        // backend; same pattern as `current_sync_cursor` above.
+        let backend = self.backend_for(&parent)?;
+
+        // Snapshot the parent's current children, ordered the same way
+        // `derive_sync_cursor` orders them so the cursor we compute
+        // matches what `currentSyncCursor` would emit for an unchanged
+        // view.
+        let mut entries = backend
+            .list_children(parent.native_id())
+            .await
+            .map_err(HandlerError::from)?;
+        entries.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+
+        let new_cursor = derive_cursor_from_sorted(&entries);
+        let current: HashMap<String, SnapshotEntry> = entries
+            .iter()
+            .map(|entry| (entry.id.0.clone(), SnapshotEntry::from_entry(entry)))
+            .collect();
+
+        let mut snapshots = self.snapshots.lock().await;
+        let previous = snapshots.get(parent_id);
+
+        // Decide whether to compute an incremental delta or fall back to
+        // the "treat everything as added" path. We fall back when:
+        //   - the caller did not supply a cursor;
+        //   - no snapshot exists for this parent (engine restart, first
+        //     observation);
+        //   - the supplied cursor does not match the stored snapshot's
+        //     cursor (the client is out of date).
+        let use_incremental = match (since_cursor, previous) {
+            (Some(cursor), Some(snapshot)) => snapshot.cursor == *cursor,
+            _ => false,
+        };
+
+        let output = if use_incremental {
+            let previous_children = &previous
+                .ok_or_else(|| {
+                    // Unreachable: we only set use_incremental=true when
+                    // previous is Some, but expressing this with the
+                    // type system would require restructuring the match
+                    // above. The Internal error keeps us within the
+                    // strict-lints subset (no unwrap_used).
+                    HandlerError::internal(
+                        "snapshot disappeared between match and incremental branch".to_string(),
+                    )
+                })?
+                .children;
+            diff_snapshots(previous_children, &current, &entries, new_cursor.clone())
+        } else {
+            // First-call behaviour: every current child is "added", the
+            // deleted list is empty, and the engine takes a fresh
+            // snapshot so the next call carrying `new_cursor` can fall
+            // through to the incremental path.
+            EnumerateChangesOutput {
+                added_or_modified: entries
+                    .iter()
+                    .cloned()
+                    .map(|entry| FileProviderItem::from(VfsItem::from(entry)))
+                    .collect(),
+                deleted: Vec::new(),
+                new_cursor: new_cursor.clone(),
+            }
+        };
+
+        snapshots.insert(
+            parent_id.to_string(),
+            ParentSnapshot {
+                cursor: new_cursor,
+                children: current,
+            },
+        );
+        Ok(output)
+    }
+}
+
+/// Compute the per-parent cursor over an already-sorted child set.
+///
+/// Kept byte-for-byte identical to [`derive_sync_cursor`] so the cursor a
+/// Swift client persists via `currentSyncCursor` is interchangeable with
+/// the one we emit from `enumerateChanges`. The free function in
+/// `cascade_engine::vfs` re-lists from the backend; we have the list in
+/// hand already, so we reproduce the hash here rather than paying for a
+/// second backend round-trip.
+fn derive_cursor_from_sorted(entries: &[FileEntry]) -> SyncCursor {
+    let mut hasher = Sha256::new();
+    for entry in entries {
+        hasher.update(entry.id.0.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(entry.name.as_bytes());
+        hasher.update([0u8]);
+        hasher.update([u8::from(entry.is_dir)]);
+        hasher.update(entry.size.unwrap_or(0).to_be_bytes());
+        hasher.update(entry.mod_time.map_or(0i64, |t| t.timestamp()).to_be_bytes());
+    }
+    SyncCursor::new(hasher.finalize().to_vec())
+}
+
+/// Compute the added/modified/deleted sets between two snapshots.
+///
+/// `previous` and `current` are the two snapshot maps keyed by item ID;
+/// `current_entries` is the same set as `current` but in the canonical
+/// sorted order so the returned `added_or_modified` list is
+/// deterministic. The cursor for the new snapshot is passed in rather
+/// than recomputed here — the caller already has it.
+fn diff_snapshots(
+    previous: &HashMap<String, SnapshotEntry>,
+    current: &HashMap<String, SnapshotEntry>,
+    current_entries: &[FileEntry],
+    new_cursor: SyncCursor,
+) -> EnumerateChangesOutput {
+    let mut added_or_modified: Vec<FileProviderItem> = Vec::new();
+    for entry in current_entries {
+        let key = &entry.id.0;
+        let Some(current_metadata) = current.get(key) else {
+            continue;
+        };
+        let unchanged = previous
+            .get(key)
+            .is_some_and(|prior| prior == current_metadata);
+        if !unchanged {
+            added_or_modified.push(FileProviderItem::from(VfsItem::from(entry.clone())));
+        }
+    }
+
+    let mut deleted: Vec<String> = previous
+        .keys()
+        .filter(|key| !current.contains_key(key.as_str()))
+        .cloned()
+        .collect();
+    // Stable order for callers that compare results across runs.
+    deleted.sort();
+
+    EnumerateChangesOutput {
+        added_or_modified,
+        deleted,
+        new_cursor,
     }
 }
 
@@ -1497,5 +1707,212 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, ErrorCode::Internal);
+    }
+
+    /// First call with no prior cursor must return every current child
+    /// as added, an empty deleted set, and a non-empty new cursor.
+    #[tokio::test]
+    async fn enumerate_changes_first_call_returns_all_as_added() {
+        let (handlers, _backend, _tempdir) = make_handlers();
+        let output = handlers.enumerate_changes("stub:root", None).await.unwrap();
+
+        // Seeded child is `stub:file1` with name "hello.txt".
+        assert_eq!(output.added_or_modified.len(), 1);
+        assert_eq!(output.added_or_modified[0].id, "stub:file1");
+        assert!(output.deleted.is_empty());
+        assert!(!output.new_cursor.is_empty());
+
+        // The cursor we just got back must match what
+        // `currentSyncCursor` would emit right now — the two RPCs share
+        // a derivation, so consumers can interchange them freely.
+        let live_cursor = handlers.current_sync_cursor("stub:root").await.unwrap();
+        assert_eq!(live_cursor, output.new_cursor);
+    }
+
+    /// After the snapshot is taken, an unchanged view must yield no
+    /// deltas and the same cursor.
+    #[tokio::test]
+    async fn enumerate_changes_unchanged_view_returns_empty_delta() {
+        let (handlers, _backend, _tempdir) = make_handlers();
+        let first = handlers.enumerate_changes("stub:root", None).await.unwrap();
+
+        let second = handlers
+            .enumerate_changes("stub:root", Some(&first.new_cursor))
+            .await
+            .unwrap();
+
+        assert!(second.added_or_modified.is_empty());
+        assert!(second.deleted.is_empty());
+        assert_eq!(second.new_cursor, first.new_cursor);
+    }
+
+    /// Adding a child, deleting a child, and modifying a child between
+    /// two snapshots must surface in the delta as added/deleted/modified.
+    #[tokio::test]
+    async fn enumerate_changes_reflects_add_delete_modify() {
+        let (handlers, backend, _tempdir) = make_handlers();
+        let first = handlers.enumerate_changes("stub:root", None).await.unwrap();
+
+        // Add a new file.
+        let new_file_id = ItemId::new("stub", "file2");
+        backend.insert(FileEntry {
+            id: new_file_id.clone(),
+            parent_id: ItemId::new("stub", "root"),
+            name: "second.txt".to_string(),
+            is_dir: false,
+            size: Some(4),
+            mod_time: Some(Utc::now()),
+            mime_type: None,
+            hash: None,
+        });
+
+        // Modify the existing file (bump size).
+        {
+            let mut files = backend
+                .files
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = files.get_mut("stub:file1").unwrap();
+            entry.size = Some(42);
+            entry.mod_time = Some(Utc::now());
+        }
+
+        // Note: no deletion yet — set up a second snapshot first so we
+        // can split add / modify from delete cleanly.
+        let second = handlers
+            .enumerate_changes("stub:root", Some(&first.new_cursor))
+            .await
+            .unwrap();
+
+        let ids: Vec<&str> = second
+            .added_or_modified
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect();
+        assert!(
+            ids.contains(&"stub:file2"),
+            "newly inserted file must appear as added"
+        );
+        assert!(
+            ids.contains(&"stub:file1"),
+            "metadata change must appear as modified"
+        );
+        assert!(second.deleted.is_empty(), "no deletes yet");
+        assert_ne!(second.new_cursor, first.new_cursor);
+
+        // Now delete the original file and check the delta.
+        backend
+            .files
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove("stub:file1");
+
+        let third = handlers
+            .enumerate_changes("stub:root", Some(&second.new_cursor))
+            .await
+            .unwrap();
+        assert!(
+            third.added_or_modified.is_empty(),
+            "no further additions after delete"
+        );
+        assert_eq!(third.deleted, vec!["stub:file1".to_string()]);
+        assert_ne!(third.new_cursor, second.new_cursor);
+    }
+
+    /// A cursor the engine does not recognise (either because the
+    /// snapshot was dropped or because the client is on a stale cursor
+    /// from a different run) must behave like a first call: every child
+    /// reported as added, nothing reported as deleted.
+    #[tokio::test]
+    async fn enumerate_changes_cursor_mismatch_behaves_like_first_call() {
+        let (handlers, _backend, _tempdir) = make_handlers();
+        // Seed the snapshot first so we know mismatched cursors aren't
+        // simply "no snapshot stored".
+        let _ = handlers.enumerate_changes("stub:root", None).await.unwrap();
+
+        let bogus = SyncCursor::new(vec![0xde, 0xad, 0xbe, 0xef]);
+        let output = handlers
+            .enumerate_changes("stub:root", Some(&bogus))
+            .await
+            .unwrap();
+
+        // Everything seeded under the parent must come back as added.
+        assert_eq!(output.added_or_modified.len(), 1);
+        assert_eq!(output.added_or_modified[0].id, "stub:file1");
+        assert!(output.deleted.is_empty());
+        assert!(!output.new_cursor.is_empty());
+    }
+
+    /// Snapshots are keyed by parent ID; deltas for one parent must not
+    /// bleed into another. Sanity check that two independent parents
+    /// each carry their own snapshot.
+    #[tokio::test]
+    async fn enumerate_changes_per_parent_isolation() {
+        let (handlers, backend, _tempdir) = make_handlers();
+
+        // Add a second directory with its own child.
+        let other_dir = ItemId::new("stub", "other");
+        backend.insert(FileEntry {
+            id: other_dir.clone(),
+            parent_id: ItemId::new("stub", "root"),
+            name: "other".to_string(),
+            is_dir: true,
+            size: None,
+            mod_time: Some(Utc::now()),
+            mime_type: None,
+            hash: None,
+        });
+        backend.insert(FileEntry {
+            id: ItemId::new("stub", "other-child"),
+            parent_id: other_dir.clone(),
+            name: "child.txt".to_string(),
+            is_dir: false,
+            size: Some(1),
+            mod_time: Some(Utc::now()),
+            mime_type: None,
+            hash: None,
+        });
+
+        let root_first = handlers.enumerate_changes("stub:root", None).await.unwrap();
+        let other_first = handlers
+            .enumerate_changes("stub:other", None)
+            .await
+            .unwrap();
+
+        // Modify only the `other` parent.
+        backend
+            .files
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove("stub:other-child");
+
+        let root_second = handlers
+            .enumerate_changes("stub:root", Some(&root_first.new_cursor))
+            .await
+            .unwrap();
+        let other_second = handlers
+            .enumerate_changes("stub:other", Some(&other_first.new_cursor))
+            .await
+            .unwrap();
+
+        assert!(
+            root_second.added_or_modified.is_empty() && root_second.deleted.is_empty(),
+            "root parent must be unchanged"
+        );
+        assert_eq!(
+            other_second.deleted,
+            vec!["stub:other-child".to_string()],
+            "only the touched parent should see the delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn enumerate_changes_fails_for_unknown_backend() {
+        let (handlers, _backend, _tempdir) = make_handlers();
+        let err = handlers
+            .enumerate_changes("ghost:root", None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
     }
 }

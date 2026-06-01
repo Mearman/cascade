@@ -29,6 +29,7 @@ pub mod methods {
     pub const DELETE_ITEM: &str = "deleteItem";
     pub const MOVE_ITEM: &str = "moveItem";
     pub const CURRENT_SYNC_CURSOR: &str = "currentSyncCursor";
+    pub const ENUMERATE_CHANGES: &str = "enumerateChanges";
 }
 
 /// Structured error returned in an [`RpcResponse`].
@@ -197,6 +198,41 @@ pub struct CurrentSyncCursorParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CurrentSyncCursorResult {
     pub cursor: SyncCursor,
+}
+
+// ---------------------------------------------------------------------------
+// enumerateChanges
+// ---------------------------------------------------------------------------
+
+/// Parameters for the `enumerateChanges` RPC.
+///
+/// `since_cursor` is the opaque cursor the Swift File Provider extension
+/// last persisted (the one the engine handed back via either
+/// `currentSyncCursor` or a prior `enumerateChanges` call). `None` — or a
+/// cursor the engine no longer recognises — means "start fresh": the
+/// engine returns every current child as `added_or_modified` and emits a
+/// new cursor describing the snapshot it just took.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EnumerateChangesParams {
+    pub parent_id: String,
+    #[serde(default)]
+    pub since_cursor: Option<SyncCursor>,
+}
+
+/// Result of the `enumerateChanges` RPC.
+///
+/// `added_or_modified` carries items that are present in the current view
+/// but were either absent from the prior snapshot or have a different
+/// metadata tuple. `deleted` carries the IDs of items present in the
+/// prior snapshot that no longer exist. `new_cursor` is the cursor the
+/// caller must echo on the next `enumerateChanges` call to receive an
+/// incremental delta — passing back a stale or unknown cursor falls
+/// through to the "first call" behaviour.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnumerateChangesResult {
+    pub added_or_modified: Vec<FileProviderItem>,
+    pub deleted: Vec<String>,
+    pub new_cursor: SyncCursor,
 }
 
 #[cfg(test)]
