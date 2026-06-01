@@ -4,16 +4,10 @@
 //
 // The replicated File Provider API enumerates two things separately:
 // the current items inside a container (`enumerateItems`) and the
-// stream of changes since a sync anchor (`enumerateChanges`).
-//
-// Cascade's bridge protocol does not yet model `enumerateChanges`; the
-// engine pushes individual notifications over the socket instead. Until
-// that side grows a real delta stream, this enumerator reports no
-// further changes for `enumerateChanges` and relies on the system to
-// re-enumerate when it compares `currentSyncAnchor` against its
-// last-known anchor. The sync anchor itself is now real — see
-// `currentSyncAnchor` below — so a change to any item beneath this
-// container will invalidate the anchor and trigger a fresh enumeration.
+// stream of changes since a sync anchor (`enumerateChanges`). Both
+// route through the same `ActionHandler` -> Unix-socket -> Rust engine
+// path so that what `currentSyncAnchor` emits and what
+// `enumerateChanges` consumes share a single cursor format.
 
 import FileProvider
 import Foundation
@@ -108,12 +102,42 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
     }
 
     func enumerateChanges(for observer: NSFileProviderChangeObserver, from syncAnchor: NSFileProviderSyncAnchor) {
-        // TODO(fileprovider): the Rust bridge needs an `enumerateChanges`
-        //   method that returns a delta keyed on a server cursor before
-        //   this implementation can do anything useful. Until then we
-        //   acknowledge the anchor unchanged and let the system fall
-        //   back to a full re-enumeration when it chooses.
-        observer.finishEnumeratingChanges(upTo: syncAnchor, moreComing: false)
+        // The system hands us the bytes of the cursor we previously
+        // emitted from either `currentSyncAnchor` or a prior
+        // `enumerateChanges` call. Re-encode them as base64url-no-pad
+        // — the same string form the engine expects on the wire — and
+        // push the delta back into the observer. A nil `sinceCursor`
+        // would only happen if the system handed us an empty anchor;
+        // we never emit one, but if it does the engine falls back to a
+        // fresh enumeration.
+        let sinceCursor = base64URLNoPadEncode(syncAnchor.rawValue)
+        Task {
+            do {
+                let (added, deletedIDs, newCursor) = try await actions.enumerateChanges(
+                    parentIdentifier: parentIdentifier,
+                    sinceCursor: sinceCursor
+                )
+                if !added.isEmpty {
+                    observer.didUpdate(added)
+                }
+                if !deletedIDs.isEmpty {
+                    let identifiers = deletedIDs.map { NSFileProviderItemIdentifier($0) }
+                    observer.didDeleteItems(withIdentifiers: identifiers)
+                }
+                guard let newAnchorBytes = base64URLNoPadDecode(newCursor) else {
+                    enumeratorLogger.error("enumerateChanges returned a cursor that failed base64url-no-pad decode: \(newCursor, privacy: .public)")
+                    observer.finishEnumeratingChanges(upTo: syncAnchor, moreComing: false)
+                    return
+                }
+                observer.finishEnumeratingChanges(
+                    upTo: NSFileProviderSyncAnchor(newAnchorBytes),
+                    moreComing: false
+                )
+            } catch {
+                enumeratorLogger.error("enumerateChanges RPC failed: \(error.localizedDescription, privacy: .public)")
+                observer.finishEnumeratingWithError(error)
+            }
+        }
     }
 
     /// Return the system the engine's current sync cursor for this

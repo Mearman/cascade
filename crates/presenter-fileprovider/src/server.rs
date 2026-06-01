@@ -33,9 +33,10 @@ use crate::handlers::{FileProviderHandlers, HandlerError, HandlerResult};
 use crate::items::FileProviderItem;
 use crate::wire::{
     CreateDirectoryParams, CreateDirectoryResult, CurrentSyncCursorParams, CurrentSyncCursorResult,
-    DeleteItemParams, DeleteItemResult, EnumerateItemsParams, EnumerateItemsResult,
-    FetchContentsParams, FetchContentsResult, GetItemParams, GetItemResult, ImportDocumentParams,
-    ImportDocumentResult, MoveItemParams, MoveItemResult, RpcError, RpcResponse, methods,
+    DeleteItemParams, DeleteItemResult, EnumerateChangesParams, EnumerateChangesResult,
+    EnumerateItemsParams, EnumerateItemsResult, FetchContentsParams, FetchContentsResult,
+    GetItemParams, GetItemResult, ImportDocumentParams, ImportDocumentResult, MoveItemParams,
+    MoveItemResult, RpcError, RpcResponse, methods,
 };
 
 /// Server that listens on a Unix domain socket and dispatches each
@@ -170,6 +171,7 @@ pub async fn dispatch(handlers: &dyn FileProviderHandlers, request: &Request) ->
         methods::DELETE_ITEM => handle_delete_item(handlers, params).await,
         methods::MOVE_ITEM => handle_move_item(handlers, params).await,
         methods::CURRENT_SYNC_CURSOR => handle_current_sync_cursor(handlers, params).await,
+        methods::ENUMERATE_CHANGES => handle_enumerate_changes(handlers, params).await,
         other => Err(HandlerError::internal(format!(
             "unknown File Provider RPC method: {other}"
         ))),
@@ -303,6 +305,24 @@ async fn handle_current_sync_cursor(
     )
 }
 
+async fn handle_enumerate_changes(
+    handlers: &dyn FileProviderHandlers,
+    params: serde_json::Value,
+) -> HandlerResult<serde_json::Value> {
+    let params: EnumerateChangesParams = parse_params(methods::ENUMERATE_CHANGES, params)?;
+    let output = handlers
+        .enumerate_changes(&params.parent_id, params.since_cursor.as_ref())
+        .await?;
+    serialise_result(
+        methods::ENUMERATE_CHANGES,
+        &EnumerateChangesResult {
+            added_or_modified: output.added_or_modified,
+            deleted: output.deleted,
+            new_cursor: output.new_cursor,
+        },
+    )
+}
+
 // Re-export so callers can build a server without pulling the
 // `wire::methods` constants individually.
 #[doc(inline)]
@@ -311,7 +331,7 @@ pub use crate::wire::methods as method_names;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handlers::{EnumerateOutput, ErrorCode};
+    use crate::handlers::{EnumerateChangesOutput, EnumerateOutput, ErrorCode};
     use async_trait::async_trait;
     use cascade_engine::protocol::Request;
     use cascade_engine::types::{CacheState, SyncCursor};
@@ -422,6 +442,19 @@ mod tests {
             self.record("current_sync_cursor");
             Ok(SyncCursor::new(vec![0xab, 0xcd, 0xef]))
         }
+
+        async fn enumerate_changes(
+            &self,
+            parent_id: &str,
+            _since_cursor: Option<&SyncCursor>,
+        ) -> HandlerResult<EnumerateChangesOutput> {
+            self.record("enumerate_changes");
+            Ok(EnumerateChangesOutput {
+                added_or_modified: vec![sample_item("gdrive:a", parent_id, "a.txt")],
+                deleted: vec!["gdrive:gone".to_string()],
+                new_cursor: SyncCursor::new(vec![0x12, 0x34]),
+            })
+        }
     }
 
     fn make_request(id: u32, method: &str, params: serde_json::Value) -> Request {
@@ -524,6 +557,43 @@ mod tests {
 
         let result = response.result.unwrap();
         assert_eq!(result, json!({}));
+    }
+
+    #[tokio::test]
+    async fn dispatch_enumerate_changes_returns_delta() {
+        let handlers = StubHandlers::default();
+        let request = make_request(
+            13,
+            methods::ENUMERATE_CHANGES,
+            json!({"parent_id": "gdrive:root"}),
+        );
+
+        let response = dispatch(&handlers, &request).await;
+
+        assert!(response.error.is_none());
+        let result = response.result.unwrap();
+        let added = result["added_or_modified"].as_array().unwrap();
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0]["id"], "gdrive:a");
+        let deleted = result["deleted"].as_array().unwrap();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0], "gdrive:gone");
+        // new_cursor is base64url-no-pad of [0x12, 0x34] = "EjQ".
+        assert_eq!(result["new_cursor"], "EjQ");
+    }
+
+    #[tokio::test]
+    async fn dispatch_enumerate_changes_accepts_since_cursor() {
+        let handlers = StubHandlers::default();
+        // `EjQ` decodes to [0x12, 0x34].
+        let request = make_request(
+            14,
+            methods::ENUMERATE_CHANGES,
+            json!({"parent_id": "gdrive:root", "since_cursor": "EjQ"}),
+        );
+
+        let response = dispatch(&handlers, &request).await;
+        assert!(response.error.is_none());
     }
 
     #[tokio::test]
