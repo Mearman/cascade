@@ -552,7 +552,7 @@ fn decode_close(data: &[u8]) -> Result<BepMessage> {
 fn decode_gossip(data: &[u8]) -> Result<BepMessage> {
     let (count, mut rest) = decode_u32(data)?;
     if count > MAX_GOSSIP_PEERS {
-        anyhow::bail!("gossip peer count {count} exceeds maximum {MAX_GOSSIP_PEERS}",);
+        anyhow::bail!("gossip peer count {count} exceeds maximum {MAX_GOSSIP_PEERS}");
     }
     let mut peers = Vec::with_capacity(count as usize);
     for _ in 0..count {
