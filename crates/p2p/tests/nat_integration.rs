@@ -374,11 +374,7 @@ impl NetNsHarness {
             //
             // Note: test binary arguments are test harness arguments directly
             // (no `--` separator needed when invoking the binary directly).
-            .args([
-                "nat_relay_end_to_end",
-                "--nocapture",
-                "--test-threads=1",
-            ])
+            .args(["nat_relay_end_to_end", "--nocapture", "--test-threads=1"])
             .env("CASCADE_NETNS_ROLE", "relay")
             // Inherit stderr for debugging; capture stdout to read the bound port.
             .stdin(Stdio::piped())
