@@ -36,6 +36,7 @@ pub mod nat;
 pub mod protocol;
 pub mod relay;
 pub mod store;
+pub mod transport;
 pub mod traversal;
 pub mod wan;
 
