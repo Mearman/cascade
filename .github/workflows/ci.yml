@@ -605,7 +605,7 @@ jobs:
           $output = cascade --version
           Write-Host $output
           $installed = ($output -split '\s+')[1]
-          $expected = $env:VERSION -replace '^v',''
+          $expected = $env:VERSION -replace '^cascade-v',''
           if ($installed -ne $expected) {
             Write-Host "version mismatch: installed=$installed expected=$expected"
             exit 1
