@@ -52,12 +52,14 @@ pub const MAX_SESSION_ID_LEN: usize = 256;
 
 /// Wall-clock cap on how long the relay handshake is allowed to take
 /// before [`RelayClient::connect_with_secret`] gives up and returns
-/// [`RelayAuthError::Timeout`]. The relay server itself does not park
-/// the inbound socket indefinitely — its `session_timeout` starts ticking
-/// the moment the parked side authenticates — but a misbehaving relay
-/// could still hang the WebSocket without reading bytes, so the client
-/// applies its own ceiling.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// [`RelayAuthError::Timeout`].
+///
+/// The relay server itself does not park the inbound socket
+/// indefinitely — its `session_timeout` starts ticking the moment the
+/// parked side authenticates — but a misbehaving relay could still hang
+/// the WebSocket without reading bytes, so the client applies its own
+/// ceiling.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Reasons a relay handshake may fail.
 ///

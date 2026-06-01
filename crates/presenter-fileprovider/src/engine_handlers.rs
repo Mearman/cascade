@@ -183,7 +183,7 @@ impl EngineHandlers {
     /// successful copy of the data.
     ///
     /// Directories descend recursively: the destination tree is built
-    /// up file-by-file via [`copy_directory_tree`], and only once every
+    /// up file-by-file via [`Self::copy_directory_tree`], and only once every
     /// child has been copied successfully is the source subtree
     /// deleted. If any child copy fails partway through, the partially
     /// built destination tree is left in place and the source subtree

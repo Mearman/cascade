@@ -22,12 +22,11 @@
 //! * [`server_reflexive_candidate_from_addr`] — turn the external
 //!   address discovered by [`detect_nat_type_rfc5780`] into a
 //!   [`Candidate`] tagged as
-//!   [`CandidateKind::ServerReflexive`][crate::candidate::CandidateKind::ServerReflexive].
+//!   [`CandidateKind::ServerReflexive`].
 //! * [`enumerate_host_candidates`] — walk every non-loopback, non-link-local
 //!   network interface address on the host and emit one
-//!   [`Candidate`] tagged as
-//!   [`CandidateKind::Host`][crate::candidate::CandidateKind::Host] per
-//!   remaining address.
+//!   [`Candidate`] tagged as [`CandidateKind::Host`] per remaining
+//!   address.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -92,8 +91,8 @@ pub enum NatDetectionError {
 /// `SocketAddr` observed during `Test I`. The mapped address is what a
 /// remote peer would have to dial to reach the host through its `NAT`
 /// — it is the input to the
-/// [`CandidateKind::ServerReflexive`][crate::candidate::CandidateKind::ServerReflexive]
-/// candidate that gets gossiped to peers.
+/// [`CandidateKind::ServerReflexive`] candidate that gets gossiped to
+/// peers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NatDetectionOutcome {
     /// Classified `NAT` taxonomy.
