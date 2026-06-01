@@ -36,6 +36,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use tokio::time::sleep;
 
 use crate::candidate::Candidate;
 
@@ -405,8 +406,98 @@ pub enum PunchError {
     InvalidConfig(&'static str),
 }
 
-// `run_hole_punch` lives in a follow-up commit so the types and traits
-// land independently.
+/// Drive a hole-punch attempt against a single candidate pair.
+///
+/// Sequence per `docs/nat-hole-punching.md` §"Hole-punching protocol":
+///
+/// 1. Verify the `SyncPunchAgreement`'s deadline is still in the
+///    future. If not, return [`PunchError::DeadlinePassed`] immediately
+///    so the punch budget is not spent on a doomed attempt.
+/// 2. Repeat at most `config.max_bursts` times:
+///    1. Send `config.burst_size` probes back-to-back via the
+///       transport, all carrying the agreement's nonce.
+///    2. Block on `transport.recv_probe(burst_deadline)` where
+///       `burst_deadline = start_of_burst + config.per_burst_gap`.
+///    3. If a probe arrives with a matching nonce, return
+///       `EstablishedFlow` stamped with `clock.now_unix_ms()`.
+///    4. If the deadline elapses or the probe carries a non-matching
+///       nonce, treat the burst as failed and continue.
+/// 3. If `PunchConfig::total_deadline` elapses or every burst fails,
+///    return [`PunchError::Timeout`].
+///
+/// # Errors
+///
+/// Returns [`PunchError::DeadlinePassed`] if the agreement's deadline
+/// is already in the past, [`PunchError::Transport`] if the transport
+/// reports an I/O error other than a deadline elapse during a send, and
+/// [`PunchError::Timeout`] if no burst succeeds within the budget.
+pub async fn run_hole_punch<T: PunchTransport + ?Sized>(
+    transport: &T,
+    pair: &CandidatePair,
+    sync: &SyncPunchAgreement,
+    config: &PunchConfig,
+    clock: &dyn Clock,
+) -> Result<EstablishedFlow, PunchError> {
+    let now_ms = clock.now_unix_ms();
+    if now_ms >= sync.deadline_unix_ms {
+        return Err(PunchError::DeadlinePassed {
+            now_ms,
+            deadline_ms: sync.deadline_unix_ms,
+        });
+    }
+
+    let overall_deadline = clock.now() + config.total_deadline;
+
+    for _burst in 0..config.max_bursts {
+        let burst_start = clock.now();
+        if burst_start >= overall_deadline {
+            return Err(PunchError::Timeout);
+        }
+
+        for _ in 0..config.burst_size {
+            transport.send_probe(pair.remote, sync.nonce).await?;
+        }
+
+        let burst_deadline = burst_start + config.per_burst_gap;
+        let recv_deadline = burst_deadline.min(overall_deadline);
+
+        match transport.recv_probe(recv_deadline).await {
+            Ok(probe) if probe.nonce == sync.nonce => {
+                return Ok(EstablishedFlow {
+                    local: pair.local,
+                    remote: pair.remote,
+                    established_at_unix_ms: clock.now_unix_ms(),
+                });
+            }
+            Ok(_) => {
+                // Wrong nonce — treat as no receipt and move on. A real
+                // socket may legitimately surface unrelated traffic on
+                // the same port (a `STUN` keep-alive, a probe from a
+                // different peer mid-flight); aborting the run on the
+                // first stray packet would be brittle.
+            }
+            Err(err) if err.kind() == io::ErrorKind::TimedOut => {
+                // Expected outcome for a burst that does not yield a
+                // probe before its deadline. Fall through to the next
+                // burst.
+            }
+            Err(err) => return Err(PunchError::Transport(err)),
+        }
+
+        // If the receive call returned early (wrong-nonce probe or a
+        // mock transport that resolves before the deadline), pace the
+        // next burst by sleeping out the remainder of the gap. This
+        // keeps the bursts roughly synchronised with the remote side
+        // even when the local transport is faster than the wire.
+        let now = clock.now();
+        if now < burst_deadline && burst_deadline <= overall_deadline {
+            let gap = burst_deadline - now;
+            sleep(gap).await;
+        }
+    }
+
+    Err(PunchError::Timeout)
+}
 
 fn highest_priority_addr(candidates: &[Candidate]) -> Option<SocketAddr> {
     candidates

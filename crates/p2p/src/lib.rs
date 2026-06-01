@@ -42,6 +42,7 @@ pub mod wan;
 pub use traversal::{
     CandidatePair, Clock, ConnectivityStrategy, EstablishedFlow, NatType, PunchConfig, PunchError,
     PunchTransport, ReceivedProbe, SyncPunchAgreement, SystemClock, decide_connectivity,
+    run_hole_punch,
 };
 
 use std::path::Path;
