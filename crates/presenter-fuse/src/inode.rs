@@ -100,8 +100,8 @@ mod tests {
         let child_a = ItemId::new("gdrive", "file_a");
         let child_b = ItemId::new("gdrive", "file_b");
 
-        let inode_a = map.allocate(child_a.clone());
-        let inode_b = map.allocate(child_b.clone());
+        let inode_a = map.allocate(child_a);
+        let inode_b = map.allocate(child_b);
 
         assert_eq!(inode_a, 2);
         assert_eq!(inode_b, 3);
@@ -114,7 +114,7 @@ mod tests {
         let child = ItemId::new("gdrive", "file_a");
 
         let first = map.allocate(child.clone());
-        let second = map.allocate(child.clone());
+        let second = map.allocate(child);
 
         assert_eq!(first, second);
         assert_eq!(map.len(), 2);
@@ -124,8 +124,7 @@ mod tests {
     fn remove_item() {
         let mut map = InodeMap::new(root_id());
         let child = ItemId::new("gdrive", "file_a");
-        let inode = map.allocate(child.clone());
-
+        let inode = map.allocate(child.clone()); // clone needed: child used again in remove
         map.remove(&child);
 
         assert_eq!(map.get_inode(&child), None);
@@ -145,14 +144,13 @@ mod tests {
     fn bidirectional_lookup() {
         let mut map = InodeMap::new(root_id());
         let child = ItemId::new("gdrive", "docs");
-        let inode = map.allocate(child.clone());
-
+        let inode = map.allocate(child.clone()); // clone needed: child used in assertions
         assert_eq!(map.get_inode(&child), Some(inode));
         assert_eq!(map.get_id(inode), Some(&child));
     }
 }
 
-/// Property-based tests for InodeMap.
+/// Property-based tests for `InodeMap`.
 #[cfg(test)]
 mod proptests {
     use super::*;
@@ -162,7 +160,7 @@ mod proptests {
         #[test]
         fn allocate_n_inodes_all_unique(ids in prop::collection::vec("[a-z]{1,10}", 1..50)) {
             let root = ItemId::new("test", "root");
-            let mut map = InodeMap::new(root.clone());
+            let mut map = InodeMap::new(root);
 
             // Deduplicate to ensure we test distinct IDs.
             let mut seen = std::collections::HashSet::new();
@@ -178,7 +176,7 @@ mod proptests {
 
             // All inodes should be unique.
             let mut sorted = inodes.clone();
-            sorted.sort();
+            sorted.sort_unstable();
             sorted.dedup();
             prop_assert_eq!(sorted.len(), inodes.len());
         }
@@ -203,7 +201,7 @@ mod proptests {
             let id = ItemId::new("test", &id_str);
 
             let first = map.allocate(id.clone());
-            let second = map.allocate(id.clone());
+            let second = map.allocate(id);
             prop_assert_eq!(first, second);
         }
     }

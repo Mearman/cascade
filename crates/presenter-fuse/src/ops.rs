@@ -665,7 +665,10 @@ mod tests {
             cascade_engine::backend::NullBackend::new("test"),
         ))));
         let ops = FuseOps::new_with_vfs(root.clone(), vfs);
-        let map = ops.inode_map.lock().unwrap();
+        let map = ops
+            .inode_map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(map.get_inode(&root), Some(crate::inode::ROOT_INODE));
     }
 

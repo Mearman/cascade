@@ -36,6 +36,10 @@ pub struct FusePresenter {
     vfs: Arc<RwLock<VfsTree>>,
     /// Base directory for cached files.
     cache_dir: PathBuf,
+    /// Active FUSE background session. Populated by `start()`, cleared by `stop()`.
+    /// Dropping the session unmounts the filesystem and joins the FUSE thread.
+    #[cfg(target_os = "linux")]
+    session: Arc<std::sync::Mutex<Option<fuser::BackgroundSession>>>,
 }
 
 impl FusePresenter {
@@ -49,6 +53,8 @@ impl FusePresenter {
             vfs,
             inode_map,
             cache_dir,
+            #[cfg(target_os = "linux")]
+            session: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -193,29 +199,27 @@ impl VfsPresenter for FusePresenter {
             let ops =
                 crate::ops::FuseOps::new_with_vfs(self.root_id.clone(), Arc::clone(&self.vfs));
             let mp = mount_point.to_path_buf();
+            let mut config = fuser::Config::default();
+            config.mount_options = vec![
+                fuser::MountOption::RO,
+                fuser::MountOption::FSName("cascade".to_string()),
+                fuser::MountOption::DefaultPermissions,
+            ];
 
-            // Spawn the FUSE session in a background thread. fuser::mount2
-            // is the *blocking* form — it returns only when the filesystem
-            // is unmounted from the outside (umount(8) / Ctrl-C / Drop).
-            // Using fuser::spawn_mount2 here would have returned a
-            // BackgroundSession that we'd need to keep alive; dropping it
-            // tears the mount down immediately, which is what produced the
-            // "FUSE session ended" log line one tick after start in CI.
-            std::thread::spawn(move || {
-                let mut config = fuser::Config::default();
-                config.mount_options = vec![
-                    fuser::MountOption::RO,
-                    fuser::MountOption::FSName("cascade".to_string()),
-                    fuser::MountOption::DefaultPermissions,
-                ];
-                if let Err(e) = fuser::mount2(ops, &mp, &config) {
-                    tracing::error!(error = %e, "FUSE mount failed");
-                } else {
-                    tracing::info!("FUSE session ended");
-                }
-            });
+            let bg = fuser::spawn_mount2(ops, &mp, &config)?;
 
-            Ok(())
+            // Store the session; acquiring and immediately releasing the lock
+            // so no lock is held across an await point.
+            {
+                let mut guard = self
+                    .session
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *guard = Some(bg);
+            }
+
+            tracing::info!(mount_point = %mount_display, "FUSE presenter started");
+            return Ok(());
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -235,8 +239,30 @@ impl VfsPresenter for FusePresenter {
 
         #[cfg(target_os = "linux")]
         {
-            // TODO: Signal the FUSE session to unmount and wait for the thread.
-            // fuser sessions unmount when dropped, or via fuser::unmount().
+            // Take the session out of the Option while holding the lock, then
+            // release the lock *before* dropping the session. BackgroundSession's
+            // Drop calls umount_and_join, which blocks until the FUSE thread
+            // exits — never block while holding a lock.
+            let session = {
+                let mut guard = self
+                    .session
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard.take()
+            };
+
+            if let Some(bg) = session {
+                // umount_and_join blocks the calling thread; run it off the
+                // async executor so we don't starve the Tokio runtime.
+                tokio::task::spawn_blocking(move || {
+                    if let Err(e) = bg.umount_and_join() {
+                        tracing::warn!(error = %e, "error while unmounting FUSE session");
+                    }
+                })
+                .await?;
+            }
+
+            tracing::info!("FUSE presenter stopped");
         }
 
         Ok(())
@@ -303,14 +329,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_fails_on_non_linux() {
+    async fn start_fails_on_non_linux() -> anyhow::Result<()> {
         #[cfg(not(target_os = "linux"))]
         {
             let root = ItemId::new("gdrive", "root");
             let presenter = FusePresenter::new(root);
             let result = presenter.start(Path::new("/mnt/test")).await;
             assert!(result.is_err());
-            let err = result.unwrap_err().to_string();
+            let err = result
+                .err()
+                .ok_or_else(|| anyhow::anyhow!("expected error"))?
+                .to_string();
             assert!(
                 err.contains("Linux"),
                 "expected Linux-specific error, got: {err}"
@@ -321,10 +350,70 @@ mod tests {
         {
             // On Linux, start would attempt a real mount — skip in unit tests.
         }
+
+        Ok(())
+    }
+
+    /// `stop()` with no prior `start()` must be a no-op.
+    #[tokio::test]
+    async fn stop_without_start_is_noop() -> anyhow::Result<()> {
+        let root = ItemId::new("gdrive", "root");
+        let presenter = FusePresenter::new(root);
+        // Must not panic or error.
+        presenter.stop().await?;
+        // Session must still be absent.
+        #[cfg(target_os = "linux")]
+        {
+            let guard = presenter
+                .session
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                guard.is_none(),
+                "session must remain None after stop with no start"
+            );
+        }
+        Ok(())
+    }
+
+    /// Calling `stop()` a second time after the session was already cleared
+    /// must be a no-op — the `Option::take()` pattern ensures this.
+    #[tokio::test]
+    async fn stop_is_idempotent() -> anyhow::Result<()> {
+        let root = ItemId::new("gdrive", "root");
+        let presenter = FusePresenter::new(root);
+        presenter.stop().await?;
+        presenter.stop().await?;
+        #[cfg(target_os = "linux")]
+        {
+            let guard = presenter
+                .session
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                guard.is_none(),
+                "session must remain None after double stop"
+            );
+        }
+        Ok(())
+    }
+
+    /// The session field starts as `None` — `stop()` on a never-started presenter
+    /// must leave it `None` without panicking.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn session_starts_none() {
+        let root = ItemId::new("gdrive", "root");
+        let presenter = FusePresenter::new(root);
+        let guard = presenter
+            .session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(guard.is_none(), "session must start as None");
     }
 
     #[tokio::test]
-    async fn upsert_allocates_inode() {
+    async fn upsert_allocates_inode() -> anyhow::Result<()> {
         let root = ItemId::new("gdrive", "root");
         let presenter = FusePresenter::new(root);
         let item = VfsItem {
@@ -338,13 +427,17 @@ mod tests {
             mime_type: None,
         };
 
-        presenter.upsert_item(item).await.unwrap();
-        let map = presenter.inode_map().lock().unwrap();
+        presenter.upsert_item(item).await?;
+        let map = presenter
+            .inode_map()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(map.get_inode(&ItemId::new("gdrive", "file1")), Some(2));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn delete_removes_inode() {
+    async fn delete_removes_inode() -> anyhow::Result<()> {
         let root = ItemId::new("gdrive", "root");
         let presenter = FusePresenter::new(root);
         let id = ItemId::new("gdrive", "file1");
@@ -359,59 +452,65 @@ mod tests {
             cache_state: CacheState::Online,
             mime_type: None,
         };
-        presenter.upsert_item(item).await.unwrap();
-        presenter.delete_item(&id).await.unwrap();
-        let map = presenter.inode_map().lock().unwrap();
+        presenter.upsert_item(item).await?;
+        presenter.delete_item(&id).await?;
+        let map = presenter
+            .inode_map()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(map.get_inode(&id), None);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn update_state_is_ok() {
+    async fn update_state_is_ok() -> anyhow::Result<()> {
         let root = ItemId::new("gdrive", "root");
         let presenter = FusePresenter::new(root);
         let id = ItemId::new("gdrive", "file1");
-        presenter
-            .update_state(&id, CacheState::Cached)
-            .await
-            .unwrap();
+        presenter.update_state(&id, CacheState::Cached).await?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn evict_removes_cached_file() {
-        let tmp = tempfile::tempdir().unwrap();
+    async fn evict_removes_cached_file() -> anyhow::Result<()> {
+        let tmp = tempfile::tempdir()?;
         let root = ItemId::new("gdrive", "root");
         let presenter = FusePresenter::new(root).with_cache_dir(tmp.path());
         let id = ItemId::new("test", "file1");
         let cache_path = presenter.cache_path_for(&id);
 
-        tokio::fs::create_dir_all(cache_path.parent().unwrap())
-            .await
-            .unwrap();
-        tokio::fs::write(&cache_path, b"data").await.unwrap();
+        let parent = cache_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("cache path has no parent"))?;
+        tokio::fs::create_dir_all(parent).await?;
+        tokio::fs::write(&cache_path, b"data").await?;
         assert!(cache_path.exists());
 
-        presenter.evict_item(&id).await.unwrap();
+        presenter.evict_item(&id).await?;
         assert!(!cache_path.exists());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn fetch_contents_caches_file() {
+    async fn fetch_contents_caches_file() -> anyhow::Result<()> {
         // fetch_contents with a NullBackend will fail (no files),
         // but we can test the caching path by pre-placing a file.
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir()?;
         let root = ItemId::new("gdrive", "root");
         let presenter = FusePresenter::new(root).with_cache_dir(tmp.path());
         let id = ItemId::new("test", "cached");
         let cache_path = presenter.cache_path_for(&id);
 
         // Pre-place a cached file.
-        tokio::fs::create_dir_all(cache_path.parent().unwrap())
-            .await
-            .unwrap();
-        tokio::fs::write(&cache_path, b"cached data").await.unwrap();
+        let parent = cache_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("cache path has no parent"))?;
+        tokio::fs::create_dir_all(parent).await?;
+        tokio::fs::write(&cache_path, b"cached data").await?;
 
         // fetch_contents should return the existing cached path.
-        let result = presenter.fetch_contents(&id).await.unwrap();
+        let result = presenter.fetch_contents(&id).await?;
         assert_eq!(result, cache_path);
+        Ok(())
     }
 }
