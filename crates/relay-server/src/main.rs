@@ -25,10 +25,11 @@ struct Cli {
 
     /// 64-character hexadecimal shared secret (32 bytes after decoding).
     /// Generate with `openssl rand -hex 32`. Both peers and the relay must
-    /// hold the same secret. Pass via `--shared-secret "$(cat secret.hex)"`
-    /// or inline; the workspace clap doesn't enable the `env` feature so
-    /// there is no `CASCADE_RELAY_SHARED_SECRET` shortcut.
-    #[arg(long)]
+    /// hold the same secret.
+    ///
+    /// Can also be supplied via the `CASCADE_RELAY_SHARED_SECRET` environment
+    /// variable to avoid the secret appearing on the process command line.
+    #[arg(long, env = "CASCADE_RELAY_SHARED_SECRET")]
     shared_secret: String,
 
     /// How long the first peer of a session may wait for its partner

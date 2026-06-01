@@ -39,7 +39,7 @@ serde_yaml = "0.9"
 rusqlite = { version = "0.35", features = ["bundled"] }
 
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 
 # Error handling
 anyhow = "1"

@@ -6,8 +6,11 @@
 # environment: blocks or helm values, without overriding the CMD.
 #
 # Required:
-#   CASCADE_RELAY_SECRET  — 64-character hex shared HMAC secret.
-#                           Generate with: openssl rand -hex 32
+#   CASCADE_RELAY_SHARED_SECRET  — 64-character hex shared HMAC secret.
+#                                  Generate with: openssl rand -hex 32
+#                                  Passed via environment variable only, never
+#                                  on the command line, to prevent the secret
+#                                  appearing in /proc/<pid>/cmdline.
 #
 # Optional:
 #   CASCADE_RELAY_LISTEN  — bind address for the peer listener.
@@ -22,14 +25,18 @@
 
 set -eu
 
-if [ -z "${CASCADE_RELAY_SECRET:-}" ]; then
-    echo "ERROR: CASCADE_RELAY_SECRET is not set." >&2
+if [ -z "${CASCADE_RELAY_SHARED_SECRET:-}" ]; then
+    echo "ERROR: CASCADE_RELAY_SHARED_SECRET is not set." >&2
     echo "       Generate a secret with: openssl rand -hex 32" >&2
     exit 1
 fi
 
+# Export so clap picks it up via env = "CASCADE_RELAY_SHARED_SECRET".
+# The secret is never passed on the command line, preventing it from
+# appearing in /proc/<pid>/cmdline or process listings.
+export CASCADE_RELAY_SHARED_SECRET
+
 ARGS="--bind ${CASCADE_RELAY_LISTEN:-0.0.0.0:9999}"
-ARGS="$ARGS --shared-secret $CASCADE_RELAY_SECRET"
 
 if [ -n "${CASCADE_RELAY_METRICS:-}" ]; then
     ARGS="$ARGS --metrics-bind $CASCADE_RELAY_METRICS"
