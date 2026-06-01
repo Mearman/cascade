@@ -4,7 +4,8 @@ use std::fmt;
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use data_encoding::BASE64URL_NOPAD;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Unique identifier for a file or directory across all backends.
 /// Format: `"{backend_id}:{backend_native_id}"`.
@@ -58,6 +59,70 @@ impl fmt::Display for FileId {
 /// Opaque to the engine — stored and passed through to backends.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Cursor(pub String);
+
+/// Opaque cursor identifying a sync state.
+///
+/// The byte payload is engine-internal; consumers (the File Provider
+/// extension, future presenters) treat it as a black box and pass it
+/// back unchanged to resume enumeration or compare against the system's
+/// last-known anchor.
+///
+/// Two cursors are equal if their bytes are equal; ordering is not
+/// defined (the engine may emit cursors out of monotonic order if its
+/// internal storage is updated by multiple writers).
+///
+/// On the wire the cursor is encoded as `base64url`-no-pad, which keeps
+/// it URL- and JSON-string-safe without ever exposing the raw bytes to
+/// consumers that have no business interpreting them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct SyncCursor {
+    bytes: Vec<u8>,
+}
+
+impl SyncCursor {
+    /// Wrap the given bytes as a cursor.
+    #[must_use]
+    pub const fn new(bytes: Vec<u8>) -> Self {
+        Self { bytes }
+    }
+
+    /// Empty cursor — used as the initial value when the consumer has
+    /// no prior sync history. Always distinct from any cursor the engine
+    /// has emitted (engine-emitted cursors always carry at least one
+    /// non-zero byte; the empty cursor has length zero).
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self { bytes: Vec::new() }
+    }
+
+    /// Borrow the raw cursor bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// True when this is the empty cursor (no prior sync state).
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
+
+impl Serialize for SyncCursor {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&BASE64URL_NOPAD.encode(&self.bytes))
+    }
+}
+
+impl<'de> Deserialize<'de> for SyncCursor {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let encoded = <&str as Deserialize>::deserialize(deserializer)?;
+        let bytes = BASE64URL_NOPAD
+            .decode(encoded.as_bytes())
+            .map_err(serde::de::Error::custom)?;
+        Ok(Self { bytes })
+    }
+}
 
 /// A file or directory in the VFS.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -302,6 +367,31 @@ mod tests {
             .to_string(),
             "cached"
         );
+    }
+
+    #[test]
+    fn sync_cursor_empty_round_trips() {
+        let cursor = SyncCursor::empty();
+        assert!(cursor.is_empty());
+        let json = serde_json::to_string(&cursor).unwrap();
+        assert_eq!(json, "\"\"");
+        let decoded: SyncCursor = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, cursor);
+    }
+
+    #[test]
+    fn sync_cursor_round_trips_through_json() {
+        let cursor = SyncCursor::new(vec![1, 2, 3, 0xff, 0]);
+        let json = serde_json::to_string(&cursor).unwrap();
+        let decoded: SyncCursor = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, cursor);
+        assert_eq!(decoded.as_bytes(), &[1, 2, 3, 0xff, 0]);
+    }
+
+    #[test]
+    fn sync_cursor_rejects_invalid_base64() {
+        let result: Result<SyncCursor, _> = serde_json::from_str("\"!!!\"");
+        assert!(result.is_err());
     }
 
     #[test]
