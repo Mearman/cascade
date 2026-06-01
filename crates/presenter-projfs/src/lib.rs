@@ -327,6 +327,22 @@ impl HResultCode {
 /// The Win32 constants live in `windows::Win32::Foundation::*`; the
 /// numeric values are reproduced here so the mapping compiles on
 /// non-Windows targets and can be tested cross-platform.
+///
+/// Two further Win32 codes appear in the `GetFileData` callback but
+/// are produced at the call site rather than from an
+/// [`std::io::ErrorKind`], so they are not in the table above:
+///
+/// - `ERROR_NOT_ENOUGH_MEMORY` (Win32 8) — returned when
+///   `PrjAllocateAlignedBuffer` returns null. The allocator could not
+///   produce an aligned buffer for the requested size, typically
+///   because the paged pool is exhausted or the requested length is
+///   unsatisfiable.
+/// - `ERROR_CALL_NOT_IMPLEMENTED` (Win32 120) — returned by design
+///   when no [`ContentProvider`] is installed. This is the documented
+///   `ProjFS` contract for "the provider intentionally does not serve
+///   this callback"; the kernel drops into browse-only mode in
+///   response. It is not used as a generic failure sentinel anywhere
+///   else in the read path.
 #[cfg_attr(
     not(any(target_os = "windows", test)),
     allow(
@@ -1038,7 +1054,7 @@ mod windows_impl {
     use tokio::sync::RwLock;
     use windows::Win32::Foundation::{
         ERROR_CALL_NOT_IMPLEMENTED, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER,
-        ERROR_OPERATION_ABORTED, S_OK,
+        ERROR_NOT_ENOUGH_MEMORY, ERROR_OPERATION_ABORTED, S_OK,
     };
     use windows::Win32::Storage::ProjectedFileSystem::{
         PRJ_CALLBACK_DATA, PRJ_CALLBACKS, PRJ_CB_DATA_FLAG_ENUM_RESTART_SCAN,
@@ -1506,16 +1522,23 @@ mod windows_impl {
         let usable_usize = bytes.len().min(cap);
         let usable = u32::try_from(usable_usize).unwrap_or(u32::MAX);
 
-        // Allocate an aligned buffer. ProjFS requires unbuffered I/O
-        // alignment; PrjAllocateAlignedBuffer is the documented way to
-        // get a buffer that satisfies it for the active namespace.
+        // Allocate an aligned buffer. `ProjFS` requires unbuffered I/O
+        // alignment; `PrjAllocateAlignedBuffer` is the documented way
+        // to get a buffer that satisfies it for the active namespace.
         //
-        // SAFETY: `namespace_ctx` is the live namespace handle ProjFS
+        // SAFETY: `namespace_ctx` is the live namespace handle `ProjFS`
         // gave us. `PrjAllocateAlignedBuffer` returns null on failure;
-        // we check before dereferencing.
+        // we check before dereferencing. A null return means the
+        // allocator could not service the request — typically the
+        // paged pool is exhausted or the requested size is unsatisfiable
+        // — so we surface `ERROR_NOT_ENOUGH_MEMORY` (Win32 8) rather
+        // than the historic `ERROR_CALL_NOT_IMPLEMENTED`. The former
+        // is the documented Win32 code for an allocation failure and
+        // lets `ProjFS` and any logging layer distinguish a transient
+        // resource exhaustion from a "callback not wired up" signal.
         let buffer = unsafe { PrjAllocateAlignedBuffer(namespace_ctx, usable_usize) };
         if buffer.is_null() {
-            return hresult_from_win32(ERROR_CALL_NOT_IMPLEMENTED.0);
+            return hresult_from_win32(ERROR_NOT_ENOUGH_MEMORY.0);
         }
 
         // SAFETY: `buffer` points to at least `usable_usize` writable
@@ -2347,6 +2370,23 @@ mod tests {
         let code = HResultCode::from_win32(0x0001_2345);
         #[allow(clippy::cast_possible_wrap)]
         let expected = 0x8007_2345_u32 as i32;
+        assert_eq!(code.get(), expected);
+    }
+
+    /// The `PrjAllocateAlignedBuffer` failure path in `get_file_data`
+    /// surfaces `ERROR_NOT_ENOUGH_MEMORY` (Win32 8) — the documented
+    /// Win32 code for an allocation failure — rather than the historic
+    /// `ERROR_CALL_NOT_IMPLEMENTED`. The actual call only fires on
+    /// Windows, but the value the callback would return is computed by
+    /// [`HResultCode::from_win32`], which is cross-platform; assert
+    /// the packed result here so the mapping survives a refactor even
+    /// when the suite runs on macOS or Linux.
+    #[test]
+    fn hresult_code_packs_error_not_enough_memory() {
+        // ERROR_NOT_ENOUGH_MEMORY = 8 → 0x80070008 as a signed i32.
+        let code = HResultCode::from_win32(8);
+        #[allow(clippy::cast_possible_wrap)]
+        let expected = 0x8007_0008_u32 as i32;
         assert_eq!(code.get(), expected);
     }
 
