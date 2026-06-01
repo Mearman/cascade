@@ -376,10 +376,27 @@ jobs:
           VERSION: ${{ needs.release.outputs.version }}
         run: |
           TAG_URL="https://github.com/Mearman/cascade/releases/download/${VERSION}"
-          curl -sL "${TAG_URL}/cascade-aarch64-macos.tar.gz.sha256" | awk '{print $1}' > sha-macos-arm
-          curl -sL "${TAG_URL}/cascade-x86_64-macos.tar.gz.sha256" | awk '{print $1}' > sha-macos-x86
-          curl -sL "${TAG_URL}/cascade-x86_64-linux.tar.gz.sha256" | awk '{print $1}' > sha-linux-x86
-          curl -sL "${TAG_URL}/cascade-aarch64-linux.tar.gz.sha256" | awk '{print $1}' > sha-linux-arm
+          # `--fail` makes curl exit non-zero on 4xx/5xx so a Not-Found body
+          # doesn't get piped through awk and end up in the formula (see the
+          # v0.1.33 Scoop bucket regression where `Hash: Not` shipped).
+          # `--retry` covers the small propagation window between
+          # `softprops/action-gh-release` returning success and the asset
+          # being downloadable from the public CDN. Validate that what we
+          # got is a 64-char lowercase hex sha256 before letting it through.
+          fetch_sha() {
+            local name="$1"
+            local out="$2"
+            curl -sL --fail --retry 6 --retry-delay 5 --retry-all-errors \
+              "${TAG_URL}/${name}.sha256" | awk '{print $1}' > "${out}"
+            if ! [[ "$(cat "${out}")" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::checksum for ${name} not a 64-char hex digest: $(cat "${out}")"
+              exit 1
+            fi
+          }
+          fetch_sha cascade-aarch64-macos.tar.gz sha-macos-arm
+          fetch_sha cascade-x86_64-macos.tar.gz sha-macos-x86
+          fetch_sha cascade-x86_64-linux.tar.gz sha-linux-x86
+          fetch_sha cascade-aarch64-linux.tar.gz sha-linux-arm
       - name: Generate formula
         env:
           VERSION: ${{ needs.release.outputs.version }}
@@ -456,7 +473,14 @@ jobs:
           VERSION: ${{ needs.release.outputs.version }}
         run: |
           TAG_URL="https://github.com/Mearman/cascade/releases/download/${VERSION}"
-          curl -sL "${TAG_URL}/cascade-x86_64-windows.zip.sha256" | awk '{print $1}' > sha-windows-x86
+          # See the matching block in `update-tap` for the rationale —
+          # this is the regression that landed in v0.1.33 as `Hash: Not`.
+          curl -sL --fail --retry 6 --retry-delay 5 --retry-all-errors \
+            "${TAG_URL}/cascade-x86_64-windows.zip.sha256" | awk '{print $1}' > sha-windows-x86
+          if ! [[ "$(cat sha-windows-x86)" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Windows checksum not a 64-char hex digest: $(cat sha-windows-x86)"
+            exit 1
+          fi
       - name: Generate manifest
         env:
           VERSION: ${{ needs.release.outputs.version }}
