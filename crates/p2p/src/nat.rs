@@ -68,9 +68,10 @@ pub enum NatType {
 }
 
 // TODO(nat-reconcile): merge this enum with `crate::traversal::NatType` in a
-// follow-up round. Both share five variants; this one is kept distinct until
-// every caller of `nat::NatType::Open` / `nat::NatType::Symmetric` has been
-// audited and migrated.
+// follow-up round. Both share the same six variants now (`Open`, `FullCone`,
+// `RestrictedCone`, `PortRestrictedCone`, `Symmetric`, `Unknown`); this one
+// is kept distinct until every caller of `nat::NatType::Open` /
+// `nat::NatType::Symmetric` has been audited and migrated.
 
 /// Error returned by `RFC 5780` `NAT` detection.
 #[derive(Debug, Error)]
@@ -665,13 +666,34 @@ const fn padding_for(attribute_len: usize) -> usize {
         % STUN_ATTRIBUTE_HEADER_LEN
 }
 
+/// Monotonic counter mixed into every transaction ID so two requests
+/// issued in the same nanosecond cannot collide. `SystemTime::now()` has
+/// nanosecond resolution but is not guaranteed to advance between
+/// adjacent calls; under the RFC 5780 four-test sequence we issue
+/// requests back-to-back within microseconds, well within the same
+/// nanosecond on some platforms. The counter monotonically increases
+/// per-process and gives us 64 bits of uniqueness independent of the
+/// clock.
+static TRANSACTION_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Generate a 96-bit STUN transaction ID. RFC 5389 §6 requires
+/// transactions to be uniquely identified; the response-matching code
+/// (see [`response_matches_transaction`]) needs distinct IDs across any
+/// two in-flight requests. We satisfy that by mixing a per-process
+/// monotonic counter, the system clock, and the process ID — the
+/// counter guarantees uniqueness even under same-nanosecond bursts,
+/// the timestamp provides cross-process uniqueness without coordination,
+/// and the PID adds a final disambiguator between concurrent processes
+/// that happen to start in the same nanosecond.
 fn transaction_id() -> Result<[u8; STUN_TRANSACTION_ID_LEN]> {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock is before Unix epoch")?
         .as_nanos();
     let pid = u128::from(std::process::id());
-    let mixed = timestamp ^ (pid << 64);
+    let counter =
+        u128::from(TRANSACTION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let mixed = timestamp ^ (pid << 64) ^ (counter << 32);
     let bytes = mixed.to_be_bytes();
     let offset = bytes.len() - STUN_TRANSACTION_ID_LEN;
     let mut transaction_id = [0u8; STUN_TRANSACTION_ID_LEN];

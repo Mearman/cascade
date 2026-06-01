@@ -143,6 +143,15 @@ func makeError(from rpcError: RpcError, method: String, itemID: String?) -> NSFi
     case "internal":
         actionLogger.error("RPC \(method, privacy: .public) for \(itemID ?? "-", privacy: .public) failed: internal — \(rpcError.message, privacy: .public)")
         return NSFileProviderError(.serverUnreachable, userInfo: userInfo)
+    case "not_supported":
+        // `NSFileProviderError.Code` has no dedicated "operation not
+        // supported" case; `.cannotSynchronize` is the documented
+        // "there is no way to perform the requested operation"
+        // outcome and is the best fit for a capability gap such as
+        // cross-backend move. Avoids `.serverUnreachable`'s
+        // misleading "the server is down" framing.
+        actionLogger.error("RPC \(method, privacy: .public) for \(itemID ?? "-", privacy: .public) failed: not_supported — \(rpcError.message, privacy: .public)")
+        return NSFileProviderError(.cannotSynchronize, userInfo: userInfo)
     default:
         actionLogger.warning("RPC \(method, privacy: .public) for \(itemID ?? "-", privacy: .public) returned unknown error code \(rpcError.code, privacy: .public) — \(rpcError.message, privacy: .public)")
         return NSFileProviderError(.serverUnreachable, userInfo: userInfo)

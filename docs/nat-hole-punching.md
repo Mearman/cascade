@@ -11,7 +11,7 @@ the protocol changes required to negotiate it.
 The STUN client in [`crates/p2p/src/nat.rs`](../crates/p2p/src/nat.rs) (lines
 53–62) issues an RFC 5389 Binding Request and compares the mapped address to
 the local socket. With a single server it distinguishes only two outcomes:
-`NatType::Public` when the addresses match and `NatType::Symmetric` otherwise.
+`NatType::Open` when the addresses match and `NatType::Symmetric` otherwise.
 The cone variants in the enum are unreachable.
 
 `detect_nat_with_logging`
@@ -169,7 +169,7 @@ When hole punching fails, traffic flows through a relay. Two operational
 models:
 
 **(a) Self-hosted relays on user devices.** Any device detected as
-`NatType::Public` can opt in to relay for its peers. The
+`NatType::Open` can opt in to relay for its peers. The
 [`relay.rs`](../crates/p2p/src/relay.rs) byte-pipe model means the relay sees
 only ciphertext; cost is bandwidth on the operator's own hardware. Discovery
 follows the gossip channel: a relay-capable device advertises a

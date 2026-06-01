@@ -587,45 +587,56 @@ impl PunchTransport for UdpPunchTransport {
     }
 
     async fn recv_probe(&self, deadline: Instant) -> io::Result<ReceivedProbe> {
-        // Translate the absolute deadline into a relative duration the
-        // tokio timer understands. A deadline already in the past maps
-        // to an immediate `TimedOut`, matching the state machine's
-        // "no probe, advance burst" contract.
-        let now = Instant::now();
-        let Some(remaining) = deadline.checked_duration_since(now) else {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "recv deadline already passed",
-            ));
-        };
-        if remaining.is_zero() {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "recv deadline already passed",
-            ));
-        }
-
-        let mut buf = [0u8; PROBE_PAYLOAD_LEN];
-        let recv = timeout(remaining, self.socket.recv_from(&mut buf)).await;
-        let (read, from) = match recv {
-            Ok(result) => result?,
-            Err(_) => {
-                return Err(io::Error::new(io::ErrorKind::TimedOut, "recv timed out"));
+        // Loop until either a properly-sized probe arrives or the
+        // deadline elapses. Without this loop, a single stray packet
+        // (a `STUN` keep-alive, a stale probe from a previous run,
+        // any non-probe UDP traffic on the bound port) would surface
+        // as `TimedOut` to the state machine and burn a burst slot
+        // even though wall-clock time has barely advanced. The state
+        // machine's contract is "one call, one deadline window";
+        // honour it here by absorbing wrong-length datagrams against
+        // the same deadline.
+        loop {
+            let now = Instant::now();
+            let Some(remaining) = deadline.checked_duration_since(now) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "recv deadline already passed",
+                ));
+            };
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "recv deadline already passed",
+                ));
             }
-        };
 
-        if read != PROBE_PAYLOAD_LEN {
-            // Non-probe traffic on the same port — discard and surface
-            // as `TimedOut` so the burst loop keeps waiting until its
-            // own deadline expires.
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "non-probe packet received",
-            ));
+            let mut buf = [0u8; PROBE_PAYLOAD_LEN];
+            let recv = timeout(remaining, self.socket.recv_from(&mut buf)).await;
+            let (read, from) = match recv {
+                Ok(result) => result?,
+                Err(_) => {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "recv timed out"));
+                }
+            };
+
+            if read != PROBE_PAYLOAD_LEN {
+                // Non-probe traffic on the same port — discard and
+                // keep waiting against the same deadline. Logged at
+                // `trace` so a debugger can see how much stray traffic
+                // is on the wire, but otherwise transparent.
+                tracing::trace!(
+                    bytes_read = read,
+                    expected = PROBE_PAYLOAD_LEN,
+                    %from,
+                    "discarding non-probe packet"
+                );
+                continue;
+            }
+
+            let nonce = u64::from_be_bytes(buf);
+            return Ok(ReceivedProbe { from, nonce });
         }
-
-        let nonce = u64::from_be_bytes(buf);
-        Ok(ReceivedProbe { from, nonce })
     }
 }
 
