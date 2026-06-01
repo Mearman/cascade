@@ -156,6 +156,7 @@ mod axum_endpoint {
 pub use axum_endpoint::serve_metrics;
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
 

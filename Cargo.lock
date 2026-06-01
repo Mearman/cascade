@@ -498,6 +498,7 @@ dependencies = [
  "hex",
  "hmac",
  "http",
+ "rand",
  "sha2",
  "thiserror",
  "tokio",
