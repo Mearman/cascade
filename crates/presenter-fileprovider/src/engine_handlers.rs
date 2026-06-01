@@ -108,18 +108,26 @@ impl EngineHandlers {
 
     /// Execute a cross-backend move as a download / upload / delete dance.
     ///
-    /// The destination upload is committed before the source delete runs.
-    /// If the upload fails, the source is left untouched and the local
-    /// staging file is removed. If the source delete fails after a
+    /// Files take the simple path: stage to disk, upload to the
+    /// destination, then delete the source. If the upload fails the
+    /// source is left untouched. If the source delete fails after a
     /// successful upload, the move is reported as `Internal` with both
     /// `ItemId`s — the data is now in both places and the user must
     /// clean up the source manually. We deliberately do not roll back
     /// the destination in that case because that would destroy the only
     /// successful copy of the data.
     ///
-    /// Directories are rejected up front with `NotSupported`; recursive
-    /// cross-backend directory moves require a per-child walk and are
-    /// out of scope for this round.
+    /// Directories descend recursively: the destination tree is built
+    /// up file-by-file via [`copy_directory_tree`], and only once every
+    /// child has been copied successfully is the source subtree
+    /// deleted. If any child copy fails partway through, the partially
+    /// built destination tree is left in place and the source subtree
+    /// is not touched at all. The caller sees an `Internal` error
+    /// pointing at the failed child; the user can either retry the move
+    /// (which will collide at the top-level name and be rejected) or
+    /// delete the partial destination and try again. We choose this
+    /// over rolling back because partial state on the destination is
+    /// recoverable, whereas data loss on the source is not.
     ///
     /// Concurrency: the Apple File Provider framework serialises
     /// per-item operations on the system side, so this method does not
@@ -136,13 +144,6 @@ impl EngineHandlers {
             .db
             .get_file(item_id)?
             .ok_or_else(|| HandlerError::not_found(format!("item not found: {item_id}")))?;
-        if src_entry.is_dir {
-            // TODO(fileprovider): recursive cross-backend directory move.
-            return Err(HandlerError::not_supported(
-                "cross-backend directory moves require recursive copy; only files are supported"
-                    .to_string(),
-            ));
-        }
 
         let src_backend = self.backend_for(item_id)?;
         let dst_backend = self.backend_for(new_parent)?;
@@ -162,42 +163,46 @@ impl EngineHandlers {
             )));
         }
 
-        let staging_path = self
-            .stage_for_move(&src_entry, src_backend.as_ref())
-            .await?;
-
-        let mut reader = tokio::fs::File::open(&staging_path).await.map_err(|err| {
-            HandlerError::internal(format!(
-                "open staging file {}: {err}",
-                staging_path.display()
-            ))
-        })?;
-        let dst_parent_file_id = FileId(new_parent.0.clone());
-        let upload_result = dst_backend
-            .upload(Path::new(new_name), &mut reader, &dst_parent_file_id)
-            .await;
-        drop(reader);
-
-        // The staging file is no longer needed after upload returns,
-        // regardless of outcome. Best-effort cleanup — a failure here
-        // does not change the move outcome.
-        if let Err(err) = tokio::fs::remove_file(&staging_path).await {
-            tracing::warn!(
-                path = %staging_path.display(),
-                error = %err,
-                "failed to remove cross-backend move staging file",
-            );
+        if src_entry.is_dir {
+            self.cross_backend_move_directory(
+                &src_entry,
+                src_backend.as_ref(),
+                dst_backend.as_ref(),
+                new_parent,
+                new_name,
+            )
+            .await
+        } else {
+            self.cross_backend_move_file(
+                &src_entry,
+                src_backend.as_ref(),
+                dst_backend.as_ref(),
+                new_parent,
+                new_name,
+            )
+            .await
         }
+    }
 
-        let dst_entry = match upload_result {
-            Ok(entry) => entry,
-            Err(err) => return Err(HandlerError::from(err)),
-        };
+    /// Top-level cross-backend file move: stage, upload, then delete
+    /// the source. Updates the state DB with the new destination entry
+    /// and removes the source subtree on success.
+    async fn cross_backend_move_file(
+        &self,
+        src_entry: &FileEntry,
+        src_backend: &dyn Backend,
+        dst_backend: &dyn Backend,
+        new_parent: &ItemId,
+        new_name: &str,
+    ) -> HandlerResult<FileProviderItem> {
+        let dst_entry = self
+            .copy_file_across_backends(src_entry, src_backend, dst_backend, new_parent, new_name)
+            .await?;
 
         // Upload committed — try to delete the source. If this fails the
         // data is in BOTH places; we have to surface that loudly rather
         // than silently lose data by rolling back the destination.
-        if let Err(err) = src_backend.delete(&src_entry).await {
+        if let Err(err) = src_backend.delete(src_entry).await {
             tracing::error!(
                 source_id = %src_entry.id,
                 destination_id = %dst_entry.id,
@@ -217,6 +222,183 @@ impl EngineHandlers {
         self.db.upsert_file(&dst_entry)?;
         self.db.delete_subtree(&src_entry.id)?;
         Ok(FileProviderItem::from(VfsItem::from(dst_entry)))
+    }
+
+    /// Top-level cross-backend directory move: recursively copy the
+    /// source tree to the destination, and only delete the source
+    /// subtree once every child has been copied successfully.
+    ///
+    /// Partial-failure semantics: if any child copy fails, the
+    /// partially-built destination tree is left in place and the
+    /// source is untouched. We do not roll back the destination
+    /// because the source subtree is still authoritative — the user
+    /// can delete the partial destination tree and retry. Rolling
+    /// back automatically risks deleting data the user has already
+    /// observed on the destination, which is strictly worse than
+    /// leaving a partial tree behind.
+    async fn cross_backend_move_directory(
+        &self,
+        src_entry: &FileEntry,
+        src_backend: &dyn Backend,
+        dst_backend: &dyn Backend,
+        new_parent: &ItemId,
+        new_name: &str,
+    ) -> HandlerResult<FileProviderItem> {
+        let dst_root = self
+            .copy_directory_tree(src_entry, src_backend, dst_backend, new_parent, new_name)
+            .await?;
+
+        // Entire tree copied — now reclaim the source. We walk
+        // leaves-first so backends that do not cascade delete (the
+        // in-memory test backend and some primitive providers) still
+        // see an empty directory by the time we delete the root.
+        if let Err(err) = Self::delete_source_subtree(src_entry, src_backend).await {
+            tracing::error!(
+                source_id = %src_entry.id,
+                destination_id = %dst_root.id,
+                error = %err,
+                "cross-backend directory move: destination tree built but source subtree delete failed; manual cleanup required",
+            );
+            self.db.upsert_file(&dst_root)?;
+            return Err(HandlerError::internal(format!(
+                "cross-backend directory move partially completed: destination {} is the new copy; source {} still exists and could not be deleted ({err})",
+                dst_root.id, src_entry.id,
+            )));
+        }
+
+        self.db.upsert_file(&dst_root)?;
+        self.db.delete_subtree(&src_entry.id)?;
+        Ok(FileProviderItem::from(VfsItem::from(dst_root)))
+    }
+
+    /// Stage `src_entry` to a temp file, upload it to `dst_backend`
+    /// under `dst_parent`, then unlink the staging file.
+    ///
+    /// Does not touch the source backend or the state DB — callers
+    /// compose this into the larger move flow. Returns the new
+    /// destination `FileEntry`.
+    async fn copy_file_across_backends(
+        &self,
+        src_entry: &FileEntry,
+        src_backend: &dyn Backend,
+        dst_backend: &dyn Backend,
+        dst_parent: &ItemId,
+        new_name: &str,
+    ) -> HandlerResult<FileEntry> {
+        let staging_path = self.stage_for_move(src_entry, src_backend).await?;
+
+        let mut reader = tokio::fs::File::open(&staging_path).await.map_err(|err| {
+            HandlerError::internal(format!(
+                "open staging file {}: {err}",
+                staging_path.display()
+            ))
+        })?;
+        let dst_parent_file_id = FileId(dst_parent.0.clone());
+        let upload_result = dst_backend
+            .upload(Path::new(new_name), &mut reader, &dst_parent_file_id)
+            .await;
+        drop(reader);
+
+        // The staging file is no longer needed after upload returns,
+        // regardless of outcome. Best-effort cleanup — a failure here
+        // does not change the move outcome.
+        if let Err(err) = tokio::fs::remove_file(&staging_path).await {
+            tracing::warn!(
+                path = %staging_path.display(),
+                error = %err,
+                "failed to remove cross-backend move staging file",
+            );
+        }
+
+        upload_result.map_err(HandlerError::from)
+    }
+
+    /// Recursively copy `src_dir` (a directory `FileEntry`) from
+    /// `src_backend` into `dst_backend` under `dst_parent`, naming the
+    /// new top-level directory `new_name`.
+    ///
+    /// The destination directory is created first; then every child
+    /// is copied via `copy_file_across_backends` (for files) or this
+    /// method recursively (for subdirectories). The source is left
+    /// untouched — the caller is responsible for deleting it after
+    /// the entire tree has been copied successfully.
+    ///
+    /// Returns the new top-level destination directory entry.
+    fn copy_directory_tree<'a>(
+        &'a self,
+        src_dir: &'a FileEntry,
+        src_backend: &'a dyn Backend,
+        dst_backend: &'a dyn Backend,
+        dst_parent: &'a ItemId,
+        new_name: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = HandlerResult<FileEntry>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            // Create the destination directory before walking children
+            // so subsequent uploads have a parent ID to point at.
+            let dst_parent_file_id = FileId(dst_parent.0.clone());
+            let dst_dir = dst_backend
+                .create_dir_with_parent(new_name, &dst_parent_file_id)
+                .await
+                .map_err(HandlerError::from)?;
+
+            let children = src_backend
+                .list_children(src_dir.id.native_id())
+                .await
+                .map_err(|err| {
+                    HandlerError::internal(format!("list source children of {}: {err}", src_dir.id))
+                })?;
+
+            for child in children {
+                if child.is_dir {
+                    self.copy_directory_tree(
+                        &child,
+                        src_backend,
+                        dst_backend,
+                        &dst_dir.id,
+                        &child.name,
+                    )
+                    .await?;
+                } else {
+                    self.copy_file_across_backends(
+                        &child,
+                        src_backend,
+                        dst_backend,
+                        &dst_dir.id,
+                        &child.name,
+                    )
+                    .await?;
+                }
+            }
+
+            Ok(dst_dir)
+        })
+    }
+
+    /// Recursively delete the source subtree rooted at `entry` from
+    /// `backend`, leaves first. Used after a successful directory
+    /// copy to reclaim space on the source side.
+    ///
+    /// Walks leaves-first because some backends (the in-memory test
+    /// backend, and primitive providers that lack server-side cascade
+    /// delete) only remove the directly-named entry. Backends that do
+    /// cascade delete (Google Drive trashes the whole subtree when you
+    /// trash a parent) see an already-empty directory by the time we
+    /// reach the root and the redundant per-child deletes succeed
+    /// because the children are already gone.
+    fn delete_source_subtree<'a>(
+        entry: &'a FileEntry,
+        backend: &'a dyn Backend,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            if entry.is_dir {
+                let children = backend.list_children(entry.id.native_id()).await?;
+                for child in children {
+                    Self::delete_source_subtree(&child, backend).await?;
+                }
+            }
+            backend.delete(entry).await
+        })
     }
 
     /// Materialise `src_entry` to a private staging file under the cache
@@ -1110,34 +1292,438 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn move_item_cross_backend_directory_returns_not_supported() {
-        let (handlers, src, _dst, _tempdir) = make_cross_backend_handlers();
-
-        // Seed a directory under the source root that we'll try to move.
-        let dir_id = ItemId::new("src", "subdir");
-        let dir_entry = FileEntry {
-            id: dir_id,
-            parent_id: ItemId::new("src", "root"),
-            name: "subdir".to_string(),
+    /// Insert a directory `FileEntry` into both the source backend and
+    /// the state DB so a cross-backend directory move can use it.
+    fn seed_src_directory(
+        backend: &InMemoryBackend,
+        db: &StateDb,
+        native_id: &str,
+        parent_native: &str,
+        name: &str,
+    ) -> FileEntry {
+        let entry = FileEntry {
+            id: ItemId::new(backend.id(), native_id),
+            parent_id: ItemId::new(backend.id(), parent_native),
+            name: name.to_string(),
             is_dir: true,
             size: None,
             mod_time: Some(Utc::now()),
             mime_type: None,
             hash: None,
         };
-        src.insert(dir_entry.clone());
-        handlers.db.upsert_file(&dir_entry).unwrap();
+        backend.insert(entry.clone());
+        db.upsert_file(&entry).unwrap();
+        entry
+    }
+
+    /// Insert a file `FileEntry` plus content into the source backend
+    /// and persist it in the state DB.
+    fn seed_src_file(
+        backend: &InMemoryBackend,
+        db: &StateDb,
+        native_id: &str,
+        parent_native: &str,
+        name: &str,
+        bytes: &[u8],
+    ) -> FileEntry {
+        let entry = FileEntry {
+            id: ItemId::new(backend.id(), native_id),
+            parent_id: ItemId::new(backend.id(), parent_native),
+            name: name.to_string(),
+            is_dir: false,
+            size: Some(bytes.len() as u64),
+            mod_time: Some(Utc::now()),
+            mime_type: Some("text/plain".to_string()),
+            hash: None,
+        };
+        backend.insert(entry.clone());
+        db.upsert_file(&entry).unwrap();
+        backend
+            .content
+            .lock()
+            .unwrap()
+            .insert(entry.id.0.clone(), bytes.to_vec());
+        entry
+    }
+
+    /// Count the entries under `dst_native_parent` in `backend` with
+    /// the given `name`. Used to assert that a recursive directory
+    /// copy landed where it was supposed to.
+    fn find_child(
+        backend: &InMemoryBackend,
+        parent_full_id: &str,
+        name: &str,
+    ) -> Option<FileEntry> {
+        backend
+            .files
+            .lock()
+            .unwrap()
+            .values()
+            .find(|entry| entry.parent_id.0 == parent_full_id && entry.name == name)
+            .cloned()
+    }
+
+    #[tokio::test]
+    async fn move_item_cross_backend_empty_directory_succeeds() {
+        let (handlers, src, dst, _tempdir) = make_cross_backend_handlers();
+
+        // Source: a single empty directory directly under the root.
+        seed_src_directory(&src, &handlers.db, "subdir", "root", "subdir");
+
+        let moved = handlers
+            .move_item("src:subdir", "dst:root", "subdir")
+            .await
+            .unwrap();
+
+        assert!(moved.is_directory);
+        assert_eq!(moved.parent_id, "dst:root");
+        assert_eq!(moved.filename, "subdir");
+
+        // Destination has a directory of the expected name; source
+        // does not.
+        assert!(
+            find_child(&dst, "dst:root", "subdir").is_some(),
+            "destination should contain the moved directory"
+        );
+        assert!(
+            !src.files.lock().unwrap().contains_key("src:subdir"),
+            "source backend must no longer hold the moved directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_item_cross_backend_flat_directory_with_files_succeeds() {
+        let (handlers, src, dst, _tempdir) = make_cross_backend_handlers();
+
+        // Source layout: /subdir/{a.txt, b.txt}.
+        seed_src_directory(&src, &handlers.db, "subdir", "root", "subdir");
+        seed_src_file(&src, &handlers.db, "a", "subdir", "a.txt", b"alpha");
+        seed_src_file(&src, &handlers.db, "b", "subdir", "b.txt", b"bravo");
+
+        let moved = handlers
+            .move_item("src:subdir", "dst:root", "subdir")
+            .await
+            .unwrap();
+        assert!(moved.is_directory);
+
+        // Destination directory exists and holds both children with
+        // their original bytes.
+        let dst_dir = find_child(&dst, "dst:root", "subdir")
+            .expect("destination should contain the moved directory");
+        let dst_a =
+            find_child(&dst, &dst_dir.id.0, "a.txt").expect("destination should contain a.txt");
+        let dst_b =
+            find_child(&dst, &dst_dir.id.0, "b.txt").expect("destination should contain b.txt");
+        let dst_content = dst.content.lock().unwrap();
+        assert_eq!(
+            dst_content.get(&dst_a.id.0).map(Vec::as_slice),
+            Some(b"alpha".as_slice())
+        );
+        assert_eq!(
+            dst_content.get(&dst_b.id.0).map(Vec::as_slice),
+            Some(b"bravo".as_slice())
+        );
+
+        // Source no longer holds the directory or its children.
+        let src_files = src.files.lock().unwrap();
+        assert!(!src_files.contains_key("src:subdir"));
+        assert!(!src_files.contains_key("src:a"));
+        assert!(!src_files.contains_key("src:b"));
+    }
+
+    #[tokio::test]
+    async fn move_item_cross_backend_nested_directory_succeeds() {
+        let (handlers, src, dst, _tempdir) = make_cross_backend_handlers();
+
+        // Source layout:
+        //   /outer/
+        //     top.txt
+        //     /inner/
+        //       deep.txt
+        //       /innermost/
+        //         leaf.txt
+        seed_src_directory(&src, &handlers.db, "outer", "root", "outer");
+        seed_src_file(&src, &handlers.db, "top", "outer", "top.txt", b"top-bytes");
+        seed_src_directory(&src, &handlers.db, "inner", "outer", "inner");
+        seed_src_file(
+            &src,
+            &handlers.db,
+            "deep",
+            "inner",
+            "deep.txt",
+            b"deep-bytes",
+        );
+        seed_src_directory(&src, &handlers.db, "innermost", "inner", "innermost");
+        seed_src_file(
+            &src,
+            &handlers.db,
+            "leaf",
+            "innermost",
+            "leaf.txt",
+            b"leaf-bytes",
+        );
+
+        let moved = handlers
+            .move_item("src:outer", "dst:root", "outer")
+            .await
+            .unwrap();
+        assert!(moved.is_directory);
+
+        // Walk the destination tree mirror by mirror and confirm
+        // every node materialised in the right place with the right
+        // bytes.
+        let dst_outer = find_child(&dst, "dst:root", "outer").expect("dst/outer");
+        let dst_top = find_child(&dst, &dst_outer.id.0, "top.txt").expect("dst/outer/top.txt");
+        let dst_inner = find_child(&dst, &dst_outer.id.0, "inner").expect("dst/outer/inner");
+        let dst_deep =
+            find_child(&dst, &dst_inner.id.0, "deep.txt").expect("dst/outer/inner/deep.txt");
+        let dst_innermost =
+            find_child(&dst, &dst_inner.id.0, "innermost").expect("dst/outer/inner/innermost");
+        let dst_leaf = find_child(&dst, &dst_innermost.id.0, "leaf.txt")
+            .expect("dst/outer/inner/innermost/leaf.txt");
+
+        let dst_content = dst.content.lock().unwrap();
+        assert_eq!(
+            dst_content.get(&dst_top.id.0).map(Vec::as_slice),
+            Some(b"top-bytes".as_slice())
+        );
+        assert_eq!(
+            dst_content.get(&dst_deep.id.0).map(Vec::as_slice),
+            Some(b"deep-bytes".as_slice())
+        );
+        assert_eq!(
+            dst_content.get(&dst_leaf.id.0).map(Vec::as_slice),
+            Some(b"leaf-bytes".as_slice())
+        );
+
+        // Source subtree gone in its entirety.
+        let src_files = src.files.lock().unwrap();
+        for native in ["outer", "top", "inner", "deep", "innermost", "leaf"] {
+            let id = format!("src:{native}");
+            assert!(
+                !src_files.contains_key(&id),
+                "source backend still holds {id} after directory move"
+            );
+        }
+    }
+
+    /// A backend that wraps `InMemoryBackend` but fails the Nth call
+    /// to `upload` (1-indexed), letting tests trigger a partial
+    /// failure halfway through a recursive directory move.
+    #[derive(Debug)]
+    struct UploadFailingBackend {
+        inner: InMemoryBackend,
+        calls: Mutex<usize>,
+        fail_on: usize,
+    }
+
+    impl UploadFailingBackend {
+        fn new(id: &str, fail_on: usize) -> Self {
+            Self {
+                inner: InMemoryBackend::new(id),
+                calls: Mutex::new(0),
+                fail_on,
+            }
+        }
+
+        fn insert(&self, entry: FileEntry) {
+            self.inner.insert(entry);
+        }
+    }
+
+    #[async_trait]
+    impl Backend for UploadFailingBackend {
+        fn id(&self) -> &str {
+            self.inner.id()
+        }
+
+        fn display_name(&self) -> &str {
+            self.inner.display_name()
+        }
+
+        async fn quota(&self) -> anyhow::Result<Option<Quota>> {
+            self.inner.quota().await
+        }
+
+        async fn changes(&self, cursor: Option<&Cursor>) -> anyhow::Result<(Vec<Change>, Cursor)> {
+            self.inner.changes(cursor).await
+        }
+
+        async fn metadata(&self, path: &Path) -> anyhow::Result<FileEntry> {
+            self.inner.metadata(path).await
+        }
+
+        async fn download(
+            &self,
+            file: &FileEntry,
+            writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
+        ) -> anyhow::Result<()> {
+            self.inner.download(file, writer).await
+        }
+
+        async fn upload(
+            &self,
+            path: &Path,
+            reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+            parent_id: &FileId,
+        ) -> anyhow::Result<FileEntry> {
+            let call = {
+                let mut counter = self
+                    .calls
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *counter += 1;
+                *counter
+            };
+            if call == self.fail_on {
+                anyhow::bail!("simulated upload failure on call {call}");
+            }
+            self.inner.upload(path, reader, parent_id).await
+        }
+
+        async fn update(
+            &self,
+            file_id: &FileId,
+            reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+        ) -> anyhow::Result<FileEntry> {
+            self.inner.update(file_id, reader).await
+        }
+
+        async fn create_dir(&self, path: &Path) -> anyhow::Result<FileEntry> {
+            self.inner.create_dir(path).await
+        }
+
+        async fn create_dir_with_parent(
+            &self,
+            name: &str,
+            parent_id: &FileId,
+        ) -> anyhow::Result<FileEntry> {
+            self.inner.create_dir_with_parent(name, parent_id).await
+        }
+
+        async fn delete(&self, file: &FileEntry) -> anyhow::Result<()> {
+            self.inner.delete(file).await
+        }
+
+        async fn move_entry(&self, src: &Path, dst: &Path) -> anyhow::Result<FileEntry> {
+            self.inner.move_entry(src, dst).await
+        }
+
+        async fn move_by_id(
+            &self,
+            src_id: &FileId,
+            dst_parent_id: &FileId,
+            new_name: &str,
+        ) -> anyhow::Result<FileEntry> {
+            self.inner.move_by_id(src_id, dst_parent_id, new_name).await
+        }
+
+        async fn list_children(&self, parent_native_id: &str) -> anyhow::Result<Vec<FileEntry>> {
+            self.inner.list_children(parent_native_id).await
+        }
+
+        async fn poll_interval(&self) -> Option<Duration> {
+            self.inner.poll_interval().await
+        }
+    }
+
+    #[tokio::test]
+    async fn move_item_cross_backend_directory_partial_failure_leaves_source_intact() {
+        // Destination upload fails on the second call (i.e. after the
+        // first child file has uploaded). The handler must surface an
+        // error and leave the source subtree completely untouched.
+        let src = Arc::new(InMemoryBackend::new("src"));
+        let dst = Arc::new(UploadFailingBackend::new("dst", 2));
+
+        let src_dyn: Arc<dyn Backend> = src.clone();
+        let dst_dyn: Arc<dyn Backend> = dst.clone();
+        let mut tree = VfsTree::new(src_dyn);
+        tree.mount(PathBuf::from("/dst"), dst_dyn);
+        let vfs = Arc::new(RwLock::new(tree));
+        let cache_dir = tempfile::tempdir().unwrap();
+
+        let db = Arc::new(StateDb::open_in_memory().unwrap());
+        db.register_backend("src", "stub", "Src", None, None)
+            .unwrap();
+        db.register_backend("dst", "stub", "Dst", Some("/dst"), None)
+            .unwrap();
+
+        // Seed the source root.
+        let src_root = FileEntry {
+            id: ItemId::new("src", "root"),
+            parent_id: ItemId::new("src", ""),
+            name: "root".to_string(),
+            is_dir: true,
+            size: None,
+            mod_time: Some(Utc::now()),
+            mime_type: None,
+            hash: None,
+        };
+        src.insert(src_root.clone());
+        db.upsert_file(&src_root).unwrap();
+
+        // Seed the destination root via the wrapper's inner backend.
+        let dst_root = FileEntry {
+            id: ItemId::new("dst", "root"),
+            parent_id: ItemId::new("dst", ""),
+            name: "root".to_string(),
+            is_dir: true,
+            size: None,
+            mod_time: Some(Utc::now()),
+            mime_type: None,
+            hash: None,
+        };
+        dst.insert(dst_root.clone());
+        db.upsert_file(&dst_root).unwrap();
+
+        // Source layout: /subdir/{a.txt, b.txt}. The first upload
+        // succeeds (a.txt) and the second fails (b.txt), leaving a
+        // partial destination tree.
+        seed_src_directory(&src, &db, "subdir", "root", "subdir");
+        seed_src_file(&src, &db, "a", "subdir", "a.txt", b"alpha");
+        seed_src_file(&src, &db, "b", "subdir", "b.txt", b"bravo");
+
+        let handlers = EngineHandlers::new(vfs, db.clone(), cache_dir.path().to_path_buf());
 
         let err = handlers
             .move_item("src:subdir", "dst:root", "subdir")
             .await
             .unwrap_err();
-        assert_eq!(err.code, ErrorCode::NotSupported);
+        assert_eq!(err.code, ErrorCode::Internal);
+
+        // Source subtree is completely intact — neither the directory
+        // nor any child file was deleted.
+        let src_files = src.files.lock().unwrap();
         assert!(
-            err.message.contains("recursive"),
-            "message should explain why directories are rejected: {}",
-            err.message
+            src_files.contains_key("src:subdir"),
+            "source directory must still exist after partial failure"
+        );
+        assert!(
+            src_files.contains_key("src:a"),
+            "source child a.txt must still exist after partial failure"
+        );
+        assert!(
+            src_files.contains_key("src:b"),
+            "source child b.txt must still exist after partial failure"
+        );
+
+        // Source bytes intact too.
+        let src_content = src.content.lock().unwrap();
+        assert_eq!(
+            src_content.get("src:a").map(Vec::as_slice),
+            Some(b"alpha".as_slice())
+        );
+        assert_eq!(
+            src_content.get("src:b").map(Vec::as_slice),
+            Some(b"bravo".as_slice())
+        );
+
+        // State DB still knows about the source subtree.
+        assert!(
+            db.get_file(&ItemId::new("src", "subdir"))
+                .unwrap()
+                .is_some(),
+            "state DB must still hold the source directory after partial failure"
         );
     }
 
