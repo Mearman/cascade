@@ -405,6 +405,56 @@ struct CallbackContext {
     raw_ptr: usize,
 }
 
+impl Drop for ProjFsPresenter {
+    /// Reclaim the `CallbackContextInner` Box-allocation on drop if the
+    /// caller forgot to call `stop()`. Without this, a presenter that
+    /// `start()`s and then drops would leak the heap-allocated context
+    /// that we handed to ProjFS via `instance_context`. The `VfsPresenter`
+    /// trait contract requires `stop()` on shutdown, but the language
+    /// can't enforce it — this is the belt-and-braces.
+    ///
+    /// On non-Windows targets the handle and callback_ctx are always
+    /// `None` (start returns an error before allocation), so this is a
+    /// no-op.
+    #[cfg(target_os = "windows")]
+    fn drop(&mut self) {
+        // try_lock is the right primitive for Drop: if another future is
+        // holding the lock we'd be dropping under aliasing anyway, and
+        // panicking in Drop is unsound. Silently skip in that case —
+        // production code always calls stop() first, and tests don't
+        // race on these locks.
+        if let Ok(mut slot) = self.handle.try_lock()
+            && let Some(handle::NamespaceHandle(ctx)) = slot.take()
+        {
+            // SAFETY: ctx was produced by PrjStartVirtualizing and never
+            // released. See stop_virtualising for the full safety note.
+            #[allow(unsafe_code)]
+            unsafe {
+                windows::Win32::Storage::ProjectedFileSystem::PrjStopVirtualizing(ctx);
+            }
+        }
+        if let Ok(mut slot) = self.callback_ctx.try_lock()
+            && let Some(CallbackContext { raw_ptr, .. }) = slot.take()
+            && raw_ptr != 0
+        {
+            // SAFETY: raw_ptr originated from Box::into_raw in
+            // start_virtualising. ProjFS has stopped (or was never
+            // started) so no callbacks can still dereference it.
+            #[allow(unsafe_code)]
+            unsafe {
+                drop(Box::from_raw(raw_ptr as *mut handle::CallbackContextInner));
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn drop(&mut self) {
+        // On non-Windows targets `start()` never reaches the allocation
+        // path, so `handle` and `callback_ctx` are always `None`. Nothing
+        // to reclaim.
+    }
+}
+
 impl ProjFsPresenter {
     /// Create a new `ProjFS` presenter rooted at `mount_point`.
     #[must_use]
@@ -659,6 +709,15 @@ mod windows_impl {
 
     /// `PRJ_QUERY_FILE_NAME_CB` — existence check used by ProjFS to
     /// decide whether to descend into the projection.
+    ///
+    /// **Thread model**: ProjFS dispatches callbacks from kernel-owned
+    /// worker threads that are NOT part of any Tokio runtime. The
+    /// `blocking_read` calls below are therefore correct. Do NOT
+    /// invoke these callbacks directly from inside a `#[tokio::test]`
+    /// or any other async context — `RwLock::blocking_read` panics
+    /// when entered from a Tokio worker. Tests that need to exercise
+    /// callback logic should call the platform-independent helpers
+    /// (`resolve_path`, `collect_children`, etc.) instead.
     #[allow(unsafe_code)]
     unsafe extern "system" fn query_file_name(callback_data: *const PRJ_CALLBACK_DATA) -> HRESULT {
         // SAFETY: the inner blocks all dereference pointers ProjFS
