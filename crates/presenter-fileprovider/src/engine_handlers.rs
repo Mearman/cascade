@@ -353,9 +353,23 @@ impl FileProviderHandlers for EngineHandlers {
             .flush()
             .await
             .map_err(|error| HandlerError::internal(format!("flush temp file: {error}")))?;
-        tokio::fs::rename(&temp_path, &cache_path)
-            .await
-            .map_err(|error| HandlerError::internal(format!("persist cache file: {error}")))?;
+        if let Err(error) = tokio::fs::rename(&temp_path, &cache_path).await {
+            // Best-effort cleanup of the staged temp file so a failing
+            // rename (cross-device, permissions, disk full) doesn't
+            // leave a `.tmp` sibling. Mirrors the cleanup pattern in
+            // `cross_backend_move` below.
+            if let Err(unlink_err) = tokio::fs::remove_file(&temp_path).await {
+                tracing::warn!(
+                    target: "cascade::presenter_fileprovider",
+                    path = %temp_path.display(),
+                    error = %unlink_err,
+                    "failed to remove staged temp file after rename failure"
+                );
+            }
+            return Err(HandlerError::internal(format!(
+                "persist cache file: {error}"
+            )));
+        }
 
         Ok(cache_path)
     }

@@ -282,10 +282,11 @@ async fn relay_times_out_unpaired_session() {
     )
     .await;
 
-    // No second peer arrives. After ~750 ms the reaper will have run at least
-    // once (interval = max(250ms, timeout/4) = 250ms) and the parked entry
-    // expires at +500ms. Expect the server to close the socket.
-    tokio::time::sleep(Duration::from_millis(750)).await;
+    // No second peer arrives. The parked entry expires at +500ms; the
+    // reaper runs every `max(250ms, timeout/4) = 250ms`. Sleep long
+    // enough that several reaper ticks have fired post-expiry — 1500ms
+    // gives four ticks of slack to survive slow CI runners.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
     expect_server_close(&mut client).await;
 
     wait_until(

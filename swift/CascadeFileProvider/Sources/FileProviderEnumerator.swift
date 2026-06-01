@@ -61,18 +61,28 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
     func invalidate() {}
 
     func enumerateItems(for observer: NSFileProviderEnumerationObserver, startingAt page: NSFileProviderPage) {
+        // Fetch ONE page per invocation and surrender control back to the
+        // File Provider framework via `finishEnumerating(upTo:)`. The
+        // framework calls us again with our `NSFileProviderPage` when it
+        // wants the next batch, so back-pressure is honoured and large
+        // directories don't materialise into one huge `Task`.
         Task {
             do {
-                var cursor: String? = decodeStartingPage(page)
-                repeat {
-                    let (items, nextPage) = try await actions.enumerateItems(
-                        parentIdentifier: parentIdentifier,
-                        pageCursor: cursor
-                    )
-                    observer.didEnumerate(items)
-                    cursor = nextPage
-                } while cursor != nil
-                observer.finishEnumerating(upTo: nil)
+                let cursor: String? = decodeStartingPage(page)
+                let (items, nextPage) = try await actions.enumerateItems(
+                    parentIdentifier: parentIdentifier,
+                    pageCursor: cursor
+                )
+                observer.didEnumerate(items)
+                if let nextCursor = nextPage, let data = nextCursor.data(using: .utf8) {
+                    // Hand the cursor back to the framework so the next
+                    // call to `enumerateItems(for:startingAt:)` carries
+                    // it through `decodeStartingPage`.
+                    observer.finishEnumerating(upTo: NSFileProviderPage(data))
+                } else {
+                    // No more pages — end of enumeration.
+                    observer.finishEnumerating(upTo: nil)
+                }
             } catch {
                 observer.finishEnumeratingWithError(error)
             }

@@ -547,26 +547,49 @@ impl SyncEngine {
             (remote, candidates)
         };
 
+        // Filter the relay pool by what the relay-client can currently
+        // authenticate against. `cascade_p2p::relay::RelayClient::connect`
+        // does not yet send the HMAC handshake frame the relay-server
+        // requires (see crates/relay-server/src/auth.rs), so an
+        // unauthenticated dial would be immediately rejected by the
+        // relay. Until the relay-client gains an HMAC-auth path
+        // (next round's post-relay transport upgrade), present an
+        // empty pool to `decide_connectivity` so the `Relay` arm is
+        // never chosen.
+        //
+        // TODO(nat-relay-auth): once `RelayClient::connect` accepts the
+        // shared secret and emits the HMAC handshake, drop this filter
+        // and pass `self.relay_endpoints` directly. The
+        // `relay_shared_secret` field is already loaded by
+        // `P2pBackend::open`.
+        let relay_pool_for_decision: &[SocketAddr] = &[];
+        if !self.relay_endpoints.is_empty() {
+            tracing::warn!(
+                target: "cascade::backend::p2p",
+                count = self.relay_endpoints.len(),
+                "relay_endpoints configured but relay-client HMAC auth is not wired yet; the Relay strategy is suppressed until the next round"
+            );
+        }
+
         let mut strategy = decide_connectivity(
             local_nat,
             remote_nat,
             &remote_candidates,
-            &self.relay_endpoints,
+            relay_pool_for_decision,
         );
 
         // Honour the opt-out: a chosen HolePunch is downgraded to the
         // most reasonable fallback so the rest of the wiring runs as
-        // normal. Falling back to relay when one is configured matches
-        // the precedence the table already uses for symmetric pairs.
+        // normal. Falling back to relay when one is configured would
+        // match the precedence the table uses for symmetric pairs,
+        // but with the relay pool currently suppressed we have only
+        // Direct as a fallback.
         if !self.enable_hole_punch && matches!(strategy, ConnectivityStrategy::HolePunch { .. }) {
-            strategy = self.relay_endpoints.first().map_or_else(
-                || ConnectivityStrategy::Direct { addr: peer.address },
-                |relay| ConnectivityStrategy::Relay { relay: *relay },
-            );
+            strategy = ConnectivityStrategy::Direct { addr: peer.address };
             debug!(
                 target: "cascade::backend::p2p",
                 peer = %peer.device_id,
-                "hole-punch disabled — downgraded strategy"
+                "hole-punch disabled — downgraded strategy to direct"
             );
         }
 
