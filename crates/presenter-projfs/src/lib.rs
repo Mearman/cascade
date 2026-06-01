@@ -242,7 +242,7 @@ impl NotificationEvent {
         reason = "consumed only by Windows callbacks and unit tests"
     )
 )]
-const fn allow_delete(_path: &str, _items: &HashMap<String, VfsItem>) -> bool {
+const fn allow_delete(_path: &str, _is_directory: bool, _items: &HashMap<String, VfsItem>) -> bool {
     true
 }
 
@@ -269,6 +269,54 @@ pub trait ContentProvider: Send + Sync + std::fmt::Debug {
     /// Implementations should return a short read (fewer bytes than
     /// requested) at end of file rather than an error.
     fn read_range(&self, id: &ItemId, offset: u64, length: u32) -> std::io::Result<Vec<u8>>;
+}
+
+/// Decision the `ProjFS` `GetFileData` callback derives from a
+/// [`ContentProvider::read_range`] result, before any FFI is invoked.
+///
+/// Extracting this classification keeps the EOF and error-handling
+/// branches testable cross-platform; the Windows-only callback maps
+/// each variant to the appropriate HRESULT (`S_OK` for `Eof`,
+/// `ERROR_CALL_NOT_IMPLEMENTED` for `Failed`, `PrjWriteFileData` for
+/// `Bytes`).
+#[cfg_attr(
+    not(any(target_os = "windows", test)),
+    allow(
+        dead_code,
+        reason = "consumed only by Windows callbacks and unit tests"
+    )
+)]
+#[derive(Debug)]
+pub(crate) enum ProviderReadOutcome {
+    /// Provider returned a non-empty buffer; the callback writes it
+    /// back via `PrjWriteFileData`.
+    Bytes(Vec<u8>),
+    /// Provider returned zero bytes — end of file. The callback maps
+    /// this to `S_OK`, which `ProjFS` accepts as a legitimate short
+    /// read.
+    Eof,
+    /// Provider read failed. The callback maps this to
+    /// `ERROR_CALL_NOT_IMPLEMENTED`; richer per-error mapping is a
+    /// follow-up.
+    Failed,
+}
+
+/// Map a [`ContentProvider::read_range`] result to a
+/// [`ProviderReadOutcome`]. Pure function; tested directly without
+/// `ProjFS` involvement.
+#[cfg_attr(
+    not(any(target_os = "windows", test)),
+    allow(
+        dead_code,
+        reason = "consumed only by Windows callbacks and unit tests"
+    )
+)]
+pub(crate) fn classify_read(result: std::io::Result<Vec<u8>>) -> ProviderReadOutcome {
+    match result {
+        Ok(bytes) if bytes.is_empty() => ProviderReadOutcome::Eof,
+        Ok(bytes) => ProviderReadOutcome::Bytes(bytes),
+        Err(_) => ProviderReadOutcome::Failed,
+    }
 }
 
 /// State tracked for an in-flight directory enumeration session.
@@ -1291,28 +1339,33 @@ mod windows_impl {
             return hresult_from_win32(ERROR_OPERATION_ABORTED.0);
         }
 
-        let bytes = match provider.read_range(&item_id, byte_offset, length) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                tracing::warn!(
-                    id = %item_id,
-                    offset = byte_offset,
-                    length,
-                    error = %err,
-                    "ContentProvider::read_range failed; returning ERROR_CALL_NOT_IMPLEMENTED"
-                );
+        let read_result = provider.read_range(&item_id, byte_offset, length);
+        if let Err(ref err) = read_result {
+            tracing::warn!(
+                id = %item_id,
+                offset = byte_offset,
+                length,
+                error = %err,
+                "ContentProvider::read_range failed; returning ERROR_CALL_NOT_IMPLEMENTED"
+            );
+        }
+        // Classifying the read result here keeps the EOF and failure
+        // branches independently testable cross-platform — see
+        // `classify_read` and the `classify_read_*` unit tests.
+        let bytes = match super::classify_read(read_result) {
+            super::ProviderReadOutcome::Bytes(bytes) => bytes,
+            super::ProviderReadOutcome::Eof => {
+                // End of file — ProjFS treats S_OK with zero bytes as
+                // a legitimate short read.
+                return S_OK;
+            }
+            super::ProviderReadOutcome::Failed => {
                 return hresult_from_win32(ERROR_CALL_NOT_IMPLEMENTED.0);
             }
         };
 
         if token.is_cancelled() {
             return hresult_from_win32(ERROR_OPERATION_ABORTED.0);
-        }
-
-        if bytes.is_empty() {
-            // End of file — ProjFS treats S_OK with zero bytes as a
-            // legitimate short read.
-            return S_OK;
         }
         // Cap to u32 so the ProjFS length argument fits. ProjFS reads
         // are bounded by what the kernel asked us for (`length` is
@@ -1378,7 +1431,7 @@ mod windows_impl {
     ///
     /// The full set of `PRJ_NOTIFICATION_*` flags is mapped via
     /// [`super::NotificationEvent::from_i32`]; unrecognised codes are
-    /// logged at `warn` and produce `S_OK` so ProjFS does not retry.
+    /// logged at `warn` and produce `S_OK` so `ProjFS` does not retry.
     /// For `PRE_DELETE` the presenter consults [`super::allow_delete`]
     /// (currently always-allow) and returns `ERROR_ACCESS_DENIED`
     /// when the policy says no.
@@ -1433,9 +1486,10 @@ mod windows_impl {
 
         if matches!(event, super::NotificationEvent::PreDelete) {
             let items = ctx.items.blocking_read();
-            if !super::allow_delete(&path, &items) {
+            if !super::allow_delete(&path, is_directory, &items) {
                 tracing::info!(
                     path = %path,
+                    is_directory,
                     "ProjFS PRE_DELETE vetoed by allow_delete policy"
                 );
                 return hresult_from_win32(windows::Win32::Foundation::ERROR_ACCESS_DENIED.0);
@@ -2071,8 +2125,12 @@ mod tests {
     #[test]
     fn allow_delete_default_returns_true() {
         let items: HashMap<String, VfsItem> = HashMap::new();
-        assert!(allow_delete("any/path.txt", &items));
-        assert!(allow_delete("", &items));
+        // File and directory deletes both pass the always-allow stub.
+        assert!(allow_delete("any/path.txt", false, &items));
+        assert!(allow_delete("a/dir", true, &items));
+        // Empty path also passes — no special case on path shape.
+        assert!(allow_delete("", false, &items));
+        assert!(allow_delete("", true, &items));
     }
 
     /// A fresh token is un-cancelled; cancelling one clone is
@@ -2112,5 +2170,51 @@ mod tests {
         // Past end of file returns empty, not error.
         let beyond = provider.read_range(&id, 100, 10).unwrap();
         assert!(beyond.is_empty());
+    }
+
+    /// `classify_read` collapses a `ContentProvider::read_range` result
+    /// to the three outcomes `GetFileData` cares about. This is the
+    /// platform-independent stand-in for end-to-end testing the
+    /// callback's HRESULT decision: `S_OK` for `Eof`,
+    /// `ERROR_CALL_NOT_IMPLEMENTED` for `Failed`, and `PrjWriteFileData`
+    /// for `Bytes`. Exercised against the real `MockContentProvider` so
+    /// regressions in the EOF threshold surface here rather than only
+    /// on Windows CI.
+    #[test]
+    fn classify_read_handles_eof_bytes_and_failure() {
+        let id = ItemId::new("backend", "file");
+        let provider = MockContentProvider::default();
+        provider.insert(id.clone(), b"hello".to_vec());
+
+        // Non-empty read → Bytes.
+        let bytes_result = provider.read_range(&id, 0, 5);
+        match classify_read(bytes_result) {
+            ProviderReadOutcome::Bytes(b) => assert_eq!(b, b"hello"),
+            other => panic!("expected Bytes, got {other:?}"),
+        }
+
+        // Out-of-range read returns empty Vec → Eof. This is the path
+        // `GetFileData` returns S_OK on — assert it survives a round
+        // trip through the real provider, not just an `Ok(vec![])`
+        // literal.
+        let eof_result = provider.read_range(&id, 100, 10);
+        assert!(matches!(
+            classify_read(eof_result),
+            ProviderReadOutcome::Eof
+        ));
+
+        // I/O error → Failed (the callback returns
+        // `ERROR_CALL_NOT_IMPLEMENTED`).
+        let failed: std::io::Result<Vec<u8>> = Err(std::io::Error::other("synthetic failure"));
+        assert!(matches!(classify_read(failed), ProviderReadOutcome::Failed));
+
+        // A zero-byte read that happens to be exactly at end of file
+        // (length 0, offset == file end) is still `Eof`; the provider
+        // returns `Ok(vec![])` here too.
+        let exactly_at_end = provider.read_range(&id, 5, 0);
+        assert!(matches!(
+            classify_read(exactly_at_end),
+            ProviderReadOutcome::Eof
+        ));
     }
 }
