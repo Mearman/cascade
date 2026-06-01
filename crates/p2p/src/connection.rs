@@ -10,7 +10,11 @@
 //! authoritative; the post-handshake check guards against a future
 //! misconfiguration where the wrong verifier is wired in.
 //!
-//! Connection order: direct TCP with TLS first, then relay fallback.
+//! Direct TCP+TLS only — relay fallback is driven by
+//! [`crate::relay::RelayClient::connect_with_secret`] from the
+//! `cascade-backend-p2p` sync engine, which knows the connectivity
+//! strategy and the shared secret. The connection manager itself does
+//! not attempt relay fallback any more.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -23,7 +27,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 
 use crate::discovery::DiscoveredPeer;
 use crate::identity::DeviceIdentity;
-use crate::relay::{RelayClient, RelayConnection};
+use crate::relay::RelayConnection;
 
 /// Ensure a process-level `CryptoProvider` is installed.
 ///
@@ -36,15 +40,17 @@ fn ensure_crypto_provider() {
     );
 }
 
-/// Manages TLS-authenticated connections to P2P peers.
+/// Manages TLS-authenticated direct connections to P2P peers.
+///
+/// Relay fallback lives one layer up in the backend's sync engine, which
+/// has the connectivity strategy and the shared secret needed for the
+/// HMAC handshake the relay server requires.
 #[derive(Debug)]
 pub struct ConnectionManager {
     /// Our device identity (certificate + key).
     identity: DeviceIdentity,
     /// Device IDs we accept connections from.
     trusted_device_ids: Vec<String>,
-    /// Relay URLs for fallback connections.
-    relay_urls: Vec<String>,
 }
 
 /// A TLS-authenticated connection to a peer. Wraps either a client or
@@ -60,46 +66,25 @@ pub enum PeerConnection {
 impl ConnectionManager {
     /// Create a connection manager with our identity and trusted peers.
     #[must_use]
-    pub const fn new(
-        identity: DeviceIdentity,
-        trusted_device_ids: Vec<String>,
-        relay_urls: Vec<String>,
-    ) -> Self {
+    pub const fn new(identity: DeviceIdentity, trusted_device_ids: Vec<String>) -> Self {
         Self {
             identity,
             trusted_device_ids,
-            relay_urls,
         }
     }
 
-    /// Connect to a known peer. Tries direct TLS first, then relay fallback.
+    /// Connect to a known peer over direct TCP+TLS.
     pub async fn connect(&self, peer: &DiscoveredPeer) -> Result<PeerConnection> {
-        match self.connect_direct(peer.address, &peer.device_id).await {
-            Ok(stream) => Ok(PeerConnection::Direct(Box::new(stream))),
-            Err(direct_error) if self.relay_urls.is_empty() => {
-                Err(direct_error).with_context(|| {
-                    format!(
-                        "connecting directly to peer {} at {}",
-                        peer.device_id, peer.address
-                    )
-                })
-            }
-            Err(direct_error) => {
-                let mut relay_errors = Vec::new();
-                for relay_url in &self.relay_urls {
-                    match RelayClient::connect(relay_url, &peer.device_id).await {
-                        Ok(connection) => return Ok(PeerConnection::Relay(Box::new(connection))),
-                        Err(error) => relay_errors.push(format!("{relay_url}: {error:#}")),
-                    }
-                }
-                anyhow::bail!(
-                    "direct connection to peer {} at {} failed: {direct_error}; relay fallback failed: {}",
-                    peer.device_id,
-                    peer.address,
-                    relay_errors.join("; ")
-                );
-            }
-        }
+        let stream = self
+            .connect_direct(peer.address, &peer.device_id)
+            .await
+            .with_context(|| {
+                format!(
+                    "connecting directly to peer {} at {}",
+                    peer.device_id, peer.address
+                )
+            })?;
+        Ok(PeerConnection::Direct(Box::new(stream)))
     }
 
     /// Accept an incoming connection and verify the peer's device ID.
@@ -468,15 +453,14 @@ mod tests {
     fn connection_manager_builds_client_connector() {
         let identity = DeviceIdentity::generate().unwrap();
         let device_id = identity.device_id.clone();
-        let manager = ConnectionManager::new(identity, vec![], vec![]);
+        let manager = ConnectionManager::new(identity, vec![]);
         let _connector = manager.build_client_connector(&device_id).unwrap();
     }
 
     #[test]
     fn connection_manager_builds_server_acceptor() {
         let identity = DeviceIdentity::generate().unwrap();
-        let manager =
-            ConnectionManager::new(identity.clone(), vec!["SOME-PEER".to_string()], vec![]);
+        let manager = ConnectionManager::new(identity.clone(), vec!["SOME-PEER".to_string()]);
         let acceptor = manager.build_server_acceptor();
         assert!(acceptor.is_ok());
     }
@@ -484,7 +468,7 @@ mod tests {
     #[tokio::test]
     async fn accept_rejects_untrusted_device_id() {
         let identity = DeviceIdentity::generate().unwrap();
-        let manager = ConnectionManager::new(identity, vec!["TRUSTED-PEER".to_string()], vec![]);
+        let manager = ConnectionManager::new(identity, vec!["TRUSTED-PEER".to_string()]);
 
         // Start a listener.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -493,7 +477,7 @@ mod tests {
         // Connect with a different identity.
         let attacker_identity = DeviceIdentity::generate().unwrap();
         let attacker_manager =
-            ConnectionManager::new(attacker_identity, vec!["ANYTHING".to_string()], vec![]);
+            ConnectionManager::new(attacker_identity, vec!["ANYTHING".to_string()]);
 
         let accept_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -527,11 +511,8 @@ mod tests {
         // ServerCertVerifier — no application data flows.
         let server_identity = DeviceIdentity::generate().unwrap();
         let server_device_id = server_identity.device_id.clone();
-        let server_manager = ConnectionManager::new(
-            server_identity.clone(),
-            vec![server_device_id.clone()],
-            vec![],
-        );
+        let server_manager =
+            ConnectionManager::new(server_identity.clone(), vec![server_device_id.clone()]);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -546,8 +527,7 @@ mod tests {
         });
 
         let client_identity = DeviceIdentity::generate().unwrap();
-        let client_manager =
-            ConnectionManager::new(client_identity, vec![server_device_id], vec![]);
+        let client_manager = ConnectionManager::new(client_identity, vec![server_device_id]);
 
         let result = client_manager
             .connect_direct(address, "SOME-OTHER-DEVICE-WE-DO-NOT-TRUST")
@@ -565,7 +545,7 @@ mod tests {
     async fn connect_uses_direct_tcp_when_peer_is_reachable() {
         let identity = DeviceIdentity::generate().unwrap();
         let device_id = identity.device_id.clone();
-        let manager = ConnectionManager::new(identity.clone(), vec![device_id.clone()], vec![]);
+        let manager = ConnectionManager::new(identity.clone(), vec![device_id.clone()]);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -580,7 +560,7 @@ mod tests {
             device_id: device_id.clone(),
             address,
         };
-        let client_manager = ConnectionManager::new(identity, vec![device_id], vec![]);
+        let client_manager = ConnectionManager::new(identity, vec![device_id]);
         let connection = client_manager.connect(&peer).await.unwrap();
 
         match connection {
@@ -588,45 +568,6 @@ mod tests {
             PeerConnection::Relay(_) => panic!("expected direct connection"),
         }
         accept_task.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn connect_falls_back_to_relay_when_direct_tcp_fails() {
-        let identity = DeviceIdentity::generate().unwrap();
-        let device_id = identity.device_id.clone();
-
-        let unavailable = unavailable_loopback_address().await;
-        let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let relay_address = relay_listener.local_addr().unwrap();
-        let relay_task = tokio::spawn(async move {
-            let (stream, _) = relay_listener.accept().await.unwrap();
-            let _websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
-        });
-
-        let peer = DiscoveredPeer {
-            device_id: device_id.clone(),
-            address: unavailable,
-        };
-        let manager = ConnectionManager::new(
-            identity,
-            vec![device_id],
-            vec![format!("ws://{relay_address}")],
-        );
-
-        let connection = manager.connect(&peer).await.unwrap();
-
-        match connection {
-            PeerConnection::Direct(_) => panic!("expected relay connection"),
-            PeerConnection::Relay(_) => {}
-        }
-        relay_task.await.unwrap();
-    }
-
-    async fn unavailable_loopback_address() -> SocketAddr {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
-        address
     }
 
     /// Build a DigitallySignedStruct via the public Codec path —
