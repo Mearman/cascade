@@ -32,11 +32,13 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::time::sleep;
+use tokio::net::UdpSocket;
+use tokio::time::{sleep, timeout};
 
 use crate::candidate::Candidate;
 
@@ -516,6 +518,115 @@ fn relay_or_punch(
         },
         |relay| ConnectivityStrategy::Relay { relay: *relay },
     )
+}
+
+/// Wire-level size of a hole-punch probe payload in bytes.
+///
+/// Probes carry only the negotiated `64`-bit nonce in big-endian order;
+/// `recv_probe` rejects anything longer or shorter so unrelated traffic
+/// (`STUN` keep-alives, stray packets from previous attempts) does not
+/// trip the state machine.
+const PROBE_PAYLOAD_LEN: usize = 8;
+
+/// Production [`PunchTransport`] backed by a `tokio` `UdpSocket`.
+///
+/// Each instance owns one bound socket. Probes carry an `8`-byte
+/// big-endian nonce; any inbound datagram that is not exactly that
+/// length is discarded as not-a-probe by returning
+/// [`io::ErrorKind::TimedOut`] so the state machine treats it the same
+/// as a missed burst.
+///
+/// The socket is wrapped in [`Arc`] so the same transport can be cloned
+/// across tasks if the caller needs concurrent receive loops. Tokio's
+/// `UdpSocket` permits concurrent `send_to` and `recv_from` against the
+/// same handle.
+#[derive(Debug, Clone)]
+pub struct UdpPunchTransport {
+    socket: Arc<UdpSocket>,
+}
+
+impl UdpPunchTransport {
+    /// Bind a UDP socket to `local`.
+    ///
+    /// Pass a port of `0` to let the OS assign an ephemeral port; the
+    /// assigned address is then visible via [`Self::local_addr`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates the underlying [`io::Error`] from `UdpSocket::bind`.
+    pub async fn bind(local: SocketAddr) -> io::Result<Self> {
+        let socket = UdpSocket::bind(local).await?;
+        Ok(Self {
+            socket: Arc::new(socket),
+        })
+    }
+
+    /// Local address the operating system assigned.
+    ///
+    /// Especially relevant when `local` was bound with port `0` — the
+    /// returned address contains the ephemeral port the OS picked.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the underlying [`io::Error`] from
+    /// `UdpSocket::local_addr`.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+}
+
+#[async_trait]
+impl PunchTransport for UdpPunchTransport {
+    async fn send_probe(&self, dst: SocketAddr, nonce: u64) -> io::Result<()> {
+        let payload = nonce.to_be_bytes();
+        let sent = self.socket.send_to(&payload, dst).await?;
+        if sent != payload.len() {
+            return Err(io::Error::new(io::ErrorKind::WriteZero, "short probe send"));
+        }
+        Ok(())
+    }
+
+    async fn recv_probe(&self, deadline: Instant) -> io::Result<ReceivedProbe> {
+        // Translate the absolute deadline into a relative duration the
+        // tokio timer understands. A deadline already in the past maps
+        // to an immediate `TimedOut`, matching the state machine's
+        // "no probe, advance burst" contract.
+        let now = Instant::now();
+        let Some(remaining) = deadline.checked_duration_since(now) else {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "recv deadline already passed",
+            ));
+        };
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "recv deadline already passed",
+            ));
+        }
+
+        let mut buf = [0u8; PROBE_PAYLOAD_LEN];
+        let recv = timeout(remaining, self.socket.recv_from(&mut buf)).await;
+        let (read, from) = match recv {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "recv timed out"));
+            }
+        };
+
+        if read != PROBE_PAYLOAD_LEN {
+            // Non-probe traffic on the same port — discard and surface
+            // as `TimedOut` so the burst loop keeps waiting until its
+            // own deadline expires.
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "non-probe packet received",
+            ));
+        }
+
+        let nonce = u64::from_be_bytes(buf);
+        Ok(ReceivedProbe { from, nonce })
+    }
 }
 
 #[cfg(test)]
