@@ -488,18 +488,20 @@ mod tests {
 
     use tokio::sync::mpsc;
 
-    /// In-memory `Transport` pair backed by `mpsc` channels. One side's
-    /// `send_frame` lands in the other side's `recv_frame` queue. Both
-    /// sides shutdown by dropping their senders. Used by the unit
-    /// tests for the BEP session loop above this layer — no sockets
-    /// involved.
-    pub(crate) struct ChannelTransport {
+    /// In-memory `Transport` pair backed by `mpsc` channels.
+    ///
+    /// One side's `send_frame` lands in the other side's `recv_frame` queue.
+    /// Both sides shut down by dropping their senders. Used by unit tests for
+    /// the BEP session loop — no sockets involved.
+    #[derive(Debug)]
+    pub struct ChannelTransport {
         tx: mpsc::UnboundedSender<Vec<u8>>,
         rx: mpsc::UnboundedReceiver<Vec<u8>>,
     }
 
     impl ChannelTransport {
-        pub(crate) fn pair() -> (Self, Self) {
+        #[must_use]
+        pub fn pair() -> (Self, Self) {
             let (a_tx, b_rx) = mpsc::unbounded_channel();
             let (b_tx, a_rx) = mpsc::unbounded_channel();
             (Self { tx: a_tx, rx: a_rx }, Self { tx: b_tx, rx: b_rx })
@@ -518,7 +520,8 @@ mod tests {
         }
     }
 
-    pub(crate) struct ChannelTransportReader {
+    #[derive(Debug)]
+    pub struct ChannelTransportReader {
         rx: mpsc::UnboundedReceiver<Vec<u8>>,
     }
 
@@ -529,7 +532,8 @@ mod tests {
         }
     }
 
-    pub(crate) struct ChannelTransportWriter {
+    #[derive(Debug)]
+    pub struct ChannelTransportWriter {
         tx: mpsc::UnboundedSender<Vec<u8>>,
     }
 
@@ -567,10 +571,10 @@ mod tests {
     #[tokio::test]
     async fn channel_pair_eof_on_drop() {
         let (a, b) = ChannelTransport::pair();
-        let (_a_r, _a_w) = a.split();
+        let (_a_r, a_w) = a.split();
         let (mut b_r, _b_w) = b.split();
-        // Drop A's writer too — recv on B sees EOF.
-        drop(_a_w);
+        // Drop A's writer — recv on B sees EOF.
+        drop(a_w);
         let got = b_r.recv_frame().await.unwrap();
         assert!(got.is_none(), "expected None on clean EOF");
     }
@@ -639,6 +643,6 @@ mod tests {
 // The pair is gated on `cfg(test)`; the parent module's tests reach
 // for it via `crate::transport::test_support::ChannelTransport`.
 #[cfg(test)]
-pub(crate) mod test_support {
-    pub(crate) use super::tests::ChannelTransport;
+pub mod test_support {
+    pub use super::tests::ChannelTransport;
 }
