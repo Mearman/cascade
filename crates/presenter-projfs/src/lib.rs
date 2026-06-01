@@ -11,9 +11,8 @@
 //!
 //! # Scaffold status
 //!
-//! This is the v8 roadmap scaffold. The crate exposes a [`ProjFsPresenter`]
-//! that implements [`VfsPresenter`], but most of the methods that talk to
-//! the OS are stubs:
+//! The crate is partway through the v8 roadmap. Browse callbacks are
+//! live; read and write callbacks remain stubbed.
 //!
 //! - [`ProjFsPresenter::upsert_item`] and [`ProjFsPresenter::delete_item`]
 //!   are real — they update an in-memory `HashMap<String, VfsItem>`
@@ -28,13 +27,14 @@
 //!   into this method.
 //! - [`ProjFsPresenter::start`] registers the virtualisation root and
 //!   begins virtualising via `PrjMarkDirectoryAsPlaceholder` and
-//!   `PrjStartVirtualizing`, but every callback in the table immediately
-//!   returns `S_OK` with empty results (or
-//!   `HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)` where empty is not a
-//!   legal answer). The mount appears as an empty directory until the
-//!   callbacks are filled in.
+//!   `PrjStartVirtualizing`. The callback table now serves
+//!   `QueryFileName`, `GetPlaceholderInfo`, and the
+//!   `Start`/`Get`/`End` directory enumeration triplet from the
+//!   in-memory items map. `dir`-style listings work; reading a file's
+//!   bytes does not (see follow-up work).
 //! - [`ProjFsPresenter::stop`] calls `PrjStopVirtualizing` against the
-//!   stored namespace handle.
+//!   stored namespace handle, then releases the heap-allocated
+//!   callback context.
 //!
 //! On non-Windows targets, [`ProjFsPresenter::start`] returns
 //! `Err("ProjFS presenter is only supported on Windows")` and
@@ -42,24 +42,13 @@
 //!
 //! # Follow-up work
 //!
-//! The eight `ProjFS` callbacks that need real implementations are:
+//! Three callbacks remain stubbed:
 //!
-//! 1. `StartDirectoryEnumerationCallback` — open a directory iterator
-//!    keyed by enumeration `GUID`, backed by the engine `VfsTree`.
-//! 2. `EndDirectoryEnumerationCallback` — release the iterator.
-//! 3. `GetDirectoryEnumerationCallback` — yield the next batch of
-//!    entries into the `PRJ_DIR_ENTRY_BUFFER_HANDLE` honouring the
-//!    `PCWSTR` search expression.
-//! 4. `GetPlaceholderInfoCallback` — translate a path to
-//!    `PRJ_PLACEHOLDER_INFO`, populating `FileBasicInfo` from the
-//!    matching `VfsItem`.
-//! 5. `GetFileDataCallback` — stream file bytes from the backend via
+//! 1. `GetFileDataCallback` — stream file bytes from the backend via
 //!    `PrjWriteFileData`, respecting the requested offset and length.
-//! 6. `QueryFileNameCallback` — case-insensitive existence check used
-//!    by `ProjFS` to decide whether to descend into the projection.
-//! 7. `NotificationCallback` — react to user-driven changes
+//! 2. `NotificationCallback` — react to user-driven changes
 //!    (open/close/rename/delete) and forward them back into the engine.
-//! 8. `CancelCommandCallback` — abort the in-flight Tokio task for a
+//! 3. `CancelCommandCallback` — abort the in-flight Tokio task for a
 //!    given `PRJ_CALLBACK_DATA.CommandId`.
 //!
 //! Each requires translating between `ProjFS`'s enumeration session model
