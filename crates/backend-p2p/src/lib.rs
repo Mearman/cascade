@@ -121,8 +121,8 @@ pub struct P2pBackendConfig {
     pub relay_endpoints: Vec<std::net::SocketAddr>,
     /// Shared secret authenticating this device against the relay
     /// pool. `None` means the relay path is provisioned but unusable;
-    /// `decide_connectivity` may still pick `Relay` but
-    /// `RelayClient::connect` will fail until a secret is configured.
+    /// `decide_connectivity` may still pick `Relay` but the relay
+    /// strategy will skip the dial without a secret.
     /// The 32-byte width matches the cascade relay's HMAC key length.
     pub relay_shared_secret: Option<[u8; 32]>,
     /// Hole-punching opt-out. When `false`, [`cascade_p2p::decide_connectivity`]

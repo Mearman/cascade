@@ -23,9 +23,13 @@ does not expose a hook to influence connection behaviour from this signal."
 
 A relay transport exists too —
 [`crates/p2p/src/relay.rs`](../crates/p2p/src/relay.rs) is a WebSocket
-byte-pipe that tunnels TLS-wrapped BEP frames between two endpoints. There is
-no relay server, no relay-discovery protocol, and nothing in `SyncEngine` ever
-calls `RelayClient::connect`. The pieces exist; nothing is wired up.
+byte-pipe that tunnels TLS-wrapped BEP frames between two endpoints, and
+`crates/relay-server/` carries the matching server. The `SyncEngine`
+drives `RelayClient::connect_with_secret` once `decide_connectivity`
+picks the `Relay` strategy, authenticating against the server with the
+configured shared HMAC secret; the post-relay BEP transport upgrade
+(running a real BEP session over the tunnel) lives with the post-punch
+upgrade in a future round.
 
 ## NAT taxonomy
 

@@ -374,6 +374,7 @@ dependencies = [
  "chrono",
  "data-encoding",
  "futures-util",
+ "hmac",
  "rcgen",
  "rusqlite",
  "rustls-pemfile",
@@ -493,6 +494,7 @@ version = "0.1.31"
 dependencies = [
  "anyhow",
  "axum",
+ "cascade-p2p",
  "clap",
  "futures-util",
  "hex",

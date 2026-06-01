@@ -60,6 +60,12 @@ const P2P_DIR: &str = "p2p";
 const DEFAULT_LISTEN_PORT: u16 = 22000;
 
 /// Top-level P2P engine composing all subsystems.
+///
+/// Relay fallback is driven by the backend's sync engine via
+/// [`relay::RelayClient::connect_with_secret`], which has access to the
+/// pre-shared HMAC secret needed to authenticate against the relay
+/// server. The engine here covers identity, discovery, and the block
+/// store.
 #[derive(Debug)]
 pub struct P2pEngine {
     /// This device's identity.
@@ -68,8 +74,6 @@ pub struct P2pEngine {
     block_store: BlockStore,
     /// TCP port for incoming BEP connections.
     listen_port: u16,
-    /// Relay servers used when direct WAN connections fail.
-    relay_urls: Vec<String>,
     /// Peer book for gossip-based P2P discovery.
     peer_book: wan::PeerBook,
 }
@@ -88,7 +92,6 @@ impl P2pEngine {
             identity,
             block_store,
             listen_port: DEFAULT_LISTEN_PORT,
-            relay_urls: Vec::new(),
             peer_book: wan::PeerBook::new(),
         })
     }
@@ -100,7 +103,6 @@ impl P2pEngine {
             identity,
             block_store,
             listen_port: DEFAULT_LISTEN_PORT,
-            relay_urls: Vec::new(),
             peer_book: wan::PeerBook::new(),
         }
     }
@@ -120,22 +122,6 @@ impl P2pEngine {
     /// Set the BEP listen port.
     pub const fn set_listen_port(&mut self, port: u16) {
         self.listen_port = port;
-    }
-
-    /// Relay URLs used as WAN fallback transports.
-    #[must_use]
-    pub fn relay_urls(&self) -> &[String] {
-        &self.relay_urls
-    }
-
-    /// Replace the ordered relay fallback URL list.
-    pub fn set_relay_urls(&mut self, relay_urls: Vec<String>) {
-        self.relay_urls = relay_urls;
-    }
-
-    /// Add a relay fallback URL.
-    pub fn add_relay_url(&mut self, relay_url: String) {
-        self.relay_urls.push(relay_url);
     }
 
     /// Access the block store.
@@ -191,20 +177,21 @@ impl P2pEngine {
         &mut self.peer_book
     }
 
-    /// Establish a TLS-authenticated peer connection, trying direct before relay.
+    /// Establish a TLS-authenticated direct peer connection.
+    ///
+    /// Relay fallback is driven one layer up by the backend's sync
+    /// engine, which holds the shared HMAC secret needed by the relay
+    /// client. This method is a thin wrapper around the connection
+    /// manager and never attempts relay.
     pub async fn connect_peer(
         &self,
         peer: &discovery::DiscoveredPeer,
     ) -> Result<connection::PeerConnection> {
         let trusted_ids: Vec<String> = self.peer_book.peers().keys().cloned().collect();
-        connection::ConnectionManager::new(
-            self.identity.clone(),
-            trusted_ids,
-            self.relay_urls.clone(),
-        )
-        .connect(peer)
-        .await
-        .context("connecting to P2P peer")
+        connection::ConnectionManager::new(self.identity.clone(), trusted_ids)
+            .connect(peer)
+            .await
+            .context("connecting to P2P peer")
     }
 
     /// Detect the local NAT type using a STUN server.

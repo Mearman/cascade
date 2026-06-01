@@ -226,7 +226,7 @@ pub struct SyncEngine {
     /// Pre-shared HMAC secret authenticating against the relay pool.
     /// `None` means the relay path is provisioned but unusable
     /// (`decide_connectivity` may still pick `Relay` but
-    /// `RelayClient::connect` will fail loudly).
+    /// `attempt_relay` skips the dial when no secret is set).
     relay_shared_secret: Option<[u8; 32]>,
     /// Hole-punching opt-out. When `false`, a `ConnectivityStrategy::HolePunch`
     /// is downgraded to direct-or-relay before any UDP burst is emitted.
@@ -487,7 +487,7 @@ impl SyncEngine {
         if !trusted.contains(&peer.device_id) {
             anyhow::bail!("device {} is not trusted", peer.device_id);
         }
-        let manager = ConnectionManager::new(self.identity.clone(), trusted, vec![]);
+        let manager = ConnectionManager::new(self.identity.clone(), trusted);
         let conn = manager
             .connect(&DiscoveredPeer {
                 device_id: peer.device_id.clone(),
@@ -547,50 +547,48 @@ impl SyncEngine {
             (remote, candidates)
         };
 
-        // Filter the relay pool by what the relay-client can currently
-        // authenticate against. `cascade_p2p::relay::RelayClient::connect`
-        // does not yet send the HMAC handshake frame the relay-server
-        // requires (see crates/relay-server/src/auth.rs), so an
-        // unauthenticated dial would be immediately rejected by the
-        // relay. Until the relay-client gains an HMAC-auth path
-        // (next round's post-relay transport upgrade), present an
-        // empty pool to `decide_connectivity` so the `Relay` arm is
-        // never chosen.
-        //
-        // TODO(nat-relay-auth): once `RelayClient::connect` accepts the
-        // shared secret and emits the HMAC handshake, drop this filter
-        // and pass `self.relay_endpoints` directly. The
-        // `relay_shared_secret` field is already loaded by
-        // `P2pBackend::open`.
-        let relay_pool_for_decision: &[SocketAddr] = &[];
-        if !self.relay_endpoints.is_empty() {
-            tracing::warn!(
-                target: "cascade::backend::p2p",
-                count = self.relay_endpoints.len(),
-                "relay_endpoints configured but relay-client HMAC auth is not wired yet; the Relay strategy is suppressed until the next round"
-            );
-        }
-
+        // Feed the full relay pool to `decide_connectivity`. The
+        // relay client now performs the HMAC handshake against the
+        // server (see `cascade_p2p::relay::RelayClient::connect_with_secret`
+        // and `crates/relay-server/src/auth.rs`) so the Relay arm is
+        // viable for any peer whose direct + hole-punch paths fail.
+        // `attempt_relay` still no-ops when no shared secret is
+        // configured — the strategy can be picked but the dial fails
+        // loudly rather than silently.
         let mut strategy = decide_connectivity(
             local_nat,
             remote_nat,
             &remote_candidates,
-            relay_pool_for_decision,
+            &self.relay_endpoints,
         );
 
         // Honour the opt-out: a chosen HolePunch is downgraded to the
         // most reasonable fallback so the rest of the wiring runs as
-        // normal. Falling back to relay when one is configured would
-        // match the precedence the table uses for symmetric pairs,
-        // but with the relay pool currently suppressed we have only
-        // Direct as a fallback.
+        // normal. Prefer relay when one is configured and we hold a
+        // shared secret — that matches the precedence the table uses
+        // for symmetric pairs. Otherwise fall through to Direct so we
+        // at least try the peer's reported address rather than giving
+        // up.
         if !self.enable_hole_punch && matches!(strategy, ConnectivityStrategy::HolePunch { .. }) {
-            strategy = ConnectivityStrategy::Direct { addr: peer.address };
-            debug!(
-                target: "cascade::backend::p2p",
-                peer = %peer.device_id,
-                "hole-punch disabled — downgraded strategy to direct"
-            );
+            strategy = if let (Some(&first_relay), true) = (
+                self.relay_endpoints.first(),
+                self.relay_shared_secret.is_some(),
+            ) {
+                debug!(
+                    target: "cascade::backend::p2p",
+                    peer = %peer.device_id,
+                    relay = %first_relay,
+                    "hole-punch disabled — downgraded strategy to relay"
+                );
+                ConnectivityStrategy::Relay { relay: first_relay }
+            } else {
+                debug!(
+                    target: "cascade::backend::p2p",
+                    peer = %peer.device_id,
+                    "hole-punch disabled and no usable relay — downgraded strategy to direct"
+                );
+                ConnectivityStrategy::Direct { addr: peer.address }
+            };
         }
 
         match strategy {
@@ -762,14 +760,23 @@ impl SyncEngine {
         Ok(agreement)
     }
 
-    /// Open a relay-backed connection to `peer` via `relay`.
+    /// Open an HMAC-authenticated relay connection to `peer` via `relay`.
     ///
-    /// For v1 we connect through the relay (proving the relay address
-    /// is reachable and the device id is acceptable) and immediately
-    /// log success — the post-relay BEP transport upgrade lives with
-    /// the post-punch upgrade in the next round.
+    /// The relay client now drives the full handshake against the
+    /// `cascade-relay-server` (see
+    /// [`cascade_p2p::relay::RelayClient::connect_with_secret`] and
+    /// `crates/relay-server/src/auth.rs`). For v1 we connect through
+    /// the relay (proving the address is reachable and the shared
+    /// secret matches) and immediately log success — the post-relay
+    /// BEP transport upgrade lives with the post-punch upgrade in the
+    /// next round.
+    ///
+    /// The session id used for the rendezvous is the remote peer's
+    /// device id: that matches the legacy `RelayClient::connect` API
+    /// shape. A future round will agree the session id out of band so
+    /// both peers meet at the same URL path.
     async fn attempt_relay(&self, peer: &Peer, relay: SocketAddr) -> Result<()> {
-        if self.relay_shared_secret.is_none() {
+        let Some(shared_secret) = self.relay_shared_secret else {
             debug!(
                 target: "cascade::backend::p2p",
                 peer = %peer.device_id,
@@ -777,7 +784,7 @@ impl SyncEngine {
                 "relay strategy chosen but no shared secret configured — skipping"
             );
             return Ok(());
-        }
+        };
         let relay_url = format!("ws://{relay}");
         info!(
             target: "cascade::backend::p2p",
@@ -785,7 +792,14 @@ impl SyncEngine {
             %relay,
             "opening relay connection — post-relay BEP transport upgrade is the next round"
         );
-        match cascade_p2p::relay::RelayClient::connect(&relay_url, &peer.device_id).await {
+        match cascade_p2p::relay::RelayClient::connect_with_secret(
+            &relay_url,
+            &peer.device_id,
+            &self.identity.device_id,
+            &shared_secret,
+        )
+        .await
+        {
             Ok(_conn) => Ok(()),
             Err(e) => {
                 debug!(
@@ -807,7 +821,7 @@ impl SyncEngine {
         peer_addr: SocketAddr,
     ) -> Result<()> {
         let trusted = self.trusted.lock().await.clone();
-        let manager = ConnectionManager::new(self.identity.clone(), trusted, vec![]);
+        let manager = ConnectionManager::new(self.identity.clone(), trusted);
         let (device_id, tls) = manager
             .accept(stream)
             .await

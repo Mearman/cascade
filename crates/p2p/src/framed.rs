@@ -132,13 +132,13 @@ mod tests {
         let server_identity = identity.clone();
         let server_trusted = vec![device_id.clone()];
         let server = tokio::spawn(async move {
-            let manager = ConnectionManager::new(server_identity, server_trusted, vec![]);
+            let manager = ConnectionManager::new(server_identity, server_trusted);
             let (stream, _) = listener.accept().await.unwrap();
             let (_device, tls) = manager.accept(stream).await.unwrap();
             FramedPeer::from_tls(tls)
         });
 
-        let client_manager = ConnectionManager::new(identity, vec![device_id.clone()], vec![]);
+        let client_manager = ConnectionManager::new(identity, vec![device_id.clone()]);
         let client_conn = client_manager
             .connect(&DiscoveredPeer { device_id, address })
             .await
