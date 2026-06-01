@@ -467,7 +467,7 @@ pub fn encode_message(msg: &BepMessage) -> Result<Vec<u8>> {
             let count = u32::try_from(candidates.len())
                 .map_err(|_| anyhow::anyhow!("too many candidates"))?;
             if count > MAX_CANDIDATES_PER_FRAME {
-                anyhow::bail!("candidate count {count} exceeds maximum {MAX_CANDIDATES_PER_FRAME}",);
+                anyhow::bail!("candidate count {count} exceeds maximum {MAX_CANDIDATES_PER_FRAME}");
             }
             encode_u32(&mut body, count);
             for candidate in candidates {
@@ -645,7 +645,7 @@ pub fn decode_message(frame: &[u8]) -> Result<BepMessage> {
 fn decode_candidates(data: &[u8]) -> Result<BepMessage> {
     let (count, mut rest) = decode_u32(data)?;
     if count > MAX_CANDIDATES_PER_FRAME {
-        anyhow::bail!("candidate count {count} exceeds maximum {MAX_CANDIDATES_PER_FRAME}",);
+        anyhow::bail!("candidate count {count} exceeds maximum {MAX_CANDIDATES_PER_FRAME}");
     }
     let mut candidates = Vec::with_capacity(count as usize);
     for _ in 0..count {
