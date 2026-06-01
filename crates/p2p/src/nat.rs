@@ -860,6 +860,7 @@ mod tests {
 
     use std::sync::Arc;
 
+    use if_addrs::{IfAddr, Ifv4Addr, Ifv6Addr, Interface};
     use tokio::net::UdpSocket;
 
     /// How a mock STUN server should react to a single Binding Request.
@@ -1466,5 +1467,158 @@ mod tests {
             result,
             Err(NatDetectionError::NoChangeRequestSupport)
         ));
+    }
+
+    // ---------- candidate enrichment helpers ----------
+
+    /// Build a synthetic IPv4 interface descriptor for tests. The
+    /// netmask and broadcast fields are not exercised by the host
+    /// enumerator, so we set them to dummy values.
+    fn v4_interface(name: &str, ip: Ipv4Addr, index: u32) -> Interface {
+        Interface {
+            name: name.to_string(),
+            addr: IfAddr::V4(Ifv4Addr {
+                ip,
+                netmask: Ipv4Addr::new(255, 255, 255, 0),
+                prefixlen: 24,
+                broadcast: None,
+            }),
+            index: Some(index),
+            oper_status: if_addrs::IfOperStatus::Up,
+            is_p2p: false,
+            #[cfg(windows)]
+            adapter_name: String::new(),
+        }
+    }
+
+    /// Build a synthetic IPv6 interface descriptor for tests.
+    fn v6_interface(name: &str, ip: Ipv6Addr, index: u32) -> Interface {
+        Interface {
+            name: name.to_string(),
+            addr: IfAddr::V6(Ifv6Addr {
+                ip,
+                netmask: Ipv6Addr::new(0xffff, 0xffff, 0xffff, 0xffff, 0, 0, 0, 0),
+                prefixlen: 64,
+                broadcast: None,
+            }),
+            index: Some(index),
+            oper_status: if_addrs::IfOperStatus::Up,
+            is_p2p: false,
+            #[cfg(windows)]
+            adapter_name: String::new(),
+        }
+    }
+
+    #[test]
+    fn server_reflexive_candidate_carries_rfc_8445_priority() {
+        // Type preference 100 (srflx) with local preference 1000:
+        //   100 << 24 = 1_677_721_600
+        //   1000 << 8 = 256_000
+        //   256 - 1 = 255
+        //   total = 1_677_977_855
+        let external = SocketAddr::from(([203, 0, 113, 50], 60001));
+        let candidate = server_reflexive_candidate_from_addr(external, 1000);
+
+        assert_eq!(candidate.address, external);
+        assert_eq!(candidate.kind, CandidateKind::ServerReflexive);
+        assert_eq!(candidate.priority, 1_677_977_855);
+    }
+
+    #[test]
+    fn host_enumeration_filters_loopback_and_ipv6_link_local() {
+        let loopback_v4 = v4_interface("lo0", Ipv4Addr::new(127, 0, 0, 1), 0);
+        let routable_v4 = v4_interface("en0", Ipv4Addr::new(192, 168, 1, 50), 1);
+        let link_local_v6 =
+            v6_interface("en0", Ipv6Addr::new(0xfe80, 0, 0, 0, 0x1, 0x2, 0x3, 0x4), 1);
+        let routable_v6 = v6_interface("en0", Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 1);
+        let loopback_v6 = v6_interface("lo0", Ipv6Addr::LOCALHOST, 0);
+        let interfaces = vec![
+            loopback_v4,
+            routable_v4,
+            link_local_v6,
+            routable_v6,
+            loopback_v6,
+        ];
+
+        let candidates = host_candidates_from_interfaces(&interfaces, 22000);
+
+        // Two of the five inputs survive the filter: the routable v4
+        // and the routable v6.
+        assert_eq!(candidates.len(), 2);
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.address.ip() == IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)))
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.address.ip()
+                    == IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)))
+        );
+        for candidate in &candidates {
+            assert_eq!(candidate.address.port(), 22000);
+            assert_eq!(candidate.kind, CandidateKind::Host);
+        }
+    }
+
+    #[test]
+    fn host_enumeration_preserves_ipv4_link_local() {
+        // RFC 3927 link-local (169.254.0.0/16) is dial-able on the
+        // local segment, so it must survive the filter.
+        let link_local_v4 = v4_interface("en1", Ipv4Addr::new(169, 254, 1, 5), 0);
+        let interfaces = vec![link_local_v4];
+
+        let candidates = host_candidates_from_interfaces(&interfaces, 22000);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates.first().map(|c| c.address.ip()),
+            Some(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 5))),
+        );
+    }
+
+    #[test]
+    fn host_enumeration_assigns_decreasing_local_preference_by_index() {
+        // Two routable v4 interfaces — the one earlier in the input
+        // list must get the higher priority because earlier-listed
+        // interfaces are typically the primary physical NIC.
+        let first = v4_interface("en0", Ipv4Addr::new(10, 0, 0, 2), 0);
+        let second = v4_interface("en1", Ipv4Addr::new(10, 0, 1, 2), 1);
+        let interfaces = vec![first, second];
+
+        let candidates = host_candidates_from_interfaces(&interfaces, 22000);
+
+        assert_eq!(candidates.len(), 2);
+        let first_priority = candidates.first().map(|c| c.priority);
+        let second_priority = candidates.get(1).map(|c| c.priority);
+        assert!(matches!((first_priority, second_priority), (Some(a), Some(b)) if a > b));
+    }
+
+    #[test]
+    fn host_enumeration_returns_empty_for_empty_input() {
+        let candidates = host_candidates_from_interfaces(&[], 22000);
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn ipv6_link_local_classifier_matches_prefix() {
+        // Sanity-check the prefix arithmetic. fe80::/10 means the top
+        // 10 bits are 1111111010 — equivalently, the first byte is
+        // 0xfe and the upper two bits of the second byte are 10.
+        assert!(is_ipv6_link_local(Ipv6Addr::new(
+            0xfe80, 0, 0, 0, 0, 0, 0, 1
+        )));
+        assert!(is_ipv6_link_local(Ipv6Addr::new(
+            0xfebf, 0xffff, 0, 0, 0, 0, 0, 0
+        )));
+        // 0xfec0:: is the old site-local prefix; not link-local.
+        assert!(!is_ipv6_link_local(Ipv6Addr::new(
+            0xfec0, 0, 0, 0, 0, 0, 0, 1
+        )));
+        // Documentation prefix is not link-local.
+        assert!(!is_ipv6_link_local(Ipv6Addr::new(
+            0x2001, 0xdb8, 0, 0, 0, 0, 0, 1
+        )));
     }
 }
