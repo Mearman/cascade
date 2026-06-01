@@ -44,13 +44,11 @@ use crate::candidate::Candidate;
 
 /// Detected `NAT` classification for one peer.
 ///
-/// Matches the four-way RFC 4787 split, plus `Open` for hosts on a
+/// Matches the four-way `RFC 4787` split, plus `Open` for hosts on a
 /// public address and `Unknown` for detection failures where no
-/// classification is available. Distinct from
-/// [`crate::nat::NatType`] — the existing enum in `nat.rs` predates
-/// this module and reports only `Public` / `Symmetric` from the
-/// current single-server STUN probe. The two will be reconciled when
-/// the RFC 5780 two-server detection lands.
+/// classification is available. This is the canonical `NatType` —
+/// [`crate::nat`] (the `STUN`-based producer) re-imports it so the
+/// detector and the hole-punching decision tree speak the same dialect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NatType {
     /// Host is directly reachable on a public address (no `NAT`).

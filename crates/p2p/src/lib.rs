@@ -208,7 +208,7 @@ impl P2pEngine {
     }
 
     /// Detect the local NAT type using a STUN server.
-    pub async fn detect_nat_type(&self, stun_server: &str) -> Result<nat::NatType> {
+    pub async fn detect_nat_type(&self, stun_server: &str) -> Result<traversal::NatType> {
         nat::NatTraversal::detect_nat_type(stun_server)
             .await
             .context("detecting NAT type")

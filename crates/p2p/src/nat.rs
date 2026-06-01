@@ -11,9 +11,8 @@
 //!   against a primary server (supporting `CHANGE-REQUEST`) and a
 //!   secondary server on a different `IP`.
 //!
-//! See [`crate::traversal::NatType`] for the dialect used by the
-//! hole-punching decision tree; the two enums will be reconciled once
-//! callers migrate. See `TODO(nat-reconcile)`.
+//! Both interfaces return the canonical [`crate::traversal::NatType`] —
+//! the same enum the hole-punching decision tree consumes.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,6 +21,8 @@ use anyhow::{Context, Result};
 use thiserror::Error;
 use tokio::net::UdpSocket;
 use tokio::time::{Duration, timeout};
+
+use crate::traversal::NatType;
 
 const BINDING_REQUEST: u16 = 0x0001;
 const BINDING_SUCCESS_RESPONSE: u16 = 0x0101;
@@ -48,30 +49,6 @@ const CHANGE_REQUEST_FLAG_CHANGE_IP: u32 = 0x0000_0004;
 /// `CHANGE-REQUEST` flag asking the server to respond from a different port.
 /// `RFC 5780 §7.2` reserves bit position 1 of the high byte for "change port".
 const CHANGE_REQUEST_FLAG_CHANGE_PORT: u32 = 0x0000_0002;
-
-/// `NAT` type detected by `STUN`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NatType {
-    /// Host is directly reachable on a public address — no `NAT`.
-    Open,
-    /// Full cone `NAT` — mapped port reachable from any external host.
-    FullCone,
-    /// Restricted cone `NAT` — only reachable from hosts that have received packets.
-    RestrictedCone,
-    /// Port-restricted cone `NAT` — like restricted but port-specific.
-    PortRestrictedCone,
-    /// Symmetric `NAT` — different mapping per destination. Requires relay.
-    Symmetric,
-    /// Detection failed or returned an inconclusive result. Treated
-    /// conservatively as needing relay.
-    Unknown,
-}
-
-// TODO(nat-reconcile): merge this enum with `crate::traversal::NatType` in a
-// follow-up round. Both share the same six variants now (`Open`, `FullCone`,
-// `RestrictedCone`, `PortRestrictedCone`, `Symmetric`, `Unknown`); this one
-// is kept distinct until every caller of `nat::NatType::Open` /
-// `nat::NatType::Symmetric` has been audited and migrated.
 
 /// Error returned by `RFC 5780` `NAT` detection.
 #[derive(Debug, Error)]
