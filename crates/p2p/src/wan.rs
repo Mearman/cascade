@@ -14,7 +14,8 @@ use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
 
-use crate::traversal::NatType;
+use crate::candidate::Candidate;
+use crate::traversal::{NatType, SyncPunchAgreement};
 
 /// A known peer, potentially learned via introducer gossip.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -81,11 +82,34 @@ pub struct GossipPeer {
     pub addresses: Vec<SocketAddr>,
 }
 
+/// Ephemeral per-peer traversal state — remote candidates received via
+/// `BepMessage::Candidates` and the most recent `SyncPunch` agreement.
+///
+/// Not persisted: candidates are valid only for the lifetime of the
+/// negotiation that produced them, and a punch agreement is meaningful
+/// only until its deadline passes. Re-deriving both on reconnect is
+/// cheaper than the storage and migration cost of writing them to disk.
+#[derive(Debug, Clone, Default)]
+pub struct RemotePunchState {
+    /// Reachable addresses the remote advertised most recently. Replaced
+    /// in full on every `set_remote_candidates` call — peers do not send
+    /// deltas.
+    pub candidates: Vec<Candidate>,
+    /// Latest `SyncPunch` agreement received from the peer. `None` until
+    /// the peer signals readiness for a punch attempt.
+    pub agreement: Option<SyncPunchAgreement>,
+}
+
 /// Local peer database — tracks known peers and introducer relationships.
 #[derive(Debug, Clone, Default)]
 pub struct PeerBook {
     /// Device ID → known peer entry.
     peers: HashMap<String, KnownPeer>,
+    /// Device ID → ephemeral hole-punch state. Kept out of `KnownPeer`
+    /// because `Candidate` and `SyncPunchAgreement` are not serde types
+    /// and the values are valid only across a single connection
+    /// negotiation.
+    punch: HashMap<String, RemotePunchState>,
 }
 
 impl PeerBook {
@@ -182,13 +206,25 @@ impl PeerBook {
     /// the removal so it isn't immediately re-added.
     pub fn remove_peer(&mut self, device_id: &str) {
         self.peers.remove(device_id);
+        // Drop any ephemeral punch state too — keeping it around after
+        // the peer record is gone leaks memory and risks acting on
+        // stale candidates if the same id later re-registers.
+        self.punch.remove(device_id);
     }
 
     /// Remove all peers introduced by a specific introducer.
     /// Called when an introducer itself is removed.
     pub fn remove_introduced_by(&mut self, introducer_id: &str) {
+        let introducer = introducer_id.to_string();
         self.peers
-            .retain(|_, peer| !peer.introduced_by.contains(&introducer_id.to_string()));
+            .retain(|_, peer| !peer.introduced_by.contains(&introducer));
+        // Mirror the retention on the punch-state map: any peer that
+        // has just been dropped from `peers` should not retain its
+        // candidates or agreement either. Borrow-checker note: collect
+        // the surviving IDs first so the `peers` map isn't borrowed
+        // while `punch` is being mutated.
+        let surviving: std::collections::HashSet<String> = self.peers.keys().cloned().collect();
+        self.punch.retain(|id, _| surviving.contains(id));
     }
 
     /// Get a peer by device ID.
@@ -213,6 +249,65 @@ impl PeerBook {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.peers.is_empty()
+    }
+
+    /// Store the most recent `NAT` classification for `device_id`. A
+    /// silent no-op when the peer is not in the book — callers should
+    /// add the peer first (typically through [`Self::add_peer`] or
+    /// [`Self::merge_gossip`]) so a future direct contact stamps a real
+    /// timestamp via [`Self::mark_seen`].
+    pub fn set_last_known_nat_type(&mut self, device_id: &str, nat_type: NatType) {
+        if let Some(entry) = self.peers.get_mut(device_id) {
+            entry.last_known_nat_type = Some(nat_type);
+        }
+    }
+
+    /// Most recent `NAT` classification observed for `device_id`.
+    ///
+    /// `None` when the peer is unknown or has never had a classification
+    /// recorded — the caller should treat the absence conservatively
+    /// (`NatType::Unknown`) when feeding the traversal decision tree.
+    #[must_use]
+    pub fn last_known_nat_type(&self, device_id: &str) -> Option<NatType> {
+        self.peers
+            .get(device_id)
+            .and_then(|p| p.last_known_nat_type)
+    }
+
+    /// Replace the remote candidate list for `device_id`. Peers send the
+    /// complete set in every [`crate::protocol::BepMessage::Candidates`]
+    /// frame — there is no delta protocol — so the stored value is
+    /// always the latest snapshot.
+    pub fn set_remote_candidates(&mut self, device_id: &str, candidates: Vec<Candidate>) {
+        self.punch
+            .entry(device_id.to_string())
+            .or_default()
+            .candidates = candidates;
+    }
+
+    /// Reachable addresses the remote most recently advertised, or
+    /// `None` when no candidates have been received yet.
+    #[must_use]
+    pub fn remote_candidates(&self, device_id: &str) -> Option<&[Candidate]> {
+        self.punch.get(device_id).map(|s| s.candidates.as_slice())
+    }
+
+    /// Record the peer's `SyncPunch` agreement so a subsequent
+    /// `run_hole_punch` call can read back the negotiated nonce and
+    /// deadline. Replaces any prior agreement — the most recent signal
+    /// wins.
+    pub fn start_punch_with(&mut self, device_id: &str, agreement: SyncPunchAgreement) {
+        self.punch
+            .entry(device_id.to_string())
+            .or_default()
+            .agreement = Some(agreement);
+    }
+
+    /// Latest `SyncPunch` agreement received from `device_id`, or
+    /// `None` when the peer has not signalled a punch attempt.
+    #[must_use]
+    pub fn current_punch_agreement(&self, device_id: &str) -> Option<SyncPunchAgreement> {
+        self.punch.get(device_id).and_then(|s| s.agreement)
     }
 
     /// Build a gossip message to send to a specific peer. Excludes
@@ -468,6 +563,70 @@ mod tests {
         let encoded = serde_json::to_string(&peer).expect("serialise");
         let decoded: KnownPeer = serde_json::from_str(&encoded).expect("deserialise");
         assert_eq!(decoded, peer);
+    }
+
+    #[test]
+    fn set_last_known_nat_type_updates_existing_peer() {
+        let mut book = PeerBook::new();
+        book.add_peer("DEVICE-A".to_string(), vec![addr(22000)]);
+        book.set_last_known_nat_type("DEVICE-A", NatType::FullCone);
+        assert_eq!(
+            book.last_known_nat_type("DEVICE-A"),
+            Some(NatType::FullCone)
+        );
+    }
+
+    #[test]
+    fn set_last_known_nat_type_on_unknown_peer_is_noop() {
+        let mut book = PeerBook::new();
+        book.set_last_known_nat_type("UNKNOWN", NatType::Symmetric);
+        assert_eq!(book.last_known_nat_type("UNKNOWN"), None);
+    }
+
+    #[test]
+    fn set_remote_candidates_replaces_in_full() {
+        use crate::candidate::{Candidate, CandidateKind};
+        let mut book = PeerBook::new();
+        let first = Candidate::new(addr(22000), CandidateKind::Host, 0);
+        let second = Candidate::new(addr(22001), CandidateKind::ServerReflexive, 0);
+        book.set_remote_candidates("DEVICE-A", vec![first]);
+        assert_eq!(book.remote_candidates("DEVICE-A").unwrap().len(), 1);
+        book.set_remote_candidates("DEVICE-A", vec![second, first]);
+        assert_eq!(book.remote_candidates("DEVICE-A").unwrap().len(), 2);
+        assert!(book.remote_candidates("UNKNOWN").is_none());
+    }
+
+    #[test]
+    fn start_punch_with_records_agreement() {
+        let mut book = PeerBook::new();
+        let agreement = SyncPunchAgreement {
+            nonce: 42,
+            deadline_unix_ms: 1_700_000_000_000,
+        };
+        book.start_punch_with("DEVICE-A", agreement);
+        assert_eq!(book.current_punch_agreement("DEVICE-A"), Some(agreement));
+        assert_eq!(book.current_punch_agreement("OTHER"), None);
+    }
+
+    #[test]
+    fn remove_peer_drops_punch_state_too() {
+        use crate::candidate::{Candidate, CandidateKind};
+        let mut book = PeerBook::new();
+        book.add_peer("DEVICE-A".to_string(), vec![addr(22000)]);
+        book.set_remote_candidates(
+            "DEVICE-A",
+            vec![Candidate::new(addr(22000), CandidateKind::Host, 0)],
+        );
+        book.start_punch_with(
+            "DEVICE-A",
+            SyncPunchAgreement {
+                nonce: 1,
+                deadline_unix_ms: 0,
+            },
+        );
+        book.remove_peer("DEVICE-A");
+        assert!(book.remote_candidates("DEVICE-A").is_none());
+        assert!(book.current_punch_agreement("DEVICE-A").is_none());
     }
 
     #[test]
