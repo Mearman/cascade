@@ -124,6 +124,22 @@ impl VfsTree {
     pub fn children(&self) -> &[(PathBuf, Arc<dyn Backend>)] {
         &self.children
     }
+
+    /// Find a registered backend by its `id()`.
+    ///
+    /// Returns the root backend if its ID matches, otherwise the first child
+    /// mount with a matching ID. Used by presenters that need to dispatch an
+    /// operation by the `backend_id:native_id` portion of an `ItemId`.
+    #[must_use]
+    pub fn backend_by_id(&self, id: &str) -> Option<&Arc<dyn Backend>> {
+        if self.root.id() == id {
+            return Some(&self.root);
+        }
+        self.children
+            .iter()
+            .find(|(_, backend)| backend.id() == id)
+            .map(|(_, backend)| backend)
+    }
 }
 
 #[cfg(test)]
@@ -179,5 +195,20 @@ mod tests {
         tree.mount(PathBuf::from("Work"), Arc::new(NullBackend::new("work")));
         assert!(tree.unmount(Path::new("Work")).is_some());
         assert!(tree.children().is_empty());
+    }
+
+    #[test]
+    fn backend_by_id_finds_root_and_children() {
+        let mut tree = make_tree();
+        tree.mount(PathBuf::from("Work"), Arc::new(NullBackend::new("work")));
+        tree.mount(
+            PathBuf::from("Assets"),
+            Arc::new(NullBackend::new("assets")),
+        );
+
+        assert_eq!(tree.backend_by_id("root").map(|b| b.id()), Some("root"));
+        assert_eq!(tree.backend_by_id("work").map(|b| b.id()), Some("work"));
+        assert_eq!(tree.backend_by_id("assets").map(|b| b.id()), Some("assets"));
+        assert!(tree.backend_by_id("missing").is_none());
     }
 }
