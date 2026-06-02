@@ -127,6 +127,43 @@ impl FramedHalfWriter {
     }
 }
 
+/// How the peer principal a session attributes its frames to was established.
+///
+/// The management plane treats a session's `device_id` as the caller principal
+/// when authorising [`BepMessage::ManageRequest`] frames. That is only sound when
+/// the device id is cryptographically bound to the connection — proven by the
+/// mutual-TLS handshake the [`ConnectionManager`] runs on the direct dial and
+/// accept paths, where the device id is derived from the peer's certificate.
+///
+/// On the relayed and post-hole-punch paths the device id is merely a string
+/// asserted on the wire (the relay volunteer names the `source_device`, the punch
+/// agreement names the peer) and the inner transport carries plaintext BEP frames
+/// with no inner handshake. A frame on such a session must NOT be allowed to act
+/// as a management caller, or any party who can open a tunnel could spoof a
+/// granted manager's device id.
+///
+/// The session loop carries this tag from each entry point down to the
+/// management dispatch so the unverified paths are refused before a command runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallerAuthentication {
+    /// The peer device id was proven by a mutual-TLS handshake — it is the
+    /// SHA-256 of the peer's certificate, so the management plane may trust it
+    /// as the caller principal.
+    TlsVerified,
+    /// The peer device id was asserted on the wire over a transport that ran no
+    /// end-to-end peer TLS handshake (relay tunnel or post-hole-punch UDP). The
+    /// management plane must not treat it as an authenticated caller.
+    Unverified,
+}
+
+impl CallerAuthentication {
+    /// Whether a session with this authentication may issue management
+    /// commands. Only a TLS-verified principal qualifies.
+    const fn permits_management(self) -> bool {
+        matches!(self, Self::TlsVerified)
+    }
+}
+
 /// Object-safe trait the boxed reader half implements.
 ///
 /// `SessionReader<R>` is generic over the underlying transport
@@ -1708,9 +1745,15 @@ impl SyncEngine {
         framed: FramedPeer,
     ) -> Result<()> {
         let (reader, writer) = framed.split();
+        // Every `run_framed_session` caller is a direct TLS path
+        // (`handle_inbound` accept, `connect_to` dial) where the device id was
+        // derived from the peer's certificate by the `ConnectionManager`
+        // handshake. The principal is therefore cryptographically bound and may
+        // act as a management caller.
         self.run_session_loop(
             device_id,
             observed_peer_addr,
+            CallerAuthentication::TlsVerified,
             FramedHalfReader::Tls(reader),
             FramedHalfWriter::Tls(writer),
         )
@@ -1750,6 +1793,13 @@ impl SyncEngine {
                 .run_session_loop(
                     device_id,
                     None,
+                    // Post-punch UDP and relay-tunnel transports run no
+                    // end-to-end peer TLS handshake: the device id is asserted
+                    // on the wire (by the relay volunteer or the punch
+                    // agreement), not proven by a certificate. The principal is
+                    // therefore unverified and must not be trusted as a
+                    // management caller — `handle_manage_request` refuses it.
+                    CallerAuthentication::Unverified,
                     FramedHalfReader::Session(Box::new(SessionReaderBoxed::new(reader))),
                     FramedHalfWriter::Session(Box::new(SessionWriterBoxed::new(writer))),
                 )
@@ -1769,6 +1819,7 @@ impl SyncEngine {
         &self,
         device_id: String,
         observed_peer_addr: Option<SocketAddr>,
+        caller_auth: CallerAuthentication,
         mut reader: FramedHalfReader,
         mut writer: FramedHalfWriter,
     ) -> Result<()> {
@@ -1885,7 +1936,10 @@ impl SyncEngine {
                 Ok(None) => break Ok(()),
                 Err(e) => break Err(e),
             };
-            if let Err(e) = self.handle_message(&device_id, msg, &tx, &pending).await {
+            if let Err(e) = self
+                .handle_message(&device_id, caller_auth, msg, &tx, &pending)
+                .await
+            {
                 break Err(e);
             }
         };
@@ -1947,6 +2001,7 @@ impl SyncEngine {
     async fn handle_message(
         &self,
         peer_device_id: &str,
+        caller_auth: CallerAuthentication,
         msg: BepMessage,
         outbound: &mpsc::UnboundedSender<BepMessage>,
         pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<u8>>>>>,
@@ -2154,8 +2209,15 @@ impl SyncEngine {
                 command,
                 scope,
             } => {
-                self.handle_manage_request(peer_device_id, request_id, command, scope, outbound)
-                    .await;
+                self.handle_manage_request(
+                    peer_device_id,
+                    caller_auth,
+                    request_id,
+                    command,
+                    scope,
+                    outbound,
+                )
+                .await;
                 Ok(())
             }
             BepMessage::ManageResponse { request_id, .. } => {
@@ -2178,33 +2240,56 @@ impl SyncEngine {
     /// Run an incoming [`BepMessage::ManageRequest`] and reply with a
     /// [`BepMessage::ManageResponse`].
     ///
-    /// `peer_device_id` is the caller principal — it is the device id the TLS
-    /// connection authenticated, so the management plane needs no further proof
-    /// of identity. The request is dispatched through the injected
-    /// [`ManageDispatch`] port, which resolves the caller's grants, authorises,
-    /// audits BEFORE applying any side effect, and runs the same command
-    /// handlers the local CLI drives. When no dispatch port is configured the
-    /// node is not accepting remote administration, so the request is refused
-    /// with a typed [`ManageErrorKind::Unauthorised`] error rather than dropped.
+    /// `peer_device_id` is the caller principal, but it may only be trusted as
+    /// such when `caller_auth` is [`CallerAuthentication::TlsVerified`] — i.e.
+    /// the device id was proven by the mutual-TLS handshake on a direct dial or
+    /// accept. On relayed and post-hole-punch sessions the device id is merely
+    /// asserted on the wire, so this method refuses the request with
+    /// [`ManageErrorKind::Unauthorised`] before any grant is consulted; otherwise
+    /// a party who could open a tunnel could spoof a granted manager's device id.
+    ///
+    /// A verified request is dispatched through the injected [`ManageDispatch`]
+    /// port, which resolves the caller's grants, authorises, audits BEFORE
+    /// applying any side effect, and runs the same command handlers the local
+    /// CLI drives. When no dispatch port is configured the node is not accepting
+    /// remote administration, so the request is refused with a typed
+    /// [`ManageErrorKind::Unauthorised`] error rather than dropped.
     async fn handle_manage_request(
         &self,
         peer_device_id: &str,
+        caller_auth: CallerAuthentication,
         request_id: u64,
         command: ManageCommand,
         scope: ManageScope,
         outbound: &mpsc::UnboundedSender<BepMessage>,
     ) {
-        let result = match &self.manage_dispatch {
-            Some(dispatch) => {
-                let caller = DeviceId::new(peer_device_id.to_owned());
-                dispatch
-                    .dispatch(&caller, command, scope, chrono::Utc::now())
-                    .await
+        let result = if caller_auth.permits_management() {
+            match &self.manage_dispatch {
+                Some(dispatch) => {
+                    let caller = DeviceId::new(peer_device_id.to_owned());
+                    dispatch
+                        .dispatch(&caller, command, scope, chrono::Utc::now())
+                        .await
+                }
+                None => ManageResult::Err {
+                    kind: ManageErrorKind::Unauthorised,
+                    message: "node is not accepting remote management".to_owned(),
+                },
             }
-            None => ManageResult::Err {
+        } else {
+            // The session's device id was asserted on the wire, not proven by a
+            // TLS handshake. Refuse before consulting any grant so a spoofed
+            // principal can never reach the dispatcher.
+            debug!(
+                target: "cascade::backend::p2p",
+                peer = %peer_device_id,
+                request_id,
+                "refusing ManageRequest on a transport whose peer identity was not TLS-verified",
+            );
+            ManageResult::Err {
                 kind: ManageErrorKind::Unauthorised,
-                message: "node is not accepting remote management".to_owned(),
-            },
+                message: "management commands require a TLS-verified peer connection".to_owned(),
+            }
         };
         outbound
             .send(BepMessage::ManageResponse { request_id, result })
@@ -4701,6 +4786,7 @@ mod tests {
         engine
             .handle_message(
                 "PEER-A",
+                CallerAuthentication::TlsVerified,
                 BepMessage::Candidates {
                     candidates: candidates.clone(),
                 },
@@ -4730,6 +4816,7 @@ mod tests {
         engine
             .handle_message(
                 "PEER-A",
+                CallerAuthentication::TlsVerified,
                 BepMessage::SyncPunch {
                     nonce: 0xCAFE_BABE,
                     deadline_unix_ms: 1_700_000_000_000,
@@ -4881,6 +4968,7 @@ mod tests {
         engine
             .handle_manage_request(
                 "PEER-DEVICE-ID",
+                CallerAuthentication::TlsVerified,
                 7,
                 ManageCommand::StatusRead,
                 ManageScope::Node,
@@ -4915,6 +5003,7 @@ mod tests {
         engine
             .handle_manage_request(
                 "PEER-DEVICE-ID",
+                CallerAuthentication::TlsVerified,
                 3,
                 ManageCommand::CacheEvict,
                 ManageScope::Node,
@@ -4931,6 +5020,59 @@ mod tests {
                         ..
                     }
                 ));
+            }
+            other => panic!("expected an unauthorised ManageResponse, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn manage_request_on_unverified_transport_is_refused_before_dispatch() {
+        // Caller-spoofing regression: a relayed or post-hole-punch session
+        // carries a wire-asserted device id with no end-to-end TLS handshake. A
+        // ManageRequest arriving on such a session must be refused with
+        // Unauthorised BEFORE the dispatch port is consulted, so a party that
+        // can open a tunnel cannot assert a granted manager's device id and have
+        // commands authorised under that spoofed principal. The dispatch double
+        // is configured to return Ok, so the only way the reply is unauthorised
+        // is if the gate refused the request without ever calling dispatch.
+        let dispatch = Arc::new(RecordingDispatch::new(ManageResult::Ok {
+            summary: "should never run".to_owned(),
+        }));
+        let (_dir, engine) = make_engine("f");
+        let engine = engine.with_manage_dispatch(dispatch.clone());
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<BepMessage>();
+        engine
+            .handle_manage_request(
+                // The attacker asserts a powerful manager's device id on the wire.
+                "SPOOFED-MANAGER-DEVICE-ID",
+                CallerAuthentication::Unverified,
+                11,
+                ManageCommand::CacheEvict,
+                ManageScope::Node,
+                &tx,
+            )
+            .await;
+
+        // The dispatch port was never reached — no caller principal recorded.
+        assert_eq!(
+            dispatch.caller(),
+            None,
+            "an unverified session must not reach the dispatch port",
+        );
+        match rx.try_recv() {
+            Ok(BepMessage::ManageResponse { request_id, result }) => {
+                assert_eq!(request_id, 11);
+                assert!(
+                    matches!(
+                        result,
+                        ManageResult::Err {
+                            kind: ManageErrorKind::Unauthorised,
+                            ..
+                        }
+                    ),
+                    "a ManageRequest on an unverified transport must be refused, got {result:?}",
+                );
             }
             other => panic!("expected an unauthorised ManageResponse, got {other:?}"),
         }
