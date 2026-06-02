@@ -5,9 +5,12 @@
 //! addresses. Different mechanisms reach different peers: LAN multicast
 //! finds devices on the same segment ([`lan::LanDiscovery`]); introducer
 //! gossip surfaces peers learned transitively through trusted devices
-//! ([`gossip::GossipDiscovery`]). Both implement the [`Discovery`] trait
-//! so the rest of the engine depends only on the contract, never on a
-//! concrete mechanism.
+//! ([`gossip::GossipDiscovery`]); an optional announce server is a
+//! rendezvous directory for devices that have never met and sit on
+//! different networks ([`announce::AnnounceDiscovery`], behind the
+//! `announce` cargo feature). All implement the [`Discovery`] trait so the
+//! rest of the engine depends only on the contract, never on a concrete
+//! mechanism.
 //!
 //! [`DiscoveryService`] composes any number of [`Discovery`] sources. It
 //! resolves them concurrently, deduplicates the union of their
@@ -17,6 +20,7 @@
 //! the connectivity stack uses, so the highest-ranked candidate a peer
 //! offers sits first regardless of which source produced it.
 
+pub mod announce;
 pub mod gossip;
 pub mod lan;
 
@@ -34,6 +38,11 @@ use crate::candidate::{Candidate, CandidateKind};
 pub use lan::{Announcement, DISCOVERY_PORT, DiscoveredPeer, LanDiscovery, announce, listen};
 
 pub use gossip::GossipDiscovery;
+
+pub use announce::{AnnounceRequest, LookupResponse, MAX_ANNOUNCE_CANDIDATES, WireCandidate};
+
+#[cfg(feature = "announce")]
+pub use announce::AnnounceDiscovery;
 
 /// A source that turns a peer's device ID into reachable candidates.
 ///

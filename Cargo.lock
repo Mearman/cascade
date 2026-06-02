@@ -440,6 +440,7 @@ dependencies = [
  "hmac",
  "if-addrs",
  "rcgen",
+ "reqwest",
  "rusqlite",
  "rustls-pemfile",
  "serde",
