@@ -402,6 +402,16 @@ pub struct SyncEngine {
     /// [`CandidateKind::ServerReflexive`] candidate alongside the host
     /// set.
     local_external_addr: Arc<RwLock<Option<SocketAddr>>>,
+    /// Server-reflexive candidates learned via the peer-as-`STUN`
+    /// mechanism — one per distinct address a peer told us it observed
+    /// for our connection through a
+    /// [`BepMessage::ObservedAddress`] frame. Populated by
+    /// [`Self::set_observed_external_addr`] and folded into both the
+    /// local candidate set advertised over `BepMessage::Candidates` and
+    /// the self entry gossiped to peers, closing the gap the
+    /// `enable_wan_gossip` docstring records: `NAT`-derived external
+    /// addresses must land in the peer book and propagate via gossip.
+    observed_external_candidates: Arc<RwLock<Vec<Candidate>>>,
     /// Known relay endpoints, in preference order. Fed verbatim into
     /// [`decide_connectivity`]. Empty means the relay strategy is
     /// unavailable — the traversal logic falls through to a best-effort
@@ -446,6 +456,7 @@ impl SyncEngine {
             peer_book: Arc::new(RwLock::new(PeerBook::new())),
             local_nat_type: Arc::new(RwLock::new(NatType::Unknown)),
             local_external_addr: Arc::new(RwLock::new(None)),
+            observed_external_candidates: Arc::new(RwLock::new(Vec::new())),
             relay_endpoints: Arc::new(Vec::new()),
             relay_shared_secret: None,
             enable_hole_punch: true,
@@ -513,6 +524,35 @@ impl SyncEngine {
     /// the host set.
     pub async fn local_external_addr(&self) -> Option<SocketAddr> {
         *self.local_external_addr.read().await
+    }
+
+    /// Record an externally observed source address learned from a peer
+    /// via the peer-as-`STUN` mechanism (a
+    /// [`BepMessage::ObservedAddress`] frame). The address is converted
+    /// into a [`CandidateKind::ServerReflexive`] candidate using
+    /// [`server_reflexive_candidate_from_addr`] — exactly the same shape
+    /// a `STUN` `XOR-MAPPED-ADDRESS` would produce — and stored on the
+    /// engine. Duplicate observations of the same address collapse to a
+    /// single candidate so repeated frames from several peers do not
+    /// inflate the advertised set.
+    ///
+    /// The stored candidates feed both the local candidate set
+    /// advertised over `BepMessage::Candidates` and the self entry
+    /// gossiped to peers.
+    pub async fn set_observed_external_addr(&self, observed: SocketAddr) {
+        let candidate =
+            server_reflexive_candidate_from_addr(observed, SERVER_REFLEXIVE_LOCAL_PREFERENCE);
+        let mut stored = self.observed_external_candidates.write().await;
+        if !stored.iter().any(|c| c.address == candidate.address) {
+            stored.push(candidate);
+        }
+    }
+
+    /// Snapshot of the server-reflexive candidates learned via
+    /// peer-as-`STUN`. Empty until at least one peer has echoed our
+    /// observed source address back to us.
+    pub async fn observed_external_candidates(&self) -> Vec<Candidate> {
+        self.observed_external_candidates.read().await.clone()
     }
 
     /// Known relay endpoints, in preference order. Returned as a slice
@@ -694,7 +734,7 @@ impl SyncEngine {
             anyhow::bail!("device {} is not trusted", peer.device_id);
         }
         let manager = ConnectionManager::new(self.identity.clone(), trusted);
-        let conn = manager
+        let (observed_peer_addr, conn) = manager
             .connect(&DiscoveredPeer {
                 device_id: peer.device_id.clone(),
                 address: peer.address,
@@ -708,7 +748,10 @@ impl SyncEngine {
         let engine = self.clone();
         let device_id = peer.device_id.clone();
         tokio::spawn(async move {
-            if let Err(e) = engine.run_framed_session(device_id.clone(), framed).await {
+            if let Err(e) = engine
+                .run_framed_session(device_id.clone(), observed_peer_addr, framed)
+                .await
+            {
                 debug!("outbound session to {device_id} ended: {e:#}");
             }
         });
@@ -1068,14 +1111,15 @@ impl SyncEngine {
     ) -> Result<()> {
         let trusted = self.trusted.lock().await.clone();
         let manager = ConnectionManager::new(self.identity.clone(), trusted);
-        let (device_id, tls) = manager
+        let (device_id, observed_peer_addr, tls) = manager
             .accept(stream)
             .await
             .with_context(|| format!("accepting inbound from {peer_addr}"))?;
         info!("inbound P2P connection accepted from device {device_id}");
         self.record_peer(&device_id, peer_addr).await;
         let framed = FramedPeer::from_tls(tls);
-        self.run_framed_session(device_id, framed).await
+        self.run_framed_session(device_id, observed_peer_addr, framed)
+            .await
     }
 
     /// Record a successful peer contact in the local `PeerBook`. A
@@ -1099,10 +1143,16 @@ impl SyncEngine {
     /// through [`Self::run_session_loop`] so the post-punch UDP and
     /// post-relay WebSocket paths share the same handshake +
     /// read/write loop.
-    async fn run_framed_session(&self, device_id: String, framed: FramedPeer) -> Result<()> {
+    async fn run_framed_session(
+        &self,
+        device_id: String,
+        observed_peer_addr: SocketAddr,
+        framed: FramedPeer,
+    ) -> Result<()> {
         let (reader, writer) = framed.split();
         self.run_session_loop(
             device_id,
+            Some(observed_peer_addr),
             FramedHalfReader::Tls(reader),
             FramedHalfWriter::Tls(writer),
         )
@@ -1119,8 +1169,14 @@ impl SyncEngine {
         T: Transport + 'static,
     {
         let (reader, writer) = FramedSession::new(transport).split();
+        // A post-punch UDP or relay transport carries no observed TCP
+        // source address worth echoing back — the punched/relayed path
+        // does not expose the peer's `NAT`-mapped origin in the same
+        // way the direct TCP socket does. Skip the `ObservedAddress`
+        // frame for these transports.
         self.run_session_loop(
             device_id,
+            None,
             FramedHalfReader::Session(Box::new(SessionReaderBoxed::new(reader))),
             FramedHalfWriter::Session(Box::new(SessionWriterBoxed::new(writer))),
         )
@@ -1138,6 +1194,7 @@ impl SyncEngine {
     async fn run_session_loop(
         &self,
         device_id: String,
+        observed_peer_addr: Option<SocketAddr>,
         mut reader: FramedHalfReader,
         mut writer: FramedHalfWriter,
     ) -> Result<()> {
@@ -1195,6 +1252,15 @@ impl SyncEngine {
         })
         .ok();
 
+        // Peer-as-STUN: tell the peer the source address we observed for
+        // this connection so it can learn its own reflexive (NAT-mapped)
+        // address with no STUN server. Only sent over the direct TCP
+        // path where the observed source is meaningful — post-punch and
+        // relay transports pass `None`.
+        if let Some(observed) = observed_peer_addr {
+            tx.send(BepMessage::ObservedAddress(observed)).ok();
+        }
+
         // Advertise our reachable candidates so the peer can pair them
         // against its own set in `decide_connectivity`. Only sent when
         // the BEP listener is bound — outbound-only deployments have no
@@ -1210,7 +1276,11 @@ impl SyncEngine {
         let local_listen = *self.local_listen_addr.read().await;
         if let Some(local_addr) = local_listen {
             let external = *self.local_external_addr.read().await;
-            let candidates = gather_local_candidates(local_addr, external, Vec::new());
+            // Fold the peer-as-STUN observed reflexive candidates in as
+            // extras so they ride alongside the host and STUN-derived
+            // candidates the peer pairs against.
+            let extras = self.observed_external_candidates().await;
+            let candidates = gather_local_candidates(local_addr, external, extras);
             if !candidates.is_empty() {
                 tx.send(BepMessage::Candidates { candidates }).ok();
             }
@@ -1399,6 +1469,21 @@ impl SyncEngine {
                 );
                 Ok(())
             }
+            BepMessage::ObservedAddress(observed) => {
+                // Peer-as-STUN: the peer is telling us the source address
+                // it observed for our connection — our own reflexive
+                // (NAT-mapped) address. Fold it into the server-reflexive
+                // candidate set so it propagates through our advertised
+                // candidates and gossip.
+                self.set_observed_external_addr(observed).await;
+                debug!(
+                    target: "cascade::backend::p2p",
+                    peer = %peer_device_id,
+                    %observed,
+                    "learned own reflexive address via peer-as-STUN",
+                );
+                Ok(())
+            }
         }
     }
 
@@ -1446,30 +1531,77 @@ impl SyncEngine {
         book.merge_gossip(introducer_id, &self_id, &message);
     }
 
+    /// External addresses for the LOCAL device, gathered from the
+    /// `NAT`-detection signal: the `STUN`-derived `XOR-MAPPED-ADDRESS`
+    /// (when detection produced one) plus every server-reflexive address
+    /// learned via peer-as-`STUN` ([`BepMessage::ObservedAddress`]).
+    ///
+    /// Deduplicated, preserving first-seen order (`STUN` result first,
+    /// then observed addresses). Empty until detection runs or a peer
+    /// echoes an observed address back — an outbound-only host behind a
+    /// `NAT` with no detection has no external address to advertise.
+    async fn local_external_addresses(&self) -> Vec<SocketAddr> {
+        let mut out: Vec<SocketAddr> = Vec::new();
+        // Read each guarded value into a local before branching so the
+        // RwLock guard is not held across the `if let` / loop body
+        // (clippy::significant_drop_in_scrutinee).
+        let stun = *self.local_external_addr.read().await;
+        if let Some(stun) = stun {
+            out.push(stun);
+        }
+        let observed = self.observed_external_candidates.read().await.clone();
+        for candidate in observed {
+            if !out.contains(&candidate.address) {
+                out.push(candidate.address);
+            }
+        }
+        out
+    }
+
     /// Build a `BepMessage::Gossip` payload from the current peer
     /// book, suitable for sending to connected peers.
     ///
-    /// Excludes the local device id from the snapshot — peers do not
-    /// need us to tell them about ourselves. Each entry's
-    /// `snapshot_unix_seconds` carries the per-peer `last_seen` value
-    /// stamped by [`PeerBook::mark_seen`] on the most recent confirmed
-    /// contact (outbound connect, inbound accept, or any frame
-    /// received). A peer that has been introduced via gossip but never
-    /// reached directly is broadcast with `snapshot_unix_seconds = 0`.
+    /// Each known peer (other than the local device) is emitted with its
+    /// `last_seen` value stamped by [`PeerBook::mark_seen`] on the most
+    /// recent confirmed contact (outbound connect, inbound accept, or any
+    /// frame received). A peer introduced via gossip but never reached
+    /// directly is broadcast with `snapshot_unix_seconds = 0`.
     ///
-    /// Returns an empty vector when no peers are known.
+    /// When the local device has learned its own external
+    /// (`NAT`-derived) addresses — from `STUN` detection or peer-as-`STUN`
+    /// observation — a self entry carrying those addresses is included so
+    /// connected peers can relay our reachability to their own peers.
+    /// This closes the gap the `enable_wan_gossip` docstring records:
+    /// external addresses must fold into the peer book and propagate via
+    /// gossip. The self entry is stamped with the current time as a
+    /// fresh-contact tie-breaker.
+    ///
+    /// Returns an empty vector when no peers are known and the local
+    /// device has no external address to advertise.
     pub async fn current_gossip_snapshot(&self) -> Vec<GossipPeer> {
-        let book = self.peer_book.read().await;
-        let self_id = self.device_id();
-        book.peers()
-            .values()
-            .filter(|p| p.device_id != self_id)
-            .map(|p| GossipPeer {
-                device_id: p.device_id.clone(),
-                addresses: p.addresses.iter().map(ToString::to_string).collect(),
-                snapshot_unix_seconds: p.last_seen,
-            })
-            .collect()
+        let self_id = self.device_id().to_string();
+        let mut snapshot: Vec<GossipPeer> = {
+            let book = self.peer_book.read().await;
+            book.peers()
+                .values()
+                .filter(|p| p.device_id != self_id)
+                .map(|p| GossipPeer {
+                    device_id: p.device_id.clone(),
+                    addresses: p.addresses.iter().map(ToString::to_string).collect(),
+                    snapshot_unix_seconds: p.last_seen,
+                })
+                .collect()
+        };
+
+        let own_external = self.local_external_addresses().await;
+        if !own_external.is_empty() {
+            snapshot.push(GossipPeer {
+                device_id: self_id,
+                addresses: own_external.iter().map(ToString::to_string).collect(),
+                snapshot_unix_seconds: unix_timestamp_seconds(),
+            });
+        }
+        snapshot
     }
 
     /// Build a `BepMessage::Gossip` frame from the current peer book
@@ -2864,6 +2996,110 @@ mod tests {
             entry.snapshot_unix_seconds, 0,
             "uncontacted peers must broadcast last_seen = 0",
         );
+    }
+
+    /// Peer-as-STUN round trip over a real loopback handshake: A dials
+    /// B, both sides exchange `BepMessage::ObservedAddress` carrying the
+    /// peer's observed source address, and each engine records the
+    /// address its peer reported back as a server-reflexive candidate.
+    #[tokio::test]
+    async fn observed_address_round_trips_through_loopback_handshake() {
+        let (_dir_a, engine_a) = make_engine("shared");
+        let (_dir_b, engine_b) = make_engine("shared");
+
+        engine_a.trust(engine_b.device_id().to_string()).await;
+        engine_b.trust(engine_a.device_id().to_string()).await;
+
+        let (_cancel_tx_b, cancel_rx_b) = tokio::sync::watch::channel(false);
+        let (addr_b, _b_task) = engine_b
+            .start_listener("127.0.0.1:0".parse().unwrap(), cancel_rx_b)
+            .await
+            .unwrap();
+        engine_a
+            .connect_to(Peer {
+                device_id: engine_b.device_id().to_string(),
+                address: addr_b,
+            })
+            .await
+            .unwrap();
+
+        // The connecting side (A) learns the source address B observed
+        // for it — A's ephemeral outbound port on loopback. Poll until
+        // the ObservedAddress frame has been processed.
+        let mut a_reflexive = Vec::new();
+        for _ in 0..40 {
+            a_reflexive = engine_a.observed_external_candidates().await;
+            if !a_reflexive.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            a_reflexive.len(),
+            1,
+            "A should learn exactly one reflexive candidate from B's ObservedAddress frame",
+        );
+        let candidate = a_reflexive.first().expect("one reflexive candidate");
+        assert_eq!(candidate.kind, CandidateKind::ServerReflexive);
+        assert!(
+            candidate.address.ip().is_loopback(),
+            "the observed source on loopback must be a loopback address, got {}",
+            candidate.address,
+        );
+    }
+
+    /// A reflexive candidate sourced from an observed address must appear
+    /// in the broadcast gossip frame as a self entry, and a fresh
+    /// receiver merging that frame must record the reflexive address in
+    /// its peer book.
+    #[tokio::test]
+    async fn observed_reflexive_address_propagates_through_gossip() {
+        let (_dir, engine) = make_engine("f");
+        let observed: SocketAddr = "203.0.113.7:51820".parse().unwrap();
+        engine.set_observed_external_addr(observed).await;
+
+        // The self entry carrying the reflexive address must appear in
+        // the snapshot the broadcaster sends.
+        let snapshot = engine.current_gossip_snapshot().await;
+        let self_entry = snapshot
+            .iter()
+            .find(|p| p.device_id == engine.device_id())
+            .expect("self entry with reflexive address must be in the gossip snapshot");
+        assert!(
+            self_entry
+                .addresses
+                .iter()
+                .any(|a| a == &observed.to_string()),
+            "the observed reflexive address must be advertised, got {:?}",
+            self_entry.addresses,
+        );
+
+        // A receiver merging that frame must record the address. The
+        // receiver is a different device, so the self-exclusion guard in
+        // PeerBook::merge_gossip does not drop the broadcaster's entry.
+        let (_dir_rx, receiver) = make_engine("f");
+        receiver.merge_gossip(engine.device_id(), snapshot).await;
+        let book = receiver.peer_book().read().await;
+        let recorded = book
+            .get(engine.device_id())
+            .expect("receiver should record the broadcaster from the gossip frame");
+        assert!(
+            recorded.addresses.contains(&observed),
+            "receiver must merge the reflexive address into the peer book, got {:?}",
+            recorded.addresses,
+        );
+    }
+
+    /// Recording the same observed address more than once must not
+    /// inflate the candidate set — repeated frames from several peers
+    /// reporting the same reflexive address collapse to one candidate.
+    #[tokio::test]
+    async fn set_observed_external_addr_deduplicates() {
+        let (_dir, engine) = make_engine("f");
+        let observed: SocketAddr = "203.0.113.7:51820".parse().unwrap();
+        engine.set_observed_external_addr(observed).await;
+        engine.set_observed_external_addr(observed).await;
+        assert_eq!(engine.observed_external_candidates().await.len(), 1);
     }
 
     #[tokio::test]
