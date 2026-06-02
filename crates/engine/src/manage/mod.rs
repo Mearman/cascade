@@ -164,6 +164,24 @@ impl Scope {
         Self::Folder { path: path.into() }
     }
 
+    /// Whether this scope is *node-wide* — covering every path on the node.
+    ///
+    /// [`Scope::Node`] is node-wide by construction. A [`Scope::Folder`] is
+    /// *also* node-wide when its path normalises to no components — the
+    /// filesystem root (`"/"`, `""`, `"//"`, `"/."` …) is a wildcard over the
+    /// whole tree in everything but name. The dangerous-capability bar relies
+    /// on this so a root folder grant cannot smuggle a dangerous capability
+    /// past the wildcard check.
+    #[must_use]
+    pub fn is_node_wide(&self) -> bool {
+        match self {
+            Self::Node => true,
+            Self::Folder { path } => {
+                normalise_components(path).is_some_and(|components| components.is_empty())
+            }
+        }
+    }
+
     /// Decompose a scope into its two storage columns: a kind discriminant and
     /// an optional path. A [`Scope::Node`] has no path; a [`Scope::Folder`]
     /// always carries one.
@@ -207,14 +225,51 @@ impl Scope {
     }
 }
 
+/// Normalise a path into its resolved component list, folding `.` and `..`
+/// against a component stack.
+///
+/// Empty segments (from leading, trailing, or repeated separators) and `.`
+/// segments are dropped; a `..` segment pops the most recent component. A `..`
+/// that would pop above the root is a traversal escape: the path cannot be
+/// represented relative to the root, so the function returns `None` rather than
+/// silently clamping at the root. Callers treat `None` as "does not match",
+/// which fails closed.
+///
+/// Returning the normalised components (rather than comparing raw bytes) is what
+/// lets `/work` cover `/work/reports` but never `/workspace`, and what stops a
+/// crafted `/work/../personal` target from being treated as living under
+/// `/work`.
+fn normalise_components(path: &str) -> Option<Vec<&str>> {
+    let mut components: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                // A `..` with nothing to pop escapes above the root; the path
+                // cannot be normalised relative to the root.
+                components.pop()?;
+            }
+            other => components.push(other),
+        }
+    }
+    Some(components)
+}
+
 /// Whether `grant` is a path-component prefix of (or equal to) `target`.
 ///
-/// Comparison is on normalised path components, never raw bytes, so a grant on
-/// `/work` covers `/work/reports` but not `/workspace`. Trailing separators are
-/// ignored. An empty grant path (the filesystem root) covers every folder.
+/// Both paths are first normalised by [`normalise_components`] — empty, `.`, and
+/// `..` segments are folded — so comparison is on resolved path components,
+/// never raw bytes. A grant on `/work` covers `/work/reports` but not
+/// `/workspace`, and never `/work/../personal` (which normalises to
+/// `/personal`). A path that traverses above the root (an unbalanced `..`)
+/// fails to normalise and therefore never matches. A grant that normalises to
+/// no components (the filesystem root) covers every folder.
 fn path_prefix_covers(grant: &str, target: &str) -> bool {
-    let grant_components: Vec<&str> = grant.split('/').filter(|s| !s.is_empty()).collect();
-    let target_components: Vec<&str> = target.split('/').filter(|s| !s.is_empty()).collect();
+    let (Some(grant_components), Some(target_components)) =
+        (normalise_components(grant), normalise_components(target))
+    else {
+        return false;
+    };
 
     if grant_components.len() > target_components.len() {
         return false;
@@ -295,8 +350,10 @@ impl Grant {
 /// - the grant has not expired at `now`;
 /// - the grant's scope [covers](Scope::covers) `target`; and
 /// - if `needed` is [dangerous](Capability::is_dangerous), the grant's scope is
-///   *not* node-wide — a dangerous capability is never implicitly satisfied by
-///   a wildcard grant, only by an explicit folder grant covering `target`.
+///   *not* [node-wide](Scope::is_node_wide) — a dangerous capability is never
+///   implicitly satisfied by a wildcard grant, only by an explicit folder grant
+///   covering `target`. A root/empty folder scope counts as node-wide here, so
+///   it cannot smuggle a dangerous capability past the bar.
 #[must_use]
 pub fn authorises(
     grants: &[Grant],
@@ -311,8 +368,10 @@ pub fn authorises(
             && !grant.is_expired(now)
             && grant.scope.covers(target)
             // Dangerous capabilities are never satisfied by a node-wide grant;
-            // they must be granted explicitly for the exact scope.
-            && !(needed.is_dangerous() && matches!(grant.scope, Scope::Node))
+            // they must be granted explicitly for the exact scope. A root/empty
+            // folder scope is node-wide in everything but name, so it is barred
+            // here too — not just the `Scope::Node` variant.
+            && !(needed.is_dangerous() && grant.scope.is_node_wide())
     })
 }
 
@@ -413,6 +472,53 @@ mod tests {
     fn folder_coverage_ignores_trailing_separators() {
         assert!(Scope::folder("/work/").covers(&Scope::folder("/work")));
         assert!(Scope::folder("/work").covers(&Scope::folder("/work/")));
+    }
+
+    #[test]
+    fn folder_coverage_normalises_dot_segments() {
+        // A `.` segment is inert and must not alter coverage.
+        let work = Scope::folder("/work");
+        assert!(work.covers(&Scope::folder("/work/./reports")));
+        assert!(Scope::folder("/work/.").covers(&Scope::folder("/work")));
+    }
+
+    #[test]
+    fn folder_coverage_rejects_parent_traversal() {
+        // `/work/../personal` normalises to `/personal`, outside the granted
+        // subtree — a grant on `/work` must not cover it. This is the scope
+        // escape the "normalised path components" contract promises to prevent.
+        let work = Scope::folder("/work");
+        assert!(!work.covers(&Scope::folder("/work/../personal")));
+        // `/work/..` normalises to the root, which is not under `/work`.
+        assert!(!work.covers(&Scope::folder("/work/..")));
+    }
+
+    #[test]
+    fn folder_coverage_rejects_traversal_above_root() {
+        // An unbalanced `..` escapes above the root: the path cannot be
+        // normalised, so neither a grant nor a target carrying it ever matches.
+        assert!(!Scope::folder("/work").covers(&Scope::folder("/../etc")));
+        assert!(!Scope::folder("/../work").covers(&Scope::folder("/work")));
+        assert!(!Scope::folder("/work/../../etc").covers(&Scope::folder("/etc")));
+    }
+
+    #[test]
+    fn is_node_wide_truth_table() {
+        // The explicit node scope is node-wide.
+        assert!(Scope::Node.is_node_wide());
+        // Root/empty folder paths normalise to zero components — node-wide.
+        for path in ["/", "", "//", "/.", "/./", "/work/.."] {
+            assert!(
+                Scope::folder(path).is_node_wide(),
+                "folder scope {path:?} should be node-wide",
+            );
+        }
+        // A real subtree is not node-wide.
+        assert!(!Scope::folder("/work").is_node_wide());
+        assert!(!Scope::folder("/work/reports").is_node_wide());
+        // A path that escapes above the root does not normalise, and is not
+        // treated as node-wide (it fails closed).
+        assert!(!Scope::folder("/..").is_node_wide());
     }
 
     // ── authorises() truth table ──
@@ -571,6 +677,39 @@ mod tests {
                 ),
                 "node-wide grant must not satisfy dangerous capability {cap:?} over a folder",
             );
+        }
+    }
+
+    #[test]
+    fn dangerous_capability_is_barred_by_root_folder_scope() {
+        // A folder scope that normalises to the root is node-wide in
+        // everything but name. It must not slip a dangerous capability past the
+        // wildcard bar — the same denial as an explicit `Scope::Node` grant.
+        for cap in [
+            Capability::BackendManage,
+            Capability::LifecycleControl,
+            Capability::GrantAdmin,
+        ] {
+            for scope_path in ["/", "", "//", "/.", "/work/.."] {
+                let grants = vec![grant(cap, Scope::folder(scope_path))];
+                // Against a node-wide target: denied.
+                assert!(
+                    !authorises(&grants, &manager(), cap, &Scope::Node, at(2026, 1, 1)),
+                    "root folder scope {scope_path:?} must not satisfy {cap:?} over the node",
+                );
+                // Against any folder target the root scope would otherwise
+                // cover: still denied.
+                assert!(
+                    !authorises(
+                        &grants,
+                        &manager(),
+                        cap,
+                        &Scope::folder("/work/reports"),
+                        at(2026, 1, 1),
+                    ),
+                    "root folder scope {scope_path:?} must not satisfy {cap:?} over a folder",
+                );
+            }
         }
     }
 
