@@ -19,6 +19,13 @@ use cascade_config::{GrantConfig, ScopeConfig};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+pub mod dispatch;
+
+pub use dispatch::{
+    ManageCommandExecutor, ManageDispatch, ManageGrantStore, required_capability, run_dispatch,
+    scope_from_wire,
+};
+
 /// A device identity — the principal of the management plane.
 ///
 /// This is the base32-encoded SHA-256 of a device's TLS certificate, the same

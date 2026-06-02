@@ -16,11 +16,18 @@ use anyhow::Result;
 use tokio::sync::watch;
 use tracing::info;
 
+use async_trait::async_trait;
+use cascade_p2p::protocol::{ManageCommand, ManageResult, ManageScope as WireScope};
+use chrono::{DateTime, Utc};
+
 use crate::backend::Backend;
 use crate::cache::manager::{CacheManager, CacheManagerConfig};
 use crate::changefeed::ChangeFeed;
 use crate::config::ConfigResolver;
-use crate::db::{PinRuleRecord, StateDb};
+use crate::db::{AuditEntry, PinRuleRecord, StateDb};
+use crate::manage::{
+    DeviceId, Grant, ManageCommandExecutor, ManageDispatch, ManageGrantStore, run_dispatch,
+};
 use crate::p2p_bridge::P2pBridge;
 use crate::presenter::VfsPresenter;
 use crate::sync::runner::SyncRunner;
@@ -286,6 +293,82 @@ impl Engine {
     }
 }
 
+/// The engine is the grant store and audit sink for the management plane,
+/// reading and writing the two `state.db` tables the prior phase added.
+impl ManageGrantStore for Engine {
+    fn manage_grants(&self) -> Result<Vec<Grant>> {
+        Ok(self
+            .db
+            .list_grants()?
+            .into_iter()
+            .map(|record| record.grant)
+            .collect())
+    }
+
+    fn manage_append_audit(&self, entry: &AuditEntry) -> Result<()> {
+        self.db.append_audit(entry).map(|_id| ())
+    }
+}
+
+/// The engine is the command executor for the management plane. Each method is
+/// the *same* operation the local CLI drives — `pin`, `unpin`, `status`, and a
+/// cache eviction sweep — so a manager can never do more than the daemon could
+/// do to itself, and no command logic is duplicated. The remote path reaches
+/// these only after authorisation and auditing in [`run_dispatch`].
+#[async_trait]
+impl ManageCommandExecutor for Engine {
+    async fn manage_status(&self) -> Result<String> {
+        let status = self.status();
+        Ok(format!(
+            "running={} backends={} online={} cached={} pinned={} p2p_enabled={}",
+            status.running,
+            status.backends.len(),
+            status.cache_stats.online_count,
+            status.cache_stats.cached_count,
+            status.cache_stats.pinned_count,
+            status.p2p_enabled,
+        ))
+    }
+
+    async fn manage_pin(&self, path_glob: &str, recursive: bool) -> Result<String> {
+        self.pin(path_glob, recursive)?;
+        Ok(format!("pinned {path_glob} (recursive={recursive})"))
+    }
+
+    async fn manage_unpin(&self, path_glob: &str) -> Result<String> {
+        let removed = self.unpin(path_glob)?;
+        Ok(if removed {
+            format!("unpinned {path_glob}")
+        } else {
+            format!("no pin rule matched {path_glob}")
+        })
+    }
+
+    async fn manage_cache_evict(&self) -> Result<String> {
+        let report = self.cache.evict()?;
+        Ok(format!(
+            "evicted {} files ({} lifecycle, {} size), freed {} bytes",
+            report.total_evicted(),
+            report.lifecycle_evicted,
+            report.size_evicted,
+            report.bytes_freed,
+        ))
+    }
+}
+
+#[async_trait]
+impl ManageDispatch for Engine {
+    async fn dispatch(
+        &self,
+        caller: &DeviceId,
+        command: ManageCommand,
+        scope: WireScope,
+        now: DateTime<Utc>,
+    ) -> ManageResult {
+        run_dispatch(self, self, caller, command, scope, now).await
+    }
+}
+
 /// Handle returned by [`Engine::start()`] for monitoring background tasks.
 #[derive(Debug)]
 pub struct EngineHandle {
@@ -452,5 +535,147 @@ mod tests {
 
         let status = engine.status();
         assert_eq!(status.backends.len(), 2);
+    }
+
+    // ── Management-plane dispatch against the real engine + DB ──
+
+    use crate::manage::{Capability, Scope};
+    use chrono::Utc;
+
+    fn manager_id() -> DeviceId {
+        DeviceId::new("MANAGER")
+    }
+
+    #[tokio::test]
+    async fn dispatch_authorised_pin_mutates_state_and_audits() {
+        let engine = make_test_engine();
+        // Grant the manager pin:write over /work, persisted in the real DB.
+        engine
+            .db()
+            .insert_grant(&Grant {
+                grantee: manager_id(),
+                capability: Capability::PinWrite,
+                scope: Scope::folder("/work"),
+                granted_by: DeviceId::new("OWNER"),
+                expires: None,
+            })
+            .unwrap();
+
+        let result = engine
+            .dispatch(
+                &manager_id(),
+                ManageCommand::Pin {
+                    path_glob: "/work/reports".to_owned(),
+                    recursive: true,
+                },
+                WireScope::Folder {
+                    path: "/work/reports".to_owned(),
+                },
+                Utc::now(),
+            )
+            .await;
+
+        assert!(
+            matches!(result, ManageResult::Ok { .. }),
+            "authorised pin should succeed, got {result:?}",
+        );
+        // The side effect ran: the pin rule is now present.
+        let pins = engine.list_pins().unwrap();
+        assert!(
+            pins.iter().any(|p| p.path_glob == "/work/reports"),
+            "pin rule must have been recorded",
+        );
+        // The attempt was audited as allowed.
+        let audit = engine.db().list_audit().unwrap();
+        assert_eq!(audit.len(), 1);
+        let row = audit.first().expect("one audit row");
+        assert_eq!(row.entry.outcome, "allowed");
+        assert_eq!(row.entry.actor_device, manager_id());
+        assert_eq!(row.entry.capability, Capability::PinWrite);
+    }
+
+    #[tokio::test]
+    async fn dispatch_unauthorised_pin_makes_no_change_and_audits_denial() {
+        let engine = make_test_engine();
+        // Manager holds only status:read — a pin must be refused.
+        engine
+            .db()
+            .insert_grant(&Grant {
+                grantee: manager_id(),
+                capability: Capability::StatusRead,
+                scope: Scope::Node,
+                granted_by: DeviceId::new("OWNER"),
+                expires: None,
+            })
+            .unwrap();
+
+        let result = engine
+            .dispatch(
+                &manager_id(),
+                ManageCommand::Pin {
+                    path_glob: "/work".to_owned(),
+                    recursive: false,
+                },
+                WireScope::Folder {
+                    path: "/work".to_owned(),
+                },
+                Utc::now(),
+            )
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                ManageResult::Err {
+                    kind: cascade_p2p::protocol::ManageErrorKind::Unauthorised,
+                    ..
+                }
+            ),
+            "unauthorised pin must be refused, got {result:?}",
+        );
+        // No pin rule was created.
+        assert!(
+            engine.list_pins().unwrap().is_empty(),
+            "an unauthorised request must not mutate state",
+        );
+        // The denial was still audited.
+        let audit = engine.db().list_audit().unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(
+            audit.first().map(|r| r.entry.outcome.as_str()),
+            Some("denied"),
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_status_read_is_authorised_by_node_scope() {
+        let engine = make_test_engine();
+        engine
+            .db()
+            .insert_grant(&Grant {
+                grantee: manager_id(),
+                capability: Capability::StatusRead,
+                scope: Scope::Node,
+                granted_by: DeviceId::new("OWNER"),
+                expires: None,
+            })
+            .unwrap();
+
+        let result = engine
+            .dispatch(
+                &manager_id(),
+                ManageCommand::StatusRead,
+                WireScope::Node,
+                Utc::now(),
+            )
+            .await;
+        match result {
+            ManageResult::Ok { summary } => {
+                assert!(summary.contains("running="), "status summary: {summary}");
+            }
+            err @ ManageResult::Err { .. } => {
+                panic!("status read should be authorised, got {err:?}")
+            }
+        }
     }
 }
