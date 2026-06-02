@@ -92,14 +92,54 @@ pub enum ConnectivityStrategy {
         /// pairs by `Candidate::pairing_score`.
         remote_candidates: Vec<Candidate>,
     },
-    /// Tunnel traffic through a known relay endpoint. Selected when
-    /// either side is `Symmetric` and the partner is not `FullCone`,
-    /// or when one side's `NAT` type is `Unknown`.
+    /// Tunnel traffic through a relay. Selected when either side is
+    /// `Symmetric` and the partner is not `FullCone`, or when one side's
+    /// `NAT` type is `Unknown`.
+    ///
+    /// The chosen [`RelayRoute`] is a volunteering peer relay when one is
+    /// reachable, falling back to an operated relay endpoint otherwise —
+    /// see [`decide_connectivity`].
     Relay {
-        /// Relay endpoint chosen from the caller-provided pool. The
-        /// first reachable entry wins; the next round will replace
-        /// this with a latency-aware selector.
-        relay: SocketAddr,
+        /// The relay to tunnel through. A peer relay is preferred over an
+        /// operated one so the mesh can route around restrictive `NAT`
+        /// without depending on operated infrastructure.
+        route: RelayRoute,
+    },
+}
+
+/// A volunteering peer relay advertised via [`crate::protocol::BepMessage::RelayOffer`].
+///
+/// A node whose detected `NAT` type is `Open` or `FullCone`, and whose
+/// relay-volunteer policy permits it, offers itself as a relay to trusted
+/// peers it shares a folder with. [`decide_connectivity`] prefers such a
+/// peer over an operated relay endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerRelay {
+    /// Device id of the volunteering relay, learned from the connection
+    /// the offer arrived on.
+    pub device_id: String,
+    /// Reachable BEP endpoints the volunteer accepts relay connections on,
+    /// in preference order.
+    pub addresses: Vec<SocketAddr>,
+}
+
+/// Where a [`ConnectivityStrategy::Relay`] tunnels through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayRoute {
+    /// A volunteering peer relay. Reached by dialling `address` (the first
+    /// reachable endpoint the volunteer advertised) and asking it, via
+    /// [`crate::protocol::BepMessage::RelayConnect`], to bridge to the
+    /// target device.
+    Peer {
+        /// Device id of the volunteering relay.
+        device_id: String,
+        /// The volunteer endpoint to dial.
+        address: SocketAddr,
+    },
+    /// An operated relay endpoint drawn from the configured pool.
+    Operated {
+        /// The relay server endpoint to dial.
+        endpoint: SocketAddr,
     },
 }
 
@@ -122,16 +162,23 @@ pub enum ConnectivityStrategy {
 /// empty candidate set (the state machine will retry and ultimately
 /// give up).
 ///
-/// When the table calls for `Relay` but no relay is configured, the
+/// When the table calls for `Relay` but no relay is available, the
 /// function falls back to `HolePunch`. This best-effort path matches
 /// libp2p's behaviour: a doomed punch is more useful than refusing to
 /// connect at all, because the next round of STUN detection might
 /// reclassify one side.
+///
+/// When the table calls for `Relay`, a reachable volunteering
+/// `peer_relays` entry is preferred over an operated `known_relays`
+/// endpoint, so the mesh routes around restrictive `NAT` without
+/// depending on operated infrastructure. A peer relay is "reachable" when
+/// it advertised at least one endpoint.
 #[must_use]
 pub fn decide_connectivity(
     local: NatType,
     remote: NatType,
     remote_candidates: &[Candidate],
+    peer_relays: &[PeerRelay],
     known_relays: &[SocketAddr],
 ) -> ConnectivityStrategy {
     // Either side being `Open` short-circuits to `Direct`. The dialer
@@ -145,7 +192,7 @@ pub fn decide_connectivity(
         // address to dial. Try relay; if no relay either, fall through
         // to an empty hole-punch attempt that the state machine will
         // surface as unreachable.
-        return relay_or_punch(remote_candidates, known_relays);
+        return relay_or_punch(remote_candidates, peer_relays, known_relays);
     }
 
     if is_punchable(local, remote) {
@@ -157,7 +204,7 @@ pub fn decide_connectivity(
     // symmetric paired with restricted/port-restricted) goes to
     // relay. `Unknown` is conservative — the next STUN refresh
     // can promote the connection.
-    relay_or_punch(remote_candidates, known_relays)
+    relay_or_punch(remote_candidates, peer_relays, known_relays)
 }
 
 /// `true` when the pair can hole-punch directly.
@@ -506,15 +553,41 @@ fn highest_priority_addr(candidates: &[Candidate]) -> Option<SocketAddr> {
         .map(|c| c.address)
 }
 
+/// Pick a relay route, preferring a reachable peer relay over an operated
+/// endpoint, and falling back to a best-effort hole punch when no relay of
+/// either kind is available.
 fn relay_or_punch(
     remote_candidates: &[Candidate],
+    peer_relays: &[PeerRelay],
     known_relays: &[SocketAddr],
 ) -> ConnectivityStrategy {
+    // Prefer the first peer relay that advertised a reachable endpoint.
+    // A volunteer with an empty address list is not dialable, so it is
+    // skipped rather than chosen and then failing.
+    if let Some((device_id, address)) = peer_relays.iter().find_map(|relay| {
+        relay
+            .addresses
+            .first()
+            .map(|addr| (&relay.device_id, *addr))
+    }) {
+        return ConnectivityStrategy::Relay {
+            route: RelayRoute::Peer {
+                device_id: device_id.clone(),
+                address,
+            },
+        };
+    }
+
+    // No reachable peer relay — fall back to the operated pool.
     known_relays.first().map_or_else(
         || ConnectivityStrategy::HolePunch {
             remote_candidates: remote_candidates.to_vec(),
         },
-        |relay| ConnectivityStrategy::Relay { relay: *relay },
+        |endpoint| ConnectivityStrategy::Relay {
+            route: RelayRoute::Operated {
+                endpoint: *endpoint,
+            },
+        },
     )
 }
 
@@ -760,7 +833,7 @@ mod tests {
                     .and_then(|row| row.get(j))
                     .copied()
                     .unwrap_or(Expected::Relay);
-                let got = decide_connectivity(*local, *remote, &candidates, &relays);
+                let got = decide_connectivity(*local, *remote, &candidates, &[], &relays);
                 let actual = match got {
                     ConnectivityStrategy::Direct { .. } => Expected::Direct,
                     ConnectivityStrategy::HolePunch { .. } => Expected::Punch,
@@ -781,7 +854,7 @@ mod tests {
         let host = host_candidate(22_000);
         let srflx = srflx_candidate(54_321);
         let candidates = vec![srflx, host];
-        let strategy = decide_connectivity(NatType::Open, NatType::Open, &candidates, &[]);
+        let strategy = decide_connectivity(NatType::Open, NatType::Open, &candidates, &[], &[]);
         match strategy {
             ConnectivityStrategy::Direct { addr } => assert_eq!(addr, addr_for(22_000)),
             other => panic!("expected Direct, got {other:?}"),
@@ -791,17 +864,103 @@ mod tests {
     #[test]
     fn direct_with_no_candidates_falls_back_to_relay_when_available() {
         let relay_addr = addr(3478);
-        let strategy = decide_connectivity(NatType::Open, NatType::Symmetric, &[], &[relay_addr]);
-        assert_eq!(strategy, ConnectivityStrategy::Relay { relay: relay_addr });
+        let strategy =
+            decide_connectivity(NatType::Open, NatType::Symmetric, &[], &[], &[relay_addr]);
+        assert_eq!(
+            strategy,
+            ConnectivityStrategy::Relay {
+                route: RelayRoute::Operated {
+                    endpoint: relay_addr
+                }
+            }
+        );
     }
 
     #[test]
     fn direct_with_no_candidates_and_no_relays_falls_through_to_empty_punch() {
-        let strategy = decide_connectivity(NatType::Open, NatType::Symmetric, &[], &[]);
+        let strategy = decide_connectivity(NatType::Open, NatType::Symmetric, &[], &[], &[]);
         assert_eq!(
             strategy,
             ConnectivityStrategy::HolePunch {
                 remote_candidates: vec![]
+            }
+        );
+    }
+
+    #[test]
+    fn relay_prefers_peer_relay_over_operated_endpoint() {
+        // Both a peer relay and an operated relay are available for a pair
+        // that the table routes to `Relay` (Symmetric ↔ Symmetric). The
+        // peer relay must win so the mesh routes around restrictive NAT
+        // without leaning on operated infrastructure.
+        let operated = addr(3478);
+        let peer_relay = PeerRelay {
+            device_id: "VOLUNTEER-DEVICE".into(),
+            addresses: vec![addr(22_000)],
+        };
+        let strategy = decide_connectivity(
+            NatType::Symmetric,
+            NatType::Symmetric,
+            &[],
+            std::slice::from_ref(&peer_relay),
+            &[operated],
+        );
+        assert_eq!(
+            strategy,
+            ConnectivityStrategy::Relay {
+                route: RelayRoute::Peer {
+                    device_id: "VOLUNTEER-DEVICE".into(),
+                    address: addr(22_000),
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn relay_skips_peer_relay_with_no_addresses() {
+        // A volunteer that advertised no reachable endpoint cannot be
+        // dialled, so the decision falls back to the operated pool rather
+        // than choosing an unusable peer relay.
+        let operated = addr(3478);
+        let unreachable_peer = PeerRelay {
+            device_id: "VOLUNTEER-DEVICE".into(),
+            addresses: vec![],
+        };
+        let strategy = decide_connectivity(
+            NatType::Symmetric,
+            NatType::Symmetric,
+            &[],
+            std::slice::from_ref(&unreachable_peer),
+            &[operated],
+        );
+        assert_eq!(
+            strategy,
+            ConnectivityStrategy::Relay {
+                route: RelayRoute::Operated { endpoint: operated }
+            }
+        );
+    }
+
+    #[test]
+    fn relay_uses_peer_relay_when_no_operated_endpoint() {
+        let peer_relay = PeerRelay {
+            device_id: "VOLUNTEER-DEVICE".into(),
+            addresses: vec![addr(22_000)],
+        };
+        let strategy = decide_connectivity(
+            NatType::Symmetric,
+            NatType::Symmetric,
+            &[],
+            std::slice::from_ref(&peer_relay),
+            &[],
+        );
+        assert_eq!(
+            strategy,
+            ConnectivityStrategy::Relay {
+                route: RelayRoute::Peer {
+                    device_id: "VOLUNTEER-DEVICE".into(),
+                    address: addr(22_000),
+                }
             }
         );
     }
@@ -819,6 +978,7 @@ mod tests {
             NatType::PortRestrictedCone,
             &candidates,
             &[],
+            &[],
         );
         match strategy {
             ConnectivityStrategy::HolePunch { remote_candidates } => {
@@ -831,9 +991,21 @@ mod tests {
     #[test]
     fn relay_picks_first_known_relay() {
         let relays = vec![addr(3478), addr(3479)];
-        let strategy =
-            decide_connectivity(NatType::Symmetric, NatType::RestrictedCone, &[], &relays);
-        assert_eq!(strategy, ConnectivityStrategy::Relay { relay: addr(3478) });
+        let strategy = decide_connectivity(
+            NatType::Symmetric,
+            NatType::RestrictedCone,
+            &[],
+            &[],
+            &relays,
+        );
+        assert_eq!(
+            strategy,
+            ConnectivityStrategy::Relay {
+                route: RelayRoute::Operated {
+                    endpoint: addr(3478)
+                }
+            }
+        );
     }
 
     #[test]
@@ -848,6 +1020,7 @@ mod tests {
             NatType::PortRestrictedCone,
             &candidates,
             &[],
+            &[],
         );
         assert_eq!(
             strategy,
@@ -860,10 +1033,20 @@ mod tests {
     #[test]
     fn full_cone_symmetric_punches_either_direction() {
         // The table makes this pair symmetric: punch either way.
-        let strategy_a =
-            decide_connectivity(NatType::FullCone, NatType::Symmetric, &[], &[addr(3478)]);
-        let strategy_b =
-            decide_connectivity(NatType::Symmetric, NatType::FullCone, &[], &[addr(3478)]);
+        let strategy_a = decide_connectivity(
+            NatType::FullCone,
+            NatType::Symmetric,
+            &[],
+            &[],
+            &[addr(3478)],
+        );
+        let strategy_b = decide_connectivity(
+            NatType::Symmetric,
+            NatType::FullCone,
+            &[],
+            &[],
+            &[addr(3478)],
+        );
         assert!(matches!(strategy_a, ConnectivityStrategy::HolePunch { .. }));
         assert!(matches!(strategy_b, ConnectivityStrategy::HolePunch { .. }));
     }
@@ -880,10 +1063,14 @@ mod tests {
             NatType::PortRestrictedCone,
             NatType::Symmetric,
         ] {
-            let strategy = decide_connectivity(NatType::Unknown, partner, &[], &[relay_addr]);
+            let strategy = decide_connectivity(NatType::Unknown, partner, &[], &[], &[relay_addr]);
             assert_eq!(
                 strategy,
-                ConnectivityStrategy::Relay { relay: relay_addr },
+                ConnectivityStrategy::Relay {
+                    route: RelayRoute::Operated {
+                        endpoint: relay_addr
+                    }
+                },
                 "(Unknown ↔ {partner:?}) must relay",
             );
         }
