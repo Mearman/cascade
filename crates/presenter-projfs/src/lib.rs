@@ -1866,8 +1866,7 @@ mod windows_impl {
         // generated GUID identifying this virtualisation instance, exactly
         // as Microsoft's lifecycle sample does with `CoCreateGuid`.
         // `GUID::new()` is the windows-rs wrapper over `CoCreateGuid`.
-        let instance_id =
-            GUID::new().context("generating ProjFS virtualisation instance GUID")?;
+        let instance_id = GUID::new().context("generating ProjFS virtualisation instance GUID")?;
 
         // SAFETY: PrjMarkDirectoryAsPlaceholder reads the path string and
         // the instance-id pointer for the duration of the call. Both
@@ -1876,7 +1875,12 @@ mod windows_impl {
         // `versionInfo` is optional, so we pass `None`.
         #[allow(unsafe_code)]
         let mark_result = unsafe {
-            PrjMarkDirectoryAsPlaceholder(mount_pcwstr, PCWSTR::null(), None, &raw const instance_id)
+            PrjMarkDirectoryAsPlaceholder(
+                mount_pcwstr,
+                PCWSTR::null(),
+                None,
+                &raw const instance_id,
+            )
         };
         mark_result.context("PrjMarkDirectoryAsPlaceholder failed")?;
 
