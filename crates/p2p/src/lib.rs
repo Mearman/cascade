@@ -189,6 +189,10 @@ impl P2pEngine {
 
     /// Establish a TLS-authenticated direct peer connection.
     ///
+    /// Returns the source [`std::net::SocketAddr`] the local socket
+    /// observed for the peer alongside the connection (see
+    /// [`connection::ConnectionManager::connect`]).
+    ///
     /// Relay fallback is driven one layer up by the backend's sync
     /// engine, which holds the shared HMAC secret needed by the relay
     /// client. This method is a thin wrapper around the connection
@@ -196,7 +200,7 @@ impl P2pEngine {
     pub async fn connect_peer(
         &self,
         peer: &discovery::DiscoveredPeer,
-    ) -> Result<connection::PeerConnection> {
+    ) -> Result<(std::net::SocketAddr, connection::PeerConnection)> {
         let trusted_ids: Vec<String> = self.peer_book.peers().keys().cloned().collect();
         connection::ConnectionManager::new(self.identity.clone(), trusted_ids)
             .connect(peer)

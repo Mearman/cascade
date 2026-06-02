@@ -74,8 +74,15 @@ impl ConnectionManager {
     }
 
     /// Connect to a known peer over direct TCP+TLS.
-    pub async fn connect(&self, peer: &DiscoveredPeer) -> Result<PeerConnection> {
-        let stream = self
+    ///
+    /// Returns the connection alongside the source [`SocketAddr`] the
+    /// local socket observed for the peer. For an outbound dial that is
+    /// the peer's listening address rather than a `NAT`-mapped reflexive
+    /// one, but it is surfaced symmetrically with [`Self::accept`] so the
+    /// session layer can echo it back to the peer in a
+    /// [`crate::protocol::BepMessage::ObservedAddress`] frame.
+    pub async fn connect(&self, peer: &DiscoveredPeer) -> Result<(SocketAddr, PeerConnection)> {
+        let (observed_addr, stream) = self
             .connect_direct(peer.address, &peer.device_id)
             .await
             .with_context(|| {
@@ -84,23 +91,35 @@ impl ConnectionManager {
                     peer.device_id, peer.address
                 )
             })?;
-        Ok(PeerConnection::Direct(Box::new(stream)))
+        Ok((observed_addr, PeerConnection::Direct(Box::new(stream))))
     }
 
     /// Accept an incoming connection and verify the peer's device ID.
     ///
-    /// Returns the verified device ID and the TLS stream on success.
+    /// Returns the verified device ID, the source [`SocketAddr`] this
+    /// side observed for the peer, and the TLS stream on success. The
+    /// observed address is read from the live TCP socket so it reflects
+    /// the peer's `NAT`-mapped source rather than any address the peer
+    /// advertised — it is what powers the peer-as-`STUN` reflexive
+    /// learning on the far side once we echo it back.
+    ///
     /// The TLS handshake fails for any peer whose certificate fingerprint
     /// is not in the trusted list; the post-handshake recheck below is a
     /// belt-and-braces assertion that should be unreachable in practice.
-    pub async fn accept(&self, stream: TcpStream) -> Result<(String, TlsStream<TcpStream>)> {
+    pub async fn accept(
+        &self,
+        stream: TcpStream,
+    ) -> Result<(String, SocketAddr, TlsStream<TcpStream>)> {
         let acceptor = self.build_server_acceptor()?;
         let tls_stream = acceptor
             .accept(stream)
             .await
             .context("TLS handshake with incoming peer")?;
 
-        let (_, connection) = tls_stream.get_ref();
+        let (tcp, connection) = tls_stream.get_ref();
+        let observed_addr = tcp
+            .peer_addr()
+            .context("reading observed peer address from accepted socket")?;
         let peer_cert = connection
             .peer_certificates()
             .context("peer did not present a certificate")?;
@@ -119,7 +138,7 @@ impl ConnectionManager {
             );
         }
 
-        Ok((peer_device_id, TlsStream::Server(tls_stream)))
+        Ok((peer_device_id, observed_addr, TlsStream::Server(tls_stream)))
     }
 
     /// Initiate a direct TLS connection to an address. The `expected_device_id`
@@ -129,7 +148,7 @@ impl ConnectionManager {
         &self,
         address: SocketAddr,
         expected_device_id: &str,
-    ) -> Result<TlsStream<TcpStream>> {
+    ) -> Result<(SocketAddr, TlsStream<TcpStream>)> {
         let tcp = TcpStream::connect(address)
             .await
             .with_context(|| format!("TCP connect to {address}"))?;
@@ -146,7 +165,10 @@ impl ConnectionManager {
         // Belt-and-braces: the cert that survived the TLS handshake should
         // match the expected device, but verify once more in case a verifier
         // was misconfigured. This branch is unreachable in normal operation.
-        let (_, connection) = tls_stream.get_ref();
+        let (tcp, connection) = tls_stream.get_ref();
+        let observed_addr = tcp
+            .peer_addr()
+            .context("reading observed peer address from connected socket")?;
         let peer_cert = connection
             .peer_certificates()
             .context("peer did not present a certificate")?;
@@ -161,7 +183,7 @@ impl ConnectionManager {
             );
         }
 
-        Ok(TlsStream::Client(tls_stream))
+        Ok((observed_addr, TlsStream::Client(tls_stream)))
     }
 
     /// Build a TLS client connector that presents our identity certificate
@@ -561,7 +583,7 @@ mod tests {
             address,
         };
         let client_manager = ConnectionManager::new(identity, vec![device_id]);
-        let connection = client_manager.connect(&peer).await.unwrap();
+        let (_observed, connection) = client_manager.connect(&peer).await.unwrap();
 
         match connection {
             PeerConnection::Direct(_) => {}
