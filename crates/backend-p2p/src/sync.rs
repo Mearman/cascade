@@ -52,7 +52,9 @@ use cascade_p2p::connection::ConnectionManager;
 use cascade_p2p::discovery::DiscoveredPeer;
 use cascade_p2p::framed::{FramedPeer, FramedSession, SessionReader, SessionWriter};
 use cascade_p2p::identity::DeviceIdentity;
-use cascade_p2p::nat::{enumerate_host_candidates, server_reflexive_candidate_from_addr};
+use cascade_p2p::nat::{
+    enumerate_host_candidates, is_globally_routable_ip, server_reflexive_candidate_from_addr,
+};
 use cascade_p2p::protocol::{BepMessage, FileInfo, Folder, GossipPeer, Version};
 use cascade_p2p::store::BlockStore;
 use cascade_p2p::transport::{
@@ -536,10 +538,27 @@ impl SyncEngine {
     /// single candidate so repeated frames from several peers do not
     /// inflate the advertised set.
     ///
+    /// Non-globally-routable observations are dropped before storage
+    /// (see [`is_globally_routable_ip`]). A peer on the same LAN observes
+    /// this host's private, loopback, or link-local source; storing that
+    /// as a reflexive candidate would advertise an unreachable address to
+    /// off-LAN peers as a public mapping — exactly what real `STUN`
+    /// never does. Rejecting at ingress keeps the advertised candidate
+    /// set and the gossip self entry clean by construction rather than
+    /// filtering at advertise time.
+    ///
     /// The stored candidates feed both the local candidate set
     /// advertised over `BepMessage::Candidates` and the self entry
     /// gossiped to peers.
     pub async fn set_observed_external_addr(&self, observed: SocketAddr) {
+        if !is_globally_routable_ip(observed.ip()) {
+            debug!(
+                target: "cascade::backend::p2p",
+                %observed,
+                "dropping non-globally-routable peer-as-STUN observation",
+            );
+            return;
+        }
         let candidate =
             server_reflexive_candidate_from_addr(observed, SERVER_REFLEXIVE_LOCAL_PREFERENCE);
         let mut stored = self.observed_external_candidates.write().await;
@@ -3018,7 +3037,14 @@ mod tests {
     /// frame. The connector (A) must NOT echo the address it dialled
     /// (B's own listening address) back to B, so the listener must never
     /// record its own listening address as a server-reflexive candidate.
-    /// A, conversely, learns the genuine source B observed for it.
+    ///
+    /// Over loopback the source B observes for A is a `127.0.0.0/8`
+    /// address, which is not globally routable, so the scope filter in
+    /// `set_observed_external_addr` drops it at ingress. The net effect
+    /// is that neither side records a reflexive candidate — which is
+    /// exactly correct: a same-host observation conveys no public
+    /// reachability. (A routable observation is covered by
+    /// `set_observed_external_addr_rejects_non_routable_sources`.)
     #[tokio::test]
     async fn observed_address_flows_only_from_acceptor() {
         let (_dir_a, engine_a) = make_engine("shared");
@@ -3040,24 +3066,8 @@ mod tests {
             .await
             .unwrap();
 
-        // The connecting side (A) learns the source address B observed
-        // for it — A's ephemeral outbound port on loopback. Poll until
-        // the ObservedAddress frame has been processed.
-        let mut a_reflexive = Vec::new();
-        for _ in 0..40 {
-            a_reflexive = engine_a.observed_external_candidates().await;
-            if !a_reflexive.is_empty() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert_eq!(
-            a_reflexive.len(),
-            1,
-            "A should learn exactly one reflexive candidate from B's ObservedAddress frame",
-        );
-        let candidate = a_reflexive.first().expect("one reflexive candidate");
-        assert_eq!(candidate.kind, CandidateKind::ServerReflexive);
+        // Let the handshake and any ObservedAddress frames settle.
+        tokio::time::sleep(Duration::from_millis(300)).await;
 
         // The listener (B) must never record its own listening address as
         // a server-reflexive candidate. Before the fix, the connector
@@ -3072,6 +3082,14 @@ mod tests {
         assert!(
             b_reflexive.is_empty(),
             "acceptor sends no ObservedAddress on the outbound leg, so B records nothing, got {b_reflexive:?}",
+        );
+
+        // A's loopback source is observed by B and echoed back, but the
+        // scope filter drops it because loopback is not globally routable.
+        let a_reflexive = engine_a.observed_external_candidates().await;
+        assert!(
+            a_reflexive.is_empty(),
+            "loopback observations are not globally routable and must be dropped, got {a_reflexive:?}",
         );
     }
 
@@ -3127,6 +3145,46 @@ mod tests {
         engine.set_observed_external_addr(observed).await;
         engine.set_observed_external_addr(observed).await;
         assert_eq!(engine.observed_external_candidates().await.len(), 1);
+    }
+
+    /// A peer on the same LAN (or the local host) observes a private,
+    /// loopback, or link-local source. Folding those into the reflexive
+    /// set would advertise an unreachable address to off-LAN peers as a
+    /// public mapping, so `set_observed_external_addr` must drop them at
+    /// ingress and store nothing.
+    #[tokio::test]
+    async fn set_observed_external_addr_rejects_non_routable_sources() {
+        let (_dir, engine) = make_engine("f");
+        for raw in [
+            "127.0.0.1:51820",      // IPv4 loopback
+            "10.0.0.5:51820",       // RFC1918 10/8
+            "172.16.3.4:51820",     // RFC1918 172.16/12
+            "192.168.1.20:51820",   // RFC1918 192.168/16
+            "169.254.10.10:51820",  // IPv4 link-local
+            "0.0.0.0:51820",        // unspecified
+            "[::1]:51820",          // IPv6 loopback
+            "[fe80::1]:51820",      // IPv6 link-local
+            "[fc00::1]:51820",      // IPv6 unique-local (fc00::/8)
+            "[fd12:3456::1]:51820", // IPv6 unique-local (fd00::/8)
+            "[::]:51820",           // IPv6 unspecified
+        ] {
+            let observed: SocketAddr = raw.parse().unwrap();
+            engine.set_observed_external_addr(observed).await;
+            assert!(
+                engine.observed_external_candidates().await.is_empty(),
+                "non-routable observed source {raw} must not be stored as a reflexive candidate",
+            );
+        }
+
+        // A genuinely routable observation is still recorded.
+        let routable: SocketAddr = "198.51.100.7:51820".parse().unwrap();
+        engine.set_observed_external_addr(routable).await;
+        let stored = engine.observed_external_candidates().await;
+        assert_eq!(
+            stored.len(),
+            1,
+            "a globally-routable observed source must be recorded, got {stored:?}",
+        );
     }
 
     #[tokio::test]
