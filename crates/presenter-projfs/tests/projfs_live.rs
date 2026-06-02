@@ -103,9 +103,16 @@ impl ContentProvider for CountingProvider {
 /// directory while callbacks could still dereference the raw context would
 /// be a use-after-free. Mirrors the Drop discipline in the p2p
 /// `nat_integration` harness.
+///
+/// The guard owns the `Runtime` so `Drop` can `block_on(stop())` from the
+/// outer blocking test thread. Each test is a synchronous `#[test]` that
+/// builds one runtime and runs its whole body via `rt.block_on(..)`, so the
+/// `Drop` never runs on a reactor worker — there is no nested `block_on` to
+/// panic, and a failing assertion still tears the mount down cleanly rather
+/// than double-panicking and leaking a live `PrjStartVirtualizing` instance.
 struct LiveMount {
     presenter: Arc<ProjFsPresenter>,
-    handle: tokio::runtime::Handle,
+    rt: tokio::runtime::Runtime,
     // Held so it outlives the mount; dropped last.
     _dir: tempfile::TempDir,
 }
@@ -113,15 +120,20 @@ struct LiveMount {
 impl Drop for LiveMount {
     fn drop(&mut self) {
         let presenter = Arc::clone(&self.presenter);
-        // Block on stop() so callbacks drain before _dir is removed.
-        let _ = self.handle.block_on(async move { presenter.stop().await });
+        // `block_on` here runs on the outer blocking thread (the one the
+        // `#[test]` started on), never inside a reactor worker, so it cannot
+        // hit "Cannot start a runtime from within a runtime". Callbacks drain
+        // inside `stop()` before `_dir` is removed.
+        let _ = self.rt.block_on(async move { presenter.stop().await });
     }
 }
 
 /// Seed a root directory plus two child files, install the provider, and
 /// start virtualising. Returns the mount path, the guard, and the shared
-/// read counter.
-async fn setup() -> (std::path::PathBuf, LiveMount, Arc<AtomicUsize>) {
+/// read counter. Takes a freshly built `Runtime` and runs the async setup
+/// on it, then hands ownership of that runtime to the returned `LiveMount`
+/// so its `Drop` can drive `stop()` on the outer blocking thread.
+fn setup(rt: tokio::runtime::Runtime) -> (std::path::PathBuf, LiveMount, Arc<AtomicUsize>) {
     let dir = tempfile::tempdir().unwrap();
     let mount_path = dir.path().to_path_buf();
 
@@ -178,41 +190,63 @@ async fn setup() -> (std::path::PathBuf, LiveMount, Arc<AtomicUsize>) {
         cache_state: CacheState::Online,
         mime_type: Some("text/plain".to_string()),
     };
-    presenter.upsert_item(root_item).await.unwrap();
-    presenter.upsert_item(alpha_item).await.unwrap();
-    presenter.upsert_item(beta_item).await.unwrap();
+    // Run the async seeding and start on the supplied runtime. The whole
+    // body runs inside one `block_on`; the runtime is then handed to the
+    // guard so its `Drop` can `block_on(stop())` later.
+    rt.block_on(async {
+        presenter.upsert_item(root_item).await.unwrap();
+        presenter.upsert_item(alpha_item).await.unwrap();
+        presenter.upsert_item(beta_item).await.unwrap();
 
-    presenter
-        .start(&mount_path)
-        .await
-        .expect("PrjStartVirtualizing should succeed on a ProjFS-enabled runner");
+        presenter
+            .start(&mount_path)
+            .await
+            .expect("PrjStartVirtualizing should succeed on a ProjFS-enabled runner");
+    });
 
     let guard = LiveMount {
         presenter,
-        handle: tokio::runtime::Handle::current(),
+        rt,
         _dir: dir,
     };
     (mount_path, guard, reads)
 }
 
-/// Enumeration over the live mount lists exactly the seeded child names.
-/// Uses `spawn_blocking` so the synchronous `read_dir` (and the kernel
-/// callbacks it triggers, which call `blocking_read`) run off the test's
-/// async reactor.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn enumeration_lists_seeded_children() {
-    let (mount, _guard, _reads) = setup().await;
+/// Build the dedicated multi-thread runtime each test runs on. Multi-thread
+/// so the synchronous `read_dir`/`read` calls (which trigger kernel
+/// callbacks that take `blocking_read`) can run via `block_in_place`/
+/// `spawn_blocking` without starving the single worker.
+fn test_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("building the test runtime")
+}
 
-    let names = tokio::task::spawn_blocking(move || {
-        let mut names: Vec<String> = std::fs::read_dir(&mount)
-            .expect("read_dir on the live mount should succeed")
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        names.sort();
-        names
-    })
-    .await
-    .unwrap();
+/// Collect and sort the file names directly under `mount`.
+fn read_dir_names(mount: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(mount)
+        .expect("read_dir on the live mount should succeed")
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Enumeration over the live mount lists exactly the seeded child names.
+///
+/// A synchronous `#[test]`: it builds a dedicated runtime, runs the async
+/// setup on it via `block_on`, then issues plain `std::fs` calls on the test
+/// thread. The kernel callbacks those calls trigger run on ProjFS-owned
+/// threads and take `blocking_read`, needing no runtime context. The mount is
+/// torn down by `LiveMount::drop` on this same blocking thread — no nested
+/// `block_on`.
+#[test]
+fn enumeration_lists_seeded_children() {
+    let (mount, _guard, _reads) = setup(test_runtime());
+
+    let names = read_dir_names(&mount);
 
     assert_eq!(
         names,
@@ -225,14 +259,12 @@ async fn enumeration_lists_seeded_children() {
 /// provider (read counter advances). This is the strongest honesty signal:
 /// a browse-only mount would error on read, and a placeholder served
 /// without a Rust round-trip would leave the counter at zero.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn content_read_round_trips_through_provider() {
-    let (mount, _guard, reads) = setup().await;
+#[test]
+fn content_read_round_trips_through_provider() {
+    let (mount, _guard, reads) = setup(test_runtime());
     let expected = b"alpha file contents".to_vec();
 
-    let got = tokio::task::spawn_blocking(move || std::fs::read(mount.join("alpha.txt")))
-        .await
-        .unwrap()
+    let got = std::fs::read(mount.join("alpha.txt"))
         .expect("reading a seeded file should succeed via GetFileData");
 
     assert!(!got.is_empty(), "read must return a non-empty payload");
@@ -246,26 +278,13 @@ async fn content_read_round_trips_through_provider() {
 /// Deleting a file makes it disappear from a subsequent enumeration,
 /// exercising the notification path and the OS-level delete against the
 /// live mount.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn delete_removes_file_from_enumeration() {
-    let (mount, _guard, _reads) = setup().await;
+#[test]
+fn delete_removes_file_from_enumeration() {
+    let (mount, _guard, _reads) = setup(test_runtime());
 
-    let mount_for_delete = mount.clone();
-    tokio::task::spawn_blocking(move || std::fs::remove_file(mount_for_delete.join("beta.txt")))
-        .await
-        .unwrap()
-        .expect("removing a seeded file should succeed");
+    std::fs::remove_file(mount.join("beta.txt")).expect("removing a seeded file should succeed");
 
-    let names = tokio::task::spawn_blocking(move || {
-        let mut names: Vec<String> = std::fs::read_dir(&mount)
-            .expect("read_dir after delete should succeed")
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        names.sort();
-        names
-    })
-    .await
-    .unwrap();
+    let names = read_dir_names(&mount);
 
     assert!(
         !names.contains(&"beta.txt".to_string()),
