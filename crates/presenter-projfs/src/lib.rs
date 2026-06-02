@@ -698,6 +698,51 @@ fn collect_children(parent_id: &ItemId, items: &HashMap<String, VfsItem>) -> Vec
     out
 }
 
+/// Collect the projection root's children when no explicit root id has
+/// been configured (the loose-root fallback).
+///
+/// A top-level item is one whose `parent_id` is not itself a key in
+/// `items` — i.e. its parent lies outside the projected map. This is
+/// the same "parent-not-a-key = root" rule [`item_root`] applies, and
+/// it matches what the sync runner actually produces: top-level items
+/// are labelled `<backend>:root` (or a real folder id for a scoped
+/// mount), never a hard-coded bare `"root"`. Matching a literal
+/// `"root"` would enumerate zero children against a real daemon mount.
+///
+/// Items are filtered and sorted exactly as [`collect_children`] does,
+/// so the two paths agree on what `ProjFS` can represent.
+#[cfg_attr(
+    not(any(target_os = "windows", test)),
+    allow(
+        dead_code,
+        reason = "consumed only by Windows callbacks and unit tests"
+    )
+)]
+fn collect_root_children(items: &HashMap<String, VfsItem>) -> Vec<EnumerationEntry> {
+    let mut out: Vec<EnumerationEntry> = items
+        .values()
+        .filter(|item| !items.contains_key(&item.parent_id.0))
+        .filter_map(|item| {
+            if is_safe_windows_filename(&item.name) {
+                Some(EnumerationEntry {
+                    name: item.name.clone(),
+                    is_dir: item.is_dir,
+                    size: item.size.unwrap_or(0),
+                })
+            } else {
+                tracing::debug!(
+                    name = %item.name,
+                    id = %item.id,
+                    "skipping item with name unsafe for Windows"
+                );
+                None
+            }
+        })
+        .collect();
+    out.sort_by_key(|a| a.name.to_lowercase());
+    out
+}
+
 /// Opaque handle to a running `ProjFS` virtualisation instance.
 ///
 /// On Windows this wraps a `PRJ_NAMESPACE_VIRTUALIZATION_CONTEXT`
@@ -1083,7 +1128,7 @@ mod windows_impl {
     use super::handle::NamespaceHandle;
     use super::{
         CallbackContext, CancellationToken, ContentProvider, EnumerationState,
-        build_enumeration_state, collect_children, resolve_path,
+        build_enumeration_state, collect_children, collect_root_children, resolve_path,
     };
 
     /// Heap-allocated state the callbacks consult. Kept distinct from
@@ -1103,6 +1148,26 @@ mod windows_impl {
         /// the entry and triggers the token. Reachable from any
         /// callback thread, so wrapped in a `std::sync::Mutex`.
         cancellation_tokens: Arc<Mutex<HashMap<i32, CancellationToken>>>,
+        /// Notification mappings handed to `PrjStartVirtualizing` via
+        /// `PRJ_STARTVIRTUALIZING_OPTIONS::NotificationMappings`. ProjFS
+        /// retains the pointer for the lifetime of the virtualisation
+        /// *instance*, not just the duration of the start call (see the
+        /// Microsoft ProjFS-Managed-API `VirtualizationInstance.cs`,
+        /// which pins the array and frees it only in `StopVirtualizing`).
+        /// Storing the `Vec` on the boxed context — which lives until
+        /// `stop_virtualising` does `Box::from_raw` *after*
+        /// `PrjStopVirtualizing` has drained outstanding callbacks —
+        /// keeps the array alive exactly as long as ProjFS may read it
+        /// and frees it in lockstep with the instance.
+        _notification_mappings: Vec<PRJ_NOTIFICATION_MAPPING>,
+        /// Backing storage for the `NotificationRoot` strings the
+        /// entries in `_notification_mappings` point at. Each
+        /// `PRJ_NOTIFICATION_MAPPING::NotificationRoot` is a `PCWSTR`
+        /// borrowing into one of these `HSTRING`s, so they must outlive
+        /// the mappings (and therefore the instance) for the same
+        /// reason. Owned here so they are dropped only after
+        /// `PrjStopVirtualizing`.
+        _notification_roots: Vec<HSTRING>,
     }
 
     /// Translate a Win32 error code into an `HRESULT` in the
@@ -1265,13 +1330,20 @@ mod windows_impl {
         let items = ctx.items.blocking_read();
         let root = ctx.root_id.blocking_read();
 
-        // Empty path = enumerate the projection root.
+        // Empty path = enumerate the projection root. With an explicit
+        // root id, collect that id's direct children. Without one
+        // (loose-root mode), collect every item whose parent is not a
+        // key in the map — the sync runner labels top-level items
+        // `<backend>:root`, never a bare `"root"`, so matching a literal
+        // string would enumerate nothing against a real daemon mount.
         let state = if path.is_empty() {
-            let parent_id = root
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| ItemId(String::from("root")));
-            build_enumeration_state(&parent_id, &items)
+            match root.as_ref() {
+                Some(root_id) => build_enumeration_state(root_id, &items),
+                None => EnumerationState {
+                    entries: collect_root_children(&items),
+                    position: 0,
+                },
+            }
         } else {
             let Some(dir) = resolve_path(&path, &items, root.as_ref()) else {
                 return hresult_from_win32(ERROR_FILE_NOT_FOUND.0);
@@ -1502,7 +1574,29 @@ mod windows_impl {
             return hresult_from_win32(ERROR_OPERATION_ABORTED.0);
         }
 
-        let read_result = provider.read_range(&item_id, byte_offset, length);
+        // A panic must never unwind across this `extern "system"`
+        // boundary — that is undefined behaviour. `read_range` returns
+        // `io::Result<Vec<u8>>` (both `UnwindSafe`); the provider itself
+        // is behind `&dyn ContentProvider`, so wrap the call in
+        // `AssertUnwindSafe` and map any caught panic to a visible Win32
+        // failure (`ERROR_GEN_FAILURE`) rather than aborting the host.
+        let read_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            provider.read_range(&item_id, byte_offset, length)
+        })) {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::error!(
+                    id = %item_id,
+                    offset = byte_offset,
+                    length,
+                    "ContentProvider::read_range panicked; mapping to ERROR_GEN_FAILURE"
+                );
+                return HRESULT(
+                    super::HResultCode::from_win32(windows::Win32::Foundation::ERROR_GEN_FAILURE.0)
+                        .get(),
+                );
+            }
+        };
         if let Err(ref err) = read_result {
             tracing::warn!(
                 id = %item_id,
@@ -1785,21 +1879,6 @@ mod windows_impl {
         };
         mark_result.context("PrjMarkDirectoryAsPlaceholder failed")?;
 
-        // Build the callback context. The Box is the owning handle:
-        // we hand its raw pointer to ProjFS via instance_context and
-        // recover it in `stop_virtualising` to free the allocation.
-        let inner = Box::new(CallbackContextInner {
-            items: Arc::clone(&items),
-            root_id: Arc::clone(&root_id),
-            enumerations: Arc::clone(&enumerations),
-            content_provider,
-            cancellation_tokens,
-        });
-        let inner_ptr = Box::into_raw(inner);
-        let instance_context = inner_ptr.cast::<c_void>();
-
-        let callbacks = build_callbacks();
-
         // Register a notification mapping so the kernel delivers the
         // events the presenter actually acts on. Without an explicit
         // mapping ProjFS uses a default set that excludes
@@ -1822,26 +1901,74 @@ mod windows_impl {
             | PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_DELETED;
         // The root is the empty relative path: the virtualisation root
         // itself. `PCWSTR::null()` is not valid for a notification root,
-        // so use an explicit empty wide string that outlives the call.
-        let notification_root = HSTRING::from("");
-        let mut mappings = [PRJ_NOTIFICATION_MAPPING {
-            NotificationBitMask: notification_mask,
-            NotificationRoot: PCWSTR(notification_root.as_ptr()),
-        }];
+        // so use an explicit empty wide string. The `HSTRING` is owned
+        // by the boxed context (`_notification_roots`) so it lives for
+        // the instance lifetime — ProjFS keeps the `NotificationRoot`
+        // pointer for as long as the instance runs, not just across the
+        // start call.
+        let notification_roots = vec![HSTRING::from("")];
+        // Build the mapping array referencing the owned root string.
+        // ProjFS retains this array's pointer for the instance lifetime,
+        // so it must live on the boxed context too (`_notification_mappings`).
+        let notification_mappings: Vec<PRJ_NOTIFICATION_MAPPING> = notification_roots
+            .iter()
+            .map(|root| PRJ_NOTIFICATION_MAPPING {
+                NotificationBitMask: notification_mask,
+                NotificationRoot: PCWSTR(root.as_ptr()),
+            })
+            .collect();
+
+        // Build the callback context. The Box is the owning handle:
+        // we hand its raw pointer to ProjFS via instance_context and
+        // recover it in `stop_virtualising` to free the allocation. The
+        // notification mappings and their backing root strings are owned
+        // here so they outlive every callback and are freed in lockstep
+        // with the instance.
+        let inner = Box::new(CallbackContextInner {
+            items: Arc::clone(&items),
+            root_id: Arc::clone(&root_id),
+            enumerations: Arc::clone(&enumerations),
+            content_provider,
+            cancellation_tokens,
+            _notification_mappings: notification_mappings,
+            _notification_roots: notification_roots,
+        });
+        let inner_ptr = Box::into_raw(inner);
+        let instance_context = inner_ptr.cast::<c_void>();
+
+        let callbacks = build_callbacks();
+
+        // Point the options at the boxed Vec's storage. SAFETY:
+        // `inner_ptr` is the live Box allocation from `Box::into_raw`
+        // above; we have not freed it and no other reference exists, so
+        // reading `_notification_mappings` through the raw pointer is a
+        // sound shared borrow. The Vec's `as_ptr()` is stable for the
+        // life of the Box (Vec never reallocates while untouched), which
+        // is exactly the instance lifetime ProjFS requires.
+        #[allow(unsafe_code)]
+        let (mappings_ptr, mappings_len) = unsafe {
+            let mappings = &(*inner_ptr)._notification_mappings;
+            (mappings.as_ptr(), mappings.len())
+        };
         let options = PRJ_STARTVIRTUALIZING_OPTIONS {
-            NotificationMappings: mappings.as_mut_ptr(),
-            NotificationMappingsCount: u32::try_from(mappings.len()).unwrap_or(0),
+            NotificationMappings: mappings_ptr.cast_mut(),
+            NotificationMappingsCount: u32::try_from(mappings_len).unwrap_or(0),
             ..PRJ_STARTVIRTUALIZING_OPTIONS::default()
         };
 
         // SAFETY: PrjStartVirtualizing copies the callback function
         // pointers out of `callbacks`. The stack-local table is valid
-        // for the duration of the call. The instance_context pointer
-        // is the raw Box we just allocated; the kernel keeps it until
-        // PrjStopVirtualizing returns. `options`, `mappings`, and
-        // `notification_root` all live on this stack frame, which does
-        // not return (no await) until PrjStartVirtualizing has read
-        // them, so the pointers stay valid for the duration of the call.
+        // for the duration of the call. The instance_context pointer is
+        // the raw Box we just allocated; the kernel keeps it until
+        // PrjStopVirtualizing returns. `options` lives on this stack
+        // frame, which does not return (no await) until
+        // PrjStartVirtualizing has read it. The `NotificationMappings`
+        // array and the `NotificationRoot` strings it borrows are owned
+        // by the boxed context (`_notification_mappings` /
+        // `_notification_roots`), which outlives the instance and is
+        // dropped only by `stop_virtualising` after PrjStopVirtualizing
+        // drains — matching ProjFS's instance-lifetime borrow of these
+        // pointers.
         #[allow(unsafe_code)]
         let start_result = unsafe {
             PrjStartVirtualizing(
@@ -2203,6 +2330,61 @@ mod tests {
         assert_eq!(state.entries.len(), 2);
         assert_eq!(state.entries[0].name, "a.txt");
         assert_eq!(state.entries[1].name, "b.txt");
+    }
+
+    /// Loose-root enumeration (no explicit root configured) returns the
+    /// items the sync runner actually produces: top-level entries are
+    /// parented at `<backend>:root`, which is *not* a key in the map, so
+    /// the "parent-not-a-key = root" rule must pick them up. A
+    /// hard-coded `"root"` match would have returned nothing here.
+    #[test]
+    fn collect_root_children_matches_sync_runner_parent_ids() {
+        let mut items = HashMap::new();
+        // Two top-level items parented at the sync-runner's synthetic
+        // backend root id. That id is never inserted as an item, so it
+        // is not a key in the map.
+        let synthetic_root = ItemId(String::from("gdrive:root"));
+        for name in ["Documents", "Photos"] {
+            let id = ItemId::new("gdrive", name);
+            items.insert(
+                id.0.clone(),
+                VfsItem {
+                    id,
+                    parent_id: synthetic_root.clone(),
+                    name: name.to_string(),
+                    is_dir: true,
+                    size: None,
+                    mod_time: None,
+                    cache_state: CacheState::Online,
+                    mime_type: None,
+                },
+            );
+        }
+        // A nested child whose parent *is* a key in the map — it must
+        // not appear at the root.
+        let documents_id = ItemId::new("gdrive", "Documents");
+        let nested_id = ItemId::new("gdrive", "report.txt");
+        items.insert(
+            nested_id.0.clone(),
+            VfsItem {
+                id: nested_id,
+                parent_id: documents_id,
+                name: "report.txt".to_string(),
+                is_dir: false,
+                size: Some(10),
+                mod_time: None,
+                cache_state: CacheState::Online,
+                mime_type: None,
+            },
+        );
+
+        let roots = collect_root_children(&items);
+        let names: Vec<&str> = roots.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["Documents", "Photos"],
+            "loose-root enumeration must return the sync-runner's top-level items, not a bare \"root\" match"
+        );
     }
 
     /// `with_root` records the supplied id and `root()` reads it
