@@ -548,3 +548,93 @@ async fn poll_interval_is_sixty_seconds() {
     let interval = backend.poll_interval().await;
     assert_eq!(interval, Some(std::time::Duration::from_mins(1)));
 }
+
+// ── concurrent client path (TLS-deadlock investigation harness) ────────────────
+//
+// Background: the Drive backend carries a long-standing workaround for a hang
+// that the project memory describes as a "TLS deadlock" — a fresh per-request
+// reqwest client with connection pooling disabled (`pool_max_idle_per_host(0)`)
+// and `http1_only()`. The hang was only ever observed through the WebDAV
+// presenter, where an axum/hyper-1.x *server* and a reqwest/hyper-1.x *client*
+// share one tokio runtime: the second backend TLS handshake, opened while the
+// server is mid-response, never completed. A minimal repro against a plain
+// HTTP echo server never reproduced it; only the real handler against the real
+// TLS endpoint did.
+//
+// This test pins down what the Drive backend can be held responsible for: that
+// nothing *inside* this crate deadlocks under concurrency. It drives many
+// requests through the shared backend at once, exercising the two internal
+// synchronisation points that could plausibly stall a task —
+//
+//   * the token `Mutex` in `GdriveBackend::access_token` (lib.rs), which must
+//     drop its guard before the refresh `.await`, and
+//   * the lock-free token-bucket `RateLimiter` in client.rs, whose `acquire`
+//     loop sleeps between attempts —
+//
+// and asserts they all complete well inside a deadline. wiremock speaks plain
+// HTTP with no TLS handshake, so this harness deliberately cannot reach the
+// suspected hyper server+client TLS interaction; that it stays green is the
+// evidence that the remaining cause lives outside this crate, not within it.
+// If a future change reintroduced a guard held across an `.await`, this test
+// would hang and trip the deadline rather than passing silently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_requests_through_shared_client_do_not_deadlock() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let server = MockServer::start().await;
+
+    // Every request lists the same folder. A small artificial delay on the
+    // mock keeps several requests in flight simultaneously so the shared token
+    // mutex and rate limiter are genuinely contended, not serialised by luck.
+    Mock::given(method("GET"))
+        .and(path("/files"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(20))
+                .set_body_json(json!({
+                    "files": [file_json("f1", "a.txt", "shared-parent", 1)]
+                })),
+        )
+        .mount(&server)
+        .await;
+
+    let backend: Arc<dyn Backend> = Arc::from(make_backend(&server));
+
+    // Enough concurrency to overlap many in-flight requests through the one
+    // backend. The exact count is not load-bearing; it only has to be large
+    // enough that requests genuinely overlap given the 20ms mock delay.
+    let concurrency = 32;
+    let mut handles = Vec::with_capacity(concurrency);
+    for _ in 0..concurrency {
+        let backend = Arc::clone(&backend);
+        handles.push(tokio::spawn(async move {
+            backend.list_children("shared-parent").await
+        }));
+    }
+
+    // A generous deadline: 32 requests at a 20ms mock delay across 4 worker
+    // threads complete in well under a second even fully serialised, so two
+    // seconds leaves ample slack while still failing fast on a real deadlock.
+    // Each task is awaited under the same shared deadline; a true deadlock
+    // leaves at least one task pending and trips the timeout below.
+    let deadline = Duration::from_secs(2);
+    let drained = tokio::time::timeout(deadline, async move {
+        let mut entries_per_task = Vec::with_capacity(handles.len());
+        for handle in handles {
+            let entries = handle
+                .await
+                .expect("task panicked")
+                .expect("list_children failed");
+            entries_per_task.push(entries);
+        }
+        entries_per_task
+    })
+    .await
+    .expect("concurrent requests deadlocked: in-flight tasks did not complete in time");
+
+    for entries in drained {
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "a.txt");
+    }
+}
