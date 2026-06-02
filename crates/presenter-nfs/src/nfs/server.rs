@@ -266,7 +266,7 @@ fn dispatch_rpc(
             procedures::handle_nfs_call(procedure, args, ctx, cache_mode)
         }
         (prog, ver) if prog == v4_xdr::NFS4_PROGRAM && ver == v4_xdr::NFS_V4 => {
-            handle_nfs4_call(procedure, args, ctx, state_mgr)
+            handle_nfs4_call(procedure, args, ctx, state_mgr, cache_mode)
         }
         (MOUNT_PROGRAM, ver) if ver == MOUNT_V3 => mount::handle_mount_call(procedure, args, ctx),
         _ => return make_rpc_error(xid, RPC_REPLY_DENIED),
@@ -292,10 +292,11 @@ fn handle_nfs4_call(
     args: &[u8],
     ctx: &Arc<NfsContext>,
     state_mgr: &Arc<StateManager>,
+    cache_mode: NfsCacheMode,
 ) -> Vec<u8> {
     match proc {
         v4_xdr::NFSPROC4_NULL => vec![],
-        v4_xdr::NFSPROC4_COMPOUND => compound::handle_compound(args, ctx, state_mgr),
+        v4_xdr::NFSPROC4_COMPOUND => compound::handle_compound(args, ctx, state_mgr, cache_mode),
         _ => {
             let mut r = Vec::new();
             v4_xdr::encode_u32(&mut r, v4_xdr::NFS4ERR_INVAL);

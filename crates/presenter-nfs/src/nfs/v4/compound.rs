@@ -9,13 +9,28 @@ use super::state::StateManager;
 use super::xdr::{
     self, ACCESS4_DELETE, ACCESS4_EXECUTE, ACCESS4_LOOKUP, ACCESS4_MODIFY, ACCESS4_READ,
     FATTR4_FILEID, FATTR4_MODE, FATTR4_SIZE, FATTR4_TYPE, Fattr4, NFS4_OK, NFS4ERR_BADHANDLE,
-    NFS4ERR_INVAL, NFS4ERR_IO, NFS4ERR_ROFS, NfsFh4, OP_ACCESS, OP_CLOSE, OP_COMMIT, OP_CREATE,
-    OP_GETATTR, OP_GETFH, OP_LINK, OP_LOCK, OP_LOCKT, OP_LOCKU, OP_LOOKUP, OP_LOOKUPP, OP_OPEN,
-    OP_PUTFH, OP_PUTROOTFH, OP_READ, OP_READDIR, OP_READLINK, OP_REMOVE, OP_RENAME, OP_RESTOREFH,
-    OP_SAVEFH, OP_SETATTR, OP_WRITE,
+    NFS4ERR_INVAL, NFS4ERR_IO, NFS4ERR_NOTSUPP, NFS4ERR_ROFS, NfsFh4, OP_ACCESS, OP_CLOSE,
+    OP_COMMIT, OP_CREATE, OP_GETATTR, OP_GETFH, OP_LINK, OP_LOCK, OP_LOCKT, OP_LOCKU, OP_LOOKUP,
+    OP_LOOKUPP, OP_OPEN, OP_PUTFH, OP_PUTROOTFH, OP_READ, OP_READDIR, OP_READLINK, OP_REMOVE,
+    OP_RENAME, OP_RESTOREFH, OP_SAVEFH, OP_SETATTR, OP_WRITE,
 };
 use crate::nfs::context::NfsContext;
+use crate::nfs::server::NfsCacheMode;
 use std::sync::Arc;
+
+/// The status an unimplemented write operation reports for a given cache mode.
+///
+/// A read-only export ([`NfsCacheMode::Off`]) refuses writes with
+/// `NFS4ERR_ROFS`. A write-capable export reports `NFS4ERR_NOTSUPP` because the
+/// write path is not yet implemented — distinct from a deliberately read-only
+/// mount. This mirrors the `NFSv3` gating in [`crate::nfs::procedures`].
+const fn write_unsupported_status(cache_mode: NfsCacheMode) -> u32 {
+    if cache_mode.writes_permitted() {
+        NFS4ERR_NOTSUPP
+    } else {
+        NFS4ERR_ROFS
+    }
+}
 
 /// Handle an `NFSv4` COMPOUND request.
 ///
@@ -27,7 +42,9 @@ pub fn handle_compound(
     args: &[u8],
     ctx: &Arc<NfsContext>,
     state_mgr: &Arc<StateManager>,
+    cache_mode: NfsCacheMode,
 ) -> Vec<u8> {
+    let write_unsupported = write_unsupported_status(cache_mode);
     let mut reply = Vec::new();
 
     // Decode tag.
@@ -181,12 +198,17 @@ pub fn handle_compound(
             }
             OP_READDIR => handle_readdir(&mut cursor, ctx, current_fh.as_ref()),
             OP_READ => handle_read(&mut cursor, ctx, current_fh.as_ref()),
-            OP_WRITE => handle_write(&mut cursor),
+            OP_WRITE => handle_write(&mut cursor, write_unsupported),
             OP_OPEN => handle_open(&mut cursor, ctx, state_mgr, current_fh.as_ref()),
             OP_CLOSE => handle_close(&mut cursor, state_mgr),
-            OP_CREATE => handle_create(&mut cursor, current_fh.as_ref()),
-            OP_REMOVE => handle_remove(&mut cursor, current_fh.as_ref()),
-            OP_RENAME => handle_rename(&mut cursor, current_fh.as_ref(), saved_fh.as_ref()),
+            OP_CREATE => handle_create(&mut cursor, current_fh.as_ref(), write_unsupported),
+            OP_REMOVE => handle_remove(&mut cursor, current_fh.as_ref(), write_unsupported),
+            OP_RENAME => handle_rename(
+                &mut cursor,
+                current_fh.as_ref(),
+                saved_fh.as_ref(),
+                write_unsupported,
+            ),
             OP_SAVEFH => {
                 saved_fh.clone_from(&current_fh);
                 op_status_reply(NFS4_OK)
@@ -202,10 +224,10 @@ pub fn handle_compound(
                 {
                     cursor = rest;
                 }
-                op_status_reply(NFS4ERR_ROFS)
+                op_status_reply(write_unsupported)
             }
             OP_READLINK | OP_LOCK | OP_LOCKT | OP_LOCKU => op_status_reply(NFS4ERR_INVAL),
-            OP_LINK => op_status_reply(NFS4ERR_ROFS),
+            OP_LINK => op_status_reply(write_unsupported),
             _ => {
                 overall_status = NFS4ERR_INVAL;
                 break;
@@ -337,8 +359,12 @@ fn handle_read(cursor: &mut &[u8], ctx: &NfsContext, current_fh: Option<&NfsFh4>
     )
 }
 
-/// Handle WRITE operation (returns ROFS for now).
-fn handle_write(cursor: &mut &[u8]) -> Vec<u8> {
+/// Handle WRITE operation.
+///
+/// The write path is not yet implemented. `unsupported_status` carries the
+/// mode-dependent refusal: `NFS4ERR_ROFS` on a read-only export, otherwise
+/// `NFS4ERR_NOTSUPP`.
+fn handle_write(cursor: &mut &[u8], unsupported_status: u32) -> Vec<u8> {
     if let Ok((_, rest)) = xdr::decode_stateid(cursor)
         && let Ok((_, rest)) = xdr::decode_u64(rest)
         && let Ok((_, rest)) = xdr::decode_u32(rest)
@@ -346,7 +372,7 @@ fn handle_write(cursor: &mut &[u8]) -> Vec<u8> {
     {
         *cursor = rest;
     }
-    op_status_reply(NFS4ERR_ROFS)
+    op_status_reply(unsupported_status)
 }
 
 /// Handle OPEN operation (minimal — creates state but no real file I/O).
@@ -458,8 +484,16 @@ fn handle_close(cursor: &mut &[u8], state_mgr: &Arc<StateManager>) -> Vec<u8> {
     reply
 }
 
-/// Handle CREATE operation (returns ROFS for now).
-fn handle_create(cursor: &mut &[u8], current_fh: Option<&NfsFh4>) -> Vec<u8> {
+/// Handle CREATE operation.
+///
+/// The write path is not yet implemented. `unsupported_status` carries the
+/// mode-dependent refusal: `NFS4ERR_ROFS` on a read-only export, otherwise
+/// `NFS4ERR_NOTSUPP`.
+fn handle_create(
+    cursor: &mut &[u8],
+    current_fh: Option<&NfsFh4>,
+    unsupported_status: u32,
+) -> Vec<u8> {
     let Ok((_obj_type, rest)) = xdr::decode_u32(cursor) else {
         return op_status_reply(NFS4ERR_INVAL);
     };
@@ -475,25 +509,38 @@ fn handle_create(cursor: &mut &[u8], current_fh: Option<&NfsFh4>) -> Vec<u8> {
     }
 
     let _ = current_fh;
-    op_status_reply(NFS4ERR_ROFS)
+    op_status_reply(unsupported_status)
 }
 
-/// Handle REMOVE operation (returns ROFS for now).
-fn handle_remove(cursor: &mut &[u8], current_fh: Option<&NfsFh4>) -> Vec<u8> {
+/// Handle REMOVE operation.
+///
+/// The write path is not yet implemented. `unsupported_status` carries the
+/// mode-dependent refusal: `NFS4ERR_ROFS` on a read-only export, otherwise
+/// `NFS4ERR_NOTSUPP`.
+fn handle_remove(
+    cursor: &mut &[u8],
+    current_fh: Option<&NfsFh4>,
+    unsupported_status: u32,
+) -> Vec<u8> {
     let Ok((_name, rest)) = xdr::decode_string(cursor) else {
         return op_status_reply(NFS4ERR_INVAL);
     };
     *cursor = rest;
 
     let _ = current_fh;
-    op_status_reply(NFS4ERR_ROFS)
+    op_status_reply(unsupported_status)
 }
 
-/// Handle RENAME operation (returns ROFS for now).
+/// Handle RENAME operation.
+///
+/// The write path is not yet implemented. `unsupported_status` carries the
+/// mode-dependent refusal: `NFS4ERR_ROFS` on a read-only export, otherwise
+/// `NFS4ERR_NOTSUPP`.
 fn handle_rename(
     cursor: &mut &[u8],
     current_fh: Option<&NfsFh4>,
     saved_fh: Option<&NfsFh4>,
+    unsupported_status: u32,
 ) -> Vec<u8> {
     let Ok((_oldname, rest)) = xdr::decode_string(cursor) else {
         return op_status_reply(NFS4ERR_INVAL);
@@ -506,7 +553,7 @@ fn handle_rename(
     *cursor = rest;
 
     let _ = (current_fh, saved_fh);
-    op_status_reply(NFS4ERR_ROFS)
+    op_status_reply(unsupported_status)
 }
 
 /// Build attributes for a path.
@@ -607,7 +654,7 @@ mod tests {
     fn compound_putrootfh_getfh() {
         let (ctx, state_mgr) = test_ctx();
         let args = build_compound(&[(OP_PUTROOTFH, &[]), (OP_GETFH, &[])]);
-        let reply = handle_compound(&args, &ctx, &state_mgr);
+        let reply = handle_compound(&args, &ctx, &state_mgr, NfsCacheMode::Minimal);
         let (status, _) = xdr::decode_u32(&reply).unwrap();
         assert_eq!(status, NFS4_OK);
     }
@@ -619,7 +666,7 @@ mod tests {
         xdr::encode_attr_bitmap(&mut bitmap_args, &[FATTR4_TYPE, FATTR4_SIZE]);
 
         let args = build_compound(&[(OP_PUTROOTFH, &[]), (OP_GETATTR, &bitmap_args)]);
-        let reply = handle_compound(&args, &ctx, &state_mgr);
+        let reply = handle_compound(&args, &ctx, &state_mgr, NfsCacheMode::Minimal);
         let (status, _) = xdr::decode_u32(&reply).unwrap();
         assert_eq!(status, NFS4_OK);
     }
@@ -635,7 +682,7 @@ mod tests {
             (OP_LOOKUP, &lookup_args),
             (OP_GETFH, &[]),
         ]);
-        let reply = handle_compound(&args, &ctx, &state_mgr);
+        let reply = handle_compound(&args, &ctx, &state_mgr, NfsCacheMode::Minimal);
         let (status, _) = xdr::decode_u32(&reply).unwrap();
         assert_eq!(status, NFS4_OK);
     }
@@ -644,7 +691,7 @@ mod tests {
     fn compound_getfh_without_putfh_fails() {
         let (ctx, state_mgr) = test_ctx();
         let args = build_compound(&[(OP_GETFH, &[])]);
-        let reply = handle_compound(&args, &ctx, &state_mgr);
+        let reply = handle_compound(&args, &ctx, &state_mgr, NfsCacheMode::Minimal);
         let (status, _) = xdr::decode_u32(&reply).unwrap();
         assert_eq!(status, NFS4ERR_BADHANDLE);
     }
@@ -656,7 +703,7 @@ mod tests {
         xdr::encode_u32(&mut access_args, ACCESS4_READ | ACCESS4_LOOKUP);
 
         let args = build_compound(&[(OP_PUTROOTFH, &[]), (OP_ACCESS, &access_args)]);
-        let reply = handle_compound(&args, &ctx, &state_mgr);
+        let reply = handle_compound(&args, &ctx, &state_mgr, NfsCacheMode::Minimal);
         let (status, _) = xdr::decode_u32(&reply).unwrap();
         assert_eq!(status, NFS4_OK);
     }
@@ -674,24 +721,38 @@ mod tests {
             (OP_RESTOREFH, &[]),
             (OP_GETFH, &[]),
         ]);
-        let reply = handle_compound(&args, &ctx, &state_mgr);
+        let reply = handle_compound(&args, &ctx, &state_mgr, NfsCacheMode::Minimal);
         let (status, _) = xdr::decode_u32(&reply).unwrap();
         assert_eq!(status, NFS4_OK);
     }
 
-    #[test]
-    fn compound_write_returns_rofs() {
-        let (ctx, state_mgr) = test_ctx();
+    fn write_compound_args() -> Vec<u8> {
         let mut write_args = Vec::new();
         xdr::encode_stateid(&mut write_args, &super::super::xdr::StateId::zero());
         xdr::encode_u64(&mut write_args, 0);
         xdr::encode_u32(&mut write_args, 0);
         xdr::encode_opaque(&mut write_args, b"test");
+        build_compound(&[(OP_PUTROOTFH, &[]), (OP_WRITE, &write_args)])
+    }
 
-        let args = build_compound(&[(OP_PUTROOTFH, &[]), (OP_WRITE, &write_args)]);
-        let reply = handle_compound(&args, &ctx, &state_mgr);
+    #[test]
+    fn write_on_read_only_export_returns_rofs() {
+        let (ctx, state_mgr) = test_ctx();
+        let args = write_compound_args();
+        let reply = handle_compound(&args, &ctx, &state_mgr, NfsCacheMode::Off);
         let (status, _) = xdr::decode_u32(&reply).unwrap();
         assert_eq!(status, NFS4ERR_ROFS);
+    }
+
+    #[test]
+    fn write_on_write_capable_export_returns_notsupp() {
+        let (ctx, state_mgr) = test_ctx();
+        for mode in [NfsCacheMode::Minimal, NfsCacheMode::Full] {
+            let args = write_compound_args();
+            let reply = handle_compound(&args, &ctx, &state_mgr, mode);
+            let (status, _) = xdr::decode_u32(&reply).unwrap();
+            assert_eq!(status, NFS4ERR_NOTSUPP);
+        }
     }
 
     #[test]
@@ -704,7 +765,7 @@ mod tests {
         xdr::encode_stateid(&mut close_args, &sid);
 
         let args = build_compound(&[(OP_PUTROOTFH, &[]), (OP_CLOSE, &close_args)]);
-        let reply = handle_compound(&args, &ctx, &state_mgr);
+        let reply = handle_compound(&args, &ctx, &state_mgr, NfsCacheMode::Minimal);
         let (status, _) = xdr::decode_u32(&reply).unwrap();
         assert_eq!(status, NFS4_OK);
 
@@ -723,7 +784,7 @@ mod tests {
             (OP_LOOKUPP, &[]),
             (OP_GETFH, &[]),
         ]);
-        let reply = handle_compound(&args, &ctx, &state_mgr);
+        let reply = handle_compound(&args, &ctx, &state_mgr, NfsCacheMode::Minimal);
         let (status, _) = xdr::decode_u32(&reply).unwrap();
         assert_eq!(status, NFS4_OK);
     }

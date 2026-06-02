@@ -25,6 +25,7 @@ pub const NFS4ERR_NAMETOOLONG: u32 = 63;
 pub const NFS4ERR_NOTEMPTY: u32 = 66;
 pub const NFS4ERR_STALE: u32 = 70;
 pub const NFS4ERR_BADHANDLE: u32 = 10001;
+pub const NFS4ERR_NOTSUPP: u32 = 10004;
 pub const NFS4ERR_BAD_STATEID: u32 = 10026;
 pub const NFS4ERR_GRACE: u32 = 10035;
 
