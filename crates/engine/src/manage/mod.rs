@@ -83,6 +83,42 @@ pub enum Capability {
 }
 
 impl Capability {
+    /// The stable wire/storage identifier for this capability — the
+    /// colon-delimited form from the design document (`status:read`, …). This
+    /// is the same string the serde representation uses; it is exposed
+    /// directly so storage code can persist a capability without routing
+    /// through JSON.
+    #[must_use]
+    pub const fn as_wire(self) -> &'static str {
+        match self {
+            Self::StatusRead => "status:read",
+            Self::PinWrite => "pin:write",
+            Self::CacheManage => "cache:manage",
+            Self::ConfigPush => "config:push",
+            Self::PolicySet => "policy:set",
+            Self::BackendManage => "backend:manage",
+            Self::LifecycleControl => "lifecycle:control",
+            Self::GrantAdmin => "grant:admin",
+        }
+    }
+
+    /// Parse a capability from its [wire form](Self::as_wire). Returns `None`
+    /// for an unrecognised identifier.
+    #[must_use]
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "status:read" => Some(Self::StatusRead),
+            "pin:write" => Some(Self::PinWrite),
+            "cache:manage" => Some(Self::CacheManage),
+            "config:push" => Some(Self::ConfigPush),
+            "policy:set" => Some(Self::PolicySet),
+            "backend:manage" => Some(Self::BackendManage),
+            "lifecycle:control" => Some(Self::LifecycleControl),
+            "grant:admin" => Some(Self::GrantAdmin),
+            _ => None,
+        }
+    }
+
     /// Whether this capability is *dangerous* — meaning it can never be
     /// implicitly satisfied by a node-wide / wildcard grant. A dangerous
     /// capability must be granted explicitly for the exact scope it is
@@ -114,11 +150,38 @@ pub enum Scope {
     },
 }
 
+/// The storage discriminant for a node-wide [`Scope`].
+pub const SCOPE_KIND_NODE: &str = "node";
+/// The storage discriminant for a folder [`Scope`].
+pub const SCOPE_KIND_FOLDER: &str = "folder";
+
 impl Scope {
     /// Construct a folder scope from a path.
     #[must_use]
     pub fn folder(path: impl Into<String>) -> Self {
         Self::Folder { path: path.into() }
+    }
+
+    /// Decompose a scope into its two storage columns: a kind discriminant and
+    /// an optional path. A [`Scope::Node`] has no path; a [`Scope::Folder`]
+    /// always carries one.
+    #[must_use]
+    pub const fn to_columns(&self) -> (&'static str, Option<&str>) {
+        match self {
+            Self::Node => (SCOPE_KIND_NODE, None),
+            Self::Folder { path } => (SCOPE_KIND_FOLDER, Some(path.as_str())),
+        }
+    }
+
+    /// Reconstruct a scope from its two storage columns. Returns `None` for an
+    /// unrecognised kind, or for a folder kind missing its path.
+    #[must_use]
+    pub fn from_columns(kind: &str, path: Option<String>) -> Option<Self> {
+        match kind {
+            SCOPE_KIND_NODE => Some(Self::Node),
+            SCOPE_KIND_FOLDER => path.map(|path| Self::Folder { path }),
+            _ => None,
+        }
     }
 
     /// Whether `self` (a held grant's scope) covers `target` (the scope an

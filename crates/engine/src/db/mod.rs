@@ -1,6 +1,7 @@
 pub mod schema;
 
 use crate::db::schema::SchemaVersion;
+use crate::manage::{Capability, DeviceId, Grant, Scope};
 use crate::types::{CacheState, Cursor, FileEntry, ItemId};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -740,6 +741,247 @@ impl StateDb {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(peers)
     }
+
+    // ── Management-plane grant operations ──
+
+    /// Insert a capability grant. Returns the row id assigned by `SQLite`.
+    pub fn insert_grant(&self, grant: &Grant) -> Result<i64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let (scope_kind, scope_path) = grant.scope.to_columns();
+        conn.execute(
+            "INSERT INTO grants (grantee, capability, scope_kind, scope_path, granted_by, expires)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (
+                grant.grantee.as_str(),
+                grant.capability.as_wire(),
+                scope_kind,
+                scope_path,
+                grant.granted_by.as_str(),
+                grant.expires.map(|e| e.timestamp()),
+            ),
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// List every grant currently held, in insertion order.
+    pub fn list_grants(&self) -> Result<Vec<GrantRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, grantee, capability, scope_kind, scope_path, granted_by, expires
+             FROM grants ORDER BY id ASC",
+        )?;
+        let rows = stmt
+            .query_map([], Self::grant_record_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter().map(GrantRecord::try_from_raw).collect()
+    }
+
+    /// Revoke a grant by its row id. Returns `true` if a row was deleted.
+    pub fn revoke_grant(&self, id: i64) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let rows = conn.execute("DELETE FROM grants WHERE id = ?1", [id])?;
+        Ok(rows > 0)
+    }
+
+    /// Read a raw grant row. The capability and scope are validated by
+    /// [`GrantRecord::try_from_raw`] after the SQL boundary.
+    fn grant_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawGrantRow> {
+        let expires_ts: Option<i64> = row.get(6)?;
+        Ok(RawGrantRow {
+            id: row.get(0)?,
+            grantee: row.get(1)?,
+            capability: row.get(2)?,
+            scope_kind: row.get(3)?,
+            scope_path: row.get(4)?,
+            granted_by: row.get(5)?,
+            expires: expires_ts.and_then(|ts| DateTime::from_timestamp(ts, 0)),
+        })
+    }
+
+    // ── Management-plane audit operations ──
+
+    /// Append an audit row. The audit log is append-only — there is
+    /// deliberately no update or delete path.
+    pub fn append_audit(&self, entry: &AuditEntry) -> Result<i64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let (scope_kind, scope_path) = entry.scope.to_columns();
+        conn.execute(
+            "INSERT INTO manage_audit
+                 (timestamp, actor_device, capability, scope_kind, scope_path, command, outcome)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            (
+                entry.timestamp.timestamp(),
+                entry.actor_device.as_str(),
+                entry.capability.as_wire(),
+                scope_kind,
+                scope_path,
+                &entry.command,
+                &entry.outcome,
+            ),
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// List audit rows in append order (ascending row id, which is also
+    /// chronological for a monotonic clock).
+    pub fn list_audit(&self) -> Result<Vec<AuditRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, timestamp, actor_device, capability, scope_kind, scope_path, command, outcome
+             FROM manage_audit ORDER BY id ASC",
+        )?;
+        let rows = stmt
+            .query_map([], Self::audit_record_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter().map(AuditRecord::try_from_raw).collect()
+    }
+
+    /// Read a raw audit row. The capability and scope are validated by
+    /// [`AuditRecord::try_from_raw`] after the SQL boundary.
+    fn audit_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawAuditRow> {
+        let timestamp_ts: i64 = row.get(1)?;
+        Ok(RawAuditRow {
+            id: row.get(0)?,
+            timestamp: timestamp_ts,
+            actor_device: row.get(2)?,
+            capability: row.get(3)?,
+            scope_kind: row.get(4)?,
+            scope_path: row.get(5)?,
+            command: row.get(6)?,
+            outcome: row.get(7)?,
+        })
+    }
+}
+
+/// Raw column values for a `grants` row, before validation.
+struct RawGrantRow {
+    id: i64,
+    grantee: String,
+    capability: String,
+    scope_kind: String,
+    scope_path: Option<String>,
+    granted_by: String,
+    expires: Option<DateTime<Utc>>,
+}
+
+/// A capability grant row from the database, with its row id.
+#[derive(Debug, Clone)]
+pub struct GrantRecord {
+    /// The `SQLite` row id, used to revoke the grant.
+    pub id: i64,
+    /// The grant itself.
+    pub grant: Grant,
+}
+
+impl GrantRecord {
+    /// Validate a raw grant row into a typed record. Fails loudly if the
+    /// stored capability or scope cannot be parsed, rather than silently
+    /// dropping an unrecognised grant.
+    fn try_from_raw(raw: RawGrantRow) -> Result<Self> {
+        let capability = Capability::from_wire(&raw.capability).ok_or_else(|| {
+            anyhow::anyhow!("unknown capability in grant {}: {}", raw.id, raw.capability)
+        })?;
+        let scope = Scope::from_columns(&raw.scope_kind, raw.scope_path).ok_or_else(|| {
+            anyhow::anyhow!("invalid scope kind in grant {}: {}", raw.id, raw.scope_kind)
+        })?;
+        Ok(Self {
+            id: raw.id,
+            grant: Grant {
+                grantee: DeviceId::new(raw.grantee),
+                capability,
+                scope,
+                granted_by: DeviceId::new(raw.granted_by),
+                expires: raw.expires,
+            },
+        })
+    }
+}
+
+/// An audit entry to append — the input side of the append-only audit log.
+#[derive(Debug, Clone)]
+pub struct AuditEntry {
+    /// When the command was processed.
+    pub timestamp: DateTime<Utc>,
+    /// The device that issued the command.
+    pub actor_device: DeviceId,
+    /// The capability the command exercised.
+    pub capability: Capability,
+    /// The scope the command targeted.
+    pub scope: Scope,
+    /// A short human-readable summary of the command.
+    pub command: String,
+    /// The outcome (for example `allowed`, `denied`, or an error summary).
+    pub outcome: String,
+}
+
+/// Raw column values for a `manage_audit` row, before validation.
+struct RawAuditRow {
+    id: i64,
+    timestamp: i64,
+    actor_device: String,
+    capability: String,
+    scope_kind: String,
+    scope_path: Option<String>,
+    command: String,
+    outcome: String,
+}
+
+/// An audit row read back from the database, with its row id.
+#[derive(Debug, Clone)]
+pub struct AuditRecord {
+    /// The `SQLite` row id (monotonic, hence the append order).
+    pub id: i64,
+    /// The audit entry.
+    pub entry: AuditEntry,
+}
+
+impl AuditRecord {
+    /// Validate a raw audit row into a typed record. Fails loudly if the
+    /// stored timestamp, capability, or scope cannot be parsed.
+    fn try_from_raw(raw: RawAuditRow) -> Result<Self> {
+        let timestamp = DateTime::from_timestamp(raw.timestamp, 0)
+            .ok_or_else(|| anyhow::anyhow!("invalid audit timestamp in row {}", raw.id))?;
+        let capability = Capability::from_wire(&raw.capability).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown capability in audit row {}: {}",
+                raw.id,
+                raw.capability
+            )
+        })?;
+        let scope = Scope::from_columns(&raw.scope_kind, raw.scope_path).ok_or_else(|| {
+            anyhow::anyhow!(
+                "invalid scope kind in audit row {}: {}",
+                raw.id,
+                raw.scope_kind
+            )
+        })?;
+        Ok(Self {
+            id: raw.id,
+            entry: AuditEntry {
+                timestamp,
+                actor_device: DeviceId::new(raw.actor_device),
+                capability,
+                scope,
+                command: raw.command,
+                outcome: raw.outcome,
+            },
+        })
+    }
 }
 
 /// A registered backend row from the database.
@@ -922,5 +1164,114 @@ mod tests {
         let db = StateDb::open_in_memory().unwrap();
         let file_id = ItemId::new("gdrive", "nonexistent");
         assert_eq!(db.is_dirty(&file_id).unwrap(), None);
+    }
+
+    // ── Management-plane grant tests ──
+
+    fn sample_grant() -> Grant {
+        Grant {
+            grantee: DeviceId::new("MANAGER"),
+            capability: Capability::PinWrite,
+            scope: Scope::folder("/work"),
+            granted_by: DeviceId::new("OWNER"),
+            expires: None,
+        }
+    }
+
+    #[test]
+    fn test_grant_insert_list_revoke_round_trip() {
+        let db = StateDb::open_in_memory().unwrap();
+        assert!(db.list_grants().unwrap().is_empty());
+
+        let id = db.insert_grant(&sample_grant()).unwrap();
+
+        let listed = db.list_grants().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, id);
+        assert_eq!(listed[0].grant, sample_grant());
+
+        assert!(db.revoke_grant(id).unwrap());
+        assert!(db.list_grants().unwrap().is_empty());
+        // Revoking again finds nothing.
+        assert!(!db.revoke_grant(id).unwrap());
+    }
+
+    #[test]
+    fn test_grant_node_scope_and_expiry_round_trip() {
+        let db = StateDb::open_in_memory().unwrap();
+        let expiry = chrono::DateTime::from_timestamp(1_900_000_000, 0).unwrap();
+        let grant = Grant {
+            grantee: DeviceId::new("MANAGER"),
+            capability: Capability::StatusRead,
+            scope: Scope::Node,
+            granted_by: DeviceId::new("OWNER"),
+            expires: Some(expiry),
+        };
+        db.insert_grant(&grant).unwrap();
+
+        let listed = db.list_grants().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].grant.scope, Scope::Node);
+        assert_eq!(listed[0].grant.expires, Some(expiry));
+    }
+
+    #[test]
+    fn test_grants_list_in_insertion_order() {
+        let db = StateDb::open_in_memory().unwrap();
+        let first = db.insert_grant(&sample_grant()).unwrap();
+        let second = db
+            .insert_grant(&Grant {
+                capability: Capability::CacheManage,
+                ..sample_grant()
+            })
+            .unwrap();
+        let listed = db.list_grants().unwrap();
+        assert_eq!(listed[0].id, first);
+        assert_eq!(listed[1].id, second);
+    }
+
+    // ── Management-plane audit tests ──
+
+    fn audit_entry(command: &str, secs: i64) -> AuditEntry {
+        AuditEntry {
+            timestamp: chrono::DateTime::from_timestamp(secs, 0).unwrap(),
+            actor_device: DeviceId::new("MANAGER"),
+            capability: Capability::PinWrite,
+            scope: Scope::folder("/work"),
+            command: command.to_string(),
+            outcome: "allowed".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_audit_append_and_list_round_trip() {
+        let db = StateDb::open_in_memory().unwrap();
+        assert!(db.list_audit().unwrap().is_empty());
+
+        let entry = audit_entry("pin /work/report", 1_800_000_000);
+        let id = db.append_audit(&entry).unwrap();
+
+        let listed = db.list_audit().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, id);
+        assert_eq!(listed[0].entry.command, "pin /work/report");
+        assert_eq!(listed[0].entry.capability, Capability::PinWrite);
+        assert_eq!(listed[0].entry.scope, Scope::folder("/work"));
+        assert_eq!(listed[0].entry.outcome, "allowed");
+    }
+
+    #[test]
+    fn test_audit_is_append_only_and_ordered() {
+        let db = StateDb::open_in_memory().unwrap();
+        // Append three entries; later entries get larger row ids regardless of
+        // timestamp, so the listing preserves append order.
+        let a = db.append_audit(&audit_entry("first", 1_000)).unwrap();
+        let b = db.append_audit(&audit_entry("second", 999)).unwrap();
+        let c = db.append_audit(&audit_entry("third", 1_001)).unwrap();
+        assert!(a < b && b < c);
+
+        let listed = db.list_audit().unwrap();
+        let commands: Vec<&str> = listed.iter().map(|r| r.entry.command.as_str()).collect();
+        assert_eq!(commands, ["first", "second", "third"]);
     }
 }

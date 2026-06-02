@@ -9,7 +9,7 @@ impl SchemaVersion {
     /// Current schema version.
     #[must_use]
     pub const fn current() -> Self {
-        Self(1)
+        Self(2)
     }
 }
 
@@ -18,8 +18,9 @@ pub fn migrate(conn: &Connection, from: SchemaVersion, _to: SchemaVersion) -> Re
     if from < SchemaVersion(1) {
         v1_init(conn)?;
     }
-    // Future migrations:
-    // if to >= SchemaVersion(2) && from < SchemaVersion(2) { v2_xxx(conn)?; }
+    if from < SchemaVersion(2) {
+        v2_manage_plane(conn)?;
+    }
 
     Ok(())
 }
@@ -113,6 +114,46 @@ fn v1_init(conn: &Connection) -> Result<()> {
         );
 
         CREATE INDEX IF NOT EXISTS idx_block_hash ON p2p_block_index(block_hash);
+        ",
+    )?;
+
+    Ok(())
+}
+
+/// Schema v2 — the node management plane.
+///
+/// Two tables back the capability model in [`crate::manage`]: `grants` holds
+/// the capability grants resolved at authorisation time, and `manage_audit` is
+/// an append-only log of every management command the node processed. The
+/// audit table has no `UPDATE` or `DELETE` path in the typed API so a
+/// compromised manager cannot erase its tracks.
+fn v2_manage_plane(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS grants (
+            id            INTEGER PRIMARY KEY,
+            grantee       TEXT NOT NULL,
+            capability    TEXT NOT NULL,
+            scope_kind    TEXT NOT NULL,
+            scope_path    TEXT,
+            granted_by    TEXT NOT NULL,
+            expires       INTEGER
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_grants_grantee ON grants(grantee);
+
+        CREATE TABLE IF NOT EXISTS manage_audit (
+            id            INTEGER PRIMARY KEY,
+            timestamp     INTEGER NOT NULL,
+            actor_device  TEXT NOT NULL,
+            capability    TEXT NOT NULL,
+            scope_kind    TEXT NOT NULL,
+            scope_path    TEXT,
+            command       TEXT NOT NULL,
+            outcome       TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_manage_audit_ts ON manage_audit(timestamp);
         ",
     )?;
 
