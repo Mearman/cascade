@@ -978,10 +978,11 @@ mod tests {
 ///
 /// These run against an in-process `mainline::Testnet` — a small swarm of DHT
 /// nodes bound to local UDP sockets. They exercise the real BEP44
-/// store-and-fetch path the offline `MockDht` tests cannot, but because they
-/// bind UDP and bootstrap a swarm they are `#[ignore]`'d so the standard
-/// offline `cargo test` run stays green. Run them explicitly with
-/// `cargo test -p cascade-p2p --features dht -- --ignored`.
+/// store-and-fetch and republish-supersession paths the offline `MockDht` tests
+/// cannot, but because they bind UDP and bootstrap a swarm they are
+/// `#[ignore]`'d so the standard offline `cargo test` run stays green. Run them
+/// explicitly with `cargo test -p cascade-p2p --features dht -- --ignored`; the
+/// `DHT live tests (local mainline testnet)` CI job runs exactly this.
 #[cfg(all(test, feature = "dht"))]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod live_tests {
@@ -1061,5 +1062,58 @@ mod live_tests {
         let discovery = DhtDiscovery::new(node);
 
         assert!(discovery.resolve("NEVER-ANNOUNCED").await.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "binds local UDP sockets and bootstraps a DHT swarm"]
+    async fn republishing_supersedes_the_earlier_value_over_a_live_testnet() {
+        // Republish is what keeps an announced candidate set continuously
+        // present: BEP44 mutable items are soft state that a storing node drops
+        // if it is not refreshed within the expiry window (see
+        // `DHT_REPUBLISH_INTERVAL`'s derivation from `BEP44_VALUE_EXPIRY_SECS`).
+        // Each refresh is a `put_mutable` carrying a higher sequence number, and
+        // a resolver must read back the *most recent* value, not a stale one.
+        //
+        // This is the live counterpart of the offline `re_announce_replaces_
+        // the_stored_set` mock test: it drives the real BEP44 sequence-number
+        // path against the swarm, so a regression where republish stopped
+        // bumping the seq (or the read stopped preferring the highest seq) — a
+        // class of bug the mock cannot see, because the mock simply overwrites
+        // its map entry — fails here. The announcer republishes and a *separate*
+        // resolver reads, so the supersession is observed across nodes exactly
+        // as a real refresh-then-lookup would be.
+        //
+        // The two announces bracket a full live resolve, so the wall-clock
+        // sequence numbers (`unix_millis`) are milliseconds apart and the second
+        // strictly exceeds the first — the republish supersedes rather than
+        // racing the earlier write.
+        let testnet = Testnet::builder(10).build().unwrap();
+        let bootstrap = bootstrap_addrs(&testnet);
+
+        let announcer = DhtDiscovery::new(MainlineDht::open_local(&bootstrap).unwrap());
+        let resolver = DhtDiscovery::new(MainlineDht::open_local(&bootstrap).unwrap());
+
+        let first = Candidate::new(addr(22000), CandidateKind::Host, 65_535);
+        announcer.announce("DEVICE-A", &[first]).await;
+
+        // The first publication is readable before the refresh.
+        let before = resolver.resolve("DEVICE-A").await;
+        assert_eq!(
+            before,
+            vec![first],
+            "the first announced value must be readable before the republish",
+        );
+
+        // Republish a different candidate set under the same device id. The
+        // higher wall-clock sequence number must make this value win.
+        let refreshed = Candidate::new(addr(44000), CandidateKind::ServerReflexive, 0);
+        announcer.announce("DEVICE-A", &[refreshed]).await;
+
+        let after = resolver.resolve("DEVICE-A").await;
+        assert_eq!(
+            after,
+            vec![refreshed],
+            "the republished value must supersede the earlier one on resolve",
+        );
     }
 }
