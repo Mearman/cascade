@@ -853,6 +853,55 @@ fn is_ipv6_link_local(addr: Ipv6Addr) -> bool {
         .is_some_and(|first| (first & 0xffc0) == 0xfe80)
 }
 
+/// The top two bits of an `IPv6` unique-local address (`fc00::/7`).
+/// `fc00::/7` covers `fc00::/8` and `fd00::/8`; masking the top byte
+/// with `0xfe` and comparing against `0xfc` matches both.
+const IPV6_ULA_PREFIX: u16 = 0xfc00;
+
+/// Mask isolating the `fc00::/7` prefix on the leading `IPv6` segment.
+const IPV6_ULA_MASK: u16 = 0xfe00;
+
+/// Is `addr` an `IPv6` unique-local address (`fc00::/7`)?
+///
+/// `Ipv6Addr::is_unique_local` is the natural answer but it is still
+/// unstable on the pinned toolchain, so the prefix check is implemented
+/// directly to stay on stable Rust — mirroring [`is_ipv6_link_local`].
+fn is_ipv6_unique_local(addr: Ipv6Addr) -> bool {
+    addr.segments()
+        .into_iter()
+        .next()
+        .is_some_and(|first| (first & IPV6_ULA_MASK) == IPV6_ULA_PREFIX)
+}
+
+/// Is `ip` an address that could be reachable from a peer on the public
+/// Internet, i.e. a candidate for a genuine server-reflexive mapping?
+///
+/// Peer-as-`STUN` only conveys new reachability information when the
+/// observing peer sits *outside* this host's `NAT`. A peer on the same
+/// LAN observes a private, loopback, or link-local source; advertising
+/// that to off-LAN peers as a public mapping pollutes their peer book
+/// the way real `STUN` never does — `STUN` servers never return a
+/// private mapping. Rejecting non-globally-routable addresses keeps the
+/// gossiped external set and the `Candidates` frame clean by
+/// construction.
+///
+/// This is deliberately conservative: it excludes everything that is
+/// definitely not globally routable (loopback, unspecified, `IPv4`
+/// private/link-local ranges, `IPv6` link-local and unique-local) and
+/// admits the rest. It is not a full `IANA` special-purpose registry
+/// check — the goal is to drop same-LAN and loopback observations, not
+/// to police every reserved block.
+#[must_use]
+pub fn is_globally_routable_ip(ip: IpAddr) -> bool {
+    if ip.is_loopback() || ip.is_unspecified() {
+        return false;
+    }
+    match ip {
+        IpAddr::V4(v4) => !(v4.is_private() || v4.is_link_local()),
+        IpAddr::V6(v6) => !(is_ipv6_link_local(v6) || is_ipv6_unique_local(v6)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1618,5 +1667,59 @@ mod tests {
         assert!(!is_ipv6_link_local(Ipv6Addr::new(
             0x2001, 0xdb8, 0, 0, 0, 0, 0, 1
         )));
+    }
+
+    #[test]
+    fn ipv6_unique_local_classifier_matches_prefix() {
+        // fc00::/7 covers both fc00::/8 and fd00::/8.
+        assert!(is_ipv6_unique_local(Ipv6Addr::new(
+            0xfc00, 0, 0, 0, 0, 0, 0, 1
+        )));
+        assert!(is_ipv6_unique_local(Ipv6Addr::new(
+            0xfd12, 0x3456, 0, 0, 0, 0, 0, 1
+        )));
+        // fe80::/10 is link-local, not unique-local.
+        assert!(!is_ipv6_unique_local(Ipv6Addr::new(
+            0xfe80, 0, 0, 0, 0, 0, 0, 1
+        )));
+        // Global unicast documentation prefix is not unique-local.
+        assert!(!is_ipv6_unique_local(Ipv6Addr::new(
+            0x2001, 0xdb8, 0, 0, 0, 0, 0, 1
+        )));
+    }
+
+    #[test]
+    fn globally_routable_rejects_non_routable_and_admits_public() {
+        // Non-routable: loopback, unspecified, RFC1918, link-local, ULA.
+        for ip in [
+            "127.0.0.1",
+            "0.0.0.0",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.0.1",
+            "169.254.1.1",
+            "::1",
+            "::",
+            "fe80::1",
+            "fc00::1",
+            "fd00::1",
+        ] {
+            let parsed: IpAddr = ip.parse().expect("valid IP literal");
+            assert!(
+                !is_globally_routable_ip(parsed),
+                "{ip} must be classified as non-routable",
+            );
+        }
+
+        // Routable public-ish addresses (documentation ranges count as
+        // routable for this conservative check — they are not private,
+        // loopback, or link-local).
+        for ip in ["198.51.100.7", "203.0.113.7", "8.8.8.8", "2001:db8::1"] {
+            let parsed: IpAddr = ip.parse().expect("valid IP literal");
+            assert!(
+                is_globally_routable_ip(parsed),
+                "{ip} must be classified as routable",
+            );
+        }
     }
 }
