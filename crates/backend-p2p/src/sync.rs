@@ -55,7 +55,10 @@ use cascade_p2p::identity::DeviceIdentity;
 use cascade_p2p::nat::{
     enumerate_host_candidates, is_globally_routable_ip, server_reflexive_candidate_from_addr,
 };
-use cascade_p2p::protocol::{BepMessage, FileInfo, Folder, GossipPeer, Version};
+use cascade_p2p::pipe::ByteMeter;
+use cascade_p2p::protocol::{
+    BepMessage, FileInfo, Folder, GossipPeer, MAX_RELAY_OFFER_ADDRESSES, Version,
+};
 use cascade_p2p::store::BlockStore;
 use cascade_p2p::transport::{
     RelayTransport, Transport, TransportReader, TransportWriter, UdpFlowTransport,
@@ -187,6 +190,11 @@ const FILE_TYPE_DIR: u32 = 1;
 /// Wall-clock timeout for a block request to a single peer.
 const BLOCK_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// [`MAX_RELAY_OFFER_ADDRESSES`] as a `usize` for length comparisons when
+/// building an offer. Derived from the protocol constant so the volunteer's
+/// self-imposed cap can never drift from the encoder's ceiling.
+const MAX_RELAY_OFFER_ADDRESSES_USIZE: usize = MAX_RELAY_OFFER_ADDRESSES as usize;
+
 /// Wall-clock window granted for a hole-punch attempt. Both peers must
 /// have signalled `SyncPunch` and emitted their first burst before the
 /// nonce expires. Five seconds matches the upper bound documented in
@@ -309,20 +317,6 @@ struct PeerHandle {
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<u8>>>>>,
     /// Source of fresh `request_id` values for outbound Request frames.
     next_request_id: Arc<AtomicU64>,
-}
-
-/// One half of a relay bridge this node is volunteering.
-///
-/// Created when a [`BepMessage::RelayConnect`] is admitted on the
-/// requester's session. Holds the device id the requester wants to reach
-/// and the admission slot; dropping it (when the bridge tears down)
-/// releases the slot so the relay-session count tracks live bridges.
-#[derive(Debug)]
-struct RelayBridge {
-    /// Device id the requester wants relayed traffic forwarded to.
-    target: String,
-    /// Admission slot, released on drop.
-    _guard: peer_relay::RelaySessionGuard,
 }
 
 impl PeerHandle {
@@ -464,12 +458,24 @@ pub struct SyncEngine {
     /// rejecting new sessions past the limit rather than silently
     /// dropping them.
     relay_capacity: Arc<peer_relay::RelayCapacity>,
-    /// Active relay bridges this node is volunteering, keyed by the
-    /// requester's device id. Each entry records the bridge target and
-    /// holds the admission slot for the bridge's lifetime. Populated when
-    /// a `BepMessage::RelayConnect` is admitted; the entry is removed when
-    /// the requester's session ends, releasing the slot.
-    relay_bridges: Arc<Mutex<HashMap<String, RelayBridge>>>,
+    /// Active relay bridges this node is volunteering. Each bridge is
+    /// registered under BOTH bridged device ids (requester and target) so
+    /// `RelayData` arriving from either side resolves the opposite side and
+    /// return traffic flows. The two entries share one `Arc`, so the
+    /// admission slot in the [`peer_relay::RelayBridge`] is released exactly
+    /// once when the last reference drops. Populated when a
+    /// `BepMessage::RelayConnect` is admitted; both entries are removed when
+    /// either bridged session ends.
+    relay_bridges: Arc<Mutex<HashMap<String, Arc<peer_relay::RelayBridge>>>>,
+    /// Inner-session terminals this node owns as either the requester or the
+    /// target of a relayed connection, keyed by the device id of the
+    /// carrying session (the volunteer). When a `BepMessage::RelayData`
+    /// frame arrives on a session whose device id is a key here, the payload
+    /// is an inner BEP frame for the tunnelled session, so it is fed to the
+    /// terminal's reader rather than forwarded. The requester registers a
+    /// terminal in [`Self::attempt_peer_relay`]; the target registers one on
+    /// [`BepMessage::RelayInbound`].
+    relay_terminals: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>>,
 }
 
 impl SyncEngine {
@@ -506,6 +512,7 @@ impl SyncEngine {
                 crate::DEFAULT_MAX_RELAY_BANDWIDTH_BYTES_PER_SEC,
             )),
             relay_bridges: Arc::new(Mutex::new(HashMap::new())),
+            relay_terminals: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -597,6 +604,42 @@ impl SyncEngine {
             self.local_nat_type().await,
             NatType::Open | NatType::FullCone
         )
+    }
+
+    /// Reachable BEP endpoints to advertise in a [`BepMessage::RelayOffer`].
+    ///
+    /// A third peer dials one of these to open a relay session through us, so
+    /// every address must be one a peer on the public Internet can reach. The
+    /// set is the globally-routable subset of our local candidate set: the
+    /// host candidates the listener exposes plus the STUN-derived and
+    /// peer-as-`STUN` reflexive addresses, filtered to globally-routable IPs
+    /// (private, loopback and link-local addresses are never reachable from
+    /// off-LAN and would only mislead the receiver). Deduplicated, capped at
+    /// [`cascade_p2p::protocol::MAX_RELAY_OFFER_ADDRESSES`] to match the
+    /// encoder's ceiling. Empty when the listener is unbound or no routable
+    /// address is known, in which case the caller suppresses the offer.
+    async fn relay_offer_addresses(&self) -> Vec<SocketAddr> {
+        let Some(local_addr) = *self.local_listen_addr.read().await else {
+            return Vec::new();
+        };
+        let external = *self.local_external_addr.read().await;
+        let extras = self.observed_external_candidates().await;
+        let candidates = gather_local_candidates(local_addr, external, extras);
+
+        let mut addresses: Vec<SocketAddr> = Vec::new();
+        for candidate in candidates {
+            if !is_globally_routable_ip(candidate.address.ip()) {
+                continue;
+            }
+            if addresses.contains(&candidate.address) {
+                continue;
+            }
+            addresses.push(candidate.address);
+            if addresses.len() >= MAX_RELAY_OFFER_ADDRESSES_USIZE {
+                break;
+            }
+        }
+        addresses
     }
 
     /// Capacity governor for relay sessions this node bridges. Exposed so
@@ -1276,15 +1319,22 @@ impl SyncEngine {
     /// Dials the volunteer's BEP listener at `relay_address`, completes
     /// the TLS handshake (the volunteer must be a trusted device), then
     /// sends a [`BepMessage::RelayConnect`] naming the target peer. The
-    /// volunteer admits the bridge against its own session cap and
-    /// forwards [`BepMessage::RelayData`] frames between this session and
-    /// its session to `peer`. The two endpoints negotiate end-to-end
-    /// inside the relayed frames, so the volunteer sees only opaque data.
+    /// connection to the volunteer becomes a *carry* channel: it is not run
+    /// as an ordinary BEP peer session. Instead the requester runs an inner
+    /// BEP session toward the target over a [`peer_relay::PeerRelayTransport`]
+    /// — each inner frame is wrapped in a [`BepMessage::RelayData`] envelope
+    /// the volunteer forwards verbatim, and inbound `RelayData` is unwrapped
+    /// back into inner frames. The volunteer admits the bridge against its
+    /// own session cap and bridges the two carry channels, seeing only
+    /// opaque payloads.
     ///
-    /// Mirrors [`Self::attempt_relay`] for the operated path: the dial and
-    /// session wiring run in a spawned task and a dial failure is logged
-    /// rather than propagated, so the connection loop can move on to the
-    /// next peer.
+    /// This mirrors [`Self::attempt_relay`] for the operated path: there the
+    /// requester runs the inner session over
+    /// [`cascade_p2p::transport::RelayTransport`] and the relay server is a
+    /// blind transport; here the volunteer plays that blind-transport role.
+    /// The dial and session wiring run in a spawned task and a dial failure
+    /// is logged rather than propagated, so the connection loop can move on
+    /// to the next peer.
     async fn attempt_peer_relay(
         &self,
         peer: &Peer,
@@ -1335,9 +1385,9 @@ impl SyncEngine {
 
         let framed = FramedPeer::from_connection(conn)?;
         let (reader, mut writer) = framed.split();
-        // Ask the volunteer to bridge us to the target before running the
-        // session. The volunteer admits or rejects against its cap; a
-        // rejection arrives as a `Close` the session loop surfaces.
+        // Ask the volunteer to bridge us to the target before driving the
+        // carry channel. The volunteer admits or rejects against its cap; a
+        // rejection arrives as a `Close` the carry loop surfaces as EOF.
         writer
             .send(&BepMessage::RelayConnect {
                 target_device: peer.device_id.clone(),
@@ -1351,12 +1401,13 @@ impl SyncEngine {
             })?;
 
         let engine = self.clone();
+        let relay_device_owned = relay_device.to_owned();
         let target_device = peer.device_id.clone();
         tokio::spawn(async move {
             if let Err(e) = engine
-                .run_session_loop(
+                .run_relay_carry_loop(
+                    relay_device_owned.clone(),
                     target_device.clone(),
-                    None,
                     FramedHalfReader::Tls(reader),
                     FramedHalfWriter::Tls(writer),
                 )
@@ -1364,23 +1415,148 @@ impl SyncEngine {
             {
                 debug!(
                     target: "cascade::backend::p2p",
+                    relay = %relay_device_owned,
                     target = %target_device,
                     error = %e,
-                    "peer-relayed BEP session ended",
+                    "peer-relay carry channel ended",
                 );
             }
         });
         Ok(())
     }
 
-    /// Forward one relayed frame from the session identified by
-    /// `from_device` to the peer it is bridged to.
+    /// Drive one end of a peer-relay tunnel.
     ///
-    /// The bridge target was recorded on the originating session's
-    /// [`PeerHandle`] when its [`BepMessage::RelayConnect`] was admitted.
-    /// The payload is wrapped back into a [`BepMessage::RelayData`] frame
-    /// and sent verbatim; the relay never inspects it. A frame arriving on
-    /// a session with no bridge target (no `RelayConnect` was admitted) is
+    /// `carry_device` is the volunteer whose connection carries the tunnel;
+    /// `inner_device` is the far endpoint the inner BEP session talks to (the
+    /// target for a requester, the requester for a target). The carry
+    /// connection is treated as a blind transport: its only job is to ferry
+    /// [`BepMessage::RelayData`] frames. This loop:
+    ///
+    /// - registers an inner-session terminal keyed by `carry_device` so the
+    ///   shared session machinery (and this loop's own reads) route inbound
+    ///   `RelayData` payloads into the inner session;
+    /// - spawns the inner BEP session over a
+    ///   [`peer_relay::PeerRelayTransport`], keyed by `inner_device`, so the
+    ///   full handshake, index exchange and block transfer run end to end
+    ///   through the tunnel;
+    /// - pumps the carry connection: outbound `RelayData` envelopes the inner
+    ///   transport produces go out on the carry writer, and inbound frames
+    ///   are unwrapped and fed to the terminal.
+    ///
+    /// The terminal and inner peer handle are removed when the carry channel
+    /// closes.
+    async fn run_relay_carry_loop(
+        &self,
+        carry_device: String,
+        inner_device: String,
+        mut carry_reader: FramedHalfReader,
+        mut carry_writer: FramedHalfWriter,
+    ) -> Result<()> {
+        // Channel the inner transport writer pushes RelayData envelopes onto;
+        // the carry writer task drains it to the volunteer connection.
+        let (carry_tx, mut carry_rx) = mpsc::unbounded_channel::<BepMessage>();
+        // Channel carrying inbound inner frames to the inner session reader.
+        let (inner_tx, inner_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
+        // Register the terminal so any RelayData arriving for this carry
+        // session is decapsulated into the inner session rather than being
+        // treated as something to forward.
+        {
+            let mut terminals = self.relay_terminals.lock().await;
+            terminals.insert(carry_device.clone(), inner_tx.clone());
+        }
+
+        // Carry writer task: drain RelayData envelopes onto the volunteer
+        // connection.
+        let carry_device_for_writer = carry_device.clone();
+        let writer_task = tokio::spawn(async move {
+            while let Some(msg) = carry_rx.recv().await {
+                if let Err(e) = carry_writer.send(&msg).await {
+                    debug!(
+                        target: "cascade::backend::p2p",
+                        relay = %carry_device_for_writer,
+                        error = %e,
+                        "peer-relay carry writer failed",
+                    );
+                    return;
+                }
+            }
+            let _ = carry_writer.shutdown().await;
+        });
+
+        // Inner BEP session over the tunnel, keyed by the far endpoint.
+        let transport = peer_relay::PeerRelayTransport::new(carry_tx, inner_rx);
+        let engine = self.clone();
+        let inner_device_for_session = inner_device.clone();
+        let inner_task = tokio::spawn(async move {
+            if let Err(e) = engine
+                .run_transport_session(inner_device_for_session.clone(), transport)
+                .await
+            {
+                debug!(
+                    target: "cascade::backend::p2p",
+                    peer = %inner_device_for_session,
+                    error = %e,
+                    "peer-relayed inner BEP session ended",
+                );
+            }
+        });
+
+        // Carry read loop: unwrap RelayData into inner frames, surface a
+        // Close as EOF, ignore any other frame the volunteer should not be
+        // sending on a carry channel.
+        let result = loop {
+            match carry_reader.recv().await {
+                Ok(Some(BepMessage::RelayData { payload })) => {
+                    if inner_tx.send(payload).is_err() {
+                        // Inner session ended — stop pumping.
+                        break Ok(());
+                    }
+                }
+                Ok(Some(BepMessage::Close { reason })) => {
+                    debug!(
+                        target: "cascade::backend::p2p",
+                        relay = %carry_device,
+                        reason,
+                        "peer relay closed the carry channel",
+                    );
+                    break Ok(());
+                }
+                Ok(Some(_other)) => {
+                    debug!(
+                        target: "cascade::backend::p2p",
+                        relay = %carry_device,
+                        "ignoring non-RelayData frame on peer-relay carry channel",
+                    );
+                }
+                Ok(None) => break Ok(()),
+                Err(e) => break Err(e),
+            }
+        };
+
+        // Tear down: dropping inner_tx ends the inner session reader (EOF),
+        // and removing the terminal stops future routing to it.
+        {
+            let mut terminals = self.relay_terminals.lock().await;
+            terminals.remove(&carry_device);
+        }
+        drop(inner_tx);
+        let _ = inner_task.await;
+        let _ = writer_task.await;
+        result
+    }
+
+    /// Forward one relayed frame from the session identified by
+    /// `from_device` to the peer it is bridged to, metering the payload
+    /// against the relay bandwidth budget.
+    ///
+    /// The bridge was registered symmetrically (under both bridged device
+    /// ids) when the [`BepMessage::RelayConnect`] was admitted, so a frame
+    /// from either bridged side resolves the opposite side and return
+    /// traffic flows. The payload is re-wrapped into a
+    /// [`BepMessage::RelayData`] frame and sent verbatim; the relay never
+    /// inspects it. A frame arriving on a session with no bridge entry is
     /// dropped with a debug log rather than forwarded blindly.
     async fn forward_relay_data(&self, from_device: &str, payload: Vec<u8>) {
         let target_device = {
@@ -1393,8 +1569,19 @@ impl SyncEngine {
                 );
                 return;
             };
-            bridge.target.clone()
+            let Some(target) = bridge.forward_target(from_device) else {
+                debug!(
+                    target: "cascade::backend::p2p",
+                    from = %from_device,
+                    "dropping RelayData — sender is not part of its bridge",
+                );
+                return;
+            };
+            target.to_owned()
         };
+        // Account the forwarded payload against the bandwidth meter so the
+        // configured ceiling reflects real relayed traffic.
+        self.relay_capacity.record(payload.len() as u64);
         let peers = self.peers.lock().await;
         let Some(target) = peers.get(&target_device) else {
             debug!(
@@ -1479,23 +1666,39 @@ impl SyncEngine {
     /// Used after a successful hole-punch (UDP) or relay handshake
     /// (WebSocket). Funnels the transport's read/write halves into
     /// the same handshake + dispatch loop as [`Self::run_framed_session`].
-    async fn run_transport_session<T>(&self, device_id: String, transport: T) -> Result<()>
+    fn run_transport_session<T>(
+        &self,
+        device_id: String,
+        transport: T,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
     where
         T: Transport + 'static,
     {
         let (reader, writer) = FramedSession::new(transport).split();
+        let engine = self.clone();
         // A post-punch UDP or relay transport carries no observed TCP
         // source address worth echoing back — the punched/relayed path
         // does not expose the peer's `NAT`-mapped origin in the same
         // way the direct TCP socket does. Skip the `ObservedAddress`
         // frame for these transports.
-        self.run_session_loop(
-            device_id,
-            None,
-            FramedHalfReader::Session(Box::new(SessionReaderBoxed::new(reader))),
-            FramedHalfWriter::Session(Box::new(SessionWriterBoxed::new(writer))),
-        )
-        .await
+        //
+        // This returns a boxed `Send` trait object rather than an opaque
+        // `async fn` future on purpose. The peer-relay path re-enters the
+        // session loop (`run_session_loop` → `handle_message` →
+        // `spawn_relay_terminal` spawns a fresh `run_transport_session`),
+        // which makes the concrete future type recursive and unprovably
+        // `Send`. Erasing it to a named boxed-`dyn` type at this single edge —
+        // the only place a session re-enters itself — cuts the cycle.
+        Box::pin(async move {
+            engine
+                .run_session_loop(
+                    device_id,
+                    None,
+                    FramedHalfReader::Session(Box::new(SessionReaderBoxed::new(reader))),
+                    FramedHalfWriter::Session(Box::new(SessionWriterBoxed::new(writer))),
+                )
+                .await
+        })
     }
 
     /// Inner loop shared by every session entry point.
@@ -1601,6 +1804,24 @@ impl SyncEngine {
             }
         }
 
+        // Volunteer as a relay if policy and NAT allow. A peer that records
+        // this offer prefers us over an operated relay when its direct and
+        // hole-punch paths fail. Sent after Candidates so the peer has our
+        // reachable set first; gated on `should_volunteer_as_relay` so only
+        // Open/FullCone nodes with a permissive policy advertise.
+        if self.should_volunteer_as_relay().await {
+            let addresses = self.relay_offer_addresses().await;
+            if addresses.is_empty() {
+                debug!(
+                    target: "cascade::backend::p2p",
+                    peer = %device_id,
+                    "willing to relay but no routable BEP endpoint to advertise — skipping offer",
+                );
+            } else {
+                tx.send(BepMessage::RelayOffer { addresses }).ok();
+            }
+        }
+
         // Read loop.
         let result = loop {
             let msg = match reader.recv().await {
@@ -1618,13 +1839,21 @@ impl SyncEngine {
             let mut peers = self.peers.lock().await;
             peers.remove(&device_id);
         }
-        // If this session was the requester half of a relay bridge,
-        // dropping its entry releases the admission slot held in the
-        // `RelayBridge` guard, so the relay-session count tracks live
-        // bridges.
+        // If this session was either half of a relay bridge we were
+        // volunteering, tear the whole bridge down: remove both the entry
+        // keyed by this device and the entry keyed by the bridge partner.
+        // Dropping the last `Arc` to the shared `RelayBridge` releases the
+        // admission slot, so the relay-session count tracks live bridges.
         {
             let mut bridges = self.relay_bridges.lock().await;
-            bridges.remove(&device_id);
+            if let Some(bridge) = bridges.remove(&device_id) {
+                let partner = if bridge.requester == device_id {
+                    bridge.target.clone()
+                } else {
+                    bridge.requester.clone()
+                };
+                bridges.remove(&partner);
+            }
         }
         drop(tx);
         let _ = writer_task.await;
@@ -1822,65 +2051,200 @@ impl SyncEngine {
                 Ok(())
             }
             BepMessage::RelayConnect { target_device } => {
-                // We are being asked to bridge this session to
-                // `target_device`. Admission is gated on the configured
-                // session cap; past it the request is rejected with a
-                // `Close` rather than silently dropped, so the requester
-                // falls back to another relay or path.
-                match self.relay_capacity.admit() {
-                    Ok(guard) => {
-                        // Hold the slot for the (logical) lifetime of the
-                        // bridge. The BEP-level forwarding of subsequent
-                        // `RelayData` frames is driven by the session loop;
-                        // the guard releases when this session ends.
-                        info!(
-                            target: "cascade::backend::p2p",
-                            requester = %peer_device_id,
-                            target = %target_device,
-                            active = self.relay_capacity.active_sessions(),
-                            "admitted peer-relay bridge request"
-                        );
-                        // Record the bridge keyed by the requester's
-                        // device id, holding the admission slot. The entry
-                        // is dropped when the requester's session ends
-                        // (see `run_session_loop` cleanup), releasing the
-                        // slot. Subsequent `RelayData` frames on this
-                        // session forward to `target_device`.
-                        let mut bridges = self.relay_bridges.lock().await;
-                        bridges.insert(
-                            peer_device_id.to_owned(),
-                            RelayBridge {
-                                target: target_device,
-                                _guard: guard,
-                            },
-                        );
-                        Ok(())
-                    }
-                    Err(err) => {
-                        debug!(
-                            target: "cascade::backend::p2p",
-                            requester = %peer_device_id,
-                            target = %target_device,
-                            error = %err,
-                            "rejecting peer-relay bridge request — at capacity"
-                        );
-                        outbound
-                            .send(BepMessage::Close {
-                                reason: err.to_string(),
-                            })
-                            .ok();
-                        Ok(())
-                    }
-                }
+                self.admit_relay_bridge(peer_device_id, target_device, outbound)
+                    .await;
+                Ok(())
+            }
+            BepMessage::RelayInbound { source_device } => {
+                // A volunteer relay is telling us a requester wants to open a
+                // tunnelled session to us through it. `peer_device_id` is the
+                // volunteer carrying the tunnel; `source_device` is the
+                // requester the inner session terminates at. Stand up a carry
+                // loop terminal so subsequent `RelayData` on this session is
+                // decapsulated into an inner BEP session toward the requester.
+                self.spawn_relay_terminal(peer_device_id, source_device)
+                    .await;
+                Ok(())
             }
             BepMessage::RelayData { payload } => {
-                // Forward one opaque relayed frame to the bridged peer.
-                // The relay never inspects the payload — the two endpoints
-                // negotiate their own TLS through the tunnel.
-                self.forward_relay_data(peer_device_id, payload).await;
+                // Two roles a RelayData frame can play on this session:
+                //
+                // 1. If this session carries a tunnel we terminate (a
+                //    terminal is registered for it), the payload is an inner
+                //    BEP frame — hand it to the terminal's reader.
+                // 2. Otherwise we are the volunteer in the middle — forward
+                //    the opaque payload to the bridged peer, metering it.
+                let routed = {
+                    let terminals = self.relay_terminals.lock().await;
+                    terminals
+                        .get(peer_device_id)
+                        .map(|tx| tx.send(payload.clone()).is_ok())
+                };
+                match routed {
+                    Some(true) => {}
+                    Some(false) => {
+                        debug!(
+                            target: "cascade::backend::p2p",
+                            carry = %peer_device_id,
+                            "dropping RelayData — inner relay terminal has closed",
+                        );
+                    }
+                    None => self.forward_relay_data(peer_device_id, payload).await,
+                }
                 Ok(())
             }
         }
+    }
+
+    /// Admit (or reject) a peer-relay bridge request from `requester` to
+    /// `target`.
+    ///
+    /// Admission is gated on the configured session cap; past it the request
+    /// is rejected with a `Close` rather than silently dropped, so the
+    /// requester falls back to another relay or path. On admission the bridge
+    /// is registered symmetrically under both device ids (so return traffic
+    /// flows) and the target is told to stand up its inner-session terminal
+    /// via a [`BepMessage::RelayInbound`] frame.
+    async fn admit_relay_bridge(
+        &self,
+        requester: &str,
+        target: String,
+        outbound: &mpsc::UnboundedSender<BepMessage>,
+    ) {
+        // The target must be connected for the bridge to carry anything —
+        // the volunteer relays between two live sessions it holds.
+        let target_outbound = {
+            let peers = self.peers.lock().await;
+            peers.get(&target).map(|h| h.outbound.clone())
+        };
+        let Some(target_outbound) = target_outbound else {
+            debug!(
+                target: "cascade::backend::p2p",
+                requester = %requester,
+                target = %target,
+                "rejecting peer-relay bridge — target is not connected to this relay",
+            );
+            outbound
+                .send(BepMessage::Close {
+                    reason: format!("relay target {target} not connected"),
+                })
+                .ok();
+            return;
+        };
+
+        match self.relay_capacity.admit() {
+            Ok(guard) => {
+                info!(
+                    target: "cascade::backend::p2p",
+                    requester = %requester,
+                    target = %target,
+                    active = self.relay_capacity.active_sessions(),
+                    "admitted peer-relay bridge request"
+                );
+                // Register the bridge under BOTH device ids, sharing one Arc
+                // so the admission slot releases exactly once when the last
+                // reference drops. Either bridged session ending removes both
+                // entries (see `run_session_loop` cleanup).
+                let bridge = Arc::new(peer_relay::RelayBridge {
+                    requester: requester.to_owned(),
+                    target: target.clone(),
+                    guard,
+                });
+                {
+                    let mut bridges = self.relay_bridges.lock().await;
+                    bridges.insert(requester.to_owned(), Arc::clone(&bridge));
+                    bridges.insert(target.clone(), bridge);
+                }
+                // Tell the target to terminate the inner session for the
+                // requester. Without this the target would treat the inner
+                // frames as something to forward and drop them.
+                target_outbound
+                    .send(BepMessage::RelayInbound {
+                        source_device: requester.to_owned(),
+                    })
+                    .ok();
+            }
+            Err(err) => {
+                debug!(
+                    target: "cascade::backend::p2p",
+                    requester = %requester,
+                    target = %target,
+                    error = %err,
+                    "rejecting peer-relay bridge request — at capacity"
+                );
+                outbound
+                    .send(BepMessage::Close {
+                        reason: err.to_string(),
+                    })
+                    .ok();
+            }
+        }
+    }
+
+    /// Stand up an inner-session terminal for a relayed connection we are the
+    /// target of.
+    ///
+    /// `carry_device` is the volunteer carrying the tunnel; `source_device`
+    /// is the requester the inner session talks to. Spawns
+    /// [`Self::run_relay_carry_loop`] driven by the carry session's own
+    /// outbound channel and a fresh inbound channel; the loop registers the
+    /// terminal keyed by `carry_device` and runs the inner BEP session.
+    async fn spawn_relay_terminal(&self, carry_device: &str, source_device: String) {
+        let carry_outbound = {
+            let peers = self.peers.lock().await;
+            peers.get(carry_device).map(|h| h.outbound.clone())
+        };
+        let Some(carry_outbound) = carry_outbound else {
+            debug!(
+                target: "cascade::backend::p2p",
+                carry = %carry_device,
+                source = %source_device,
+                "ignoring RelayInbound — carrying session is gone",
+            );
+            return;
+        };
+
+        // Channel feeding inbound inner frames to the inner session reader.
+        // Move the receiver straight into the transport so it is never held
+        // as a local across an await (which would taint this future's
+        // auto-traits); only the cloneable sender is registered.
+        let (inner_tx, inner_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let transport = peer_relay::PeerRelayTransport::new(carry_outbound, inner_rx);
+        {
+            let mut terminals = self.relay_terminals.lock().await;
+            terminals.insert(carry_device.to_owned(), inner_tx);
+        }
+
+        info!(
+            target: "cascade::backend::p2p",
+            carry = %carry_device,
+            source = %source_device,
+            "standing up peer-relay inner session terminal"
+        );
+
+        let engine = self.clone();
+        let carry_device_owned = carry_device.to_owned();
+        let source_for_log = source_device.clone();
+        tokio::spawn(async move {
+            if let Err(e) = engine.run_transport_session(source_device, transport).await {
+                debug!(
+                    target: "cascade::backend::p2p",
+                    source = %source_for_log,
+                    error = %e,
+                    "peer-relay target inner session ended",
+                );
+            }
+            // The inner session ended — drop the terminal so the carry
+            // session stops routing to a dead channel.
+            engine.remove_relay_terminal(&carry_device_owned).await;
+        });
+    }
+
+    /// Remove the inner-session terminal registered for the carrying session
+    /// `carry_device`, if any. Called when a relay terminal's inner session
+    /// ends so the carry session stops routing `RelayData` to a dead channel.
+    async fn remove_relay_terminal(&self, carry_device: &str) {
+        self.relay_terminals.lock().await.remove(carry_device);
     }
 
     /// Merge an incoming gossip snapshot into the local peer book.
@@ -3942,6 +4306,237 @@ mod tests {
         );
     }
 
+    /// End-to-end: a volunteer with a permissive policy and an `Open` NAT must
+    /// actually emit a `RelayOffer` on session setup, and the connecting peer
+    /// must record it so its `peer_relays()` becomes non-empty. This drives
+    /// real framed TLS sessions over loopback — the gap the unit tests left,
+    /// where `record_relay_offer` was only ever called directly.
+    #[tokio::test]
+    async fn volunteer_emits_relay_offer_on_session_setup() {
+        let (_dir_v, volunteer) = make_engine("shared");
+        let (_dir_a, requester) = make_engine("shared");
+
+        volunteer.trust(requester.device_id().to_string()).await;
+        requester.trust(volunteer.device_id().to_string()).await;
+
+        // The volunteer is Open with the default Auto policy, so it should
+        // advertise itself once its listener is bound (the offer addresses are
+        // drawn from the bound host candidates, filtered to routable IPs).
+        volunteer.set_local_nat_type(NatType::Open).await;
+
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let (addr_v, _v_task) = volunteer
+            .start_listener("127.0.0.1:0".parse().unwrap(), cancel_rx)
+            .await
+            .unwrap();
+        // Seed a routable external mapping so the offer set is non-empty even
+        // though the loopback listener address itself is not globally routable.
+        volunteer
+            .set_local_external_addr(Some("203.0.113.7:22000".parse().unwrap()))
+            .await;
+
+        requester
+            .connect_to(Peer {
+                device_id: volunteer.device_id().to_string(),
+                address: addr_v,
+            })
+            .await
+            .unwrap();
+
+        // Wait for the volunteer's handshake (which emits the RelayOffer) to
+        // reach the requester and populate its peer-relay map.
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let relays = requester.peer_relays().await;
+            if let Some(relay) = relays.first() {
+                assert_eq!(relay.device_id, volunteer.device_id());
+                assert!(
+                    relay
+                        .addresses
+                        .contains(&"203.0.113.7:22000".parse().unwrap()),
+                    "offer must carry the volunteer's routable endpoint",
+                );
+                return;
+            }
+        }
+        panic!("requester never recorded the volunteer's relay offer");
+    }
+
+    /// A node whose policy is `Off` must never advertise, even with an `Open`
+    /// NAT and a routable endpoint — the connecting peer's `peer_relays()`
+    /// stays empty over a full session.
+    #[tokio::test]
+    async fn off_policy_volunteer_emits_no_relay_offer_over_session() {
+        let (_dir_v, volunteer) = make_engine("shared");
+        let volunteer = volunteer.with_relay_volunteer(RelayVolunteer::Off);
+        let (_dir_a, requester) = make_engine("shared");
+
+        volunteer.trust(requester.device_id().to_string()).await;
+        requester.trust(volunteer.device_id().to_string()).await;
+        volunteer.set_local_nat_type(NatType::Open).await;
+
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let (addr_v, _v_task) = volunteer
+            .start_listener("127.0.0.1:0".parse().unwrap(), cancel_rx)
+            .await
+            .unwrap();
+        volunteer
+            .set_local_external_addr(Some("203.0.113.7:22000".parse().unwrap()))
+            .await;
+
+        requester
+            .connect_to(Peer {
+                device_id: volunteer.device_id().to_string(),
+                address: addr_v,
+            })
+            .await
+            .unwrap();
+
+        // Give the handshake ample time, then confirm no offer was recorded.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            requester.peer_relays().await.is_empty(),
+            "an Off-policy node must not advertise itself as a relay",
+        );
+    }
+
+    /// Full two-hop relay: A reaches B by tunnelling through volunteer V, with
+    /// no direct A↔B connection. Proves bytes traverse A → V → B AND back:
+    /// the inner BEP handshake completes (ClusterConfig/Index both ways), an
+    /// `IndexUpdate` from A lands in B's index (forward), and A fetches a block
+    /// that only B holds (return), so a request/response round trip survives
+    /// the bidirectional bridge. The volunteer's bandwidth meter must also see
+    /// the relayed bytes — the live path it was previously bypassing.
+    #[tokio::test]
+    async fn two_hop_relay_carries_bep_session_both_ways() {
+        let (_dir_v, volunteer) = make_engine("shared");
+        let (_dir_a, engine_a) = make_engine("shared");
+        let (_dir_b, engine_b) = make_engine("shared");
+
+        // Full trust mesh — every device must accept the others' TLS.
+        for peer in [engine_a.device_id(), engine_b.device_id()] {
+            volunteer.trust(peer.to_string()).await;
+        }
+        engine_a.trust(volunteer.device_id().to_string()).await;
+        engine_a.trust(engine_b.device_id().to_string()).await;
+        engine_b.trust(volunteer.device_id().to_string()).await;
+        engine_b.trust(engine_a.device_id().to_string()).await;
+
+        // A block only B holds, so the return direction (B → A) is exercised
+        // by a real Request/Response.
+        let only_on_b = b"payload that only the target peer holds".repeat(4);
+        let block_hash = BlockHash::from_data(&only_on_b);
+        engine_b
+            .blocks
+            .store_block(&block_hash, &only_on_b)
+            .await
+            .unwrap();
+
+        // The volunteer accepts inbound sessions; B and A both dial it.
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let (addr_v, _v_task) = volunteer
+            .start_listener("127.0.0.1:0".parse().unwrap(), cancel_rx)
+            .await
+            .unwrap();
+
+        // B connects to V first so the volunteer holds a live session to the
+        // target before A asks to be bridged to it.
+        engine_b
+            .connect_to(Peer {
+                device_id: volunteer.device_id().to_string(),
+                address: addr_v,
+            })
+            .await
+            .unwrap();
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if volunteer.has_peer(engine_b.device_id()).await {
+                break;
+            }
+        }
+        assert!(
+            volunteer.has_peer(engine_b.device_id()).await,
+            "volunteer must hold a session to the target before bridging",
+        );
+
+        // A asks the volunteer to bridge it to B. No direct A↔B link exists.
+        engine_a
+            .attempt_peer_relay(
+                &Peer {
+                    device_id: engine_b.device_id().to_string(),
+                    address: "127.0.0.1:1".parse().unwrap(),
+                },
+                volunteer.device_id(),
+                addr_v,
+            )
+            .await
+            .unwrap();
+
+        // Wait for the inner relayed session to register on both ends.
+        for _ in 0..60 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if engine_a.has_peer(engine_b.device_id()).await
+                && engine_b.has_peer(engine_a.device_id()).await
+            {
+                break;
+            }
+        }
+        assert!(
+            engine_a.has_peer(engine_b.device_id()).await,
+            "A must hold an inner session to B through the relay",
+        );
+        assert!(
+            engine_b.has_peer(engine_a.device_id()).await,
+            "B must hold an inner session to A through the relay",
+        );
+
+        // Forward direction: an IndexUpdate from A must reach B's index.
+        let entry = IndexEntry {
+            path: "relayed.txt".to_string(),
+            is_dir: false,
+            size: 11,
+            modified: 1_700_000_000,
+            block_hashes: vec![0u8; 32],
+            deleted: false,
+            row_version: 0,
+            version: Vec::new(),
+        };
+        engine_a.index.upsert(&entry).unwrap();
+        engine_a.broadcast_update(&entry).await;
+        let mut forward_ok = false;
+        for _ in 0..60 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if engine_b.index.get("relayed.txt").unwrap().is_some() {
+                forward_ok = true;
+                break;
+            }
+        }
+        assert!(
+            forward_ok,
+            "A's IndexUpdate never reached B through the relay"
+        );
+
+        // Return direction: A fetches a block only B holds. This requires a
+        // Request A → B and a Response B → A, both crossing the bridge.
+        let fetched = engine_a
+            .fetch_block(
+                "relayed.txt",
+                0,
+                u32::try_from(only_on_b.len()).unwrap(),
+                block_hash.0,
+            )
+            .await
+            .expect("A must fetch B's block back through the relay");
+        assert_eq!(fetched, only_on_b);
+
+        // The volunteer must have metered the relayed bytes — proof the live
+        // forwarding path, not a parallel helper, accounted the traffic.
+        assert!(
+            volunteer.relay_capacity().bytes_relayed() > 0,
+            "the relay bandwidth meter must see the bridged bytes",
+        );
+    }
+
     #[tokio::test]
     async fn volunteers_only_when_policy_allows_and_nat_permits() {
         let (_dir, engine) = make_engine("f");
@@ -4115,5 +4710,15 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not trusted"));
+    }
+}
+
+#[cfg(test)]
+mod sync_engine_send_check {
+    use super::*;
+    #[allow(dead_code)]
+    fn assert_traits() {
+        fn is_send_sync<T: Send + Sync>() {}
+        is_send_sync::<SyncEngine>();
     }
 }
