@@ -782,6 +782,37 @@ impl StateDb {
         rows.into_iter().map(GrantRecord::try_from_raw).collect()
     }
 
+    /// The stored [`Scope`] of the grant with row id `id`, or `None` when no
+    /// such grant exists.
+    ///
+    /// Used by the management-plane dispatcher to authorise a `GrantRevoke`
+    /// against the scope of the row it will actually delete, rather than a
+    /// caller-advertised wire scope.
+    pub fn grant_scope(&self, id: i64) -> Result<Option<Scope>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let row = conn.query_row(
+            "SELECT scope_kind, scope_path FROM grants WHERE id = ?1",
+            [id],
+            |row| {
+                let kind: String = row.get(0)?;
+                let path: Option<String> = row.get(1)?;
+                Ok((kind, path))
+            },
+        );
+        match row {
+            Ok((kind, path)) => {
+                let scope = Scope::from_columns(&kind, path)
+                    .ok_or_else(|| anyhow::anyhow!("invalid scope kind in grant {id}: {kind}"))?;
+                Ok(Some(scope))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Revoke a grant by its row id. Returns `true` if a row was deleted.
     pub fn revoke_grant(&self, id: i64) -> Result<bool> {
         let conn = self
