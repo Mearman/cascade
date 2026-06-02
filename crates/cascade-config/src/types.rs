@@ -107,6 +107,48 @@ pub struct DeviceConfig {
     pub name: String,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Management-plane capability grants declared for this node. Lets a fleet
+    /// provision authority declaratively rather than only imperatively. Like
+    /// the rest of `DeviceConfig`, this is root-only — grants in child
+    /// `.cascade` files are ignored.
+    #[serde(default)]
+    pub grants: Vec<GrantConfig>,
+}
+
+/// A declarative management-plane grant in the root device config.
+///
+/// This is the config-level shape only: the `granted_by` device is supplied by
+/// the engine at load time (it is the local node owner), and the `capability`
+/// string is validated against the engine's capability vocabulary there. The
+/// config crate stays free of the engine's domain enums so the dependency
+/// direction (engine depends on config, never the reverse) is preserved.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantConfig {
+    /// The device this grant authorises, by device ID.
+    pub grantee: String,
+    /// The capability conferred, in its colon-delimited wire form (for example
+    /// `status:read`). Validated by the engine on load.
+    pub capability: String,
+    /// The scope the capability applies over.
+    pub scope: ScopeConfig,
+    /// When the grant expires, as an RFC 3339 timestamp. Absent means it never
+    /// expires. Parsed by the engine on load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires: Option<String>,
+}
+
+/// The scope of a [`GrantConfig`] — node-wide or a folder subtree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ScopeConfig {
+    /// The whole node.
+    Node,
+    /// A folder subtree, identified by its path prefix.
+    Folder {
+        /// The folder path prefix.
+        path: String,
+    },
 }
 
 /// Resolved config after walking from mount root to a target directory.
@@ -233,6 +275,75 @@ mod tests {
         assert_eq!(a.ignore.len(), 2);
         // Cache is nearest-wins (overridden)
         assert_eq!(a.cache.as_ref().unwrap().max_size, Some("5GB".to_string()));
+    }
+
+    #[test]
+    fn device_config_with_grants_deserialises() {
+        let toml = r#"
+            [device]
+            name = "node-a"
+
+            [[device.grants]]
+            grantee = "MANAGERDEVICEID"
+            capability = "pin:write"
+            scope = { kind = "folder", path = "/work" }
+
+            [[device.grants]]
+            grantee = "MANAGERDEVICEID"
+            capability = "status:read"
+            scope = { kind = "node" }
+            expires = "2026-12-31T00:00:00Z"
+        "#;
+        let config: CascadeConfig = toml::from_str(toml).unwrap();
+        let device = config.device.unwrap();
+        assert_eq!(device.name, "node-a");
+        assert_eq!(device.grants.len(), 2);
+
+        let first = &device.grants[0];
+        assert_eq!(first.grantee, "MANAGERDEVICEID");
+        assert_eq!(first.capability, "pin:write");
+        assert!(matches!(&first.scope, ScopeConfig::Folder { path } if path == "/work"));
+        assert!(first.expires.is_none());
+
+        let second = &device.grants[1];
+        assert!(matches!(second.scope, ScopeConfig::Node));
+        assert_eq!(second.expires.as_deref(), Some("2026-12-31T00:00:00Z"));
+    }
+
+    #[test]
+    fn device_grants_do_not_propagate_through_merge() {
+        // Device config (and its grants) is root-only: merging a child config
+        // never carries device grants into the parent.
+        let mut root = CascadeConfig::empty();
+        root.device = Some(DeviceConfig {
+            name: "node-a".to_string(),
+            tags: vec![],
+            grants: vec![GrantConfig {
+                grantee: "MANAGER".to_string(),
+                capability: "status:read".to_string(),
+                scope: ScopeConfig::Node,
+                expires: None,
+            }],
+        });
+
+        let mut child = CascadeConfig::empty();
+        child.device = Some(DeviceConfig {
+            name: "child".to_string(),
+            tags: vec![],
+            grants: vec![GrantConfig {
+                grantee: "INTRUDER".to_string(),
+                capability: "grant:admin".to_string(),
+                scope: ScopeConfig::Node,
+                expires: None,
+            }],
+        });
+
+        root.merge(child);
+        // The root's device config is untouched by the child's.
+        let device = root.device.unwrap();
+        assert_eq!(device.name, "node-a");
+        assert_eq!(device.grants.len(), 1);
+        assert_eq!(device.grants[0].grantee, "MANAGER");
     }
 
     #[test]

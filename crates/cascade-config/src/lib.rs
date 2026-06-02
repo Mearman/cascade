@@ -17,4 +17,6 @@ pub mod merge;
 pub mod parse;
 pub mod types;
 
-pub use types::{CascadeConfig, IgnoreRule, ResolvedConfig};
+pub use types::{
+    CascadeConfig, DeviceConfig, GrantConfig, IgnoreRule, ResolvedConfig, ScopeConfig,
+};

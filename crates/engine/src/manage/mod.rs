@@ -14,6 +14,8 @@
 //! (`ManageRequest` / `ManageResponse`) and command dispatch land in later
 //! phases.
 
+use anyhow::{Context, Result, anyhow};
+use cascade_config::{GrantConfig, ScopeConfig};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -249,6 +251,37 @@ impl Grant {
     #[must_use]
     pub fn is_expired(&self, now: DateTime<Utc>) -> bool {
         self.expires.is_some_and(|expiry| now >= expiry)
+    }
+
+    /// Build a domain grant from a declarative [`GrantConfig`] in the root
+    /// device config, supplying the local node owner as `granted_by`.
+    ///
+    /// Validates the capability against the known vocabulary, the scope, and
+    /// any expiry timestamp (RFC 3339), failing loudly rather than silently
+    /// dropping a malformed declaration.
+    pub fn from_config(config: &GrantConfig, granted_by: &DeviceId) -> Result<Self> {
+        let capability = Capability::from_wire(&config.capability)
+            .ok_or_else(|| anyhow!("unknown capability in grant config: {}", config.capability))?;
+        let scope = match &config.scope {
+            ScopeConfig::Node => Scope::Node,
+            ScopeConfig::Folder { path } => Scope::folder(path.clone()),
+        };
+        let expires = config
+            .expires
+            .as_deref()
+            .map(|raw| {
+                DateTime::parse_from_rfc3339(raw)
+                    .with_context(|| format!("parsing grant expiry timestamp: {raw}"))
+                    .map(|dt| dt.with_timezone(&Utc))
+            })
+            .transpose()?;
+        Ok(Self {
+            grantee: DeviceId::new(config.grantee.clone()),
+            capability,
+            scope,
+            granted_by: granted_by.clone(),
+            expires,
+        })
     }
 }
 
@@ -652,6 +685,61 @@ mod tests {
         let json = serde_json::to_string(&g).unwrap();
         let back: Grant = serde_json::from_str(&json).unwrap();
         assert_eq!(g, back);
+    }
+
+    // ── Config conversion ──
+
+    #[test]
+    fn grant_from_config_folder_scope() {
+        let config = GrantConfig {
+            grantee: "MANAGER".to_string(),
+            capability: "pin:write".to_string(),
+            scope: ScopeConfig::Folder {
+                path: "/work".to_string(),
+            },
+            expires: None,
+        };
+        let grant = Grant::from_config(&config, &owner()).unwrap();
+        assert_eq!(grant.grantee, DeviceId::new("MANAGER"));
+        assert_eq!(grant.capability, Capability::PinWrite);
+        assert_eq!(grant.scope, Scope::folder("/work"));
+        assert_eq!(grant.granted_by, owner());
+        assert!(grant.expires.is_none());
+    }
+
+    #[test]
+    fn grant_from_config_node_scope_with_expiry() {
+        let config = GrantConfig {
+            grantee: "MANAGER".to_string(),
+            capability: "status:read".to_string(),
+            scope: ScopeConfig::Node,
+            expires: Some("2026-12-31T00:00:00Z".to_string()),
+        };
+        let grant = Grant::from_config(&config, &owner()).unwrap();
+        assert_eq!(grant.scope, Scope::Node);
+        assert_eq!(grant.expires, Some(at(2026, 12, 31)));
+    }
+
+    #[test]
+    fn grant_from_config_rejects_unknown_capability() {
+        let config = GrantConfig {
+            grantee: "MANAGER".to_string(),
+            capability: "totally:bogus".to_string(),
+            scope: ScopeConfig::Node,
+            expires: None,
+        };
+        assert!(Grant::from_config(&config, &owner()).is_err());
+    }
+
+    #[test]
+    fn grant_from_config_rejects_bad_expiry() {
+        let config = GrantConfig {
+            grantee: "MANAGER".to_string(),
+            capability: "status:read".to_string(),
+            scope: ScopeConfig::Node,
+            expires: Some("not-a-timestamp".to_string()),
+        };
+        assert!(Grant::from_config(&config, &owner()).is_err());
     }
 
     #[test]
