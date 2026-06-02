@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.51](https://github.com/Mearman/cascade/compare/cascade-v0.1.50...cascade-v0.1.51) - 2026-06-02
+
+### Added
+
+- *(cascade)* surface the remote management verbs in the manager CLI
+- *(cascade)* inject the backend factory for runtime BackendAdd
+
+### Fixed
+
+- *(engine)* confine pushed config rules and stop the sync runner
+
 ## [0.1.50](https://github.com/Mearman/cascade/compare/cascade-v0.1.49...cascade-v0.1.50) - 2026-06-02
 
 ### Other
