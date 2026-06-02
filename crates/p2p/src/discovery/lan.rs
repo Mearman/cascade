@@ -247,4 +247,19 @@ mod tests {
         assert!(json.contains("DEVICE1"));
         assert!(json.contains("12345"));
     }
+
+    #[test]
+    fn discovered_peer_becomes_host_candidate() {
+        let peer = DiscoveredPeer {
+            device_id: "DEVICE-A".to_string(),
+            address: SocketAddr::from(([192, 168, 0, 5], 22000)),
+        };
+        let candidate = discovered_peer_to_candidate(&peer);
+        assert_eq!(candidate.kind, CandidateKind::Host);
+        assert_eq!(candidate.address, peer.address);
+        assert_eq!(
+            candidate.priority,
+            crate::candidate::compute_priority(CandidateKind::Host, LAN_HOST_LOCAL_PREFERENCE),
+        );
+    }
 }

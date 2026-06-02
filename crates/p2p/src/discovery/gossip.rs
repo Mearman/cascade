@@ -74,3 +74,45 @@ impl Discovery for GossipDiscovery {
     /// deliberate no-op.
     async fn announce(&self, _self_id: &str, _candidates: &[Candidate]) {}
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    fn addr(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    #[tokio::test]
+    async fn resolve_prefers_remote_candidates() {
+        let mut book = PeerBook::new();
+        book.add_peer("DEVICE-A".to_string(), vec![addr(22000)]);
+        let advertised = Candidate::new(addr(33000), CandidateKind::ServerReflexive, 0);
+        book.set_remote_candidates("DEVICE-A", vec![advertised]);
+
+        let source = GossipDiscovery::new(Arc::new(RwLock::new(book)));
+        let resolved = source.resolve("DEVICE-A").await;
+        assert_eq!(resolved, vec![advertised]);
+    }
+
+    #[tokio::test]
+    async fn resolve_falls_back_to_known_addresses() {
+        let mut book = PeerBook::new();
+        book.add_peer("DEVICE-A".to_string(), vec![addr(22000), addr(22001)]);
+
+        let source = GossipDiscovery::new(Arc::new(RwLock::new(book)));
+        let resolved = source.resolve("DEVICE-A").await;
+        assert_eq!(resolved.len(), 2);
+        assert!(resolved.iter().all(|c| c.kind == CandidateKind::Host));
+        let ports: Vec<u16> = resolved.iter().map(|c| c.address.port()).collect();
+        assert!(ports.contains(&22000));
+        assert!(ports.contains(&22001));
+    }
+
+    #[tokio::test]
+    async fn resolve_unknown_device_is_empty() {
+        let source = GossipDiscovery::new(Arc::new(RwLock::new(PeerBook::new())));
+        assert!(source.resolve("UNKNOWN").await.is_empty());
+    }
+}
