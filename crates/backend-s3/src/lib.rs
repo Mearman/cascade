@@ -557,6 +557,83 @@ impl Backend for S3Backend {
         Ok(())
     }
 
+    /// Read a byte range of an object via an HTTP `Range` GET.
+    ///
+    /// Issues a signed `GET` with `Range: bytes=<offset>-<offset+length-1>`.
+    /// The `Range` header is sent unsigned — the existing signing flow only
+    /// signs `host`, `x-amz-content-sha256`, and `x-amz-date`, so `Range`
+    /// travels as an extra (unsigned) header exactly like `content-length`
+    /// and `x-amz-copy-source` elsewhere in this backend. This still
+    /// authenticates because `SigV4` does not require `Range` to be signed.
+    ///
+    /// Response handling per [`Backend::read_range`]'s contract:
+    /// - `206 Partial Content` — the server honoured the range; the body is
+    ///   the requested slice and is used as-is.
+    /// - `200 OK` — the server ignored `Range` and returned the whole object;
+    ///   slice client-side to `[offset, offset+length)`.
+    /// - `416 Range Not Satisfiable` — `offset` is at or past EOF; return
+    ///   empty.
+    ///
+    /// A `length` of `0` returns empty without issuing a request.
+    async fn read_range(
+        &self,
+        file: &FileEntry,
+        offset: u64,
+        length: u32,
+    ) -> anyhow::Result<Vec<u8>> {
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+
+        let key = file.id.native_id();
+        let url = self.object_url(key);
+
+        // HTTP Range is inclusive on both ends: bytes=start-end covers
+        // end - start + 1 bytes. length >= 1 here, so end >= offset.
+        let end = offset.saturating_add(u64::from(length)).saturating_sub(1);
+        let range_value = format!("bytes={offset}-{end}");
+
+        let resp = self
+            .signed_request("GET", &url, &[], &[], &[("range", &range_value)])
+            .await?;
+
+        let status = resp.status();
+
+        // 416: the requested range starts at or past the end of the object.
+        if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+            return Ok(Vec::new());
+        }
+
+        let resp = Self::check_response(resp).await?;
+        let server_honoured_range = resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+        let bytes = resp.bytes().await?;
+
+        let out = if server_honoured_range {
+            // 206: body is already the requested slice.
+            bytes.to_vec()
+        } else {
+            // 200 (or any other 2xx): the server returned the whole object and
+            // ignored Range. Slice client-side, matching the trait contract.
+            let start = usize::try_from(offset)
+                .unwrap_or(usize::MAX)
+                .min(bytes.len());
+            let len = usize::try_from(length).unwrap_or(usize::MAX);
+            let slice_end = start.saturating_add(len).min(bytes.len());
+            bytes.get(start..slice_end).unwrap_or_default().to_vec()
+        };
+
+        tracing::debug!(
+            file = %file.id,
+            offset,
+            length,
+            returned = out.len(),
+            honoured_range = server_honoured_range,
+            "read range from S3"
+        );
+
+        Ok(out)
+    }
+
     async fn upload(
         &self,
         path: &Path,
