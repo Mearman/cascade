@@ -1859,20 +1859,24 @@ mod windows_impl {
         let mount_hstring = HSTRING::from(mount_point.as_os_str());
         let mount_pcwstr = PCWSTR(mount_hstring.as_ptr());
 
-        // SAFETY: PrjMarkDirectoryAsPlaceholder reads the path string
-        // for the duration of the call. `mount_hstring` outlives the
-        // call because it is held on the stack until after the FFI
-        // returns. The version_info and virtualisation_instance_id
-        // arguments are optional; we pass `None`/null for both since
-        // we do not yet track provider version metadata.
+        // The virtualisation instance ID is a REQUIRED `[in]` parameter of
+        // `PrjMarkDirectoryAsPlaceholder` (only `targetPathName` and
+        // `versionInfo` are optional). Passing a null GUID returns
+        // ERROR_INVALID_PARAMETER (0x80070057); ProjFS wants a freshly
+        // generated GUID identifying this virtualisation instance, exactly
+        // as Microsoft's lifecycle sample does with `CoCreateGuid`.
+        // `GUID::new()` is the windows-rs wrapper over `CoCreateGuid`.
+        let instance_id =
+            GUID::new().context("generating ProjFS virtualisation instance GUID")?;
+
+        // SAFETY: PrjMarkDirectoryAsPlaceholder reads the path string and
+        // the instance-id pointer for the duration of the call. Both
+        // `mount_hstring` and `instance_id` are stack locals that outlive
+        // the call (no `.await` between here and the FFI return).
+        // `versionInfo` is optional, so we pass `None`.
         #[allow(unsafe_code)]
         let mark_result = unsafe {
-            PrjMarkDirectoryAsPlaceholder(
-                mount_pcwstr,
-                PCWSTR::null(),
-                None,
-                std::ptr::null::<GUID>(),
-            )
+            PrjMarkDirectoryAsPlaceholder(mount_pcwstr, PCWSTR::null(), None, &raw const instance_id)
         };
         mark_result.context("PrjMarkDirectoryAsPlaceholder failed")?;
 
