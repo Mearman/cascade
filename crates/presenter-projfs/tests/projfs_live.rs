@@ -158,18 +158,14 @@ fn setup(rt: tokio::runtime::Runtime) -> (std::path::PathBuf, LiveMount, Arc<Ato
             .with_content_provider(provider),
     );
 
-    // Seed the projection: a root directory item plus two child files
-    // parented to it.
-    let root_item = VfsItem {
-        id: root_id.clone(),
-        parent_id: ItemId::new("test", "void"),
-        name: "root".to_string(),
-        is_dir: true,
-        size: None,
-        mod_time: None,
-        cache_state: CacheState::Online,
-        mime_type: None,
-    };
+    // Seed the projection: two child files parented to the virtual root
+    // anchor. The root id is the `with_root` anchor, NOT itself a
+    // projected item — this mirrors the daemon's sync runner, which
+    // upserts the children parented to `<backend>:root` but never
+    // materialises a root item. Seeding a real root item would make a
+    // top-level file's `ancestor_chain` resolve to `root/alpha.txt`
+    // instead of the root-relative `alpha.txt` that ProjFS passes the
+    // callbacks, so `get_placeholder_info`'s `resolve_path` would miss it.
     let alpha_item = VfsItem {
         id: alpha_id,
         parent_id: root_id.clone(),
@@ -194,7 +190,6 @@ fn setup(rt: tokio::runtime::Runtime) -> (std::path::PathBuf, LiveMount, Arc<Ato
     // body runs inside one `block_on`; the runtime is then handed to the
     // guard so its `Drop` can `block_on(stop())` later.
     rt.block_on(async {
-        presenter.upsert_item(root_item).await.unwrap();
         presenter.upsert_item(alpha_item).await.unwrap();
         presenter.upsert_item(beta_item).await.unwrap();
 
