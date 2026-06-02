@@ -41,6 +41,7 @@ rand = "0.9"
 ## The announce end-to-end test drives the real AnnounceDiscovery client
 ## against the server endpoint, so the client feature is needed in tests.
 cascade-p2p = { path = "../p2p", features = ["announce"] }
+serde_json.workspace = true
 
 [lints]
 workspace = true
