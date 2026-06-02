@@ -184,9 +184,11 @@ pub struct ConfiguredPeer {
 #[derive(Debug, Clone, Default)]
 pub struct DhtConfig {
     /// Bootstrap nodes used to join the Mainline DHT, as resolved socket
-    /// addresses. Empty falls back to the `mainline` crate's built-in public
-    /// bootstrap set, so an operator can enable the DHT without supplying their
-    /// own bootstrap nodes.
+    /// addresses. Empty falls back to the named public default
+    /// ([`cascade_p2p::discovery::DEFAULT_DHT_BOOTSTRAP_NODES`]), so an operator
+    /// can enable the DHT without supplying their own bootstrap nodes; a
+    /// non-empty list pins exactly those nodes and the public default is not
+    /// mixed in.
     pub bootstrap_nodes: Vec<std::net::SocketAddr>,
 }
 
@@ -1621,9 +1623,14 @@ async fn announce_server_publish_loop(
 /// stores them under our device-id key via the [`Discovery::announce`] impl on
 /// [`cascade_p2p::discovery::DhtDiscovery`]. A store that does not reach enough
 /// DHT nodes is handled best-effort inside the node — publication is
-/// best-effort, exactly like LAN and announce-server publish. Reuses the
-/// announce-server publish cadence ([`ANNOUNCE_PUBLISH_INTERVAL`]) so the DHT
-/// entry refreshes on the same soft-state rhythm.
+/// best-effort, exactly like LAN and announce-server publish.
+///
+/// Unlike the announce-server loop, the cadence here is
+/// [`cascade_p2p::discovery::DHT_REPUBLISH_INTERVAL`], derived from the BEP44
+/// mutable-item expiry rather than the announce-server soft-state rhythm: a DHT
+/// value is dropped by its storing nodes if not refreshed within the expiry
+/// window, so the republish interval is set to refresh well inside that window
+/// and keep the candidate set continuously resolvable.
 ///
 /// Exits as soon as `cancel` flips to `true`.
 async fn dht_publish_loop(
@@ -1641,7 +1648,7 @@ async fn dht_publish_loop(
             dht.announce(&device_id, &candidates).await;
         }
         tokio::select! {
-            () = tokio::time::sleep(ANNOUNCE_PUBLISH_INTERVAL) => {}
+            () = tokio::time::sleep(cascade_p2p::discovery::DHT_REPUBLISH_INTERVAL) => {}
             res = cancel.changed() => {
                 if res.is_err() || *cancel.borrow() {
                     return;
@@ -1757,9 +1764,11 @@ async fn discovery_listen_loop(
 ///   announce server. Requires `listen_addr` to be set (the DHT advertises the
 ///   bound port).
 /// - `dht_bootstrap_nodes` (optional) — array of `host:port` Mainline-DHT
-///   bootstrap nodes used to join the DHT. Omitted or empty falls back to the
-///   `mainline` crate's built-in public bootstrap set. Ignored when
-///   `enable_dht` is `false`.
+///   bootstrap nodes used to join the DHT. Omitted or explicitly empty falls
+///   back to the named public default
+///   ([`cascade_p2p::discovery::DEFAULT_DHT_BOOTSTRAP_NODES`]) so the DHT works
+///   out of the box; supplying a non-empty list pins exactly those nodes (the
+///   public default is then not used). Ignored when `enable_dht` is `false`.
 pub fn create_backend(config: &toml::Value) -> Result<Box<dyn Backend>> {
     Ok(Box::new(open_from_config(config)?))
 }
@@ -2644,11 +2653,37 @@ mod tests {
     #[test]
     fn parse_dht_config_enabled_without_bootstrap_uses_empty_set() {
         // Enabling without bootstrap nodes is valid — the live node falls
-        // back to the public bootstrap set — so the parsed config carries an
-        // empty bootstrap list rather than failing.
+        // back to the named public default set — so the parsed config carries
+        // an empty bootstrap list rather than failing. The empty list is the
+        // signal `MainlineDht::open` reads as "use DEFAULT_DHT_BOOTSTRAP_NODES".
         let value = toml::from_str::<toml::Value>("name = \"x\"\nenable_dht = true").unwrap();
         let dht = parse_dht_config(&value).unwrap().expect("DHT enabled");
         assert!(dht.bootstrap_nodes.is_empty());
+    }
+
+    #[test]
+    fn parse_dht_config_explicit_empty_bootstrap_array_uses_default() {
+        // An operator who writes `dht_bootstrap_nodes = []` explicitly gets the
+        // same default-fallback as omitting the key: the parsed list is empty,
+        // which the node resolves to the public default. This pins the
+        // "empty override falls back to the default" contract at the config
+        // layer.
+        let toml_src = "name = \"x\"\nenable_dht = true\ndht_bootstrap_nodes = []";
+        let value = toml::from_str::<toml::Value>(toml_src).unwrap();
+        let dht = parse_dht_config(&value).unwrap().expect("DHT enabled");
+        assert!(dht.bootstrap_nodes.is_empty());
+    }
+
+    #[test]
+    fn parse_dht_config_override_is_preserved_verbatim() {
+        // A non-empty override is carried through unchanged, so the node pins
+        // exactly those nodes rather than the public default.
+        let toml_src = "name = \"x\"\nenable_dht = true\n\
+             dht_bootstrap_nodes = [\"203.0.113.1:6881\"]";
+        let value = toml::from_str::<toml::Value>(toml_src).unwrap();
+        let dht = parse_dht_config(&value).unwrap().expect("DHT enabled");
+        assert_eq!(dht.bootstrap_nodes.len(), 1);
+        assert_eq!(dht.bootstrap_nodes[0].port(), 6881);
     }
 
     #[test]
@@ -2734,6 +2769,39 @@ mod tests {
             // An address with no server listening — the publish loop's
             // register calls fail and are swallowed best-effort.
             announce_servers: vec!["http://127.0.0.1:1".to_string()],
+            ..Default::default()
+        };
+        let backend = P2pBackend::open(cfg).unwrap();
+        let mut cancel_rx = backend.cancel.subscribe();
+        assert!(!*cancel_rx.borrow());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(backend);
+        cancel_rx.changed().await.unwrap();
+        assert!(*cancel_rx.borrow());
+    }
+
+    /// Enabling the DHT (via `Some(DhtConfig)`) with no operator-supplied
+    /// bootstrap nodes must not block or panic on backend open: the node joins
+    /// the public default set, the publish loop comes up on the BEP44 republish
+    /// cadence, and both honour the shutdown watch. We confirm the spawned tasks
+    /// observe cancellation, proving the DHT publish loop exits cleanly like
+    /// every other background task. The default bootstrap nodes are real public
+    /// routers, but `open` only binds the local UDP socket — it does not block
+    /// on reaching them — so this stays an offline test.
+    #[tokio::test]
+    async fn dht_enabled_backend_opens_and_shuts_down() {
+        let dir = tempdir().unwrap();
+        let cfg = P2pBackendConfig {
+            instance_id: "p2p-dht".to_string(),
+            folder_id: "p2p-dht".to_string(),
+            display_name: "Dht".to_string(),
+            index_path: dir.path().join("index.db"),
+            block_store_root: dir.path().join("blocks"),
+            identity_dir: dir.path().join("identity"),
+            listen_addr: Some("127.0.0.1:0".parse().unwrap()),
+            // Presence of the config is the enable switch; an empty bootstrap
+            // list falls back to the named public default inside the node.
+            dht: Some(DhtConfig::default()),
             ..Default::default()
         };
         let backend = P2pBackend::open(cfg).unwrap();

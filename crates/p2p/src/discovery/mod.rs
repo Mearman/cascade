@@ -48,10 +48,13 @@ pub use announce::{AnnounceRequest, LookupResponse, MAX_ANNOUNCE_CANDIDATES, Wir
 #[cfg(feature = "announce")]
 pub use announce::AnnounceDiscovery;
 
-pub use dht::{DHT_KEY_LEN, DhtDiscovery, DhtKey, DhtNode, StoredCandidates};
+pub use dht::{
+    DHT_KEY_LEN, DHT_REPUBLISH_INTERVAL, DHT_RESOLVE_TIMEOUT, DhtDiscovery, DhtGetOutcome, DhtKey,
+    DhtNode, StoredCandidates,
+};
 
 #[cfg(feature = "dht")]
-pub use dht::MainlineDht;
+pub use dht::{DEFAULT_DHT_BOOTSTRAP_NODES, MainlineDht};
 
 /// A source that turns a peer's device ID into reachable candidates.
 ///

@@ -127,6 +127,55 @@ impl DhtKey {
     }
 }
 
+/// How long the resolver waits for a BEP44 `get` before giving up.
+///
+/// A Mainline DHT `get` walks the network iteratively, hop by hop, towards the
+/// nodes closest to the target — several round-trips, not one. The `mainline`
+/// crate's own per-request timeout ([`mainline::DEFAULT_REQUEST_TIMEOUT`]) is
+/// two seconds *per hop*; a full iterative lookup against the live network
+/// routinely takes several of those in series before it either yields the value
+/// or exhausts the closest nodes. Twenty seconds is a generous ceiling over that
+/// real BEP44 get latency: long enough that a slow-but-live lookup completes,
+/// short enough that a wedged or partitioned lookup fails the resolve rather
+/// than hanging the management-plane dial that waits on it. The live node treats
+/// a lookup that overruns this as "no value found" — the same absence every
+/// [`Discovery`] source reports for a peer it cannot place — and logs the
+/// timeout distinctly from a clean not-found so the two are tellable apart in
+/// the field.
+pub const DHT_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Conservative estimate, in seconds, of how long a storing node keeps a BEP44
+/// mutable item before expiring it.
+///
+/// [BEP44](https://www.bittorrent.org/beps/bep_0044.html) leaves the exact
+/// retention to the storing node, but the `BitTorrent` network's de-facto figure
+/// — the same two hours BEP5 uses for an `announce_peer` lease — is what storing
+/// implementations converge on: a value not refreshed within roughly two hours
+/// is dropped. The republish cadence is derived from this so an announced
+/// candidate set never silently lapses out of the DHT between refreshes. Held in
+/// seconds (not a `Duration`) so the republish interval below derives from it by
+/// plain const integer arithmetic.
+const BEP44_VALUE_EXPIRY_SECS: u64 = 2 * 60 * 60;
+
+/// Divisor applied to the BEP44 expiry to set the republish cadence.
+///
+/// Republishing every *half* the expiry window keeps the value continuously
+/// present with a full window of slack: one missed refresh (a transient network
+/// blip) still leaves the previous value live until the next tick. Named so the
+/// "refresh twice per expiry window" intent is explicit rather than a bare `2`.
+const DHT_REPUBLISH_DIVISOR: u64 = 2;
+
+/// How often a device republishes its candidate set into the DHT.
+///
+/// BEP44 mutable items are soft state: a storing node drops a value it has not
+/// seen refreshed within roughly the BEP44 expiry window. Refreshing twice per
+/// expiry window keeps the value present without hammering the DHT the way a
+/// minute-scale cadence would, and the interval is derived from the expiry
+/// estimate rather than picked arbitrarily, so the two move together: widen the
+/// expiry belief and the cadence widens with it.
+pub const DHT_REPUBLISH_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(BEP44_VALUE_EXPIRY_SECS / DHT_REPUBLISH_DIVISOR);
+
 /// Maximum length, in bytes, of a BEP44 mutable-item value.
 ///
 /// [BEP44](https://www.bittorrent.org/beps/bep_0044.html) caps a stored value
@@ -221,6 +270,38 @@ impl StoredCandidates {
     }
 }
 
+/// Outcome of a [`DhtNode::get`] lookup.
+///
+/// A DHT lookup has three meaningfully different endings, and collapsing them
+/// to a bare `Vec<Vec<u8>>` would lose the one that matters operationally:
+///
+/// - [`Found`](DhtGetOutcome::Found) — at least one node returned a value. The
+///   list carries every value seen (a lookup can surface more than one: two
+///   storing nodes, or a value mid-replacement), and the caller merges them.
+/// - [`NotFound`](DhtGetOutcome::NotFound) — the lookup completed and no node
+///   holds a value for the key. The peer simply has not announced (or its entry
+///   has expired). This is the normal "unknown device" ending.
+/// - [`TimedOut`](DhtGetOutcome::TimedOut) — the iterative lookup did not finish
+///   within [`DHT_RESOLVE_TIMEOUT`]. The peer *might* have a value we never
+///   reached. This is a transport-health signal, not absence, and the resolver
+///   logs it distinctly so a partitioned or wedged DHT is diagnosable rather
+///   than masquerading as "every peer is offline".
+///
+/// [`DhtDiscovery::resolve`] folds both `NotFound` and `TimedOut` to "no
+/// candidates" — the [`Discovery`] contract cannot surface a per-source error,
+/// and a single source coming up empty is normal when others may still succeed
+/// — but it logs the two endings differently so the distinction survives where
+/// it is useful: in the logs of a node that cannot reach anyone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DhtGetOutcome {
+    /// The lookup found one or more stored values for the key.
+    Found(Vec<Vec<u8>>),
+    /// The lookup completed cleanly and no node holds a value for the key.
+    NotFound,
+    /// The lookup did not complete within [`DHT_RESOLVE_TIMEOUT`].
+    TimedOut,
+}
+
 /// A put/get key-value store over 160-bit DHT keys.
 ///
 /// This is the seam between the discovery logic and the actual distributed
@@ -230,10 +311,10 @@ impl StoredCandidates {
 /// implementation, `MainlineDht`, talks to the `BitTorrent` Mainline DHT; the
 /// in-memory mock used in tests stores values in a map.
 ///
-/// `get` returns every value any node holds for the key. A DHT lookup can
-/// surface more than one stored value (different storing nodes, or a value
-/// mid-replacement), so the contract is a list rather than a single value; the
-/// caller decides how to merge them.
+/// `get` returns a [`DhtGetOutcome`] that distinguishes a clean not-found from a
+/// timed-out lookup, because the two mean different things — one peer is absent,
+/// the other the network is unreachable — and a node that can place no peers at
+/// all wants that distinction in its logs.
 #[async_trait]
 pub trait DhtNode: Send + Sync {
     /// Store `value` under `key` in the DHT. Best-effort: a store that does
@@ -241,11 +322,11 @@ pub trait DhtNode: Send + Sync {
     /// discovery announce is itself best-effort and runs on a background loop.
     async fn put(&self, key: DhtKey, value: Vec<u8>);
 
-    /// Look `key` up in the DHT, returning every stored value found. An
-    /// empty vector means no node holds a value for the key — modelled as
-    /// absence, not an error, the same way every [`Discovery`] source treats a
-    /// peer it knows nothing about.
-    async fn get(&self, key: DhtKey) -> Vec<Vec<u8>>;
+    /// Look `key` up in the DHT, distinguishing a clean not-found from a
+    /// timed-out lookup (see [`DhtGetOutcome`]). Implementations bound the
+    /// lookup at [`DHT_RESOLVE_TIMEOUT`] so a wedged iterative search reports
+    /// [`DhtGetOutcome::TimedOut`] rather than hanging the resolver.
+    async fn get(&self, key: DhtKey) -> DhtGetOutcome;
 }
 
 /// DHT-backed discovery source.
@@ -276,15 +357,38 @@ impl<N: DhtNode> Discovery for DhtDiscovery<N> {
     /// (different storing nodes, or a value mid-replacement) the decoded
     /// candidates are unioned; the composing [`super::DiscoveryService`]
     /// deduplicates the result by `(address, kind)`, so returning the union
-    /// here is safe. An unknown device id — no value under the key — yields no
-    /// candidates.
+    /// here is safe.
+    ///
+    /// A clean not-found and a timed-out lookup both yield no candidates — the
+    /// [`Discovery`] contract has no per-source error channel, and one source
+    /// coming up empty is normal — but the two are logged distinctly so a node
+    /// that can reach no peers can tell "this device has not announced" from
+    /// "the DHT is unreachable from here".
     async fn resolve(&self, device_id: &str) -> Vec<Candidate> {
         let key = DhtKey::from_device_id(device_id);
-        let values = self.node.get(key).await;
-        values
-            .iter()
-            .flat_map(|bytes| StoredCandidates::decode(bytes))
-            .collect()
+        match self.node.get(key).await {
+            DhtGetOutcome::Found(values) => values
+                .iter()
+                .flat_map(|bytes| StoredCandidates::decode(bytes))
+                .collect(),
+            DhtGetOutcome::NotFound => {
+                tracing::debug!(
+                    target: "cascade::p2p::discovery::dht",
+                    device_id = %device_id,
+                    "DHT lookup completed with no stored value for device",
+                );
+                Vec::new()
+            }
+            DhtGetOutcome::TimedOut => {
+                tracing::warn!(
+                    target: "cascade::p2p::discovery::dht",
+                    device_id = %device_id,
+                    timeout_secs = DHT_RESOLVE_TIMEOUT.as_secs(),
+                    "DHT lookup timed out before completing; treating as no candidates",
+                );
+                Vec::new()
+            }
+        }
     }
 
     /// Store this device's `candidates` under its DHT key so peers can resolve
@@ -308,7 +412,7 @@ impl<N: DhtNode> Discovery for DhtDiscovery<N> {
 }
 
 #[cfg(feature = "dht")]
-pub use live::MainlineDht;
+pub use live::{DEFAULT_DHT_BOOTSTRAP_NODES, MainlineDht};
 
 #[cfg(feature = "dht")]
 mod live {
@@ -316,9 +420,28 @@ mod live {
 
     use anyhow::Result;
     use async_trait::async_trait;
-    use mainline::{Dht, MutableItem, SigningKey};
+    use mainline::{DEFAULT_BOOTSTRAP_NODES, Dht, MutableItem, SigningKey};
 
-    use super::{DhtKey, DhtNode};
+    use super::{DHT_RESOLVE_TIMEOUT, DhtGetOutcome, DhtKey, DhtNode};
+
+    /// The default Mainline-DHT bootstrap nodes used when an operator supplies
+    /// no `dht_bootstrap_nodes` of their own.
+    ///
+    /// These are the long-standing public DHT routers — `router.bittorrent.com`,
+    /// `dht.transmissionbt.com`, `dht.libtorrent.org`, and `relay.pkarr.org` —
+    /// that the wider `BitTorrent` ecosystem bootstraps against, surfaced here as
+    /// a named constant rather than left implicit in the `mainline` crate so an
+    /// operator can see exactly what an out-of-the-box DHT join talks to. The set
+    /// is the `mainline` crate's own [`mainline::DEFAULT_BOOTSTRAP_NODES`],
+    /// re-exposed so the default is documented at the cascade layer and stays in
+    /// lockstep with the crate rather than being hand-copied (which would rot if
+    /// the crate's set changed).
+    ///
+    /// Each entry is a `host:port` string resolved at join time. An operator who
+    /// wants to pin their own nodes sets `dht_bootstrap_nodes` in the backend
+    /// TOML; an omitted or explicitly empty override falls back to exactly this
+    /// set, so the DHT is usable without supplying any bootstrap nodes.
+    pub const DEFAULT_DHT_BOOTSTRAP_NODES: &[&str] = &DEFAULT_BOOTSTRAP_NODES;
 
     /// Mainline-DHT-backed [`DhtNode`].
     ///
@@ -353,10 +476,12 @@ mod live {
     impl MainlineDht {
         /// Build a Mainline-DHT node, bootstrapping against `bootstrap_nodes`.
         ///
-        /// An empty `bootstrap_nodes` uses the `mainline` crate's built-in
-        /// public bootstrap set. There is no persisted signing key: every BEP44
-        /// keypair is derived from the device id at put/get time, so the node
-        /// holds no long-lived secret of its own.
+        /// An empty `bootstrap_nodes` falls back to the named public default,
+        /// [`DEFAULT_DHT_BOOTSTRAP_NODES`], so an out-of-the-box DHT join talks
+        /// to a known, documented set rather than relying on an implicit crate
+        /// default. There is no persisted signing key: every BEP44 keypair is
+        /// derived from the device id at put/get time, so the node holds no
+        /// long-lived secret of its own.
         ///
         /// Returns an error only on a process-level failure — binding the DHT
         /// UDP socket — not on a per-query failure, which is handled best-effort
@@ -371,14 +496,21 @@ mod live {
         /// address rather than the all-interfaces default. Production opens with
         /// `None` (the node must be reachable on every interface); the live test
         /// pins it to localhost so it talks to the in-process testnet.
+        ///
+        /// An empty `bootstrap_nodes` joins via [`DEFAULT_DHT_BOOTSTRAP_NODES`].
+        /// A non-empty list is used verbatim, so the live testnet helper — which
+        /// always passes concrete localhost bootstrap addresses — never reaches
+        /// for the public default.
         fn open_inner(
             bootstrap_nodes: &[SocketAddr],
             bind_ip: Option<std::net::Ipv4Addr>,
         ) -> Result<Self> {
             let mut builder = Dht::builder();
-            if !bootstrap_nodes.is_empty() {
-                builder.bootstrap(bootstrap_nodes);
-            }
+            // Surface the default explicitly rather than leaving the builder to
+            // fall back to its own internal set: an operator reading this code
+            // sees exactly which nodes a default join contacts.
+            let effective = resolve_bootstrap_nodes(bootstrap_nodes);
+            builder.bootstrap(&effective);
             if let Some(ip) = bind_ip {
                 builder.bind_address(ip);
             }
@@ -396,6 +528,24 @@ mod live {
         #[cfg(test)]
         pub(super) fn open_local(bootstrap_nodes: &[SocketAddr]) -> Result<Self> {
             Self::open_inner(bootstrap_nodes, Some(std::net::Ipv4Addr::LOCALHOST))
+        }
+    }
+
+    /// Resolve the effective bootstrap set the node will join through.
+    ///
+    /// This is the default-vs-override decision, isolated from socket binding so
+    /// it is unit-testable: an empty `configured` list (the operator supplied
+    /// none, or supplied an explicitly empty `dht_bootstrap_nodes`) falls back to
+    /// [`DEFAULT_DHT_BOOTSTRAP_NODES`]; a non-empty list is used verbatim, each
+    /// address rendered as the `host:port` string the `mainline` builder accepts.
+    fn resolve_bootstrap_nodes(configured: &[SocketAddr]) -> Vec<String> {
+        if configured.is_empty() {
+            DEFAULT_DHT_BOOTSTRAP_NODES
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect()
+        } else {
+            configured.iter().map(SocketAddr::to_string).collect()
         }
     }
 
@@ -426,15 +576,27 @@ mod live {
             }
         }
 
-        async fn get(&self, key: DhtKey) -> Vec<Vec<u8>> {
+        async fn get(&self, key: DhtKey) -> DhtGetOutcome {
             // Derive the announcer's public key from the queried device id and
             // read the most-recent item under SHA-1(public_key) — the exact
             // target the announcer wrote to. No salt, matching the put path.
             let public_key = signing_key_for(key).verifying_key().to_bytes();
             let dht = self.dht.clone();
-            dht.get_mutable_most_recent(&public_key, None)
-                .await
-                .map_or_else(Vec::new, |item| vec![item.value().to_vec()])
+            // Bound the iterative lookup: `get_mutable_most_recent` returns
+            // `None` for a clean not-found, but a partitioned or wedged lookup
+            // could otherwise run far longer than the resolver's caller is
+            // willing to wait. A timeout reads as `TimedOut`, distinct from the
+            // `None`-driven `NotFound`, so the two endings are tellable apart.
+            match tokio::time::timeout(
+                DHT_RESOLVE_TIMEOUT,
+                dht.get_mutable_most_recent(&public_key, None),
+            )
+            .await
+            {
+                Ok(Some(item)) => DhtGetOutcome::Found(vec![item.value().to_vec()]),
+                Ok(None) => DhtGetOutcome::NotFound,
+                Err(_elapsed) => DhtGetOutcome::TimedOut,
+            }
         }
     }
 
@@ -442,6 +604,47 @@ mod live {
     /// sequence number so a later announce supersedes an earlier one.
     fn unix_millis() -> i64 {
         chrono::Utc::now().timestamp_millis()
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+    mod tests {
+        use std::net::SocketAddr;
+
+        use super::{DEFAULT_DHT_BOOTSTRAP_NODES, resolve_bootstrap_nodes};
+
+        #[test]
+        fn empty_override_resolves_to_the_named_public_default() {
+            // No operator-supplied bootstrap nodes → the named default set is
+            // used, so the DHT is usable out of the box.
+            let resolved = resolve_bootstrap_nodes(&[]);
+            let expected: Vec<String> = DEFAULT_DHT_BOOTSTRAP_NODES
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect();
+            assert_eq!(resolved, expected);
+            assert!(!resolved.is_empty(), "the default set must be non-empty");
+        }
+
+        #[test]
+        fn non_empty_override_replaces_the_default_verbatim() {
+            // Operator-pinned nodes are used as-is, rendered to the host:port
+            // strings the builder accepts, and the public default is not mixed
+            // in.
+            let pinned: Vec<SocketAddr> = vec![
+                "127.0.0.1:6881".parse().unwrap(),
+                "10.0.0.1:6882".parse().unwrap(),
+            ];
+            let resolved = resolve_bootstrap_nodes(&pinned);
+            assert_eq!(resolved, vec!["127.0.0.1:6881", "10.0.0.1:6882"]);
+            // None of the public default routers leak into a pinned set.
+            for default in DEFAULT_DHT_BOOTSTRAP_NODES {
+                assert!(
+                    !resolved.iter().any(|r| r == default),
+                    "pinned override must not include the public default {default}",
+                );
+            }
+        }
     }
 }
 
@@ -477,14 +680,51 @@ mod tests {
             self.store.lock().await.insert(key.0, vec![value]);
         }
 
-        async fn get(&self, key: DhtKey) -> Vec<Vec<u8>> {
+        async fn get(&self, key: DhtKey) -> DhtGetOutcome {
+            // A key with stored values reads as `Found`; a key never written
+            // reads as a clean `NotFound`. The mock has no network, so it never
+            // times out — the `TimedOut` ending is exercised by `TimeoutDht`.
             self.store
                 .lock()
                 .await
                 .get(&key.0)
                 .cloned()
-                .unwrap_or_default()
+                .map_or(DhtGetOutcome::NotFound, DhtGetOutcome::Found)
         }
+    }
+
+    /// A [`DhtNode`] double whose `get` always reports the timed-out ending,
+    /// standing in for an iterative lookup that never completes. Lets the
+    /// resolver's not-found-vs-timeout handling be exercised without a network.
+    #[derive(Clone, Default)]
+    struct TimeoutDht;
+
+    #[async_trait]
+    impl DhtNode for TimeoutDht {
+        async fn put(&self, _key: DhtKey, _value: Vec<u8>) {}
+
+        async fn get(&self, _key: DhtKey) -> DhtGetOutcome {
+            DhtGetOutcome::TimedOut
+        }
+    }
+
+    #[test]
+    fn republish_interval_refreshes_strictly_inside_the_bep44_expiry_window() {
+        // The republish cadence exists so an announced value never lapses: it
+        // must refresh strictly faster than the expiry window, with slack for a
+        // missed tick. Pin the derivation so a change to either constant that
+        // would let the value expire between refreshes is caught.
+        let expiry = std::time::Duration::from_secs(BEP44_VALUE_EXPIRY_SECS);
+        assert!(
+            DHT_REPUBLISH_INTERVAL < expiry,
+            "republish interval {DHT_REPUBLISH_INTERVAL:?} must be shorter than the BEP44 expiry {expiry:?}",
+        );
+        // A missed refresh (one whole interval) must still leave the previous
+        // value live, i.e. two intervals must not exceed the expiry window.
+        assert!(
+            DHT_REPUBLISH_INTERVAL.saturating_mul(2) <= expiry,
+            "two republish intervals must fit inside the expiry window so one missed tick is survivable",
+        );
     }
 
     #[test]
@@ -613,6 +853,60 @@ mod tests {
     async fn resolve_unknown_device_yields_no_candidates() {
         let discovery = DhtDiscovery::new(MockDht::default());
         assert!(discovery.resolve("NEVER-ANNOUNCED").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_of_unknown_key_is_a_clean_not_found() {
+        // A key never written reads as the not-found ending, distinct from a
+        // timeout — the resolver leans on this distinction for its logging.
+        let node = MockDht::default();
+        let outcome = node.get(DhtKey::from_device_id("NEVER-ANNOUNCED")).await;
+        assert_eq!(outcome, DhtGetOutcome::NotFound);
+    }
+
+    #[tokio::test]
+    async fn get_of_known_key_is_found_with_the_stored_value() {
+        let node = MockDht::default();
+        let host = Candidate::new(addr(22000), CandidateKind::Host, 0);
+        let bytes = StoredCandidates::encode(&[host]).unwrap();
+        node.put(DhtKey::from_device_id("DEVICE-A"), bytes.clone())
+            .await;
+        let outcome = node.get(DhtKey::from_device_id("DEVICE-A")).await;
+        assert_eq!(outcome, DhtGetOutcome::Found(vec![bytes]));
+    }
+
+    #[tokio::test]
+    async fn resolve_treats_not_found_as_no_candidates() {
+        // The clean not-found ending collapses to "no candidates" at the
+        // Discovery boundary — a source coming up empty is normal.
+        let discovery = DhtDiscovery::new(MockDht::default());
+        assert!(discovery.resolve("NEVER-ANNOUNCED").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_treats_timeout_as_no_candidates() {
+        // A timed-out lookup also collapses to "no candidates" — the Discovery
+        // contract has no per-source error channel — but the resolver logs it
+        // distinctly from not-found. Here we only assert the candidate-set
+        // behaviour; the distinction lives in the DhtGetOutcome the node
+        // reports, exercised by `get_*` above and `TimeoutDht`.
+        let discovery = DhtDiscovery::new(TimeoutDht);
+        assert!(discovery.resolve("DEVICE-A").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn timeout_and_not_found_are_distinct_outcomes() {
+        // The two empty endings must not be the same value: a node that can
+        // place no peers needs to tell "device has not announced" from "the
+        // DHT is unreachable from here".
+        assert_ne!(DhtGetOutcome::NotFound, DhtGetOutcome::TimedOut);
+        let timed_out = TimeoutDht.get(DhtKey::from_device_id("DEVICE-A")).await;
+        let not_found = MockDht::default()
+            .get(DhtKey::from_device_id("DEVICE-A"))
+            .await;
+        assert_eq!(timed_out, DhtGetOutcome::TimedOut);
+        assert_eq!(not_found, DhtGetOutcome::NotFound);
+        assert_ne!(timed_out, not_found);
     }
 
     #[tokio::test]
