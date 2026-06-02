@@ -171,7 +171,7 @@ pub async fn hash_file(path: &Path) -> anyhow::Result<String> {
     let data = tokio::fs::read(path).await?;
     let mut hasher = Sha256::new();
     hasher.update(&data);
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Walk a directory tree and collect `FileState` for every file found.

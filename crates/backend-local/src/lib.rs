@@ -377,7 +377,7 @@ impl Backend for LocalBackend {
         let hash = {
             let mut hasher = sha2::Sha256::new();
             sha2::Digest::update(&mut hasher, &data);
-            format!("{:x}", hasher.finalize())
+            hex::encode(hasher.finalize())
         };
 
         let state = FileState {

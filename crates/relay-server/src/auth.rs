@@ -27,7 +27,7 @@
 //! so a forged tag against a different session cannot be replayed across
 //! the rendezvous fabric.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use thiserror::Error;
 
