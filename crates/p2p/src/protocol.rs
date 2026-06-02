@@ -23,6 +23,7 @@ const MSG_CLOSE: u32 = 6;
 const MSG_GOSSIP: u32 = 7;
 const MSG_CANDIDATES: u32 = 8;
 const MSG_SYNC_PUNCH: u32 = 9;
+const MSG_OBSERVED_ADDRESS: u32 = 10;
 
 /// Maximum number of candidates carried in a single
 /// [`BepMessage::Candidates`] frame. Bounds the receiver's allocation
@@ -378,6 +379,18 @@ pub enum BepMessage {
         /// if the deadline has already passed.
         deadline_unix_ms: u64,
     },
+    /// Tell the peer the source `SocketAddr` this side observed for the
+    /// connection — the peer-as-`STUN` mechanism that lets a host learn
+    /// its own reflexive (`NAT`-mapped) address with zero `STUN` servers.
+    ///
+    /// Sent by each side immediately after the TLS handshake completes:
+    /// the address carried is the *remote* peer's source as seen by the
+    /// local socket, so the receiver reads it back as its own externally
+    /// observed address. The receiver folds it into a
+    /// [`CandidateKind::ServerReflexive`] candidate (see
+    /// `cascade_p2p::nat::server_reflexive_candidate_from_addr`) exactly
+    /// as it would a `STUN`-derived `XOR-MAPPED-ADDRESS`.
+    ObservedAddress(SocketAddr),
 }
 
 impl BepMessage {
@@ -393,6 +406,7 @@ impl BepMessage {
             Self::Gossip { .. } => MSG_GOSSIP,
             Self::Candidates { .. } => MSG_CANDIDATES,
             Self::SyncPunch { .. } => MSG_SYNC_PUNCH,
+            Self::ObservedAddress(_) => MSG_OBSERVED_ADDRESS,
         }
     }
 }
@@ -480,6 +494,9 @@ pub fn encode_message(msg: &BepMessage) -> Result<Vec<u8>> {
         } => {
             encode_u64(&mut body, *nonce);
             encode_u64(&mut body, *deadline_unix_ms);
+        }
+        BepMessage::ObservedAddress(addr) => {
+            encode_socket_addr(&mut body, *addr)?;
         }
     }
 
@@ -638,6 +655,7 @@ pub fn decode_message(frame: &[u8]) -> Result<BepMessage> {
         MSG_GOSSIP => decode_gossip(rest),
         MSG_CANDIDATES => decode_candidates(rest),
         MSG_SYNC_PUNCH => decode_sync_punch(rest),
+        MSG_OBSERVED_ADDRESS => decode_observed_address(rest),
         _ => anyhow::bail!("unknown message type: {msg_type}"),
     }
 }
@@ -663,6 +681,11 @@ fn decode_sync_punch(data: &[u8]) -> Result<BepMessage> {
         nonce,
         deadline_unix_ms,
     })
+}
+
+fn decode_observed_address(data: &[u8]) -> Result<BepMessage> {
+    let (addr, _) = decode_socket_addr(data)?;
+    Ok(BepMessage::ObservedAddress(addr))
 }
 
 fn decode_cluster_config(data: &[u8]) -> Result<BepMessage> {
@@ -1355,6 +1378,21 @@ mod tests {
             nonce: u64::MAX,
             deadline_unix_ms: u64::MAX,
         });
+    }
+
+    #[test]
+    fn encode_decode_observed_address_ipv4() {
+        round_trip(BepMessage::ObservedAddress(v4(54_321)));
+    }
+
+    #[test]
+    fn encode_decode_observed_address_ipv6() {
+        round_trip(BepMessage::ObservedAddress(v6(54_321)));
+    }
+
+    #[test]
+    fn encode_decode_observed_address_zero_port() {
+        round_trip(BepMessage::ObservedAddress(v4(0)));
     }
 
     #[test]
