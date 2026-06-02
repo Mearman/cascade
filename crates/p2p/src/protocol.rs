@@ -28,6 +28,15 @@ const MSG_RELAY_OFFER: u32 = 11;
 const MSG_RELAY_CONNECT: u32 = 12;
 const MSG_RELAY_DATA: u32 = 13;
 const MSG_RELAY_INBOUND: u32 = 14;
+const MSG_MANAGE_REQUEST: u32 = 15;
+const MSG_MANAGE_RESPONSE: u32 = 16;
+
+/// Wire discriminant for a [`ManageResult::Ok`] outcome inside a
+/// [`BepMessage::ManageResponse`] frame.
+const MANAGE_RESULT_OK: u32 = 0;
+/// Wire discriminant for a [`ManageResult::Err`] outcome inside a
+/// [`BepMessage::ManageResponse`] frame.
+const MANAGE_RESULT_ERR: u32 = 1;
 
 /// Maximum number of candidates carried in a single
 /// [`BepMessage::Candidates`] frame. Bounds the receiver's allocation
@@ -313,6 +322,109 @@ pub struct GossipPeer {
     pub snapshot_unix_seconds: i64,
 }
 
+/// The extent a [`ManageCommand`] targets, as carried on the wire.
+///
+/// Mirrors the management-plane scope model in `cascade_engine::manage`: a
+/// command is either node-wide or confined to a folder subtree identified by a
+/// path prefix. Kept wire-typed (a plain enum over a path string) so the
+/// protocol crate stays independent of the engine's richer `Scope` type — the
+/// engine maps between the two at the dispatch boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManageScope {
+    /// The whole node — every path.
+    Node,
+    /// A folder subtree identified by its path prefix.
+    Folder {
+        /// The folder path prefix this scope covers.
+        path: String,
+    },
+}
+
+/// Wire discriminant for a node-wide [`ManageScope`].
+const MANAGE_SCOPE_NODE: u32 = 0;
+/// Wire discriminant for a folder-scoped [`ManageScope`].
+const MANAGE_SCOPE_FOLDER: u32 = 1;
+
+/// A management command a manager asks a managed node to run, as carried on the
+/// wire inside a [`BepMessage::ManageRequest`].
+///
+/// Each variant names a verb plus its arguments. The set is deliberately
+/// closed and explicit rather than a free-form `(name, args)` pair: an
+/// unrecognised verb fails to decode rather than reaching the dispatcher as an
+/// untyped string, and the managed node's authorisation logic can map each
+/// variant to the exact capability it requires. New capabilities slot in as new
+/// variants with their own message-type-independent encoding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManageCommand {
+    /// Read node status — mount state, cache usage, backend health, peer list.
+    /// Requires the `status:read` capability.
+    StatusRead,
+    /// Pin a path glob, keeping matching files offline. Requires the
+    /// `pin:write` capability.
+    Pin {
+        /// The path glob to pin.
+        path_glob: String,
+        /// Whether the pin recurses into subdirectories.
+        recursive: bool,
+    },
+    /// Remove a pin rule. Requires the `pin:write` capability.
+    Unpin {
+        /// The path glob whose pin rule to remove.
+        path_glob: String,
+    },
+    /// Run one cache eviction sweep. Requires the `cache:manage` capability.
+    CacheEvict,
+}
+
+/// Wire discriminant for [`ManageCommand::StatusRead`].
+const MANAGE_CMD_STATUS_READ: u32 = 0;
+/// Wire discriminant for [`ManageCommand::Pin`].
+const MANAGE_CMD_PIN: u32 = 1;
+/// Wire discriminant for [`ManageCommand::Unpin`].
+const MANAGE_CMD_UNPIN: u32 = 2;
+/// Wire discriminant for [`ManageCommand::CacheEvict`].
+const MANAGE_CMD_CACHE_EVICT: u32 = 3;
+
+/// The outcome of a [`ManageCommand`], carried on the wire inside a
+/// [`BepMessage::ManageResponse`].
+///
+/// `Ok` carries a short human-readable summary of what the command did (for
+/// example a status snapshot or an eviction count); `Err` carries a typed
+/// error code plus a message. The `Unauthorised` code is reserved for an
+/// authorisation failure — the managed node refusing a command the caller's
+/// grants do not cover — so a manager can distinguish "you may not" from a
+/// command that ran and failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManageResult {
+    /// The command ran successfully. Carries a short result summary.
+    Ok {
+        /// Human-readable summary of the command's effect.
+        summary: String,
+    },
+    /// The command did not run, or ran and failed.
+    Err {
+        /// The typed error kind.
+        kind: ManageErrorKind,
+        /// A human-readable message describing the failure.
+        message: String,
+    },
+}
+
+/// The kind of failure carried by [`ManageResult::Err`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManageErrorKind {
+    /// The caller's grants do not authorise the requested command over the
+    /// requested scope. The command was not run; the attempt is still audited.
+    Unauthorised,
+    /// The command was authorised but failed while running.
+    Failed,
+}
+
+/// Wire discriminant for [`ManageErrorKind::Unauthorised`].
+const MANAGE_ERR_UNAUTHORISED: u32 = 0;
+/// Wire discriminant for [`ManageErrorKind::Failed`].
+const MANAGE_ERR_FAILED: u32 = 1;
+
 /// BEP message types.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BepMessage {
@@ -460,6 +572,39 @@ pub enum BepMessage {
         /// Device id of the peer that initiated the relayed connection.
         source_device: String,
     },
+    /// Ask the peer (the managed node) to run an administrative command.
+    ///
+    /// Carried over the already-TLS-authenticated peer connection, so the
+    /// caller's device ID is established by the transport before the command is
+    /// read — the managed node uses that identity as the caller principal,
+    /// resolves the caller's grants, and only runs the command if a grant
+    /// authorises `command` over `scope`. The command dispatches into the same
+    /// internal handlers the local CLI drives; a manager can never do more than
+    /// the local daemon could do to itself.
+    ManageRequest {
+        /// Correlation id chosen by the manager. The managed node echoes it in
+        /// the matching [`BepMessage::ManageResponse`] so the manager can route
+        /// the outcome to the right waiter.
+        request_id: u64,
+        /// The command to run.
+        command: ManageCommand,
+        /// The scope the command targets. Authorisation checks the caller's
+        /// grants cover this scope.
+        scope: ManageScope,
+    },
+    /// Reply to a [`BepMessage::ManageRequest`].
+    ///
+    /// Echoes the request id and carries the [`ManageResult`] outcome. An
+    /// authorisation failure is reported as a typed
+    /// [`ManageErrorKind::Unauthorised`] error rather than silently dropping the
+    /// request, so the manager learns its grants were insufficient.
+    ManageResponse {
+        /// Echoes the `request_id` of the [`BepMessage::ManageRequest`] this
+        /// response answers.
+        request_id: u64,
+        /// The command outcome.
+        result: ManageResult,
+    },
 }
 
 impl BepMessage {
@@ -480,6 +625,8 @@ impl BepMessage {
             Self::RelayConnect { .. } => MSG_RELAY_CONNECT,
             Self::RelayData { .. } => MSG_RELAY_DATA,
             Self::RelayInbound { .. } => MSG_RELAY_INBOUND,
+            Self::ManageRequest { .. } => MSG_MANAGE_REQUEST,
+            Self::ManageResponse { .. } => MSG_MANAGE_RESPONSE,
         }
     }
 }
@@ -592,6 +739,19 @@ pub fn encode_message(msg: &BepMessage) -> Result<Vec<u8>> {
         }
         BepMessage::RelayInbound { source_device } => {
             encode_string(&mut body, source_device)?;
+        }
+        BepMessage::ManageRequest {
+            request_id,
+            command,
+            scope,
+        } => {
+            encode_u64(&mut body, *request_id);
+            encode_manage_command(&mut body, command)?;
+            encode_manage_scope(&mut body, scope)?;
+        }
+        BepMessage::ManageResponse { request_id, result } => {
+            encode_u64(&mut body, *request_id);
+            encode_manage_result(&mut body, result)?;
         }
     }
 
@@ -716,6 +876,56 @@ fn encode_version(buf: &mut Vec<u8>, version: &Version) -> Result<()> {
     Ok(())
 }
 
+fn encode_manage_scope(buf: &mut Vec<u8>, scope: &ManageScope) -> Result<()> {
+    match scope {
+        ManageScope::Node => encode_u32(buf, MANAGE_SCOPE_NODE),
+        ManageScope::Folder { path } => {
+            encode_u32(buf, MANAGE_SCOPE_FOLDER);
+            encode_string(buf, path)?;
+        }
+    }
+    Ok(())
+}
+
+fn encode_manage_command(buf: &mut Vec<u8>, command: &ManageCommand) -> Result<()> {
+    match command {
+        ManageCommand::StatusRead => encode_u32(buf, MANAGE_CMD_STATUS_READ),
+        ManageCommand::Pin {
+            path_glob,
+            recursive,
+        } => {
+            encode_u32(buf, MANAGE_CMD_PIN);
+            encode_string(buf, path_glob)?;
+            encode_u32(buf, u32::from(*recursive));
+        }
+        ManageCommand::Unpin { path_glob } => {
+            encode_u32(buf, MANAGE_CMD_UNPIN);
+            encode_string(buf, path_glob)?;
+        }
+        ManageCommand::CacheEvict => encode_u32(buf, MANAGE_CMD_CACHE_EVICT),
+    }
+    Ok(())
+}
+
+fn encode_manage_result(buf: &mut Vec<u8>, result: &ManageResult) -> Result<()> {
+    match result {
+        ManageResult::Ok { summary } => {
+            encode_u32(buf, MANAGE_RESULT_OK);
+            encode_string(buf, summary)?;
+        }
+        ManageResult::Err { kind, message } => {
+            encode_u32(buf, MANAGE_RESULT_ERR);
+            let kind_tag = match kind {
+                ManageErrorKind::Unauthorised => MANAGE_ERR_UNAUTHORISED,
+                ManageErrorKind::Failed => MANAGE_ERR_FAILED,
+            };
+            encode_u32(buf, kind_tag);
+            encode_string(buf, message)?;
+        }
+    }
+    Ok(())
+}
+
 // ── Decoding ──
 
 /// Decode a BEP message from a length-prefixed XDR frame.
@@ -755,6 +965,8 @@ pub fn decode_message(frame: &[u8]) -> Result<BepMessage> {
         MSG_RELAY_CONNECT => decode_relay_connect(rest),
         MSG_RELAY_DATA => decode_relay_data(rest),
         MSG_RELAY_INBOUND => decode_relay_inbound(rest),
+        MSG_MANAGE_REQUEST => decode_manage_request(rest),
+        MSG_MANAGE_RESPONSE => decode_manage_response(rest),
         _ => anyhow::bail!("unknown message type: {msg_type}"),
     }
 }
@@ -818,6 +1030,80 @@ fn decode_relay_data(data: &[u8]) -> Result<BepMessage> {
 fn decode_relay_inbound(data: &[u8]) -> Result<BepMessage> {
     let (source_device, _) = decode_string(data)?;
     Ok(BepMessage::RelayInbound { source_device })
+}
+
+fn decode_manage_scope(data: &[u8]) -> Result<(ManageScope, &[u8])> {
+    let (tag, rest) = decode_u32(data)?;
+    match tag {
+        MANAGE_SCOPE_NODE => Ok((ManageScope::Node, rest)),
+        MANAGE_SCOPE_FOLDER => {
+            let (path, rest) = decode_string(rest)?;
+            Ok((ManageScope::Folder { path }, rest))
+        }
+        other => anyhow::bail!("unknown manage scope tag {other}"),
+    }
+}
+
+fn decode_manage_command(data: &[u8]) -> Result<(ManageCommand, &[u8])> {
+    let (tag, rest) = decode_u32(data)?;
+    match tag {
+        MANAGE_CMD_STATUS_READ => Ok((ManageCommand::StatusRead, rest)),
+        MANAGE_CMD_PIN => {
+            let (path_glob, rest) = decode_string(rest)?;
+            let (recursive_flag, rest) = decode_u32(rest)?;
+            Ok((
+                ManageCommand::Pin {
+                    path_glob,
+                    recursive: recursive_flag != 0,
+                },
+                rest,
+            ))
+        }
+        MANAGE_CMD_UNPIN => {
+            let (path_glob, rest) = decode_string(rest)?;
+            Ok((ManageCommand::Unpin { path_glob }, rest))
+        }
+        MANAGE_CMD_CACHE_EVICT => Ok((ManageCommand::CacheEvict, rest)),
+        other => anyhow::bail!("unknown manage command tag {other}"),
+    }
+}
+
+fn decode_manage_result(data: &[u8]) -> Result<(ManageResult, &[u8])> {
+    let (tag, rest) = decode_u32(data)?;
+    match tag {
+        MANAGE_RESULT_OK => {
+            let (summary, rest) = decode_string(rest)?;
+            Ok((ManageResult::Ok { summary }, rest))
+        }
+        MANAGE_RESULT_ERR => {
+            let (kind_tag, rest) = decode_u32(rest)?;
+            let kind = match kind_tag {
+                MANAGE_ERR_UNAUTHORISED => ManageErrorKind::Unauthorised,
+                MANAGE_ERR_FAILED => ManageErrorKind::Failed,
+                other => anyhow::bail!("unknown manage error kind tag {other}"),
+            };
+            let (message, rest) = decode_string(rest)?;
+            Ok((ManageResult::Err { kind, message }, rest))
+        }
+        other => anyhow::bail!("unknown manage result tag {other}"),
+    }
+}
+
+fn decode_manage_request(data: &[u8]) -> Result<BepMessage> {
+    let (request_id, rest) = decode_u64(data)?;
+    let (command, rest) = decode_manage_command(rest)?;
+    let (scope, _) = decode_manage_scope(rest)?;
+    Ok(BepMessage::ManageRequest {
+        request_id,
+        command,
+        scope,
+    })
+}
+
+fn decode_manage_response(data: &[u8]) -> Result<BepMessage> {
+    let (request_id, rest) = decode_u64(data)?;
+    let (result, _) = decode_manage_result(rest)?;
+    Ok(BepMessage::ManageResponse { request_id, result })
 }
 
 fn decode_cluster_config(data: &[u8]) -> Result<BepMessage> {
@@ -1586,6 +1872,135 @@ mod tests {
         round_trip(BepMessage::RelayInbound {
             source_device: "SOURCE-DEVICE-ID".into(),
         });
+    }
+
+    // ── Management-plane frames ──
+
+    #[test]
+    fn encode_decode_manage_request_status_read_node_scope() {
+        round_trip(BepMessage::ManageRequest {
+            request_id: 7,
+            command: ManageCommand::StatusRead,
+            scope: ManageScope::Node,
+        });
+    }
+
+    #[test]
+    fn encode_decode_manage_request_pin_folder_scope() {
+        round_trip(BepMessage::ManageRequest {
+            request_id: 0xDEAD_BEEF,
+            command: ManageCommand::Pin {
+                path_glob: "/work/reports/*.pdf".into(),
+                recursive: true,
+            },
+            scope: ManageScope::Folder {
+                path: "/work".into(),
+            },
+        });
+    }
+
+    #[test]
+    fn encode_decode_manage_request_unpin() {
+        round_trip(BepMessage::ManageRequest {
+            request_id: 1,
+            command: ManageCommand::Unpin {
+                path_glob: "/work/old".into(),
+            },
+            scope: ManageScope::Folder {
+                path: "/work".into(),
+            },
+        });
+    }
+
+    #[test]
+    fn encode_decode_manage_request_cache_evict() {
+        round_trip(BepMessage::ManageRequest {
+            request_id: u64::MAX,
+            command: ManageCommand::CacheEvict,
+            scope: ManageScope::Node,
+        });
+    }
+
+    #[test]
+    fn encode_decode_manage_response_ok() {
+        round_trip(BepMessage::ManageResponse {
+            request_id: 42,
+            result: ManageResult::Ok {
+                summary: "evicted 3 files, freed 1024 bytes".into(),
+            },
+        });
+    }
+
+    #[test]
+    fn encode_decode_manage_response_unauthorised() {
+        round_trip(BepMessage::ManageResponse {
+            request_id: 42,
+            result: ManageResult::Err {
+                kind: ManageErrorKind::Unauthorised,
+                message: "caller MANAGER lacks pin:write over /work".into(),
+            },
+        });
+    }
+
+    #[test]
+    fn encode_decode_manage_response_failed() {
+        round_trip(BepMessage::ManageResponse {
+            request_id: 99,
+            result: ManageResult::Err {
+                kind: ManageErrorKind::Failed,
+                message: "pin matcher rejected glob".into(),
+            },
+        });
+    }
+
+    #[test]
+    fn decode_manage_request_rejects_unknown_command_tag() {
+        let mut body = Vec::new();
+        encode_u32(&mut body, MSG_MANAGE_REQUEST);
+        encode_u64(&mut body, 1);
+        encode_u32(&mut body, 99); // unknown command tag
+        let mut frame = Vec::new();
+        let body_len = u32::try_from(body.len()).unwrap_or(0);
+        encode_u32(&mut frame, body_len);
+        frame.extend_from_slice(&body);
+        let result = decode_message(&frame);
+        assert!(result.is_err(), "unknown manage command tag must fail");
+        assert!(
+            result
+                .err()
+                .map(|e| e.to_string())
+                .is_some_and(|msg| msg.contains("unknown manage command tag")),
+            "error should name the unknown command tag",
+        );
+    }
+
+    #[test]
+    fn decode_manage_request_rejects_unknown_scope_tag() {
+        let mut body = Vec::new();
+        encode_u32(&mut body, MSG_MANAGE_REQUEST);
+        encode_u64(&mut body, 1);
+        encode_u32(&mut body, MANAGE_CMD_STATUS_READ);
+        encode_u32(&mut body, 99); // unknown scope tag
+        let mut frame = Vec::new();
+        let body_len = u32::try_from(body.len()).unwrap_or(0);
+        encode_u32(&mut frame, body_len);
+        frame.extend_from_slice(&body);
+        let result = decode_message(&frame);
+        assert!(result.is_err(), "unknown manage scope tag must fail");
+    }
+
+    #[test]
+    fn decode_manage_response_rejects_unknown_result_tag() {
+        let mut body = Vec::new();
+        encode_u32(&mut body, MSG_MANAGE_RESPONSE);
+        encode_u64(&mut body, 1);
+        encode_u32(&mut body, 99); // unknown result tag
+        let mut frame = Vec::new();
+        let body_len = u32::try_from(body.len()).unwrap_or(0);
+        encode_u32(&mut frame, body_len);
+        frame.extend_from_slice(&body);
+        let result = decode_message(&frame);
+        assert!(result.is_err(), "unknown manage result tag must fail");
     }
 
     #[test]
