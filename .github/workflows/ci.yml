@@ -210,6 +210,11 @@ jobs:
             }
           }
           Write-Host "PrjFlt minifilter is loaded."
+      - name: Clippy live ProjFS test under its feature
+        # The projfs-live test file is gated behind the feature + Windows, so
+        # the workspace clippy job never lints it. Lint it here under the same
+        # gate so the test code is actually held to the workspace lint bar.
+        run: cargo clippy -p cascade-presenter-projfs --features projfs-live --all-targets -- -D warnings
       - name: Build live ProjFS test binary
         run: cargo test -p cascade-presenter-projfs --features projfs-live --test projfs_live --no-run
       - name: Run live ProjFS integration test
