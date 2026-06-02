@@ -20,7 +20,12 @@ use super::{CliContext, is_process_alive};
 /// tasks from an earlier attempt surviving into the next fallback.
 struct PresenterResources {
     /// The engine instance (dropped last so cancel signals reach tasks).
-    engine: Engine,
+    ///
+    /// Held as an `Arc` because the engine is also the management-plane
+    /// dispatcher wired into the P2P backend at startup
+    /// ([`Engine::wire_manage_dispatch`]); that wiring hands a clone of the same
+    /// `Arc` to the backend, so the engine must already live behind one here.
+    engine: Arc<Engine>,
     /// Join handle for the cache-manager background task.
     engine_handle: cascade_engine::engine::EngineHandle,
     /// Join handle for the sync runner task.
@@ -246,7 +251,11 @@ async fn try_fskit(
         enable_p2p,
         p2p_data_dir: None,
     };
-    let engine = Engine::new(engine_config)?;
+    let engine = Arc::new(Engine::new(engine_config)?);
+    // Wire the management-plane dispatcher into every backend that serves
+    // remote management (the P2P backend). Done before the presenter starts so
+    // an inbound ManageRequest is authorised and executed rather than refused.
+    engine.wire_manage_dispatch().await;
 
     let presenter = Arc::new(
         cascade_presenter_fskit::FSKitPresenter::from_default_socket()?
@@ -396,7 +405,11 @@ async fn try_fileprovider(
         enable_p2p,
         p2p_data_dir: None,
     };
-    let engine = Engine::new(engine_config)?;
+    let engine = Arc::new(Engine::new(engine_config)?);
+    // Wire the management-plane dispatcher into every backend that serves
+    // remote management (the P2P backend). Done before the presenter starts so
+    // an inbound ManageRequest is authorised and executed rather than refused.
+    engine.wire_manage_dispatch().await;
 
     // The File Provider RPC server answers inbound queries from the Swift
     // extension against the engine's live VFS, state DB, cache directory,
@@ -514,7 +527,11 @@ async fn try_projfs(
         enable_p2p,
         p2p_data_dir: None,
     };
-    let engine = Engine::new(engine_config)?;
+    let engine = Arc::new(Engine::new(engine_config)?);
+    // Wire the management-plane dispatcher into every backend that serves
+    // remote management (the P2P backend). Done before the presenter starts so
+    // an inbound ManageRequest is authorised and executed rather than refused.
+    engine.wire_manage_dispatch().await;
 
     // Capture the daemon's runtime handle while still on it. The ProjFS
     // GetFileData callback runs on a kernel thread outside any runtime; the
@@ -639,7 +656,11 @@ async fn try_webdav(
         enable_p2p,
         p2p_data_dir: None,
     };
-    let engine = Engine::new(engine_config)?;
+    let engine = Arc::new(Engine::new(engine_config)?);
+    // Wire the management-plane dispatcher into every backend that serves
+    // remote management (the P2P backend). Done before the presenter starts so
+    // an inbound ManageRequest is authorised and executed rather than refused.
+    engine.wire_manage_dispatch().await;
 
     let mut presenter = WebDavPresenter::new(mount_path);
     if let Ok(bind) = std::env::var("CASCADE_WEBDAV_BIND") {
@@ -758,7 +779,11 @@ async fn try_fuse(
         enable_p2p,
         p2p_data_dir: None,
     };
-    let engine = Engine::new(engine_config)?;
+    let engine = Arc::new(Engine::new(engine_config)?);
+    // Wire the management-plane dispatcher into every backend that serves
+    // remote management (the P2P backend). Done before the presenter starts so
+    // an inbound ManageRequest is authorised and executed rather than refused.
+    engine.wire_manage_dispatch().await;
 
     let root_id = cascade_engine::types::ItemId::new("vfs", "root");
     let presenter = Arc::new(
@@ -835,7 +860,11 @@ async fn try_nfs(
         enable_p2p,
         p2p_data_dir: None,
     };
-    let engine = Engine::new(engine_config)?;
+    let engine = Arc::new(Engine::new(engine_config)?);
+    // Wire the management-plane dispatcher into every backend that serves
+    // remote management (the P2P backend). Done before the presenter starts so
+    // an inbound ManageRequest is authorised and executed rather than refused.
+    engine.wire_manage_dispatch().await;
 
     let presenter = Arc::new(cascade_presenter_nfs::NfsPresenter::with_vfs(
         mount_path,
