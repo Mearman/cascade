@@ -2,7 +2,10 @@
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::indexing_slicing,
-    clippy::string_slice
+    clippy::string_slice,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    clippy::doc_markdown
 )]
 //! End-to-end NAT integration tests using Linux network namespaces.
 //!
@@ -47,14 +50,6 @@
 //! See `docs/nat-integration-tests.md` for the step-by-step guide.
 
 #![cfg(feature = "nat-integration")]
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::indexing_slicing,
-    clippy::missing_panics_doc,
-    clippy::missing_errors_doc,
-    clippy::doc_markdown
-)]
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
@@ -409,10 +404,11 @@ impl NetNsHarness {
                 let n = reader
                     .read_line(&mut line)
                     .expect("reading relay subprocess stdout");
-                if n == 0 {
-                    // EOF — relay exited before printing an address.
-                    panic!("relay subprocess closed stdout without printing a bound address");
-                }
+                // EOF (n == 0) means the relay exited before printing an address.
+                assert!(
+                    n != 0,
+                    "relay subprocess closed stdout without printing a bound address"
+                );
                 let trimmed = line.trim();
                 if let Some(port) = trimmed.rsplit(':').next() {
                     let port = port.trim();
@@ -468,8 +464,7 @@ fn is_root() -> bool {
         .output()
         .ok()
         .and_then(|out| String::from_utf8(out.stdout).ok())
-        .map(|s| s.trim() == "0")
-        .unwrap_or(false)
+        .is_some_and(|s| s.trim() == "0")
 }
 
 /// Returns `true` when `command` is on PATH.
@@ -477,8 +472,7 @@ fn command_exists(command: &str) -> bool {
     Command::new("which")
         .arg(command)
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success())
 }
 
 /// Run `ip netns exec <ns> <cmd> <args>`.
@@ -491,9 +485,10 @@ fn ns_run(ns: &str, cmd: &str, args: &[&str]) {
         .args(args)
         .status()
         .unwrap_or_else(|err| panic!("failed to spawn `ip netns exec {ns} {cmd}`: {err}"));
-    if !status.success() {
-        panic!("`ip netns exec {ns} {cmd} {args:?}` exited with {status}");
-    }
+    assert!(
+        status.success(),
+        "`ip netns exec {ns} {cmd} {args:?}` exited with {status}"
+    );
 }
 
 /// Run a top-level command that must succeed (no namespace context).
@@ -502,9 +497,7 @@ fn run_required(cmd: &str, args: &[&str]) {
         .args(args)
         .status()
         .unwrap_or_else(|err| panic!("failed to spawn `{cmd} {args:?}`: {err}"));
-    if !status.success() {
-        panic!("`{cmd} {args:?}` exited with {status}");
-    }
+    assert!(status.success(), "`{cmd} {args:?}` exited with {status}");
 }
 
 /// Spawn a peer subprocess inside `ns`, wait up to `timeout` for it to
@@ -579,13 +572,13 @@ fn nat_relay_end_to_end() {
 
     std::thread::sleep(Duration::from_millis(200));
 
-    let relay_addr_a = relay_addr.clone();
+    let relay_addr_a = relay_addr;
     let peer_a_result = run_peer_in_ns(NS_PEER_A, "peer-a", &relay_addr_a, peer_timeout);
-    let peer_b_result = peer_b_handle.join().expect("peer-b thread panicked");
+    let peer_b_outcome = peer_b_handle.join().expect("peer-b thread panicked");
 
     // Teardown runs here via Drop regardless of outcome.
     drop(harness);
 
     assert!(peer_a_result, "peer-a did not complete successfully");
-    assert!(peer_b_result, "peer-b did not complete successfully");
+    assert!(peer_b_outcome, "peer-b did not complete successfully");
 }
