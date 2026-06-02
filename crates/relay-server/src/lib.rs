@@ -32,6 +32,8 @@
 //! The session ID is the rendezvous key — the server is a passive
 //! matchmaker that does not speak the inner protocol.
 
+#[cfg(feature = "announce")]
+pub mod announce;
 pub mod auth;
 pub mod config;
 pub mod metrics;

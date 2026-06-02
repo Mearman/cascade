@@ -98,6 +98,7 @@ fn run_relay_subprocess() {
             session_timeout: Duration::from_secs(30),
             max_sessions: 16,
             metrics_bind: None,
+            announce_bind: None,
         };
         let handle = cascade_relay_server::server::spawn(config)
             .await

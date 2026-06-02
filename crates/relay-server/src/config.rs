@@ -22,6 +22,9 @@ pub struct RelayConfig {
     pub max_sessions: u32,
     /// Optional address for the `/metrics` `HTTP` endpoint.
     pub metrics_bind: Option<SocketAddr>,
+    /// Optional address for the announce/lookup directory `HTTP` endpoint.
+    /// `None` disables it; the relay then serves only the byte-pipe.
+    pub announce_bind: Option<SocketAddr>,
 }
 
 impl RelayConfig {
