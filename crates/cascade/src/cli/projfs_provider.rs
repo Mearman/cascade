@@ -25,15 +25,22 @@
 //! [`tokio::runtime::Handle::block_on`] on the captured daemon runtime
 //! handle. `block_on` is valid here precisely because the callback thread
 //! is outside any runtime — the same precondition that lets the presenter's
-//! other callbacks call `RwLock::blocking_read`. It would panic only if
-//! entered from inside an active runtime worker, which a `ProjFS` callback
-//! thread never is.
+//! other callbacks call `RwLock::blocking_read`. To stay panic-proof even
+//! if a future caller invokes this from inside a runtime worker, the bridge
+//! checks [`tokio::runtime::Handle::try_current`] and falls back to
+//! [`tokio::task::block_in_place`] in that case, so it never hits the
+//! "Cannot start a runtime from within a runtime" panic.
 //!
 //! # Known limitations (deliberate for v8)
 //!
 //! - The cold download is not cancellable mid-stream: the presenter's
 //!   `CancellationToken` is observed at checkpoints around `read_range`,
-//!   not inside the download. Warm range reads are cheap.
+//!   not inside the download. Warm range reads are cheap. The practical
+//!   consequence is that a `GetFileData` for a large cold file blocks its
+//!   callback thread — and therefore can delay daemon shutdown — for the
+//!   full duration of the download, with no way to interrupt it once the
+//!   `Backend::download` stream is in flight. A range-aware backend API
+//!   (HTTP Range) is the proper fix; materialise-then-seek is the interim.
 //! - When `mod_time` is `None`, the cache version is `"unknown"`, which
 //!   inherits the same staleness edge as the File Provider cache scheme.
 //!   A content-hash version is the proper fix but is a cross-presenter
@@ -45,6 +52,7 @@ use std::io::{self, ErrorKind, Read as _, Seek as _, SeekFrom};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use cascade_engine::backend::Backend;
 use cascade_engine::db::StateDb;
@@ -52,6 +60,12 @@ use cascade_engine::types::ItemId;
 use cascade_engine::vfs::VfsTree;
 use cascade_presenter_projfs::ContentProvider;
 use tokio::io::AsyncWriteExt as _;
+
+/// Process-wide monotonic counter used to name temp download files
+/// uniquely. Shared across every provider instance and callback thread,
+/// so two concurrent cold downloads of the same item can never pick the
+/// same temp path.
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Source of file bytes for the `ProjFS` `GetFileData` callback, backed
 /// by the engine's state database and backend list.
@@ -209,33 +223,69 @@ impl ContentProvider for EngineContentProvider {
 
             std::fs::create_dir_all(&item_dir)?;
 
-            // Unique temp sibling: thread id + nanos avoids collisions when
-            // two callback threads race the same cold file.
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos());
-            let unique = format!("{:?}-{nanos}", std::thread::current().id());
-            let tmp_path = item_dir.join(format!("{version}.{unique}.tmp"));
+            // Unique temp sibling: a process-wide monotonic counter
+            // guarantees a distinct name per download attempt without
+            // relying on clock resolution or thread-id reuse, so two
+            // callback threads racing the same cold file cannot collide.
+            let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let tmp_path = item_dir.join(format!("{version}.{seq}.tmp"));
 
             let backend = Arc::clone(backend);
             let tmp_for_download = tmp_path.clone();
+            let entry_size = entry.size;
             // The cold-path download is the only place this provider enters
-            // the runtime. `block_on` is safe because this callback runs on
-            // a ProjFS kernel thread, never inside a runtime worker.
-            let download_result: anyhow::Result<()> = self.handle.block_on(async move {
+            // the runtime. The ProjFS GetFileData callback runs on a
+            // kernel-owned worker thread that is outside any Tokio runtime,
+            // so a bare `Handle::block_on` is the right bridge there. But to
+            // be panic-proof in any caller (tests, or a future caller that
+            // happens to already be on a runtime worker), detect that case
+            // with `Handle::try_current` and use `block_in_place` so we
+            // never hit the "Cannot start a runtime from within a runtime"
+            // panic path. On the real callback thread `try_current` returns
+            // `Err`, so we take the plain `block_on` branch.
+            let download = async move {
                 let file = tokio::fs::File::create(&tmp_for_download).await?;
                 let mut writer = WriterAdapter { inner: file };
                 backend.download(&entry, &mut writer).await?;
                 writer.inner.flush().await?;
                 writer.inner.shutdown().await?;
-                Ok(())
-            });
+                anyhow::Ok(())
+            };
+            let download_result: anyhow::Result<()> =
+                if tokio::runtime::Handle::try_current().is_ok() {
+                    // Already inside a runtime worker: yield the worker with
+                    // `block_in_place` before blocking on the future, which
+                    // is the supported way to run a blocking section without
+                    // the nested-runtime panic.
+                    tokio::task::block_in_place(|| self.handle.block_on(download))
+                } else {
+                    self.handle.block_on(download)
+                };
 
             if let Err(err) = download_result {
                 // Best-effort cleanup of the partial temp file; ignore the
                 // result because the original download error is what matters.
                 let _ = std::fs::remove_file(&tmp_path);
                 return Err(to_io(err));
+            }
+
+            // Validate the materialised file against the metadata size before
+            // publishing it. A truncated download (network cut mid-stream that
+            // the backend reported as success) would otherwise be renamed into
+            // the cache and served as authoritative. Fail loudly instead of
+            // serving short content. Only checked when `entry.size` is known.
+            if let Some(expected) = entry_size {
+                let written = std::fs::metadata(&tmp_path)?.len();
+                if written != expected {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        format!(
+                            "downloaded length {written} does not match expected size {expected} for {}",
+                            id.0
+                        ),
+                    ));
+                }
             }
 
             std::fs::rename(&tmp_path, &cache_path)?;
