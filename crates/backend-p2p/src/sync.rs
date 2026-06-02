@@ -46,6 +46,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use cascade_engine::manage::{DeviceId, ManageDispatch};
 use cascade_p2p::block::BlockHash;
 use cascade_p2p::candidate::{Candidate, CandidateKind};
 use cascade_p2p::connection::ConnectionManager;
@@ -57,7 +58,8 @@ use cascade_p2p::nat::{
 };
 use cascade_p2p::pipe::ByteMeter;
 use cascade_p2p::protocol::{
-    BepMessage, FileInfo, Folder, GossipPeer, MAX_RELAY_OFFER_ADDRESSES, Version,
+    BepMessage, FileInfo, Folder, GossipPeer, MAX_RELAY_OFFER_ADDRESSES, ManageCommand,
+    ManageErrorKind, ManageResult, ManageScope, Version,
 };
 use cascade_p2p::store::BlockStore;
 use cascade_p2p::transport::{
@@ -370,7 +372,11 @@ impl PeerHandle {
 /// One instance per `P2pBackend`. Owns Arc-shared references to the
 /// folder index and block store so background tasks can read/write them
 /// without holding the backend itself.
-#[derive(Debug, Clone)]
+///
+/// [`Debug`] is implemented by hand rather than derived because the
+/// management-plane dispatch port is an `Arc<dyn ManageDispatch>` trait object,
+/// which does not itself implement [`Debug`].
+#[derive(Clone)]
 pub struct SyncEngine {
     folder_id: String,
     index: Arc<FolderIndex>,
@@ -476,6 +482,25 @@ pub struct SyncEngine {
     /// terminal in [`Self::attempt_peer_relay`]; the target registers one on
     /// [`BepMessage::RelayInbound`].
     relay_terminals: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>>,
+    /// Management-plane dispatch port. When `Some`, an arriving
+    /// [`BepMessage::ManageRequest`] is run through it — the peer's
+    /// TLS-authenticated device id is the caller principal, the engine resolves
+    /// that caller's grants, authorises, audits, and dispatches into the same
+    /// command handlers the local CLI drives. `None` leaves the management plane
+    /// disabled: a `ManageRequest` is refused with a typed
+    /// [`ManageErrorKind::Unauthorised`] error rather than silently ignored, so
+    /// a manager learns the node is not accepting remote administration.
+    manage_dispatch: Option<Arc<dyn ManageDispatch>>,
+}
+
+impl std::fmt::Debug for SyncEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SyncEngine")
+            .field("folder_id", &self.folder_id)
+            .field("device_short_id", &self.device_short_id)
+            .field("manage_enabled", &self.manage_dispatch.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl SyncEngine {
@@ -513,7 +538,18 @@ impl SyncEngine {
             )),
             relay_bridges: Arc::new(Mutex::new(HashMap::new())),
             relay_terminals: Arc::new(Mutex::new(HashMap::new())),
+            manage_dispatch: None,
         }
+    }
+
+    /// Builder-style setter for the management-plane dispatch port. When set, an
+    /// arriving [`BepMessage::ManageRequest`] is authorised, audited, and
+    /// dispatched through it; left unset, the management plane is disabled and
+    /// requests are refused with a typed unauthorised error.
+    #[must_use]
+    pub fn with_manage_dispatch(mut self, dispatch: Arc<dyn ManageDispatch>) -> Self {
+        self.manage_dispatch = Some(dispatch);
+        self
     }
 
     /// Builder-style setter for the known relay endpoint pool. Threaded
@@ -2113,7 +2149,66 @@ impl SyncEngine {
                 }
                 Ok(())
             }
+            BepMessage::ManageRequest {
+                request_id,
+                command,
+                scope,
+            } => {
+                self.handle_manage_request(peer_device_id, request_id, command, scope, outbound)
+                    .await;
+                Ok(())
+            }
+            BepMessage::ManageResponse { request_id, .. } => {
+                // A managed node only ever sends ManageResponse; it does not
+                // expect to receive one. A frame arriving here means the peer is
+                // confused or this node initiated a manage call elsewhere that
+                // is not routed through this session loop. Log and ignore rather
+                // than tear the session down for an out-of-place reply.
+                debug!(
+                    target: "cascade::backend::p2p",
+                    peer = %peer_device_id,
+                    request_id,
+                    "dropping unexpected ManageResponse on managed-node session",
+                );
+                Ok(())
+            }
         }
+    }
+
+    /// Run an incoming [`BepMessage::ManageRequest`] and reply with a
+    /// [`BepMessage::ManageResponse`].
+    ///
+    /// `peer_device_id` is the caller principal — it is the device id the TLS
+    /// connection authenticated, so the management plane needs no further proof
+    /// of identity. The request is dispatched through the injected
+    /// [`ManageDispatch`] port, which resolves the caller's grants, authorises,
+    /// audits BEFORE applying any side effect, and runs the same command
+    /// handlers the local CLI drives. When no dispatch port is configured the
+    /// node is not accepting remote administration, so the request is refused
+    /// with a typed [`ManageErrorKind::Unauthorised`] error rather than dropped.
+    async fn handle_manage_request(
+        &self,
+        peer_device_id: &str,
+        request_id: u64,
+        command: ManageCommand,
+        scope: ManageScope,
+        outbound: &mpsc::UnboundedSender<BepMessage>,
+    ) {
+        let result = match &self.manage_dispatch {
+            Some(dispatch) => {
+                let caller = DeviceId::new(peer_device_id.to_owned());
+                dispatch
+                    .dispatch(&caller, command, scope, chrono::Utc::now())
+                    .await
+            }
+            None => ManageResult::Err {
+                kind: ManageErrorKind::Unauthorised,
+                message: "node is not accepting remote management".to_owned(),
+            },
+        };
+        outbound
+            .send(BepMessage::ManageResponse { request_id, result })
+            .ok();
     }
 
     /// Admit (or reject) a peer-relay bridge request from `requester` to
@@ -4730,6 +4825,115 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not trusted"));
+    }
+
+    // ── Management-plane request handling ──
+
+    use std::sync::Mutex as StdMutex;
+
+    /// A fake [`ManageDispatch`] that records the caller principal it was
+    /// invoked with and returns a canned result, so a test can assert the
+    /// authenticated peer device id is threaded through as the caller and the
+    /// dispatch outcome is reflected back in the reply frame.
+    struct RecordingDispatch {
+        seen_caller: StdMutex<Option<String>>,
+        result: ManageResult,
+    }
+
+    impl RecordingDispatch {
+        fn new(result: ManageResult) -> Self {
+            Self {
+                seen_caller: StdMutex::new(None),
+                result,
+            }
+        }
+
+        fn caller(&self) -> Option<String> {
+            self.seen_caller.lock().ok().and_then(|c| c.clone())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ManageDispatch for RecordingDispatch {
+        async fn dispatch(
+            &self,
+            caller: &DeviceId,
+            _command: ManageCommand,
+            _scope: ManageScope,
+            _now: chrono::DateTime<chrono::Utc>,
+        ) -> ManageResult {
+            if let Ok(mut seen) = self.seen_caller.lock() {
+                *seen = Some(caller.as_str().to_owned());
+            }
+            self.result.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn manage_request_uses_authenticated_peer_as_caller_and_replies() {
+        let dispatch = Arc::new(RecordingDispatch::new(ManageResult::Ok {
+            summary: "did the thing".to_owned(),
+        }));
+        let (_dir, engine) = make_engine("f");
+        let engine = engine.with_manage_dispatch(dispatch.clone());
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<BepMessage>();
+        engine
+            .handle_manage_request(
+                "PEER-DEVICE-ID",
+                7,
+                ManageCommand::StatusRead,
+                ManageScope::Node,
+                &tx,
+            )
+            .await;
+
+        // The authenticated peer device id is the caller principal.
+        assert_eq!(dispatch.caller().as_deref(), Some("PEER-DEVICE-ID"));
+        // The reply echoes the request id and carries the dispatch outcome.
+        match rx.try_recv() {
+            Ok(BepMessage::ManageResponse { request_id, result }) => {
+                assert_eq!(request_id, 7);
+                assert_eq!(
+                    result,
+                    ManageResult::Ok {
+                        summary: "did the thing".to_owned()
+                    }
+                );
+            }
+            other => panic!("expected a ManageResponse, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn manage_request_without_dispatch_is_refused_unauthorised() {
+        // No dispatch port configured — the node is not accepting remote
+        // administration, so a request is refused with a typed unauthorised
+        // error rather than silently dropped.
+        let (_dir, engine) = make_engine("f");
+        let (tx, mut rx) = mpsc::unbounded_channel::<BepMessage>();
+        engine
+            .handle_manage_request(
+                "PEER-DEVICE-ID",
+                3,
+                ManageCommand::CacheEvict,
+                ManageScope::Node,
+                &tx,
+            )
+            .await;
+        match rx.try_recv() {
+            Ok(BepMessage::ManageResponse { request_id, result }) => {
+                assert_eq!(request_id, 3);
+                assert!(matches!(
+                    result,
+                    ManageResult::Err {
+                        kind: ManageErrorKind::Unauthorised,
+                        ..
+                    }
+                ));
+            }
+            other => panic!("expected an unauthorised ManageResponse, got {other:?}"),
+        }
     }
 }
 
