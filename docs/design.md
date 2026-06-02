@@ -541,14 +541,23 @@ All NFS data structures use XDR encoding (defined in RFC 1813). The XDR codec ha
 
 **VFS cache modes for NFS:**
 
+The cache mode is the typed `NfsCacheMode` enum (`off`, `minimal`, `full`),
+deserialised straight from the export config:
+
 | Mode | On-demand? | Writes? | Disk usage |
 |------|-----------|---------|------------|
-| `off` | Yes | Read-only (NFS limitation) | None |
+| `off` | Yes | Read-only | None |
 | `minimal` | Yes | Yes | Minimal |
-| `writes` | Yes | Yes | Moderate |
 | `full` | No | Yes | High |
 
-`minimal` is the default — on-demand reads, reliable writes, minimal disk usage.
+`minimal` is the default — on-demand reads, write-capable, minimal disk usage.
+Write support keys off the mode rather than a separate flag: an `off` export
+refuses every write procedure with `NFS3ERR_ROFS` / `NFS4ERR_ROFS`, while a
+write-capable export (`minimal` or `full`) reports `NFS3ERR_NOTSUPP` /
+`NFS4ERR_NOTSUPP` until the write path lands — distinguishing a deliberately
+read-only mount from one whose writes are merely unimplemented. The mode
+threads from `NfsServerConfig` through dispatch into both the NFSv3 and NFSv4
+procedure handlers.
 
 ### FUSE presenter (Linux)
 
@@ -682,12 +691,39 @@ struct PinRule {
 
 #[derive(Debug, Deserialize)]
 struct CacheConfig {
-    max_size: Option<u64>,
-    max_age: Option<Duration>,
+    /// Maximum on-disk cache size, parsed from a human-readable byte string
+    /// (`5GB`, `512MiB`). Stored as a byte count; malformed values are
+    /// rejected during deserialisation rather than at use.
     #[serde(default)]
-    default_state: Option<CacheState>,
+    max_size: Option<MaxSize>,
+    /// Maximum age a cached file may reach before it is eligible for eviction,
+    /// parsed from a human-readable duration (`7d`, `1h30m`). Stored as a
+    /// `Duration`; malformed values are rejected during deserialisation.
+    #[serde(default)]
+    max_age: Option<MaxAge>,
+    /// Declared default cache-state posture for the subtree. Absent means the
+    /// engine's own default applies.
+    #[serde(default)]
+    default_state: Option<CacheStatePosture>,
+}
+
+/// The default cache-state posture a `.cascade` file may declare. Distinct
+/// from the engine's per-file runtime `CacheState`, which also models
+/// transient states such as downloading.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum CacheStatePosture {
+    Pinned,   // keep resident on disk; never evict automatically
+    Online,   // keep metadata-only; fetch content on demand
+    Auto,     // let lifecycle policies and cache limits decide residency
 }
 ```
+
+`max_size` and `max_age` are typed wrappers (`MaxSize`, `MaxAge`) with custom
+serde implementations: they accept the same human-readable strings the
+gitignore-style directives use and parse them at config load, so a malformed
+`5gigs` is a load-time error rather than a value that misbehaves later. The
+size accepts both decimal (`GB`) and binary (`GiB`) units.
 
 ### Gitignore-style parser
 
@@ -1024,7 +1060,45 @@ LAN multicast and gossip cover peers that share a network segment or a trust pat
 
 The DHT fills the same "find an unknown peer" role serverlessly, after Syncthing's global-discovery model. Rather than holding the candidate set on an operated directory, a device publishes it into the BitTorrent Mainline DHT as a BEP44 mutable item. BEP44 addresses a mutable item by `SHA-1(public_key || salt)`, so the rendezvous only works if both ends derive the same writer keypair: `DhtKey::from_device_id` seeds an ed25519 keypair from a domain-separated hash of the device ID, so the announcer and the looker-up independently compute the identical BEP44 target with no shared secret and no per-node persisted key. `DhtDiscovery` is generic over a `DhtNode` put/get contract — exercised against an in-memory node in tests — with the live `mainline`-backed node (`MainlineDht`) behind the `dht` cargo feature. The `mainline` crate pulls in the ed25519 BEP44 signing stack.
 
-The live node is productionised. Out of the box it bootstraps against `DEFAULT_DHT_BOOTSTRAP_NODES` — the public Mainline-DHT routers the wider BitTorrent ecosystem joins against (the `mainline` crate's own default set) — so the DHT is usable without configuring anything. An operator who wants to pin their own swarm sets `dht_bootstrap_nodes` in the backend config; an explicit empty list falls back to the public default rather than starting isolated, and any other value is handed verbatim to the node's bootstrap as already-resolved addresses. Published candidate sets are soft state — a BEP44 mutable item is dropped if a storing node has not seen it refreshed within roughly the BEP44 expiry window (the de-facto two-hour figure BEP5 also uses) — so a device republishes on a cadence derived from that estimate rather than a hand-picked number: `DHT_REPUBLISH_INTERVAL` is half the expiry window, refreshing twice per window so one missed tick still leaves the previous value live. A lookup that overruns `DHT_RESOLVE_TIMEOUT` is reported as a clean absence — the same not-found every discovery source can return — so a slow DHT never wedges the management-plane dial waiting on it, and the timeout is logged distinctly from a real not-found. CI exercises the live path against an ephemeral in-process `mainline::Testnet` — a small swarm of DHT nodes on local UDP sockets — covering put/get round-trips and republish supersession without touching the public network; the same job re-lints the feature-gated live test code so a regression there fails before any swarm is bootstrapped.
+The live node is productionised. Out of the box it bootstraps against `DEFAULT_DHT_BOOTSTRAP_NODES` — the public Mainline-DHT routers the wider BitTorrent ecosystem joins against (the `mainline` crate's own default set) — so the DHT is usable without configuring anything. An operator who wants to pin their own swarm sets `dht_bootstrap_nodes` in the backend config; an explicit empty list falls back to the public default rather than starting isolated, and any other value is handed verbatim to the node's bootstrap as already-resolved addresses. `MainlineDht::open` is a blocking constructor — it resolves the bootstrap host:port set with synchronous `getaddrinfo` and binds the DHT UDP socket on the calling thread — so the backend opens it off the tokio runtime via `spawn_blocking`, keeping a slow or unreachable resolver from stalling a worker. Published candidate sets are soft state — a BEP44 mutable item is dropped if a storing node has not seen it refreshed within roughly the BEP44 expiry window (the de-facto two-hour figure BEP5 also uses) — so a device republishes on a cadence derived from that estimate rather than a hand-picked number: `DHT_REPUBLISH_INTERVAL` is half the expiry window, refreshing twice per window so one missed tick still leaves the previous value live. A lookup that overruns `DHT_RESOLVE_TIMEOUT` is reported as a clean absence (a typed `DhtGetOutcome::TimedOut` distinct from `NotFound`) — the same not-found every discovery source can return — so a slow DHT never wedges the management-plane dial waiting on it, and the timeout is logged distinctly from a real not-found. CI exercises the live path against an ephemeral in-process `mainline::Testnet` — a small swarm of DHT nodes on local UDP sockets — covering put/get round-trips and republish supersession without touching the public network; the same job re-lints the feature-gated live test code so a regression there fails before any swarm is bootstrapped.
+
+### Exposure posture
+
+How far a device reaches out for peers is governed by a single `DiscoveryReach`
+posture rather than a scatter of independent `enable_*` flags. The posture names
+an *intent* — the furthest exposure level the operator is comfortable with — and
+each discovery and traversal source self-activates when the posture permits its
+level **and** the source has what it needs to run. The server lists
+(`stun_servers`, `announce_servers`, `relay_endpoints`) and the DHT
+configuration say *where to point* a source; the posture decides *whether* it
+runs.
+
+| Posture | Reaches | LAN multicast | Gossip · hole punch · peer relay | Global directory (DHT, announce) |
+|---------|---------|:---:|:---:|:---:|
+| `lan-only` | Local segment only | yes | no | no |
+| `private` (default) | Trusted private mesh | yes | yes | no |
+| `public` | Open to the wider internet | yes | yes | yes |
+
+The levels nest — `LanOnly` ⊂ `Private` ⊂ `Public` — so each permits everything
+the level below does plus its own additions. `Private` is the default: a trusted
+mesh with LAN discovery, introducer gossip, NAT hole punching, and peer relaying,
+but no publication to any global directory. A device at `Private` is discoverable
+only by peers it already shares a segment, an introducer, or a relay with.
+
+Global publication is opt-in: only `Public` lets a device publish to and query
+the Mainline DHT and any configured announce servers, so never-met peers can
+resolve it by device id for zero-config WAN discovery. The default never opts a
+node into that — moving to `Public` is a deliberate choice.
+
+Self-activation means a permitted source still stays idle until it can actually
+work. LAN multicast is permitted at every posture (LAN is the floor) but only
+runs once a `listen_addr` is bound — without an inbound port a discovered peer
+would have nothing to dial. The DHT carries its bootstrap set always (an empty
+set falls back to the `mainline` crate's built-in public bootstrap nodes), so an
+empty bootstrap list means "use the public set", never "DHT disabled" —
+disabling the DHT is the `lan-only`/`private` posture, not the absence of
+config. Announce servers and peer relay endpoints are likewise contacted only
+when the posture permits and a server is configured.
 
 ### Device identity
 
