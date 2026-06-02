@@ -361,7 +361,7 @@ mod pairing {
     use tokio_tungstenite::WebSocketStream;
 
     use crate::metrics::Counters;
-    use crate::pipe::shuttle;
+    use crate::pipe::run_pipe;
     use crate::session::{SessionEvent, SessionRegistry};
 
     type Slot = oneshot::Sender<WebSocketStream<TcpStream>>;
@@ -426,7 +426,7 @@ mod pairing {
                 counters
                     .sessions_paired_total
                     .fetch_add(1, Ordering::Relaxed);
-                let (_a, _b) = shuttle(first_ws, second_ws, counters.clone()).await;
+                let (_a, _b) = run_pipe(first_ws, second_ws, counters.clone()).await;
                 counters.sessions_active.fetch_sub(1, Ordering::Relaxed);
                 Ok(())
             }
