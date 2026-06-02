@@ -734,7 +734,7 @@ impl SyncEngine {
             anyhow::bail!("device {} is not trusted", peer.device_id);
         }
         let manager = ConnectionManager::new(self.identity.clone(), trusted);
-        let (observed_peer_addr, conn) = manager
+        let conn = manager
             .connect(&DiscoveredPeer {
                 device_id: peer.device_id.clone(),
                 address: peer.address,
@@ -747,9 +747,13 @@ impl SyncEngine {
         let framed = FramedPeer::from_connection(conn)?;
         let engine = self.clone();
         let device_id = peer.device_id.clone();
+        // Outbound dial: pass no observed address. The connector's
+        // socket `peer_addr()` is just the address we dialled, never a
+        // reflexive observation, so we must not echo it back as one. The
+        // peer-as-STUN frame flows only from the accepting side below.
         tokio::spawn(async move {
             if let Err(e) = engine
-                .run_framed_session(device_id.clone(), observed_peer_addr, framed)
+                .run_framed_session(device_id.clone(), None, framed)
                 .await
             {
                 debug!("outbound session to {device_id} ended: {e:#}");
@@ -1118,7 +1122,10 @@ impl SyncEngine {
         info!("inbound P2P connection accepted from device {device_id}");
         self.record_peer(&device_id, peer_addr).await;
         let framed = FramedPeer::from_tls(tls);
-        self.run_framed_session(device_id, observed_peer_addr, framed)
+        // Inbound accept: the observed source address is the connecting
+        // peer's genuine NAT-mapped source, so echo it back as a
+        // peer-as-STUN observation.
+        self.run_framed_session(device_id, Some(observed_peer_addr), framed)
             .await
     }
 
@@ -1143,16 +1150,23 @@ impl SyncEngine {
     /// through [`Self::run_session_loop`] so the post-punch UDP and
     /// post-relay WebSocket paths share the same handshake +
     /// read/write loop.
+    ///
+    /// `observed_peer_addr` is `Some` only on the accepting side, where
+    /// the source address read off the live socket is the connecting
+    /// peer's genuine `NAT`-mapped source — the only direction that
+    /// yields a usable peer-as-`STUN` observation. The outbound dial
+    /// passes `None` because the connector observes nothing but the
+    /// address it already dialled.
     async fn run_framed_session(
         &self,
         device_id: String,
-        observed_peer_addr: SocketAddr,
+        observed_peer_addr: Option<SocketAddr>,
         framed: FramedPeer,
     ) -> Result<()> {
         let (reader, writer) = framed.split();
         self.run_session_loop(
             device_id,
-            Some(observed_peer_addr),
+            observed_peer_addr,
             FramedHalfReader::Tls(reader),
             FramedHalfWriter::Tls(writer),
         )
@@ -2998,12 +3012,15 @@ mod tests {
         );
     }
 
-    /// Peer-as-STUN round trip over a real loopback handshake: A dials
-    /// B, both sides exchange `BepMessage::ObservedAddress` carrying the
-    /// peer's observed source address, and each engine records the
-    /// address its peer reported back as a server-reflexive candidate.
+    /// Peer-as-STUN over a real loopback handshake: A dials B. Only the
+    /// accepting side (B) observes a genuine NAT-mapped source — A's
+    /// ephemeral outbound port — so only B sends an `ObservedAddress`
+    /// frame. The connector (A) must NOT echo the address it dialled
+    /// (B's own listening address) back to B, so the listener must never
+    /// record its own listening address as a server-reflexive candidate.
+    /// A, conversely, learns the genuine source B observed for it.
     #[tokio::test]
-    async fn observed_address_round_trips_through_loopback_handshake() {
+    async fn observed_address_flows_only_from_acceptor() {
         let (_dir_a, engine_a) = make_engine("shared");
         let (_dir_b, engine_b) = make_engine("shared");
 
@@ -3041,10 +3058,20 @@ mod tests {
         );
         let candidate = a_reflexive.first().expect("one reflexive candidate");
         assert_eq!(candidate.kind, CandidateKind::ServerReflexive);
+
+        // The listener (B) must never record its own listening address as
+        // a server-reflexive candidate. Before the fix, the connector
+        // echoed the dialled address (exactly `addr_b`) back to B, which
+        // folded it in as a bogus reflexive candidate. The connector now
+        // sends nothing, so B holds no reflexive candidate at all.
+        let b_reflexive = engine_b.observed_external_candidates().await;
         assert!(
-            candidate.address.ip().is_loopback(),
-            "the observed source on loopback must be a loopback address, got {}",
-            candidate.address,
+            !b_reflexive.iter().any(|c| c.address == addr_b),
+            "listener must not record its own listening address {addr_b} as a reflexive candidate, got {b_reflexive:?}",
+        );
+        assert!(
+            b_reflexive.is_empty(),
+            "acceptor sends no ObservedAddress on the outbound leg, so B records nothing, got {b_reflexive:?}",
         );
     }
 
