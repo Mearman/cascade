@@ -1499,25 +1499,10 @@ pub fn create_backend(config: &toml::Value) -> Result<Box<dyn Backend>> {
     // from "configured empty" (key present but empty → STUN disabled). A
     // bare `unwrap_or_default` would collapse both to an empty list and
     // silently disable NAT detection out of the box.
-    let configured_stun_servers = config.get("stun_servers").and_then(toml::Value::as_array).map(
-        |arr| {
-            arr.iter()
-                .filter_map(toml::Value::as_str)
-                .map(String::from)
-                .collect::<Vec<_>>()
-        },
-    );
+    let configured_stun_servers = parse_string_list(config.get("stun_servers"), "stun_servers")?;
     let stun_servers = resolve_stun_servers(configured_stun_servers);
-    let announce_servers = config
-        .get("announce_servers")
-        .and_then(toml::Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(toml::Value::as_str)
-                .map(String::from)
-                .collect()
-        })
-        .unwrap_or_default();
+    let announce_servers =
+        parse_string_list(config.get("announce_servers"), "announce_servers")?.unwrap_or_default();
     let relay_endpoints = config
         .get("relay_endpoints")
         .and_then(toml::Value::as_array)
@@ -1589,6 +1574,30 @@ pub fn create_backend(config: &toml::Value) -> Result<Box<dyn Backend>> {
 
     let backend = P2pBackend::open(cfg)?;
     Ok(Box::new(backend))
+}
+
+/// Parse a TOML array of strings, preserving the absent-vs-present distinction.
+///
+/// Returns `Ok(None)` when the key is absent so callers can apply their own
+/// defaults, and `Ok(Some(vec))` when present (including an empty array). A
+/// non-string array entry fails loudly with its index rather than being
+/// silently dropped, matching the loud-failure pattern used for `peers` and
+/// `relay_endpoints`.
+fn parse_string_list(value: Option<&toml::Value>, field: &str) -> Result<Option<Vec<String>>> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    let arr = raw
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("{field} must be an array of strings"))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for (idx, item) in arr.iter().enumerate() {
+        let entry = item
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("{field}[{idx}] must be a string"))?;
+        out.push(entry.to_string());
+    }
+    Ok(Some(out))
 }
 
 fn parse_peers(value: Option<&toml::Value>) -> Result<Vec<ConfiguredPeer>> {
@@ -2162,29 +2171,57 @@ mod tests {
         // End-to-end through the TOML boundary: a config that does not
         // mention `stun_servers` resolves to the public defaults, while an
         // explicit empty array disables STUN.
-        let without = toml::from_str::<toml::Value>(
-            r#"name = "x""#,
-        )
-        .unwrap();
-        let configured =
-            without.get("stun_servers").and_then(toml::Value::as_array).map(|arr| {
-                arr.iter()
-                    .filter_map(toml::Value::as_str)
-                    .map(String::from)
-                    .collect::<Vec<_>>()
-            });
+        let without = toml::from_str::<toml::Value>(r#"name = "x""#).unwrap();
+        let configured = parse_string_list(without.get("stun_servers"), "stun_servers").unwrap();
         assert!(resolve_stun_servers(configured).len() >= 2);
 
-        let empty =
-            toml::from_str::<toml::Value>("name = \"x\"\nstun_servers = []").unwrap();
+        let empty = toml::from_str::<toml::Value>("name = \"x\"\nstun_servers = []").unwrap();
         let configured_empty =
-            empty.get("stun_servers").and_then(toml::Value::as_array).map(|arr| {
-                arr.iter()
-                    .filter_map(toml::Value::as_str)
-                    .map(String::from)
-                    .collect::<Vec<_>>()
-            });
+            parse_string_list(empty.get("stun_servers"), "stun_servers").unwrap();
         assert!(resolve_stun_servers(configured_empty).is_empty());
+    }
+
+    #[test]
+    fn parse_string_list_absent_key_is_none() {
+        // An absent key must stay `None` so callers can apply their own
+        // defaults rather than seeing an empty list.
+        let value = toml::from_str::<toml::Value>(r#"name = "x""#).unwrap();
+        let parsed = parse_string_list(value.get("announce_servers"), "announce_servers").unwrap();
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn parse_string_list_empty_array_is_some_empty() {
+        // A present-but-empty array is distinct from absent: it yields
+        // `Some(vec![])` so the absent-versus-configured-empty distinction
+        // survives the TOML boundary.
+        let value = toml::from_str::<toml::Value>("name = \"x\"\nannounce_servers = []").unwrap();
+        let parsed = parse_string_list(value.get("announce_servers"), "announce_servers").unwrap();
+        assert_eq!(parsed, Some(Vec::new()));
+    }
+
+    #[test]
+    fn parse_string_list_rejects_non_string_entry() {
+        // A non-string array entry must fail loudly with its index rather
+        // than being silently dropped, which would leave a configured
+        // rendezvous server quietly uncontacted.
+        let value = toml::from_str::<toml::Value>(
+            "name = \"x\"\nannounce_servers = [\"https://a.example\", 42]",
+        )
+        .unwrap();
+        let err = parse_string_list(value.get("announce_servers"), "announce_servers")
+            .expect_err("non-string entry must error");
+        assert!(err.to_string().contains("announce_servers[1]"));
+    }
+
+    #[test]
+    fn parse_string_list_rejects_non_array() {
+        // A scalar where an array is expected must fail loudly rather than
+        // being silently ignored.
+        let value = toml::from_str::<toml::Value>("name = \"x\"\nstun_servers = \"oops\"").unwrap();
+        let err = parse_string_list(value.get("stun_servers"), "stun_servers")
+            .expect_err("non-array value must error");
+        assert!(err.to_string().contains("stun_servers must be an array"));
     }
 
     #[test]
