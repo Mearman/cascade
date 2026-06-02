@@ -15,6 +15,7 @@ pub mod changefeed;
 pub mod config;
 pub mod db;
 pub mod engine;
+pub mod manage;
 pub mod p2p_bridge;
 pub mod presenter;
 pub mod protocol;
