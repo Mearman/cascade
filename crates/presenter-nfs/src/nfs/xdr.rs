@@ -34,6 +34,7 @@ pub const NFS3ERR_ROFS: u32 = 30;
 pub const NFS3ERR_NAMETOOLONG: u32 = 63;
 pub const NFS3ERR_NOTEMPTY: u32 = 66;
 pub const NFS3ERR_STALE: u32 = 70;
+pub const NFS3ERR_NOTSUPP: u32 = 10004;
 
 // ── File types ──
 

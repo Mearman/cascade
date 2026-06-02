@@ -4,19 +4,29 @@
 //! Write procedures return `NFS3ERR_ROFS`.
 
 use super::context::NfsContext;
+use super::server::NfsCacheMode;
 use super::xdr::{
-    Fattr3, NF3DIR, NF3REG, NFS3_OK, NFS3ERR_INVAL, NFS3ERR_IO, NFS3ERR_ROFS, NFS3ERR_STALE,
-    NFS3PROC_COMMIT, NFS3PROC_CREATE, NFS3PROC_FSSTAT, NFS3PROC_GETATTR, NFS3PROC_LOOKUP,
-    NFS3PROC_MKDIR, NFS3PROC_NULL, NFS3PROC_READ, NFS3PROC_READDIR, NFS3PROC_REMOVE,
-    NFS3PROC_RENAME, NFS3PROC_RMDIR, NFS3PROC_SETATTR, NFS3PROC_WRITE, NfsFh3, NfsTime, PostOpAttr,
-    Specdata3, decode_fh, decode_string, decode_u32, decode_u64, encode_bool, encode_fh,
-    encode_post_op_attr, encode_string, encode_u32, encode_u64,
+    Fattr3, NF3DIR, NF3REG, NFS3_OK, NFS3ERR_INVAL, NFS3ERR_IO, NFS3ERR_NOTSUPP, NFS3ERR_ROFS,
+    NFS3ERR_STALE, NFS3PROC_COMMIT, NFS3PROC_CREATE, NFS3PROC_FSSTAT, NFS3PROC_GETATTR,
+    NFS3PROC_LOOKUP, NFS3PROC_MKDIR, NFS3PROC_NULL, NFS3PROC_READ, NFS3PROC_READDIR,
+    NFS3PROC_REMOVE, NFS3PROC_RENAME, NFS3PROC_RMDIR, NFS3PROC_SETATTR, NFS3PROC_WRITE, NfsFh3,
+    NfsTime, PostOpAttr, Specdata3, decode_fh, decode_string, decode_u32, decode_u64, encode_bool,
+    encode_fh, encode_post_op_attr, encode_string, encode_u32, encode_u64,
 };
 use std::sync::Arc;
 
 /// Handle an NFS procedure call with VFS context.
 /// Returns XDR-encoded reply.
-pub fn handle_nfs_call(proc: u32, args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
+///
+/// Write procedures are gated on `cache_mode`: a read-only export
+/// ([`NfsCacheMode::Off`]) refuses them with `NFS3ERR_ROFS`, while a
+/// write-capable export reports `NFS3ERR_NOTSUPP` until the write path lands.
+pub fn handle_nfs_call(
+    proc: u32,
+    args: &[u8],
+    ctx: &Arc<NfsContext>,
+    cache_mode: NfsCacheMode,
+) -> Vec<u8> {
     match proc {
         NFS3PROC_NULL => vec![],
         NFS3PROC_GETATTR => handle_getattr(args, ctx),
@@ -24,9 +34,8 @@ pub fn handle_nfs_call(proc: u32, args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8>
         NFS3PROC_READDIR => handle_readdir(args, ctx),
         NFS3PROC_READ => handle_read(args, ctx),
         NFS3PROC_FSSTAT => handle_fsstat(args, ctx),
-        // Phase 1: all write operations return read-only error.
         NFS3PROC_SETATTR | NFS3PROC_WRITE | NFS3PROC_CREATE | NFS3PROC_MKDIR | NFS3PROC_REMOVE
-        | NFS3PROC_RMDIR | NFS3PROC_RENAME | NFS3PROC_COMMIT => handle_readonly(),
+        | NFS3PROC_RMDIR | NFS3PROC_RENAME | NFS3PROC_COMMIT => handle_write(cache_mode),
         _ => handle_unimplemented(),
     }
 }
@@ -287,12 +296,20 @@ fn handle_fsstat(args: &[u8], _ctx: &Arc<NfsContext>) -> Vec<u8> {
     reply
 }
 
-/// Write operations on a read-only filesystem.
-fn handle_readonly() -> Vec<u8> {
+/// Write operations, gated on the export's cache mode.
+///
+/// A read-only export refuses writes with `NFS3ERR_ROFS`. A write-capable
+/// export reports `NFS3ERR_NOTSUPP` because the write path is not yet
+/// implemented — distinct from a deliberately read-only mount.
+fn handle_write(cache_mode: NfsCacheMode) -> Vec<u8> {
+    let status = if cache_mode.writes_permitted() {
+        NFS3ERR_NOTSUPP
+    } else {
+        NFS3ERR_ROFS
+    };
     let mut reply = Vec::new();
-    encode_u32(&mut reply, NFS3ERR_ROFS);
-    // Most write replies include post_op_attr for the dir — but for an
-    // error reply, wcc_data is sufficient with no pre/post attrs.
+    encode_u32(&mut reply, status);
+    // For an error reply, wcc_data with no pre/post attrs is sufficient.
     reply
 }
 
@@ -356,7 +373,7 @@ mod tests {
         let mut args = Vec::new();
         encode_fh(&mut args, &fh);
 
-        let reply = handle_nfs_call(NFS3PROC_GETATTR, &args, &ctx);
+        let reply = handle_nfs_call(NFS3PROC_GETATTR, &args, &ctx, NfsCacheMode::Minimal);
         let (status, _) = decode_u32(&reply).unwrap();
         assert_eq!(status, NFS3_OK);
     }
@@ -370,7 +387,7 @@ mod tests {
         let mut args = Vec::new();
         encode_fh(&mut args, &fh);
 
-        let reply = handle_nfs_call(NFS3PROC_GETATTR, &args, &ctx);
+        let reply = handle_nfs_call(NFS3PROC_GETATTR, &args, &ctx, NfsCacheMode::Minimal);
         let (status, _) = decode_u32(&reply).unwrap();
         assert_eq!(status, NFS3ERR_STALE);
     }
@@ -384,7 +401,7 @@ mod tests {
         encode_fh(&mut args, &fh);
         encode_string(&mut args, "Documents");
 
-        let reply = handle_nfs_call(NFS3PROC_LOOKUP, &args, &ctx);
+        let reply = handle_nfs_call(NFS3PROC_LOOKUP, &args, &ctx, NfsCacheMode::Minimal);
         let (status, _) = decode_u32(&reply).unwrap();
         assert_eq!(status, NFS3_OK);
 
@@ -394,11 +411,21 @@ mod tests {
     }
 
     #[test]
-    fn write_returns_rofs() {
+    fn write_on_read_only_export_returns_rofs() {
         let ctx = test_ctx();
-        let reply = handle_nfs_call(NFS3PROC_CREATE, &[], &ctx);
+        let reply = handle_nfs_call(NFS3PROC_CREATE, &[], &ctx, NfsCacheMode::Off);
         let (status, _) = decode_u32(&reply).unwrap();
         assert_eq!(status, NFS3ERR_ROFS);
+    }
+
+    #[test]
+    fn write_on_write_capable_export_returns_notsupp() {
+        let ctx = test_ctx();
+        for mode in [NfsCacheMode::Minimal, NfsCacheMode::Full] {
+            let reply = handle_nfs_call(NFS3PROC_CREATE, &[], &ctx, mode);
+            let (status, _) = decode_u32(&reply).unwrap();
+            assert_eq!(status, NFS3ERR_NOTSUPP);
+        }
     }
 
     #[test]
@@ -409,7 +436,7 @@ mod tests {
         let mut args = Vec::new();
         encode_fh(&mut args, &fh);
 
-        let reply = handle_nfs_call(NFS3PROC_FSSTAT, &args, &ctx);
+        let reply = handle_nfs_call(NFS3PROC_FSSTAT, &args, &ctx, NfsCacheMode::Minimal);
         let (status, _) = decode_u32(&reply).unwrap();
         assert_eq!(status, NFS3_OK);
     }

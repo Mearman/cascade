@@ -5,6 +5,7 @@
 
 use std::net::SocketAddr;
 
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -20,6 +21,35 @@ use super::xdr::{
 };
 use std::sync::Arc;
 
+/// The VFS cache mode for an NFS export.
+///
+/// Controls write support and how eagerly content is cached on disk. `Off`
+/// exports the tree read-only; `Minimal` and `Full` are write-capable, trading
+/// disk usage for caching eagerness. `Minimal` is the default — on-demand
+/// reads, reliable writes, minimal disk usage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NfsCacheMode {
+    /// Read-only export. Writes are refused.
+    Off,
+    /// Write-capable with minimal on-disk caching.
+    #[default]
+    Minimal,
+    /// Write-capable, caching everything eagerly.
+    Full,
+}
+
+impl NfsCacheMode {
+    /// Whether this mode permits write operations on the export.
+    #[must_use]
+    pub const fn writes_permitted(self) -> bool {
+        match self {
+            Self::Off => false,
+            Self::Minimal | Self::Full => true,
+        }
+    }
+}
+
 /// NFS server configuration.
 #[derive(Debug)]
 pub struct NfsServerConfig {
@@ -27,6 +57,8 @@ pub struct NfsServerConfig {
     pub bind_addr: SocketAddr,
     /// Export path for the mount protocol.
     pub export_path: String,
+    /// The VFS cache mode governing write support for this export.
+    pub cache_mode: NfsCacheMode,
 }
 
 impl Default for NfsServerConfig {
@@ -35,6 +67,7 @@ impl Default for NfsServerConfig {
         Self {
             bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
             export_path: "/".to_string(),
+            cache_mode: NfsCacheMode::default(),
         }
     }
 }
@@ -66,6 +99,7 @@ impl NfsServer {
     pub async fn start(config: NfsServerConfig, ctx: Arc<NfsContext>) -> anyhow::Result<Self> {
         let listener = TcpListener::bind(config.bind_addr).await?;
         let local_addr = listener.local_addr()?;
+        let cache_mode = config.cache_mode;
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
@@ -73,12 +107,14 @@ impl NfsServer {
         let state_mgr_clone = Arc::clone(&state_mgr);
 
         tokio::spawn(async move {
-            if let Err(e) = run_server(listener, shutdown_rx, ctx, state_mgr_clone).await {
+            if let Err(e) =
+                run_server(listener, shutdown_rx, ctx, state_mgr_clone, cache_mode).await
+            {
                 tracing::error!(error = %e, "NFS server error");
             }
         });
 
-        tracing::info!(addr = %local_addr, "NFS server started (v3 + v4)");
+        tracing::info!(addr = %local_addr, ?cache_mode, "NFS server started (v3 + v4)");
 
         Ok(Self {
             local_addr,
@@ -106,6 +142,7 @@ async fn run_server(
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
     ctx: Arc<NfsContext>,
     state_mgr: Arc<StateManager>,
+    cache_mode: NfsCacheMode,
 ) -> anyhow::Result<()> {
     loop {
         tokio::select! {
@@ -115,7 +152,7 @@ async fn run_server(
                 let state_mgr = state_mgr.clone();
                 tracing::debug!(peer = %addr, "NFS connection accepted");
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, &ctx, &state_mgr).await {
+                    if let Err(e) = handle_connection(stream, &ctx, &state_mgr, cache_mode).await {
                         tracing::warn!(peer = %addr, error = %e, "connection error");
                     }
                 });
@@ -136,6 +173,7 @@ async fn handle_connection(
     mut stream: tokio::net::TcpStream,
     ctx: &Arc<NfsContext>,
     state_mgr: &Arc<StateManager>,
+    cache_mode: NfsCacheMode,
 ) -> anyhow::Result<()> {
     loop {
         // Read length-prefixed RPC message.
@@ -158,7 +196,7 @@ async fn handle_connection(
         stream.read_exact(&mut msg_buf).await?;
 
         // Parse and dispatch.
-        let reply = dispatch_rpc(&msg_buf, ctx, state_mgr);
+        let reply = dispatch_rpc(&msg_buf, ctx, state_mgr, cache_mode);
 
         // Send length-prefixed reply.
         let reply_len = u32::try_from(reply.len()).unwrap_or(u32::MAX);
@@ -171,7 +209,12 @@ async fn handle_connection(
 /// Dispatch an RPC call to the correct handler (`NFSv3`, `NFSv4`, or Mount).
 /// The input is the RPC call body (after the length prefix).
 /// Returns the complete RPC reply body (without length prefix).
-fn dispatch_rpc(msg: &[u8], ctx: &Arc<NfsContext>, state_mgr: &Arc<StateManager>) -> Vec<u8> {
+fn dispatch_rpc(
+    msg: &[u8],
+    ctx: &Arc<NfsContext>,
+    state_mgr: &Arc<StateManager>,
+    cache_mode: NfsCacheMode,
+) -> Vec<u8> {
     // Parse RPC call header:
     //   xid (u32) + call body (msg_type=0 + rpc_version + program + version + procedure + auth)
     let Ok((xid, rest)) = decode_u32(msg) else {
@@ -219,7 +262,9 @@ fn dispatch_rpc(msg: &[u8], ctx: &Arc<NfsContext>, state_mgr: &Arc<StateManager>
 
     // Dispatch based on program and version.
     let result = match (program, version) {
-        (NFS_PROGRAM, ver) if ver == NFS_V3 => procedures::handle_nfs_call(procedure, args, ctx),
+        (NFS_PROGRAM, ver) if ver == NFS_V3 => {
+            procedures::handle_nfs_call(procedure, args, ctx, cache_mode)
+        }
         (prog, ver) if prog == v4_xdr::NFS4_PROGRAM && ver == v4_xdr::NFS_V4 => {
             handle_nfs4_call(procedure, args, ctx, state_mgr)
         }
@@ -294,8 +339,8 @@ mod tests {
     use super::super::context::NfsContext;
     use super::super::xdr::{NFS3PROC_NULL, RPC_REPLY_ACCEPTED};
     use super::{
-        NFS_PROGRAM, NFS_V3, NfsServer, NfsServerConfig, RPC_ACCEPT_SUCCESS, RPC_AUTH_NONE,
-        RPC_MSG_CALL, RPC_MSG_REPLY, decode_u32, dispatch_rpc, encode_u32,
+        NFS_PROGRAM, NFS_V3, NfsCacheMode, NfsServer, NfsServerConfig, RPC_ACCEPT_SUCCESS,
+        RPC_AUTH_NONE, RPC_MSG_CALL, RPC_MSG_REPLY, decode_u32, dispatch_rpc, encode_u32,
     };
     use cascade_engine::backend::NullBackend;
     use cascade_engine::vfs::VfsTree;
@@ -315,7 +360,7 @@ mod tests {
         encode_u32(&mut call, 0);
 
         let state_mgr = Arc::new(super::super::v4::state::StateManager::new());
-        let reply = dispatch_rpc(&call, &test_ctx(), &state_mgr);
+        let reply = dispatch_rpc(&call, &test_ctx(), &state_mgr, NfsCacheMode::Minimal);
         let (xid, rest) = decode_u32(&reply).unwrap();
         assert_eq!(xid, 1);
         let (msg_type, rest) = decode_u32(rest).unwrap();
@@ -346,7 +391,7 @@ mod tests {
         encode_u32(&mut call, 0);
 
         let state_mgr = Arc::new(super::super::v4::state::StateManager::new());
-        let reply = dispatch_rpc(&call, &test_ctx(), &state_mgr);
+        let reply = dispatch_rpc(&call, &test_ctx(), &state_mgr, NfsCacheMode::Minimal);
         let (xid, rest) = decode_u32(&reply).unwrap();
         assert_eq!(xid, 42);
         let (msg_type, _) = decode_u32(rest).unwrap();
@@ -378,7 +423,7 @@ mod tests {
         call.extend_from_slice(&compound_args);
 
         let state_mgr = Arc::new(super::super::v4::state::StateManager::new());
-        let reply = dispatch_rpc(&call, &test_ctx(), &state_mgr);
+        let reply = dispatch_rpc(&call, &test_ctx(), &state_mgr, NfsCacheMode::Minimal);
 
         // Verify RPC reply header.
         let (xid, rest) = decode_u32(&reply).unwrap();

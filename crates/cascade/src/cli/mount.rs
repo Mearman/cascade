@@ -6,7 +6,7 @@ use anyhow::{Context as _, Result};
 use cascade_engine::engine::{Engine, EngineConfig};
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 use cascade_engine::presenter::VfsPresenter;
-use cascade_presenter_nfs::nfs::server::{NfsServer, NfsServerConfig};
+use cascade_presenter_nfs::nfs::server::{NfsCacheMode, NfsServer, NfsServerConfig};
 use cascade_presenter_webdav::WebDavPresenter;
 
 use super::init::{BackendConfig, CascadeConfig};
@@ -896,6 +896,7 @@ async fn try_nfs(
     let server_config = NfsServerConfig {
         bind_addr: "127.0.0.1:0".parse()?,
         export_path: "/".to_string(),
+        cache_mode: NfsCacheMode::default(),
     };
     let server = match NfsServer::start(server_config, nfs_ctx).await {
         Ok(s) => s,
