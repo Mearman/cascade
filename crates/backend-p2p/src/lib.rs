@@ -506,6 +506,116 @@ impl Backend for P2pBackend {
         Ok(())
     }
 
+    /// Range read that fetches only the content-addressed blocks
+    /// overlapping `[offset, offset + length)`.
+    ///
+    /// Rather than reconstructing the whole file (as the default impl
+    /// does via [`Backend::download`]), this computes the span of blocks
+    /// that cover the requested window, fetches just those blocks (local
+    /// store first, then peers — caching anything pulled over the wire,
+    /// exactly as `download` does), assembles them into a contiguous
+    /// buffer aligned to the first block's file offset, then slices out
+    /// the exact `[offset, offset + length)` window.
+    ///
+    /// Contract: the result may be shorter than `length` at end-of-file,
+    /// is empty when `offset` is at or past the reconstructed size, and
+    /// never panics on out-of-range offset/length.
+    async fn read_range(&self, file: &FileEntry, offset: u64, length: u32) -> Result<Vec<u8>> {
+        // A zero-length request reads nothing regardless of offset.
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+
+        let native = file.id.native_id();
+        let entry = self
+            .index
+            .get(native)?
+            .ok_or_else(|| anyhow::anyhow!("not in index: {native}"))?;
+
+        // Offset at or past the reconstructed size yields no bytes.
+        if offset >= entry.size {
+            return Ok(Vec::new());
+        }
+
+        let block_size = cascade_p2p::block::block_size_for_file(entry.size);
+        let block_size_u64 = u64::from(block_size);
+        // A zero block size would make the index arithmetic below
+        // undefined; treat it as a malformed entry rather than dividing
+        // by zero.
+        if block_size_u64 == 0 {
+            anyhow::bail!("block size of zero for {native}");
+        }
+
+        // Block hashes are stored as concatenated 32-byte values.
+        let block_count = entry.block_hashes.len() / 32;
+        if block_count == 0 {
+            return Ok(Vec::new());
+        }
+        // The last addressable block index. Used to clamp the computed
+        // `last_block` so a `length` running past EOF never references a
+        // block that does not exist.
+        let max_block = block_count.saturating_sub(1);
+
+        // The window's inclusive last byte. `length > 0` and
+        // `offset < entry.size` are both already established, so the
+        // subtraction cannot wrap.
+        let last_byte = offset.saturating_add(u64::from(length)).saturating_sub(1);
+
+        let first_block_u64 = offset / block_size_u64;
+        let last_block_u64 = last_byte / block_size_u64;
+        let first_block = usize::try_from(first_block_u64)
+            .map_err(|_| anyhow::anyhow!("first block index overflow"))?;
+        let last_block = usize::try_from(last_block_u64)
+            .map_err(|_| anyhow::anyhow!("last block index overflow"))?
+            .min(max_block);
+
+        // Byte offset in the file where the assembled buffer begins —
+        // the start of the first covering block.
+        let assembled_start = first_block_u64.saturating_mul(block_size_u64);
+
+        // Fetch and concatenate only the covering blocks.
+        let mut assembled: Vec<u8> = Vec::new();
+        for idx in first_block..=last_block {
+            let hash_start = idx.saturating_mul(32);
+            let hash_end = hash_start.saturating_add(32);
+            let chunk = entry
+                .block_hashes
+                .get(hash_start..hash_end)
+                .ok_or_else(|| anyhow::anyhow!("block hash {idx} out of range for {native}"))?;
+            let mut h = [0u8; 32];
+            h.copy_from_slice(chunk);
+            let hash = BlockHash(h);
+            let data = if let Some(data) = self.blocks.get_block(&hash).await? {
+                data
+            } else {
+                let fetched = self
+                    .sync
+                    .fetch_block(native, idx, block_size, h)
+                    .await
+                    .ok_or_else(|| anyhow::anyhow!("block {hash} missing and no peer had it"))?;
+                // Cache the fetched block locally so future reads hit
+                // the store without round-tripping the network.
+                self.blocks.store_block(&hash, &fetched).await?;
+                fetched
+            };
+            assembled.extend_from_slice(&data);
+        }
+
+        // Translate the absolute window into an offset within the
+        // assembled buffer, clamping the end to what was actually
+        // reconstructed (the final block may be short).
+        let rel_start_u64 = offset.saturating_sub(assembled_start);
+        let rel_start = usize::try_from(rel_start_u64)
+            .map_err(|_| anyhow::anyhow!("relative offset overflow"))?
+            .min(assembled.len());
+        let want = usize::try_from(length).unwrap_or(usize::MAX);
+        let rel_end = rel_start.saturating_add(want).min(assembled.len());
+        Ok(assembled
+            .get(rel_start..rel_end)
+            .unwrap_or_default()
+            .to_vec())
+    }
+
     async fn upload(
         &self,
         path: &Path,
@@ -1437,6 +1547,258 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         backend_b.download(&entry_b, &mut out).await.unwrap();
         assert_eq!(out, payload);
+    }
+
+    /// A deterministic payload large enough to split into several
+    /// 128 KB blocks. Each byte is `position % 251` (a prime, so the
+    /// pattern does not align to any power-of-two block boundary),
+    /// which makes a wrong slice trivially detectable.
+    fn multi_block_payload(len: usize) -> Vec<u8> {
+        (0..len).map(|i| u8::try_from(i % 251).unwrap()).collect()
+    }
+
+    #[tokio::test]
+    async fn read_range_spans_block_boundary() {
+        let (_dir, backend) = make_backend();
+        // 3.5 blocks worth of data → four 128 KB blocks, last short.
+        let block = 128 * 1024;
+        let payload = multi_block_payload(block * 7 / 2);
+        let mut reader: IoCursor<Vec<u8>> = IoCursor::new(payload.clone());
+        let entry = backend
+            .upload(
+                Path::new("big.bin"),
+                &mut reader,
+                &FileId("p2p-test:root".to_string()),
+            )
+            .await
+            .unwrap();
+
+        // A window straddling the first/second block boundary.
+        let start = block - 100;
+        let length = 200u32;
+        let got = backend
+            .read_range(&entry, u64::try_from(start).unwrap(), length)
+            .await
+            .unwrap();
+        let end = start + usize::try_from(length).unwrap();
+        assert_eq!(got, &payload[start..end]);
+    }
+
+    #[tokio::test]
+    async fn read_range_single_block_sub_range() {
+        let (_dir, backend) = make_backend();
+        let block = 128 * 1024;
+        let payload = multi_block_payload(block * 3);
+        let mut reader: IoCursor<Vec<u8>> = IoCursor::new(payload.clone());
+        let entry = backend
+            .upload(
+                Path::new("three.bin"),
+                &mut reader,
+                &FileId("p2p-test:root".to_string()),
+            )
+            .await
+            .unwrap();
+
+        // Wholly inside the second block.
+        let start = block + 17;
+        let length = 64u32;
+        let got = backend
+            .read_range(&entry, u64::try_from(start).unwrap(), length)
+            .await
+            .unwrap();
+        let end = start + usize::try_from(length).unwrap();
+        assert_eq!(got, &payload[start..end]);
+    }
+
+    #[tokio::test]
+    async fn read_range_clamps_length_past_eof() {
+        let (_dir, backend) = make_backend();
+        let payload = multi_block_payload(5000);
+        let mut reader: IoCursor<Vec<u8>> = IoCursor::new(payload.clone());
+        let entry = backend
+            .upload(
+                Path::new("small.bin"),
+                &mut reader,
+                &FileId("p2p-test:root".to_string()),
+            )
+            .await
+            .unwrap();
+
+        // length runs well past EOF — result is truncated to the tail.
+        let got = backend.read_range(&entry, 4000, 10_000).await.unwrap();
+        assert_eq!(got, &payload[4000..]);
+    }
+
+    #[tokio::test]
+    async fn read_range_whole_file() {
+        let (_dir, backend) = make_backend();
+        let payload = multi_block_payload(128 * 1024 * 2 + 99);
+        let mut reader: IoCursor<Vec<u8>> = IoCursor::new(payload.clone());
+        let entry = backend
+            .upload(
+                Path::new("whole.bin"),
+                &mut reader,
+                &FileId("p2p-test:root".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let len = u32::try_from(payload.len()).unwrap();
+        let got = backend.read_range(&entry, 0, len).await.unwrap();
+        assert_eq!(got, payload);
+    }
+
+    #[tokio::test]
+    async fn read_range_offset_at_or_past_eof_is_empty() {
+        let (_dir, backend) = make_backend();
+        let payload = multi_block_payload(2048);
+        let mut reader: IoCursor<Vec<u8>> = IoCursor::new(payload.clone());
+        let entry = backend
+            .upload(
+                Path::new("eof.bin"),
+                &mut reader,
+                &FileId("p2p-test:root".to_string()),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            backend
+                .read_range(&entry, 2048, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            backend
+                .read_range(&entry, 99_999, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn read_range_zero_length_is_empty() {
+        let (_dir, backend) = make_backend();
+        let payload = multi_block_payload(2048);
+        let mut reader: IoCursor<Vec<u8>> = IoCursor::new(payload.clone());
+        let entry = backend
+            .upload(
+                Path::new("zero.bin"),
+                &mut reader,
+                &FileId("p2p-test:root".to_string()),
+            )
+            .await
+            .unwrap();
+
+        assert!(backend.read_range(&entry, 0, 0).await.unwrap().is_empty());
+        assert!(backend.read_range(&entry, 100, 0).await.unwrap().is_empty());
+    }
+
+    /// Cross-backend: B reads a range from a file it has indexed but not
+    /// cached. The fetch must pull ONLY the blocks covering the window
+    /// from A, leaving the rest of B's block store empty — proof that
+    /// the override does not reconstruct the whole file.
+    #[tokio::test]
+    async fn read_range_fetches_only_covering_blocks_from_peer() {
+        fn open_with_folder(dir: &std::path::Path, name: &str) -> P2pBackend {
+            let cfg = P2pBackendConfig {
+                instance_id: format!("p2p-{name}"),
+                folder_id: "shared".to_string(),
+                display_name: name.to_string(),
+                index_path: dir.join("index.db"),
+                block_store_root: dir.join("blocks"),
+                identity_dir: dir.join("identity"),
+                ..Default::default()
+            };
+            P2pBackend::open(cfg).unwrap()
+        }
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        let backend_a = open_with_folder(dir_a.path(), "a");
+        let backend_b = open_with_folder(dir_b.path(), "b");
+
+        backend_a
+            .sync()
+            .trust(backend_b.sync().device_id().to_string())
+            .await;
+        backend_b
+            .sync()
+            .trust(backend_a.sync().device_id().to_string())
+            .await;
+
+        let (_cancel_tx_a, cancel_rx_a) = tokio::sync::watch::channel(false);
+        let (addr_a, _a_task) = backend_a
+            .sync()
+            .start_listener("127.0.0.1:0".parse().unwrap(), cancel_rx_a)
+            .await
+            .unwrap();
+        backend_b
+            .sync()
+            .connect_to(crate::sync::Peer {
+                device_id: backend_a.sync().device_id().to_string(),
+                address: addr_a,
+            })
+            .await
+            .unwrap();
+
+        // Five-block file (4 full 128 KB blocks + a short tail).
+        let block = 128 * 1024;
+        let payload = multi_block_payload(block * 4 + 1234);
+        let mut reader = IoCursor::new(payload.clone());
+        backend_a
+            .upload(
+                Path::new("range.bin"),
+                &mut reader,
+                &FileId(format!("{}:root", backend_a.id())),
+            )
+            .await
+            .unwrap();
+
+        // Wait for B to learn about the file via the index update.
+        let mut found = None;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            if let Some(local) = backend_b.index.get("range.bin").unwrap() {
+                found = Some(local);
+                break;
+            }
+        }
+        let local_b = found.expect("B never received index update");
+        let total_blocks = local_b.block_hashes.len() / 32;
+        assert_eq!(total_blocks, 5);
+
+        // Read a window inside the third block only (index 2).
+        let start = block * 2 + 50;
+        let length = 300u32;
+        let entry_b = backend_b.metadata(Path::new("range.bin")).await.unwrap();
+        let got = backend_b
+            .read_range(&entry_b, u64::try_from(start).unwrap(), length)
+            .await
+            .unwrap();
+        let end = start + usize::try_from(length).unwrap();
+        assert_eq!(got, &payload[start..end]);
+
+        // Exactly one block — the covering one — should now be cached on
+        // B; the other four must still be absent. This is the load-
+        // bearing assertion: a whole-file reconstruction would have
+        // cached all five.
+        let mut cached = 0usize;
+        for chunk in local_b.block_hashes.chunks(32) {
+            let mut h = [0u8; 32];
+            h.copy_from_slice(chunk);
+            if backend_b
+                .blocks
+                .get_block(&BlockHash(h))
+                .await
+                .unwrap()
+                .is_some()
+            {
+                cached += 1;
+            }
+        }
+        assert_eq!(cached, 1, "only the covering block should be cached");
     }
 
     #[test]
