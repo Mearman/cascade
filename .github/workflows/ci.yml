@@ -55,6 +55,14 @@ jobs:
         # string_slice) are scoped out of test code at each crate root — see
         # the comment in the root Cargo.toml's [workspace.lints.clippy].
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Clippy (feature-gated discovery + integration code)
+        # The Clippy step above builds default features only, so the
+        # dht / announce / nat-integration code is never linted there. Lint it
+        # explicitly — once, on Linux, since the gated code compiles the same on
+        # every platform — so a regression in those paths fails CI rather than
+        # only surfacing for whoever happens to build the feature.
+        if: runner.os == 'Linux'
+        run: cargo clippy -p cascade-p2p --all-targets --features "dht announce nat-integration" -- -D warnings
       - name: Docs
         run: cargo doc --workspace --no-deps --document-private-items
         env:
