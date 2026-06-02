@@ -131,7 +131,7 @@ impl DhtKey {
 ///
 /// A Mainline DHT `get` walks the network iteratively, hop by hop, towards the
 /// nodes closest to the target — several round-trips, not one. The `mainline`
-/// crate's own per-request timeout ([`mainline::DEFAULT_REQUEST_TIMEOUT`]) is
+/// crate's own per-request timeout (`mainline::DEFAULT_REQUEST_TIMEOUT`) is
 /// two seconds *per hop*; a full iterative lookup against the live network
 /// routinely takes several of those in series before it either yields the value
 /// or exhausts the closest nodes. Twenty seconds is a generous ceiling over that
@@ -476,12 +476,25 @@ mod live {
     impl MainlineDht {
         /// Build a Mainline-DHT node, bootstrapping against `bootstrap_nodes`.
         ///
-        /// An empty `bootstrap_nodes` falls back to the named public default,
-        /// [`DEFAULT_DHT_BOOTSTRAP_NODES`], so an out-of-the-box DHT join talks
-        /// to a known, documented set rather than relying on an implicit crate
-        /// default. There is no persisted signing key: every BEP44 keypair is
-        /// derived from the device id at put/get time, so the node holds no
-        /// long-lived secret of its own.
+        /// An empty `bootstrap_nodes` (the operator supplied none, or supplied
+        /// an explicitly empty `dht_bootstrap_nodes`) joins the public default
+        /// set, [`DEFAULT_DHT_BOOTSTRAP_NODES`] — which is the `mainline` crate's
+        /// own default, re-exposed here so the out-of-the-box join is documented
+        /// at the cascade layer. The default set is left for the crate to resolve
+        /// on its own DHT actor thread rather than being handed to
+        /// `builder.bootstrap()`: the crate resolves the default-set *hostnames*
+        /// with blocking `getaddrinfo`, and the builder's `bootstrap()` does that
+        /// synchronously on the caller's thread, so deferring it keeps the
+        /// resolution off whatever thread opens the node and avoids the
+        /// crate's empty-result trap (a `bootstrap()` set that all fails to
+        /// resolve is stored verbatim as an empty set and is *not* replaced by
+        /// the crate default). A non-empty `bootstrap_nodes` is an operator
+        /// override of already-resolved [`SocketAddr`]s, passed verbatim — no
+        /// name resolution, so it is safe to hand straight to `bootstrap()`.
+        ///
+        /// There is no persisted signing key: every BEP44 keypair is derived
+        /// from the device id at put/get time, so the node holds no long-lived
+        /// secret of its own.
         ///
         /// Returns an error only on a process-level failure — binding the DHT
         /// UDP socket — not on a per-query failure, which is handled best-effort
@@ -497,20 +510,26 @@ mod live {
         /// `None` (the node must be reachable on every interface); the live test
         /// pins it to localhost so it talks to the in-process testnet.
         ///
-        /// An empty `bootstrap_nodes` joins via [`DEFAULT_DHT_BOOTSTRAP_NODES`].
-        /// A non-empty list is used verbatim, so the live testnet helper — which
-        /// always passes concrete localhost bootstrap addresses — never reaches
-        /// for the public default.
+        /// An empty `bootstrap_nodes` defers to the crate's own resolution of
+        /// [`DEFAULT_DHT_BOOTSTRAP_NODES`] (see [`Self::open`]); a non-empty list
+        /// of already-resolved addresses is passed to `bootstrap()` verbatim, so
+        /// the live testnet helper — which always passes concrete localhost
+        /// bootstrap addresses — pins its swarm exactly.
         fn open_inner(
             bootstrap_nodes: &[SocketAddr],
             bind_ip: Option<std::net::Ipv4Addr>,
         ) -> Result<Self> {
             let mut builder = Dht::builder();
-            // Surface the default explicitly rather than leaving the builder to
-            // fall back to its own internal set: an operator reading this code
-            // sees exactly which nodes a default join contacts.
-            let effective = resolve_bootstrap_nodes(bootstrap_nodes);
-            builder.bootstrap(&effective);
+            // Only override the crate's bootstrap set when the operator supplied
+            // concrete, already-resolved addresses. The empty (default) case is
+            // deliberately left untouched so the crate resolves
+            // DEFAULT_DHT_BOOTSTRAP_NODES on its own actor thread — see the
+            // `open` doc for why handing the default hostnames to `bootstrap()`
+            // would both block this thread on `getaddrinfo` and risk a stored
+            // empty set.
+            if let Some(override_addrs) = bootstrap_override(bootstrap_nodes) {
+                builder.bootstrap(&override_addrs);
+            }
             if let Some(ip) = bind_ip {
                 builder.bind_address(ip);
             }
@@ -531,21 +550,22 @@ mod live {
         }
     }
 
-    /// Resolve the effective bootstrap set the node will join through.
+    /// Decide whether to override the crate's bootstrap set.
     ///
     /// This is the default-vs-override decision, isolated from socket binding so
-    /// it is unit-testable: an empty `configured` list (the operator supplied
-    /// none, or supplied an explicitly empty `dht_bootstrap_nodes`) falls back to
-    /// [`DEFAULT_DHT_BOOTSTRAP_NODES`]; a non-empty list is used verbatim, each
-    /// address rendered as the `host:port` string the `mainline` builder accepts.
-    fn resolve_bootstrap_nodes(configured: &[SocketAddr]) -> Vec<String> {
+    /// it is unit-testable. An empty `configured` list returns [`None`]: the
+    /// caller leaves `builder.bootstrap()` uncalled so the crate joins its own
+    /// [`DEFAULT_DHT_BOOTSTRAP_NODES`] (resolving those hostnames on its actor
+    /// thread). A non-empty list returns [`Some`] of the operator's
+    /// already-resolved addresses, to be passed to `bootstrap()` verbatim. The
+    /// `host:port` strings the `mainline` builder ultimately wants are produced
+    /// by its own `ToSocketAddrs` impl for [`SocketAddr`], so no DNS happens for
+    /// the override case.
+    fn bootstrap_override(configured: &[SocketAddr]) -> Option<Vec<SocketAddr>> {
         if configured.is_empty() {
-            DEFAULT_DHT_BOOTSTRAP_NODES
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect()
+            None
         } else {
-            configured.iter().map(SocketAddr::to_string).collect()
+            Some(configured.to_vec())
         }
     }
 
@@ -611,39 +631,33 @@ mod live {
     mod tests {
         use std::net::SocketAddr;
 
-        use super::{DEFAULT_DHT_BOOTSTRAP_NODES, resolve_bootstrap_nodes};
+        use super::{DEFAULT_DHT_BOOTSTRAP_NODES, bootstrap_override};
 
         #[test]
-        fn empty_override_resolves_to_the_named_public_default() {
-            // No operator-supplied bootstrap nodes → the named default set is
-            // used, so the DHT is usable out of the box.
-            let resolved = resolve_bootstrap_nodes(&[]);
-            let expected: Vec<String> = DEFAULT_DHT_BOOTSTRAP_NODES
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect();
-            assert_eq!(resolved, expected);
-            assert!(!resolved.is_empty(), "the default set must be non-empty");
+        fn empty_override_defers_to_the_crate_default() {
+            // No operator-supplied bootstrap nodes → no override, so the node
+            // leaves `bootstrap()` uncalled and the crate resolves its own
+            // DEFAULT_DHT_BOOTSTRAP_NODES on its actor thread. This is what keeps
+            // the default hostnames off the opening thread and avoids the crate's
+            // empty-result trap. The default set must still be non-empty so the
+            // crate has something to resolve.
+            assert_eq!(bootstrap_override(&[]), None);
+            assert!(
+                !DEFAULT_DHT_BOOTSTRAP_NODES.is_empty(),
+                "the crate default set must be non-empty",
+            );
         }
 
         #[test]
-        fn non_empty_override_replaces_the_default_verbatim() {
-            // Operator-pinned nodes are used as-is, rendered to the host:port
-            // strings the builder accepts, and the public default is not mixed
-            // in.
+        fn non_empty_override_is_passed_through_verbatim() {
+            // Operator-pinned nodes are returned as-is for the builder to use
+            // verbatim, with no DNS and no mixing-in of the public default.
             let pinned: Vec<SocketAddr> = vec![
                 "127.0.0.1:6881".parse().unwrap(),
                 "10.0.0.1:6882".parse().unwrap(),
             ];
-            let resolved = resolve_bootstrap_nodes(&pinned);
-            assert_eq!(resolved, vec!["127.0.0.1:6881", "10.0.0.1:6882"]);
-            // None of the public default routers leak into a pinned set.
-            for default in DEFAULT_DHT_BOOTSTRAP_NODES {
-                assert!(
-                    !resolved.iter().any(|r| r == default),
-                    "pinned override must not include the public default {default}",
-                );
-            }
+            let resolved = bootstrap_override(&pinned);
+            assert_eq!(resolved, Some(pinned));
         }
     }
 }
