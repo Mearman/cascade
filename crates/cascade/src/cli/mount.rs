@@ -541,16 +541,13 @@ async fn try_projfs(
          see crates/cascade/src/main.rs (Runtime::new)"
     );
 
-    // The content provider serves on-demand reads. Its cache directory is
-    // a sibling of the state DB under the config root, matching the File
-    // Provider layout.
-    let cache_dir = ctx.config_dir.join("cache");
-    ensure_directory(&cache_dir, "ProjFS cache directory")?;
+    // The content provider serves on-demand reads. Each read fetches only
+    // the requested byte range straight from the owning backend, so there
+    // is no whole-file cache directory to provision.
     let provider = Arc::new(super::projfs_provider::EngineContentProvider::new(
         engine.vfs().clone(),
         engine.db().clone(),
         backends_for_provider,
-        cache_dir,
         handle,
     ));
 

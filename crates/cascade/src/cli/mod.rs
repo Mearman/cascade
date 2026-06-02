@@ -4,8 +4,10 @@ pub mod config;
 pub mod init;
 pub mod mount;
 /// Engine-backed `ContentProvider` for the Windows `ProjFS` presenter.
-/// Only the Windows daemon wires it up, so the module is target-gated.
-#[cfg(target_os = "windows")]
+/// Only the Windows daemon wires it up in production, so the module is
+/// Windows-gated — but it is plain cross-platform Rust, so it is also
+/// compiled under `test` to keep its unit tests running on every host.
+#[cfg(any(target_os = "windows", test))]
 pub mod projfs_provider;
 pub mod status;
 
