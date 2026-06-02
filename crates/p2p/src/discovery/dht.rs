@@ -7,19 +7,35 @@
 //! role without a central directory — it is the serverless replacement the v9
 //! roadmap and the design doc call for (see `docs/design.md`, "Peer
 //! discovery"). Instead of storing the candidate set on one server, the device
-//! stores it in the `BitTorrent` Mainline DHT under a key derived by hashing its
-//! device id; any peer that knows the device id derives the same key and reads
-//! the candidate set back out.
+//! stores it in the `BitTorrent` Mainline DHT as a BEP44 mutable item whose
+//! signing keypair is derived deterministically from its device id; any peer
+//! that knows the device id derives the same keypair, computes the same BEP44
+//! target, and reads the candidate set back out.
+//!
+//! ## Why the keypair is derived from the device id
+//!
+//! BEP44 mutable items are addressed by `target = SHA-1(public_key || salt)`,
+//! where `public_key` is the *writer's* ed25519 verifying key (see
+//! `mainline::MutableItem::target_from_key`). A naive design that signs with a
+//! random per-node key cannot work as a rendezvous: device B resolving device
+//! A would compute `SHA-1(B_pubkey || ...)`, a different target from where A
+//! wrote under `SHA-1(A_pubkey || ...)`, so B could never read A's value. The
+//! whole point of the source — "any peer that knows the device id reads the
+//! candidate set" — requires that the *public key half* of the target be
+//! derivable from the device id alone. So the ed25519 signing key is seeded
+//! from the device id with a domain-separated hash: the announcer and the
+//! looker-up independently derive the identical keypair, hence the identical
+//! target, with no shared secret and no per-node persisted key.
 //!
 //! ## Shape
 //!
 //! Discovery here is keyed lookup over a distributed hash table:
 //!
-//! - [`DhtKey::from_device_id`] maps a base32 device id to a 160-bit DHT key by
-//!   hashing it (SHA-1, matching the 160-bit key width of `BitTorrent`
-//!   info-hashes). The mapping is deterministic, so the announcer and the
-//!   looker-up derive the same key from the same device id without any shared
-//!   state.
+//! - [`DhtKey::from_device_id`] maps a base32 device id to a 32-byte ed25519
+//!   seed by hashing it (SHA-256 over a domain-separation prefix and the id).
+//!   The mapping is deterministic, so the announcer and the looker-up derive
+//!   the same seed — and therefore the same BEP44 keypair and target — from the
+//!   same device id without any shared state.
 //! - [`DhtDiscovery::announce`] serialises the local candidate set and stores
 //!   it under that key. Conceptually this is `announce_peer` keyed by
 //!   `hash(device_id)`, except the stored value is the whole candidate set
@@ -48,54 +64,79 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use sha1::{Digest, Sha1};
+use sha2::{Digest, Sha256};
 
 use super::Discovery;
-use super::announce::{MAX_ANNOUNCE_CANDIDATES, WireCandidate};
+use super::announce::WireCandidate;
 use crate::candidate::Candidate;
 
-/// Width of a DHT key in bytes.
+/// Width of the device-id-derived ed25519 seed in bytes.
 ///
-/// `BitTorrent`'s Mainline DHT keys its address space with 160-bit
-/// identifiers (SHA-1 of the info-hash, or of a BEP44 public key plus salt).
-/// The device-id-derived key matches that width so it addresses the same
-/// keyspace the underlying node operates over.
-pub const DHT_KEY_LEN: usize = 20;
+/// A BEP44 mutable item is signed by an ed25519 keypair, and ed25519 keys are
+/// built from a 32-byte seed (`SigningKey::from_bytes`). The device-id mapping
+/// produces exactly that width so the seed feeds the keypair directly, with no
+/// truncation or padding.
+pub const DHT_KEY_LEN: usize = 32;
 
-/// A 160-bit DHT key.
+/// Domain-separation prefix mixed into the device-id hash before it becomes an
+/// ed25519 seed.
+///
+/// The device id is hashed for several unrelated purposes across the codebase
+/// (it is itself a SHA-256 of the TLS certificate). Prefixing the hash input
+/// with a fixed, purpose-specific tag ensures the BEP44 seed cannot collide
+/// with any other use of the same id, so deriving the signing key here never
+/// reuses key material derived elsewhere.
+const DHT_SEED_DOMAIN: &[u8] = b"cascade-dht-bep44-seed-v1";
+
+/// A device-id-derived ed25519 seed for BEP44 addressing.
 ///
 /// Derived deterministically from a device id by [`DhtKey::from_device_id`].
-/// Two devices that agree on a device id derive the same key, which is what
-/// lets a looker-up address the announcer's stored candidate set without any
-/// prior contact.
+/// Two devices that agree on a device id derive the same seed, hence the same
+/// BEP44 signing keypair and the same DHT target, which is what lets a
+/// looker-up address the announcer's stored candidate set without any prior
+/// contact or shared secret.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DhtKey(pub [u8; DHT_KEY_LEN]);
 
 impl DhtKey {
-    /// Map a base32 device id to its DHT key by hashing it.
+    /// Map a base32 device id to its BEP44 ed25519 seed.
     ///
-    /// The device id is hashed with SHA-1, whose 160-bit digest is exactly
-    /// the DHT key width. Hashing (rather than truncating the already-hashed
-    /// device id) keeps the mapping independent of the device id's own
-    /// encoding: any string maps to a uniformly distributed key, and the
-    /// announcer and looker-up derive the same key from the same id.
+    /// The seed is `SHA-256(DHT_SEED_DOMAIN || device_id)`, whose 256-bit
+    /// digest is exactly the ed25519 seed width. Hashing (rather than using the
+    /// device-id bytes directly) keeps the seed independent of the id's own
+    /// encoding and length, and the domain-separation prefix keeps it distinct
+    /// from any other hash of the same id. The announcer and looker-up derive
+    /// the same seed from the same id, so both compute the same BEP44 keypair
+    /// and target.
     #[must_use]
     pub fn from_device_id(device_id: &str) -> Self {
-        let mut hasher = Sha1::new();
+        let mut hasher = Sha256::new();
+        hasher.update(DHT_SEED_DOMAIN);
         hasher.update(device_id.as_bytes());
         let digest = hasher.finalize();
         let mut key = [0u8; DHT_KEY_LEN];
-        // SHA-1 produces exactly `DHT_KEY_LEN` bytes, so the copy is total.
+        // SHA-256 produces exactly `DHT_KEY_LEN` bytes, so the copy is total.
         key.copy_from_slice(&digest);
         Self(key)
     }
 
-    /// The raw 160-bit key bytes.
+    /// The raw ed25519 seed bytes.
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; DHT_KEY_LEN] {
         &self.0
     }
 }
+
+/// Maximum length, in bytes, of a BEP44 mutable-item value.
+///
+/// [BEP44](https://www.bittorrent.org/beps/bep_0044.html) caps a stored value
+/// at 1000 bytes, and storing nodes on the live Mainline DHT enforce this:
+/// `mainline` does not pre-check client-side, so an oversized `put_mutable`
+/// reports success locally while the network silently drops the value. The
+/// encoder therefore bounds the *encoded byte length* against this ceiling, not
+/// the candidate count, so a value that is put is a value that can actually be
+/// stored.
+const BEP44_MAX_VALUE_LEN: usize = 1000;
 
 /// Serialisable envelope for a candidate set stored under a DHT key.
 ///
@@ -111,30 +152,62 @@ pub struct StoredCandidates {
 }
 
 impl StoredCandidates {
-    /// Encode a candidate set into the opaque bytes stored in the DHT.
+    /// Encode a candidate set into the opaque bytes stored in the DHT,
+    /// guaranteed to fit the BEP44 1000-byte value ceiling.
     ///
-    /// Caps the set at [`MAX_ANNOUNCE_CANDIDATES`] — the same bound the
-    /// announce directory applies — so a device with an implausible number of
-    /// candidates cannot bloat a DHT value. Returns the JSON-encoded bytes, or
-    /// the error if serialisation fails (which only happens on an allocator
-    /// failure for this shape).
+    /// The candidate count is the wrong thing to cap against: the announce
+    /// directory's HTTP path has no size limit, but a BEP44 value does, and
+    /// even a couple of dozen candidates serialise past 1000 bytes. So this
+    /// bounds the *encoded length* instead. Candidates are sorted by descending
+    /// priority (highest first) and the lowest-priority entries are dropped one
+    /// at a time until the JSON encoding fits [`BEP44_MAX_VALUE_LEN`], so the
+    /// most useful candidates survive and the stored value is one the network
+    /// will actually accept rather than silently reject.
+    ///
+    /// Returns the JSON-encoded bytes, or the serialisation error (which only
+    /// arises on an allocator failure for this shape). An empty candidate set
+    /// encodes to the empty-array envelope, which is well within the ceiling.
     fn encode(candidates: &[Candidate]) -> Result<Vec<u8>, serde_json::Error> {
-        let wire: Vec<WireCandidate> = candidates
+        let mut wire: Vec<WireCandidate> = candidates
             .iter()
-            .take(MAX_ANNOUNCE_CANDIDATES)
             .copied()
             .map(WireCandidate::from)
             .collect();
-        serde_json::to_vec(&Self { candidates: wire })
+        // Highest priority first, so dropping from the tail removes the
+        // least-useful candidates. The input is already announcer-ordered, but
+        // sorting here makes the byte-budget trim correct regardless of caller.
+        wire.sort_unstable_by_key(|c| std::cmp::Reverse(c.priority));
+
+        loop {
+            let encoded = serde_json::to_vec(&Self {
+                candidates: wire.clone(),
+            })?;
+            if encoded.len() <= BEP44_MAX_VALUE_LEN || wire.is_empty() {
+                if encoded.len() > BEP44_MAX_VALUE_LEN {
+                    // Only reachable when even the empty-array envelope exceeds
+                    // the ceiling, which cannot happen for this fixed shape;
+                    // surfacing it loudly beats silently announcing a value the
+                    // network will drop.
+                    tracing::warn!(
+                        target: "cascade::p2p::discovery::dht",
+                        encoded_len = encoded.len(),
+                        limit = BEP44_MAX_VALUE_LEN,
+                        "DHT candidate value exceeds the BEP44 ceiling even when empty",
+                    );
+                }
+                return Ok(encoded);
+            }
+            // Drop the lowest-priority candidate and retry.
+            wire.pop();
+        }
     }
 
     /// Decode opaque DHT bytes into in-memory candidates.
     ///
     /// Drops any candidate whose kind tag is unknown — a malformed or hostile
-    /// stored value must not coerce into a wrong kind — and caps the decoded
-    /// set at [`MAX_ANNOUNCE_CANDIDATES`]. Returns an empty vector when the
-    /// bytes do not decode to a [`StoredCandidates`], so a corrupt value reads
-    /// as "no candidates" rather than aborting the lookup.
+    /// stored value must not coerce into a wrong kind. Returns an empty vector
+    /// when the bytes do not decode to a [`StoredCandidates`], so a corrupt
+    /// value reads as "no candidates" rather than aborting the lookup.
     fn decode(bytes: &[u8]) -> Vec<Candidate> {
         let parsed: Self = match serde_json::from_slice(bytes) {
             Ok(parsed) => parsed,
@@ -143,7 +216,6 @@ impl StoredCandidates {
         parsed
             .candidates
             .into_iter()
-            .take(MAX_ANNOUNCE_CANDIDATES)
             .filter_map(WireCandidate::to_candidate)
             .collect()
     }
@@ -241,34 +313,28 @@ pub use live::MainlineDht;
 #[cfg(feature = "dht")]
 mod live {
     use std::net::SocketAddr;
-    use std::path::Path;
 
-    use anyhow::{Context, Result};
+    use anyhow::Result;
     use async_trait::async_trait;
     use mainline::{Dht, MutableItem, SigningKey};
 
     use super::{DhtKey, DhtNode};
 
-    /// File name for the persisted BEP44 signing key.
-    ///
-    /// The signing key authenticates this node's mutable DHT writes. It must
-    /// persist across restarts so a device keeps writing under the same BEP44
-    /// public key — a fresh key on every boot would orphan previously stored
-    /// candidate sets.
-    const SIGNING_KEY_FILE: &str = "dht-signing.key";
-
-    /// Width of an ed25519 signing key seed in bytes.
-    const SIGNING_KEY_SEED_LEN: usize = 32;
-
     /// Mainline-DHT-backed [`DhtNode`].
     ///
     /// Wraps the maintained `mainline` crate's `BitTorrent` Mainline DHT node and
-    /// stores candidate sets as BEP44 mutable items. The device-id-derived
-    /// [`DhtKey`] is carried as the mutable item's salt, so different device ids
-    /// map to different DHT targets under this node's single BEP44 signing key.
-    /// Reads use the most-recent mutable item for the salt; writes bump the
-    /// sequence number monotonically using the wall clock so a later announce
-    /// supersedes an earlier one.
+    /// stores candidate sets as BEP44 mutable items. Each item is signed by an
+    /// ed25519 keypair derived deterministically from the device id being
+    /// announced or resolved (the [`DhtKey`] carries that key's seed), so the
+    /// BEP44 target `SHA-1(public_key)` is the same on every node that knows the
+    /// id — that is what makes cross-device resolution work without a shared
+    /// secret or a persisted per-node key. The salt is left empty: the device id
+    /// already lives in the keypair, so it must not also live in the salt, and
+    /// the announcer and looker-up agree on "no salt" trivially.
+    ///
+    /// Reads take the most-recent mutable item for the derived public key;
+    /// writes bump the sequence number monotonically using the wall clock so a
+    /// later announce supersedes an earlier one.
     ///
     /// All DHT I/O is best-effort: a store or lookup that fails on the wire is
     /// logged and surfaces as "no candidates", never an error, matching the
@@ -276,7 +342,6 @@ mod live {
     #[derive(Clone)]
     pub struct MainlineDht {
         dht: mainline::async_dht::AsyncDht,
-        signing_key: SigningKey,
     }
 
     impl std::fmt::Debug for MainlineDht {
@@ -289,16 +354,15 @@ mod live {
         /// Build a Mainline-DHT node, bootstrapping against `bootstrap_nodes`.
         ///
         /// An empty `bootstrap_nodes` uses the `mainline` crate's built-in
-        /// public bootstrap set. The BEP44 signing key is loaded from
-        /// `identity_dir` (or generated and persisted on first run) so the node
-        /// keeps writing mutable items under a stable public key across
-        /// restarts.
+        /// public bootstrap set. There is no persisted signing key: every BEP44
+        /// keypair is derived from the device id at put/get time, so the node
+        /// holds no long-lived secret of its own.
         ///
         /// Returns an error only on a process-level failure — binding the DHT
-        /// UDP socket, or reading/writing the signing key — not on a per-query
-        /// failure, which is handled best-effort inside [`DhtNode`].
-        pub fn open(identity_dir: &Path, bootstrap_nodes: &[SocketAddr]) -> Result<Self> {
-            Self::open_inner(identity_dir, bootstrap_nodes, None)
+        /// UDP socket — not on a per-query failure, which is handled best-effort
+        /// inside [`DhtNode`].
+        pub fn open(bootstrap_nodes: &[SocketAddr]) -> Result<Self> {
+            Self::open_inner(bootstrap_nodes, None)
         }
 
         /// Shared constructor for [`Self::open`] and the test helper.
@@ -308,13 +372,9 @@ mod live {
         /// `None` (the node must be reachable on every interface); the live test
         /// pins it to localhost so it talks to the in-process testnet.
         fn open_inner(
-            identity_dir: &Path,
             bootstrap_nodes: &[SocketAddr],
             bind_ip: Option<std::net::Ipv4Addr>,
         ) -> Result<Self> {
-            let signing_key = load_or_generate_signing_key(identity_dir)
-                .context("loading DHT BEP44 signing key")?;
-
             let mut builder = Dht::builder();
             if !bootstrap_nodes.is_empty() {
                 builder.bootstrap(bootstrap_nodes);
@@ -327,71 +387,35 @@ mod live {
                 .map_err(|err| anyhow::anyhow!("building mainline DHT node: {err}"))?
                 .as_async();
 
-            Ok(Self { dht, signing_key })
+            Ok(Self { dht })
         }
 
         /// Open a node pinned to localhost, for the in-process testnet round-trip
         /// tests. Not part of the production surface — the live network requires
         /// the all-interfaces bind [`Self::open`] uses.
         #[cfg(test)]
-        pub(super) fn open_local(
-            identity_dir: &Path,
-            bootstrap_nodes: &[SocketAddr],
-        ) -> Result<Self> {
-            Self::open_inner(
-                identity_dir,
-                bootstrap_nodes,
-                Some(std::net::Ipv4Addr::LOCALHOST),
-            )
-        }
-
-        /// Build the BEP44 mutable item carrying `value` under the salt derived
-        /// from `key`.
-        ///
-        /// The DHT key is used as the salt so each device id maps to a distinct
-        /// mutable-item target under this node's single signing key. The
-        /// sequence number is the current Unix time in milliseconds, which is
-        /// monotonic enough that a later announce always supersedes an earlier
-        /// one for the same salt.
-        fn mutable_item(&self, key: DhtKey, value: &[u8], seq: i64) -> MutableItem {
-            MutableItem::new(self.signing_key.clone(), value, seq, Some(key.as_bytes()))
+        pub(super) fn open_local(bootstrap_nodes: &[SocketAddr]) -> Result<Self> {
+            Self::open_inner(bootstrap_nodes, Some(std::net::Ipv4Addr::LOCALHOST))
         }
     }
 
-    /// Load the BEP44 signing key from `dir`, generating and persisting one on
-    /// first run.
+    /// Build the BEP44 signing keypair from a device-id-derived [`DhtKey`].
     ///
-    /// The key is stored as its raw 32-byte ed25519 seed. A fresh seed is drawn
-    /// from the OS CSPRNG via `getrandom` — the canonical source for long-lived
-    /// signing-key material — and `SigningKey::from_bytes` derives the key from
-    /// it, the same construction the `mainline` crate uses. A stored seed of the
-    /// wrong length is a corrupt file and surfaces as an error rather than being
-    /// silently regenerated, so the operator notices rather than orphaning
-    /// previously stored candidate sets.
-    fn load_or_generate_signing_key(dir: &Path) -> Result<SigningKey> {
-        let path = dir.join(SIGNING_KEY_FILE);
-        if path.exists() {
-            let seed = std::fs::read(&path).context("reading DHT signing key")?;
-            let seed: [u8; SIGNING_KEY_SEED_LEN] = seed
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("DHT signing key file is not a 32-byte seed"))?;
-            Ok(SigningKey::from_bytes(&seed))
-        } else {
-            let mut seed = [0u8; SIGNING_KEY_SEED_LEN];
-            getrandom::fill(&mut seed)
-                .map_err(|err| anyhow::anyhow!("drawing DHT signing key seed: {err}"))?;
-            let signing_key = SigningKey::from_bytes(&seed);
-            std::fs::create_dir_all(dir).context("creating DHT identity directory")?;
-            std::fs::write(&path, signing_key.to_bytes()).context("writing DHT signing key")?;
-            Ok(signing_key)
-        }
+    /// The [`DhtKey`] *is* the ed25519 seed (`SHA-256` of a domain prefix and
+    /// the device id), so `SigningKey::from_bytes` reconstructs the identical
+    /// keypair on every node that knows the id. This is the whole mechanism that
+    /// makes the BEP44 target `SHA-1(public_key)` shared across devices.
+    fn signing_key_for(key: DhtKey) -> SigningKey {
+        SigningKey::from_bytes(key.as_bytes())
     }
 
     #[async_trait]
     impl DhtNode for MainlineDht {
         async fn put(&self, key: DhtKey, value: Vec<u8>) {
             let seq = unix_millis();
-            let item = self.mutable_item(key, &value, seq);
+            // No salt: the device id is already encoded in the keypair, so the
+            // target is SHA-1(public_key), which the resolver reproduces.
+            let item = MutableItem::new(signing_key_for(key), &value, seq, None);
             let dht = self.dht.clone();
             if let Err(err) = dht.put_mutable(item, None).await {
                 tracing::debug!(
@@ -403,10 +427,12 @@ mod live {
         }
 
         async fn get(&self, key: DhtKey) -> Vec<Vec<u8>> {
-            let public_key = self.signing_key.verifying_key().to_bytes();
-            let salt = key.as_bytes().to_vec();
+            // Derive the announcer's public key from the queried device id and
+            // read the most-recent item under SHA-1(public_key) — the exact
+            // target the announcer wrote to. No salt, matching the put path.
+            let public_key = signing_key_for(key).verifying_key().to_bytes();
             let dht = self.dht.clone();
-            dht.get_mutable_most_recent(&public_key, Some(&salt))
+            dht.get_mutable_most_recent(&public_key, None)
                 .await
                 .map_or_else(Vec::new, |item| vec![item.value().to_vec()])
         }
@@ -462,7 +488,7 @@ mod tests {
     }
 
     #[test]
-    fn device_id_maps_to_a_160_bit_key() {
+    fn device_id_maps_to_an_ed25519_seed_width_key() {
         let key = DhtKey::from_device_id("DEVICE-A");
         assert_eq!(key.as_bytes().len(), DHT_KEY_LEN);
     }
@@ -484,10 +510,12 @@ mod tests {
     }
 
     #[test]
-    fn key_matches_independent_sha1_of_device_id() {
-        // Pin the mapping to SHA-1 of the id bytes so a future change to the
-        // derivation is caught — the two ends must agree on exactly this.
-        let mut hasher = Sha1::new();
+    fn key_matches_independent_domain_separated_sha256_of_device_id() {
+        // Pin the mapping to SHA-256 of the domain prefix and the id bytes so a
+        // future change to the derivation is caught — both ends, and the BEP44
+        // keypair they each build from it, must agree on exactly this.
+        let mut hasher = Sha256::new();
+        hasher.update(DHT_SEED_DOMAIN);
         hasher.update(b"DEVICE-A");
         let expected = hasher.finalize();
         let key = DhtKey::from_device_id("DEVICE-A");
@@ -508,6 +536,62 @@ mod tests {
     #[test]
     fn decode_of_corrupt_bytes_yields_no_candidates() {
         assert!(StoredCandidates::decode(b"not json at all").is_empty());
+    }
+
+    #[test]
+    fn encode_keeps_a_large_set_within_the_bep44_value_ceiling() {
+        // Far more candidates than will fit in 1000 bytes. The encoder must
+        // drop the lowest-priority ones until the value fits, never emit a
+        // value the network would silently reject.
+        let many: Vec<Candidate> = (0..256u32)
+            .map(|i| {
+                let port = u16::try_from(20_000 + i).unwrap_or(u16::MAX);
+                Candidate::new(addr(port), CandidateKind::Host, port)
+            })
+            .collect();
+        let bytes = StoredCandidates::encode(&many).unwrap();
+        assert!(
+            bytes.len() <= BEP44_MAX_VALUE_LEN,
+            "encoded value {} exceeds BEP44 ceiling {BEP44_MAX_VALUE_LEN}",
+            bytes.len(),
+        );
+    }
+
+    #[test]
+    fn encode_drops_lowest_priority_candidates_when_over_budget() {
+        // When the set will not fit, the highest-priority candidates must
+        // survive and the lowest-priority ones must be dropped. A host
+        // candidate with maximum local preference outranks relayed candidates
+        // with zero local preference (host type preference dominates), so the
+        // host must be the one that survives the byte-budget trim.
+        let top = Candidate::new(addr(20000), CandidateKind::Host, u16::MAX);
+        let lesser: Vec<Candidate> = (0..256u32)
+            .map(|i| {
+                let port = u16::try_from(30_000 + i).unwrap_or(u16::MAX);
+                Candidate::new(addr(port), CandidateKind::Relayed, 0)
+            })
+            .collect();
+        let mut set = vec![top];
+        set.extend(lesser);
+
+        let bytes = StoredCandidates::encode(&set).unwrap();
+        assert!(bytes.len() <= BEP44_MAX_VALUE_LEN);
+        let decoded = StoredCandidates::decode(&bytes);
+        assert!(
+            decoded.contains(&top),
+            "the highest-priority candidate must survive the byte-budget trim",
+        );
+        assert!(
+            decoded.len() < set.len(),
+            "some low-priority candidates must have been dropped",
+        );
+    }
+
+    #[test]
+    fn encode_of_empty_set_is_well_within_the_ceiling() {
+        let bytes = StoredCandidates::encode(&[]).unwrap();
+        assert!(bytes.len() <= BEP44_MAX_VALUE_LEN);
+        assert!(StoredCandidates::decode(&bytes).is_empty());
     }
 
     #[tokio::test]
@@ -620,14 +704,9 @@ mod live_tests {
         let testnet = Testnet::builder(10).build().unwrap();
         let bootstrap = bootstrap_addrs(&testnet);
 
-        let dir = tempfile::tempdir().unwrap();
-
-        // The live node keys mutable items on (BEP44 public key, salt), so
-        // announce and resolve share one node here — the cross-device case,
-        // which does not depend on a shared signing key, is exercised by the
-        // offline mock above. Bind to localhost so the node reaches the
-        // in-process testnet (which binds localhost) on every platform.
-        let node = MainlineDht::open_local(dir.path(), &bootstrap).unwrap();
+        // Bind to localhost so the node reaches the in-process testnet (which
+        // binds localhost) on every platform.
+        let node = MainlineDht::open_local(&bootstrap).unwrap();
         let discovery = DhtDiscovery::new(node);
 
         let host = Candidate::new(addr(22000), CandidateKind::Host, 65_535);
@@ -642,11 +721,35 @@ mod live_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "binds local UDP sockets and bootstraps a DHT swarm"]
+    async fn one_node_announces_and_a_separate_node_resolves_over_a_live_testnet() {
+        // The actual purpose of the source: a device announces on one node and
+        // a *different* device, knowing only the device id, resolves it. This
+        // is the cross-device path that the offline mock cannot exercise (the
+        // mock keys on the DhtKey directly and never builds a BEP44 keypair) —
+        // it is the only test that catches a regression to per-node keying,
+        // where the announcer and resolver would compute different targets.
+        let testnet = Testnet::builder(10).build().unwrap();
+        let bootstrap = bootstrap_addrs(&testnet);
+
+        let writer = DhtDiscovery::new(MainlineDht::open_local(&bootstrap).unwrap());
+        let reader = DhtDiscovery::new(MainlineDht::open_local(&bootstrap).unwrap());
+
+        let host = Candidate::new(addr(22000), CandidateKind::Host, 65_535);
+        let srflx = Candidate::new(addr(33000), CandidateKind::ServerReflexive, 0);
+        writer.announce("DEVICE-A", &[host, srflx]).await;
+
+        let found = reader.resolve("DEVICE-A").await;
+        assert_eq!(found.len(), 2);
+        assert!(found.contains(&host));
+        assert!(found.contains(&srflx));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "binds local UDP sockets and bootstraps a DHT swarm"]
     async fn resolve_unknown_device_over_a_live_testnet_is_empty() {
         let testnet = Testnet::builder(10).build().unwrap();
         let bootstrap = bootstrap_addrs(&testnet);
-        let dir = tempfile::tempdir().unwrap();
-        let node = MainlineDht::open_local(dir.path(), &bootstrap).unwrap();
+        let node = MainlineDht::open_local(&bootstrap).unwrap();
         let discovery = DhtDiscovery::new(node);
 
         assert!(discovery.resolve("NEVER-ANNOUNCED").await.is_empty());
