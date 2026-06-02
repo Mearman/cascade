@@ -8,7 +8,10 @@
 //! ([`gossip::GossipDiscovery`]); an optional announce server is a
 //! rendezvous directory for devices that have never met and sit on
 //! different networks ([`announce::AnnounceDiscovery`], behind the
-//! `announce` cargo feature). All implement the [`Discovery`] trait so the
+//! `announce` cargo feature); and a Kademlia/Mainline DHT is the
+//! serverless equivalent of that rendezvous role
+//! ([`dht::DhtDiscovery`], with the live `mainline`-backed node behind
+//! the `dht` cargo feature). All implement the [`Discovery`] trait so the
 //! rest of the engine depends only on the contract, never on a concrete
 //! mechanism.
 //!
@@ -21,6 +24,7 @@
 //! offers sits first regardless of which source produced it.
 
 pub mod announce;
+pub mod dht;
 pub mod gossip;
 pub mod lan;
 
@@ -43,6 +47,11 @@ pub use announce::{AnnounceRequest, LookupResponse, MAX_ANNOUNCE_CANDIDATES, Wir
 
 #[cfg(feature = "announce")]
 pub use announce::AnnounceDiscovery;
+
+pub use dht::{DHT_KEY_LEN, DhtDiscovery, DhtKey, DhtNode, StoredCandidates};
+
+#[cfg(feature = "dht")]
+pub use dht::MainlineDht;
 
 /// A source that turns a peer's device ID into reachable candidates.
 ///
