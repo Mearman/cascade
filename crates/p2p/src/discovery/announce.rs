@@ -44,15 +44,31 @@
 //! so this construction is a substitution/relabel/replay defence, not a defence
 //! against forgery by a party that knows the id.
 //!
-//! The wire types (`WireCandidate`, `AnnounceRequest`, `LookupResponse`) and the
-//! per-device candidate cap (`MAX_ANNOUNCE_CANDIDATES`) are owned by the
-//! wasm-safe [`cascade_announce_wire`] crate so the announce client, the
+//! ## Write authentication
+//!
+//! The announce directory is a soft-state rendezvous that only holders of a
+//! shared secret may write to: every `POST /announce/<device_id>` carries an
+//! `HMAC-SHA256` tag over the device id and the exact request body in the
+//! [`ANNOUNCE_AUTH_HEADER`](cascade_announce_wire::auth::ANNOUNCE_AUTH_HEADER)
+//! header, and both carriers — the relay-server's directory endpoint and the
+//! Cloudflare Worker — reject a write whose tag is missing or does not verify.
+//! The client therefore holds the same 32-byte secret and stamps the header on
+//! every register. The HMAC gates *who* may write; it is orthogonal to the
+//! self-certifying signature inside the envelope, which is what a *reader*
+//! verifies. Binding the body into the tag stops a man-in-the-middle swapping
+//! the stored blob for a different (even validly-signed) one in flight.
+//!
+//! The wire types (`WireCandidate`, `AnnounceRequest`, `LookupResponse`), the
+//! per-device candidate cap (`MAX_ANNOUNCE_CANDIDATES`), and the write-auth
+//! primitive (`auth::announce_write_tag`, `ANNOUNCE_AUTH_HEADER`) are owned by
+//! the wasm-safe [`cascade_announce_wire`] crate so the announce client, the
 //! relay-server's directory endpoint, the DHT, and the Cloudflare Worker all
 //! share one definition and cannot drift. This module re-exports them and adds
 //! the `cascade-p2p`-side HTTP client (behind the `announce` cargo feature, which
 //! pulls in `reqwest`).
 
 pub use cascade_announce_wire::WireCandidate;
+pub use cascade_announce_wire::auth::{SHARED_SECRET_LEN, parse_shared_secret_hex};
 pub use cascade_announce_wire::wire::{AnnounceRequest, LookupResponse, MAX_ANNOUNCE_CANDIDATES};
 
 #[cfg(feature = "announce")]
@@ -64,9 +80,12 @@ mod client {
     use std::time::Duration;
 
     use async_trait::async_trait;
+    use cascade_announce_wire::auth::{self, ANNOUNCE_AUTH_HEADER};
     use reqwest::Client;
 
-    use super::{AnnounceRequest, LookupResponse, MAX_ANNOUNCE_CANDIDATES, WireCandidate};
+    use super::{
+        AnnounceRequest, LookupResponse, MAX_ANNOUNCE_CANDIDATES, SHARED_SECRET_LEN, WireCandidate,
+    };
     use crate::candidate::Candidate;
     use crate::discovery::Discovery;
     use crate::discovery::signing::{self, SignedCandidates};
@@ -107,6 +126,12 @@ mod client {
         base_url: String,
         client: Client,
         clock: Arc<dyn Clock>,
+        /// Shared secret authenticating this device's writes to the announce
+        /// directory. Every `POST` carries the `HMAC-SHA256` tag over the device
+        /// id and the body keyed by this secret; both carriers reject a write
+        /// whose tag is absent or wrong, so the client cannot register without
+        /// it. Read-only lookups do not use it.
+        secret: [u8; SHARED_SECRET_LEN],
     }
 
     impl std::fmt::Debug for AnnounceDiscovery {
@@ -122,16 +147,21 @@ mod client {
         ///
         /// `base_url` is the scheme-and-authority root (e.g.
         /// `https://announce.example`); the `/announce/<device_id>` path is
-        /// appended per request. A trailing slash is tolerated. The wall clock
-        /// used to stamp announce expiries and check freshness on lookup is the
-        /// real [`SystemClock`]; tests inject a virtualised clock via
-        /// [`Self::with_clock`].
+        /// appended per request. A trailing slash is tolerated. `secret` is the
+        /// 32-byte shared secret this device authenticates its registrations
+        /// with — it is stamped as the `HMAC` write tag on every `POST`, which
+        /// both carriers require. The wall clock used to stamp announce expiries
+        /// and check freshness on lookup is the real [`SystemClock`]; tests
+        /// inject a virtualised clock via [`Self::with_clock`].
         ///
         /// Returns an error only if the underlying HTTP client cannot be
         /// constructed (TLS backend initialisation), which is a process-level
         /// failure rather than a per-request one.
-        pub fn new(base_url: impl Into<String>) -> anyhow::Result<Self> {
-            Self::with_clock(base_url, Arc::new(SystemClock))
+        pub fn new(
+            base_url: impl Into<String>,
+            secret: [u8; SHARED_SECRET_LEN],
+        ) -> anyhow::Result<Self> {
+            Self::with_clock(base_url, secret, Arc::new(SystemClock))
         }
 
         /// Create a client with an injected [`Clock`].
@@ -141,6 +171,7 @@ mod client {
         /// reproducible.
         pub fn with_clock(
             base_url: impl Into<String>,
+            secret: [u8; SHARED_SECRET_LEN],
             clock: Arc<dyn Clock>,
         ) -> anyhow::Result<Self> {
             let client = Client::builder()
@@ -151,6 +182,7 @@ mod client {
                 base_url: base_url.into(),
                 client,
                 clock,
+                secret,
             })
         }
 
@@ -239,8 +271,45 @@ mod client {
             let expires_at = signing::expiry_from_now(self.clock.as_ref(), ANNOUNCE_TTL);
             let signed = SignedCandidates::sign(self_id, wire, expires_at);
             let url = self.endpoint(self_id);
-            let body = AnnounceRequest { signed };
-            match self.client.post(&url).json(&body).send().await {
+            let request = AnnounceRequest { signed };
+            // Serialise the body once and reuse those exact bytes for both the
+            // write-auth tag and the request payload, so the HMAC binds exactly
+            // what is sent. Both carriers recompute the tag over the path id and
+            // the body they received; a mismatch (a swapped body, a wrong
+            // secret, a missing header) is rejected.
+            let body = match serde_json::to_vec(&request) {
+                Ok(body) => body,
+                Err(err) => {
+                    tracing::debug!(
+                        target: "cascade::p2p::discovery::announce",
+                        %url,
+                        error = %err,
+                        "could not serialise announce request body",
+                    );
+                    return;
+                }
+            };
+            let tag = match auth::announce_write_tag(&self.secret, self_id, &body) {
+                Ok(tag) => tag,
+                Err(err) => {
+                    tracing::debug!(
+                        target: "cascade::p2p::discovery::announce",
+                        %url,
+                        error = %err,
+                        "could not compute announce write tag",
+                    );
+                    return;
+                }
+            };
+            let response = self
+                .client
+                .post(&url)
+                .header(ANNOUNCE_AUTH_HEADER, auth::encode_hex(&tag))
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body)
+                .send()
+                .await;
+            match response {
                 Ok(response) if response.status().is_success() => {}
                 Ok(response) => tracing::debug!(
                     target: "cascade::p2p::discovery::announce",
@@ -265,6 +334,7 @@ mod client {
         use std::net::SocketAddr;
         use std::sync::Arc;
 
+        use cascade_announce_wire::auth::{self, ANNOUNCE_AUTH_HEADER, SHARED_SECRET_LEN};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
         use tokio::sync::Mutex;
@@ -278,6 +348,16 @@ mod client {
 
         fn addr(port: u16) -> SocketAddr {
             SocketAddr::from(([127, 0, 0, 1], port))
+        }
+
+        /// Deterministic 32-byte shared secret the client and the mock carrier
+        /// agree on, so the produced write tag verifies against the carrier.
+        fn secret() -> [u8; SHARED_SECRET_LEN] {
+            let mut s = [0u8; SHARED_SECRET_LEN];
+            for (idx, byte) in s.iter_mut().enumerate() {
+                *byte = u8::try_from(idx).unwrap_or(0);
+            }
+            s
         }
 
         /// A fixed-time [`Clock`] so signing expiries and freshness checks are
@@ -309,13 +389,20 @@ mod client {
         /// inspects it.
         type Store = Arc<Mutex<HashMap<String, SignedCandidates>>>;
 
-        /// Read one HTTP request off `stream` and return
-        /// `(method, device_id, body)`. The mock parses only the request
-        /// line, the `Content-Length` header, and the body — enough for the
-        /// two announce routes, nothing more.
-        async fn read_request(
-            stream: &mut tokio::net::TcpStream,
-        ) -> Option<(String, String, Vec<u8>)> {
+        /// A parsed mock request: method, device id from the path, the raw
+        /// write-auth header value if present, and the body.
+        struct MockRequest {
+            method: String,
+            device_id: String,
+            auth_header: Option<String>,
+            body: Vec<u8>,
+        }
+
+        /// Read one HTTP request off `stream` and return a [`MockRequest`]. The
+        /// mock parses only the request line, the `Content-Length` and
+        /// write-auth headers, and the body — enough for the two announce
+        /// routes, nothing more.
+        async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<MockRequest> {
             let mut buf = Vec::new();
             let mut chunk = [0u8; 1024];
             // Read until we have the full header block (terminated by a blank
@@ -343,6 +430,14 @@ mod client {
                         })
                         .and_then(|v| v.trim().parse::<usize>().ok())
                         .unwrap_or(0);
+                    // The header name is matched case-insensitively because
+                    // `reqwest` may normalise the casing on the wire.
+                    let auth_header = header_str.lines().find_map(|l| {
+                        let (name, value) = l.split_once(':')?;
+                        name.trim()
+                            .eq_ignore_ascii_case(ANNOUNCE_AUTH_HEADER)
+                            .then(|| value.trim().to_owned())
+                    });
                     let body_start = pos + 4;
                     while buf.len() < body_start + content_length {
                         let read = stream.read(&mut chunk).await.ok()?;
@@ -355,7 +450,12 @@ mod client {
                         .get(body_start..body_start + content_length)
                         .unwrap_or_default()
                         .to_vec();
-                    return Some((method, device_id, body));
+                    return Some(MockRequest {
+                        method,
+                        device_id,
+                        auth_header,
+                        body,
+                    });
                 }
             }
         }
@@ -375,9 +475,26 @@ mod client {
             let _ = stream.flush().await;
         }
 
-        /// Spawn a mock announce server backed by `store`. Returns the bound
-        /// base URL. Each accepted connection serves exactly one request.
-        async fn spawn_mock_server(store: Store) -> String {
+        /// Reject an unauthenticated write the way both real carriers do: a bare
+        /// `401` with no body, so the client treats it as a non-success status.
+        async fn write_unauthorized(stream: &mut tokio::net::TcpStream) {
+            let header =
+                "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+            let _ = stream.write_all(header.as_bytes()).await;
+            let _ = stream.flush().await;
+        }
+
+        /// Spawn a mock announce server backed by `store` that authenticates
+        /// writers with `secret` exactly as the real carriers do. Returns the
+        /// bound base URL. Each accepted connection serves exactly one request.
+        ///
+        /// The `POST` path runs the shared
+        /// [`auth::verify_announce_write`] over the path device id and the exact
+        /// received body, rejecting a missing or non-verifying header with
+        /// `401`. This is what proves the *real* client produces a header that
+        /// verifies against an auth-requiring carrier, rather than a mock that
+        /// ignores auth.
+        async fn spawn_mock_server(store: Store, secret: [u8; SHARED_SECRET_LEN]) -> String {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let bound = listener.local_addr().unwrap();
             tokio::spawn(async move {
@@ -387,21 +504,38 @@ mod client {
                     };
                     let store = store.clone();
                     tokio::spawn(async move {
-                        let Some((method, device_id, body)) = read_request(&mut stream).await
-                        else {
+                        let Some(request) = read_request(&mut stream).await else {
                             return;
                         };
-                        match method.as_str() {
+                        match request.method.as_str() {
                             "POST" => {
-                                let request: AnnounceRequest =
-                                    serde_json::from_slice(&body).unwrap();
+                                // Authenticate the writer over the path id and
+                                // the exact body, the way the relay endpoint and
+                                // the Worker do. A missing or non-verifying tag
+                                // is a 401 and stores nothing.
+                                let authenticated =
+                                    request.auth_header.as_deref().is_some_and(|header| {
+                                        auth::verify_announce_write(
+                                            &secret,
+                                            &request.device_id,
+                                            &request.body,
+                                            header,
+                                        )
+                                        .unwrap_or(false)
+                                    });
+                                if !authenticated {
+                                    write_unauthorized(&mut stream).await;
+                                    return;
+                                }
+                                let parsed: AnnounceRequest =
+                                    serde_json::from_slice(&request.body).unwrap();
                                 // Store the signed blob verbatim — the carrier
                                 // never inspects or validates it.
-                                store.lock().await.insert(device_id, request.signed);
+                                store.lock().await.insert(request.device_id, parsed.signed);
                                 write_json_response(&mut stream, b"{}").await;
                             }
                             "GET" => {
-                                let signed = store.lock().await.get(&device_id).cloned();
+                                let signed = store.lock().await.get(&request.device_id).cloned();
                                 let response = LookupResponse { signed };
                                 let json = serde_json::to_vec(&response).unwrap();
                                 write_json_response(&mut stream, &json).await;
@@ -416,9 +550,13 @@ mod client {
 
         #[tokio::test]
         async fn register_then_lookup_round_trips_candidates() {
+            // The mock carrier authenticates the write with the same secret the
+            // client holds, so a successful round-trip proves the client
+            // produced a header that verifies — not merely that a mock ignored
+            // auth.
             let store: Store = Arc::new(Mutex::new(HashMap::new()));
-            let base = spawn_mock_server(store).await;
-            let client = AnnounceDiscovery::with_clock(base, fixed_clock()).unwrap();
+            let base = spawn_mock_server(store, secret()).await;
+            let client = AnnounceDiscovery::with_clock(base, secret(), fixed_clock()).unwrap();
 
             let host = Candidate::new(addr(22000), CandidateKind::Host, 65_535);
             let srflx = Candidate::new(addr(33000), CandidateKind::ServerReflexive, 0);
@@ -431,10 +569,29 @@ mod client {
         }
 
         #[tokio::test]
+        async fn register_with_a_mismatched_secret_is_rejected_and_stores_nothing() {
+            // The client holds a different secret than the carrier, so its write
+            // tag does not verify: the carrier 401s and the directory stays
+            // empty, so the subsequent lookup yields nothing. This is the exact
+            // failure mode the producer/consumer fix prevents when the secrets
+            // *do* match.
+            let store: Store = Arc::new(Mutex::new(HashMap::new()));
+            let base = spawn_mock_server(store, secret()).await;
+            let mut wrong = secret();
+            wrong[0] ^= 0xFF;
+            let client = AnnounceDiscovery::with_clock(base, wrong, fixed_clock()).unwrap();
+
+            let host = Candidate::new(addr(22000), CandidateKind::Host, 1);
+            client.announce("DEVICE-A", &[host]).await;
+
+            assert!(client.resolve("DEVICE-A").await.is_empty());
+        }
+
+        #[tokio::test]
         async fn lookup_unknown_device_yields_no_candidates() {
             let store: Store = Arc::new(Mutex::new(HashMap::new()));
-            let base = spawn_mock_server(store).await;
-            let client = AnnounceDiscovery::with_clock(base, fixed_clock()).unwrap();
+            let base = spawn_mock_server(store, secret()).await;
+            let client = AnnounceDiscovery::with_clock(base, secret(), fixed_clock()).unwrap();
 
             assert!(client.resolve("NEVER-REGISTERED").await.is_empty());
         }
@@ -447,7 +604,8 @@ mod client {
             let bound = listener.local_addr().unwrap();
             drop(listener);
             let client =
-                AnnounceDiscovery::with_clock(format!("http://{bound}"), fixed_clock()).unwrap();
+                AnnounceDiscovery::with_clock(format!("http://{bound}"), secret(), fixed_clock())
+                    .unwrap();
             assert!(client.resolve("DEVICE-A").await.is_empty());
         }
 
@@ -465,9 +623,9 @@ mod client {
             );
             signed.candidates[0].priority ^= 0x01;
             store.lock().await.insert("DEVICE-A".to_owned(), signed);
-            let base = spawn_mock_server(store).await;
+            let base = spawn_mock_server(store, secret()).await;
 
-            let client = AnnounceDiscovery::with_clock(base, fixed_clock()).unwrap();
+            let client = AnnounceDiscovery::with_clock(base, secret(), fixed_clock()).unwrap();
             assert!(client.resolve("DEVICE-A").await.is_empty());
         }
 
@@ -483,9 +641,9 @@ mod client {
                 i64::try_from(NOW_MS).unwrap() + 1000,
             );
             store.lock().await.insert("DEVICE-A".to_owned(), signed);
-            let base = spawn_mock_server(store).await;
+            let base = spawn_mock_server(store, secret()).await;
 
-            let client = AnnounceDiscovery::with_clock(base, fixed_clock()).unwrap();
+            let client = AnnounceDiscovery::with_clock(base, secret(), fixed_clock()).unwrap();
             assert!(client.resolve("DEVICE-A").await.is_empty());
         }
 
@@ -502,9 +660,9 @@ mod client {
                 i64::try_from(NOW_MS).unwrap() - 1000,
             );
             store.lock().await.insert("DEVICE-A".to_owned(), signed);
-            let base = spawn_mock_server(store).await;
+            let base = spawn_mock_server(store, secret()).await;
 
-            let client = AnnounceDiscovery::with_clock(base, fixed_clock()).unwrap();
+            let client = AnnounceDiscovery::with_clock(base, secret(), fixed_clock()).unwrap();
             assert!(client.resolve("DEVICE-A").await.is_empty());
         }
     }
