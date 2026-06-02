@@ -334,6 +334,77 @@ impl DriveClient {
         Ok(resp)
     }
 
+    /// Download a byte range of a file's content using an HTTP `Range` header.
+    ///
+    /// `offset` is the first byte to fetch; `length` is the maximum number of
+    /// bytes to return. Returns the bytes in `[offset, offset + length)`,
+    /// possibly fewer at end-of-file.
+    ///
+    /// A compliant Drive server replies `206 Partial Content` carrying exactly
+    /// the requested range. A server that ignores the `Range` header replies
+    /// `200 OK` with the full body — in that case the body is sliced to the
+    /// requested window so the contract holds either way. `416 Range Not
+    /// Satisfiable` (the offset lies at or past the end of the file) yields an
+    /// empty result rather than an error.
+    pub async fn download_range(
+        &self,
+        file_id: &str,
+        token: &str,
+        offset: u64,
+        length: u32,
+    ) -> anyhow::Result<Vec<u8>> {
+        // A zero-length request needs no network round-trip.
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+
+        self.rate_limiter.acquire().await;
+        let url = format!("{}/files/{file_id}", self.base_url);
+
+        // RFC 7233 byte ranges are inclusive: bytes=<start>-<end>. With a
+        // non-zero length, `end` is `offset + length - 1`; saturating addition
+        // and subtraction keep the arithmetic within bounds without overflow.
+        let end = offset.saturating_add(u64::from(length)).saturating_sub(1);
+        let range_header = format!("bytes={offset}-{end}");
+
+        let resp = Self::http()
+            .get(&url)
+            .bearer_auth(token)
+            .header(reqwest::header::RANGE, range_header)
+            .query(&[("alt", "media"), ("supportsAllDrives", "true")])
+            .send()
+            .await?;
+
+        let status = resp.status();
+
+        // Offset at or past EOF — the contract says return empty, not error.
+        if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+            return Ok(Vec::new());
+        }
+
+        if status.is_client_error() || status.is_server_error() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(drive_api_error("Drive range download error", status, body));
+        }
+
+        // 206 means the server honoured the range and the body is already the
+        // requested window. Any other success (notably 200) means the server
+        // ignored the header and sent the whole file, so slice client-side.
+        let honoured_range = status == reqwest::StatusCode::PARTIAL_CONTENT;
+        let bytes = resp.bytes().await?;
+
+        if honoured_range {
+            return Ok(bytes.to_vec());
+        }
+
+        let start = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(bytes.len());
+        let len = usize::try_from(length).unwrap_or(usize::MAX);
+        let stop = start.saturating_add(len).min(bytes.len());
+        Ok(bytes.get(start..stop).unwrap_or_default().to_vec())
+    }
+
     /// Fetch storage quota / about info.
     pub async fn get_about(&self, token: &str) -> anyhow::Result<AboutResponse> {
         let resp = self
