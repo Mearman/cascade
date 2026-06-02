@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.47](https://github.com/Mearman/cascade/compare/cascade-v0.1.46...cascade-v0.1.47) - 2026-06-02
+
+### Other
+
+- *(projfs-provider)* serve reads via Backend::read_range
+
 ## [0.1.46](https://github.com/Mearman/cascade/compare/cascade-v0.1.45...cascade-v0.1.46) - 2026-06-02
 
 ### Other
