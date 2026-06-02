@@ -32,12 +32,16 @@
 //! expiry with the ed25519 key derived from its device id (the same key the
 //! DHT BEP44 path signs with). The announce server is therefore a *blind,
 //! untrusted carrier* — it stores and serves the signed blob verbatim and never
-//! inspects, vouches for, or could forge it. The client verifies the signature
-//! on read: the signer must be the device being resolved, the payload must be
-//! untampered, and the expiry must be unexpired, otherwise the result is
-//! rejected. A malicious server (or a man in the middle) can withhold or
-//! corrupt a set, but it cannot fabricate one or substitute another device's
-//! addresses.
+//! inspects or vouches for it. The client verifies the signature on read: the
+//! signer must be the device being resolved, the payload must be untampered, and
+//! the expiry must be unexpired, otherwise the result is rejected. A malicious
+//! server (or a man in the middle) can withhold or corrupt a set, and it cannot
+//! *substitute* one device's set for another or silently relabel a stored
+//! envelope. It can, however, mint a fresh valid envelope for any device id it
+//! knows — the signing key is derived from the public device id, not the
+//! device's TLS private key (see [`super::signing`] for the full threat model),
+//! so this construction is a substitution/relabel/replay defence, not a defence
+//! against forgery by a party that knows the id.
 //!
 //! The wire types ([`WireCandidate`], [`AnnounceRequest`], [`LookupResponse`])
 //! are serde-serialisable and shared by the relay-server's announce endpoint,

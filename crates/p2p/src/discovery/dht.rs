@@ -59,13 +59,17 @@
 //!
 //! The stored value is the same self-certifying [`SignedCandidates`] envelope
 //! the announce server carries: the announcing device signs its candidate set,
-//! claimed
-//! device id, and expiry with the BEP44 key derived from the device id, and the
-//! resolver verifies that signature before trusting an address. The DHT is thus
-//! a blind carrier exactly as the announce server is — a storing node, or a
-//! node that returns a substituted value, cannot forge a candidate set, because
-//! it holds no signing key. There is one signing home and one verify path,
-//! shared with the announce client.
+//! claimed device id, and expiry with the BEP44 key derived from the device id,
+//! and the resolver verifies that signature before trusting an address. The DHT
+//! is thus a blind carrier exactly as the announce server is — a storing node
+//! cannot serve one device's set in answer to a query for another, relabel a
+//! stored envelope, or replay one past its expiry without the resolver rejecting
+//! it. It carries the same threat-model caveat: the signing key is derived from
+//! the public device id, so a node that knows the id can mint a fresh valid
+//! envelope for it (see [`super::signing`]); the defence is substitution,
+//! relabel, and replay resistance, not forgery resistance against an id-knowing
+//! party. There is one signing home and one verify path, shared with the
+//! announce client.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -445,10 +449,12 @@ impl<N: DhtNode> Discovery for DhtDiscovery<N> {
     /// it by device id.
     ///
     /// The set is signed with the device's BEP44 key and stamped with an expiry
-    /// before storage, so a storing node cannot forge or usefully replay it.
-    /// Encoding failures are logged and swallowed — announce is best-effort and
-    /// runs on a background loop, so a serialisation failure must not abort the
-    /// composed announce fan-out.
+    /// before storage, so a storing node cannot substitute it for another
+    /// device's set, relabel it, or usefully replay it past its expiry (it can
+    /// still mint a fresh envelope for an id it knows — see [`super::signing`]
+    /// for the threat model). Encoding failures are logged and swallowed —
+    /// announce is best-effort and runs on a background loop, so a serialisation
+    /// failure must not abort the composed announce fan-out.
     async fn announce(&self, self_id: &str, candidates: &[Candidate]) {
         let key = DhtKey::from_device_id(self_id);
         let expires_at = signing::expiry_from_now(self.clock.as_ref(), DHT_ANNOUNCE_TTL);

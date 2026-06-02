@@ -1,14 +1,50 @@
 //! Self-certifying candidate sets.
 //!
 //! An announce server (and the Mainline DHT) is a blind carrier: it stores
-//! and serves a device's candidate set for any peer that asks. Nothing stops a
-//! hostile or compromised carrier from forging a candidate set, substituting a
-//! different device's addresses, or replaying a stale set. The fix is to make
-//! the candidate set *self-certifying* — the announcing device signs it, and
-//! the resolver verifies the signature before trusting a single address. The
-//! carrier becomes untrusted plumbing: it cannot forge, substitute, or
-//! usefully replay, because it holds no signing key and the signed payload
-//! pins the claimed device id and an expiry.
+//! and serves a device's candidate set for any peer that asks. A naive carrier
+//! could substitute a different device's addresses, relabel an envelope, or
+//! replay a stale set. The candidate set is made *self-certifying* — the
+//! announcing device signs the set together with the device id it claims and an
+//! expiry, and the resolver verifies the signature before trusting a single
+//! address. This binds the addresses to the claimed id and bounds replay.
+//!
+//! ## Threat model: what this does and does not defend against
+//!
+//! The signing key is *derived from the device id* — the same public,
+//! deterministically-derived BEP44 keypair the DHT path uses (see below). The
+//! device id is itself a hash of the device's public TLS certificate
+//! ([`crate::identity`]), exchanged on every handshake and carried in plaintext
+//! in announce request paths and DHT targets. So the verifying key is derivable
+//! by anyone, *and so is the signing key*: any party that knows the device id —
+//! which includes the carrier and any active man-in-the-middle — can re-derive
+//! the identical keypair and produce a validly-signed envelope for that id.
+//!
+//! What this construction therefore achieves:
+//! - **Substitution defence.** A set signed under device A's derived key does
+//!   not verify when resolved as device B, because B's derived key differs. A
+//!   carrier cannot serve A's stored set in answer to a query for B, nor relabel
+//!   A's envelope as B without the signature failing.
+//! - **Tamper evidence on a single id.** A carrier cannot flip a byte of a
+//!   stored envelope (an address, the expiry) without invalidating the
+//!   signature, so a *passive* carrier cannot silently alter a set without
+//!   re-deriving the id's key and re-signing.
+//! - **Replay bound.** A captured envelope stops verifying once its expiry
+//!   passes.
+//!
+//! What it does **not** achieve, and must not be claimed to: it is *not*
+//! forgery- or MITM-resistant against a party that knows the device id. Because
+//! the signing key is public-id-derived rather than tied to the device's TLS
+//! private key, an active attacker who knows the id (the carrier, a MITM) can
+//! forge a fully-valid envelope pointing at attacker-controlled addresses, and
+//! [`SignedCandidates::verify`] will accept it. The signature proves only "the
+//! author knew the (public) device id", not "the author is the device". This
+//! limitation is inherited deliberately from the reused BEP44 derivation, which
+//! requires the verifying key to be derivable from the id alone so a peer that
+//! has never met the announcer can address and check its stored value without a
+//! shared secret. Binding the set to the device's TLS private key instead would
+//! break that property; the discovery layer accepts the weaker guarantee and
+//! relies on the authenticated TLS handshake (device id = hash of the presented
+//! certificate) to reject a connection to a forged address at connect time.
 //!
 //! ## The signing key is the device's BEP44 key
 //!
@@ -31,15 +67,19 @@
 //! device id the announcer is claiming, and an expiry timestamp. The envelope
 //! carries no public key — the verifier *derives* the verifying key from the
 //! device id it is resolving and checks the signature against that. This is the
-//! substitution defence: a set signed by device A's key only verifies when
-//! resolved as device A, because resolving as device B derives B's key, which
-//! never validates A's signature. There is no carried key to forge or mismatch.
+//! substitution defence: a set signed under device A's derived key only verifies
+//! when resolved as device A, because resolving as device B derives B's key,
+//! which never validates A's signature. There is no carried key to substitute.
 //! Binding the device id into the signed bytes stops a relabelled envelope (its
 //! `device_id` field changed by a carrier) from validating, since the changed
 //! bytes no longer match the signature. Binding the expiry bounds replay: a
 //! captured envelope stops verifying once its expiry passes. The signature
 //! covers a canonical byte encoding built field-by-field (not JSON), so it does
-//! not depend on map key ordering or whitespace in any serialiser.
+//! not depend on map key ordering or whitespace in any serialiser. As the threat
+//! model above states, none of this prevents a party that already knows the
+//! (public) device id from minting a fresh valid envelope for that id — the
+//! defence is against substitution, relabelling, tampering, and replay, not
+//! against forgery by an id-knowing attacker.
 
 use std::time::Duration;
 
@@ -355,8 +395,12 @@ fn device_id_len_prefix(len: usize) -> [u8; 8] {
 }
 
 /// Encode a candidate count as the `u64` big-endian prefix used in the signed
-/// bytes. The count is bounded by [`super::announce::MAX_ANNOUNCE_CANDIDATES`];
-/// the `usize`→`u64` widening is total on every supported platform.
+/// bytes. The honest announce and DHT producers cap the count at
+/// [`super::announce::MAX_ANNOUNCE_CANDIDATES`] before signing, and the carriers
+/// reject (announce server) or cannot store (DHT 1000-byte ceiling) anything
+/// larger; the encoding itself imposes no cap, but a `usize` candidate count is
+/// bounded well below `u64::MAX`, so the `usize`→`u64` widening is total on every
+/// supported platform regardless.
 fn candidate_count_prefix(count: usize) -> [u8; 8] {
     u64::try_from(count).unwrap_or(u64::MAX).to_be_bytes()
 }
