@@ -189,8 +189,10 @@ pub async fn start(
 
     #[cfg(target_os = "windows")]
     {
-        // Attempt 1: ProjFS (native, no admin required, scaffold only).
+        // Attempt 1: ProjFS (native, no admin required).
         //
+        // The presenter implements the full callback table and serves
+        // on-demand reads through the engine-backed content provider.
         // ProjFS self-mounts via the Win32 ProjectedFileSystem API and
         // cannot be used without mounting, so it is skipped when
         // --no-mount is set.
@@ -514,12 +516,30 @@ async fn try_projfs(
     };
     let engine = Engine::new(engine_config)?;
 
-    // Capture the daemon's multi-thread runtime handle while still on it.
-    // The ProjFS GetFileData callback runs on a kernel thread outside any
-    // runtime; the provider uses this handle to `block_on` the cold-path
-    // download. `try_projfs` is async, so `Handle::current()` here returns
-    // the daemon's #[tokio::main] runtime.
+    // Capture the daemon's runtime handle while still on it. The ProjFS
+    // GetFileData callback runs on a kernel thread outside any runtime; the
+    // provider uses this handle to `block_on` the cold-path download.
+    //
+    // The daemon's runtime is built explicitly with
+    // `tokio::runtime::Runtime::new()` in `main.rs` and owned by `main`'s
+    // stack for the whole life of `block_on(args.run(..))`, so it provably
+    // outlives every ProjFS callback: the daemon does not return from this
+    // function (it parks on `ctrl_c` below) until shutdown, by which point
+    // the presenter has been stopped and no further callbacks can fire.
+    //
+    // `Runtime::new()` builds a multi-thread runtime. That flavour matters:
+    // the provider's cold-path bridge falls back to `block_in_place` when it
+    // detects it is already on a runtime worker, and `block_in_place` is only
+    // valid on the multi-thread scheduler. A current-thread runtime would
+    // make that fallback panic, so assert the flavour here where the daemon
+    // wiring is in view rather than discovering it at a callback.
     let handle = tokio::runtime::Handle::current();
+    debug_assert_eq!(
+        handle.runtime_flavor(),
+        tokio::runtime::RuntimeFlavor::MultiThread,
+        "ProjFS provider requires the daemon's multi-thread runtime; \
+         see crates/cascade/src/main.rs (Runtime::new)"
+    );
 
     // The content provider serves on-demand reads. Its cache directory is
     // a sibling of the state DB under the config root, matching the File
