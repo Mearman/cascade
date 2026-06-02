@@ -16,6 +16,7 @@
 pub mod auth;
 pub mod client;
 pub mod model;
+pub mod token_store;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -30,6 +31,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use auth::AuthTokens;
 use client::{DriveClient, ListQuery};
+use token_store::{PlatformTokenStore, TokenStore};
 
 /// Create a Google Drive backend from config.
 ///
@@ -41,8 +43,30 @@ use client::{DriveClient, ListQuery};
 /// Optional keys used in integration tests:
 /// - `base_url` — override the Drive API base URL (e.g. a local mock server)
 /// - `upload_url` — override the Drive upload API URL
+/// - `token_url` — override the `OAuth2` token endpoint (refresh/exchange)
 /// - `access_token` — pre-populate an access token, bypassing Keychain lookup
+/// - `refresh_token` — pre-populate a refresh token so the refresh path is reachable
+/// - `expires_in_secs` — seconds until the pre-populated token expires (default 24h)
 pub fn create_backend(config: &toml::Value) -> anyhow::Result<Box<dyn Backend>> {
+    create_backend_with_store(config, Arc::new(PlatformTokenStore))
+}
+
+/// Build a backend with an injected [`TokenStore`].
+///
+/// Identical to [`create_backend`] but lets the caller supply the persistence
+/// backing for refreshed tokens. Integration tests use this to substitute an
+/// in-memory store so the token-refresh path can be exercised without writing
+/// to the host Keychain or config directory.
+pub fn create_backend_with_store(
+    config: &toml::Value,
+    token_store: Arc<dyn TokenStore>,
+) -> anyhow::Result<Box<dyn Backend>> {
+    // Number of hours a pre-populated access token stays valid when no explicit
+    // `expires_in_secs` is given. Long enough that normal tests never hit the
+    // refresh path; tests that want the refresh path set `expires_in_secs` to a
+    // value at or below `AuthTokens::is_expired`'s 60-second buffer.
+    const DEFAULT_TOKEN_LIFETIME_HOURS: i64 = 24;
+
     let client_id = config
         .get("client_id")
         .and_then(|v| v.as_str())
@@ -57,6 +81,14 @@ pub fn create_backend(config: &toml::Value) -> anyhow::Result<Box<dyn Backend>> 
         .get("account")
         .and_then(|v| v.as_str())
         .unwrap_or("default")
+        .to_string();
+    // The OAuth2 token endpoint. Production callers leave this at Google's URL;
+    // integration tests override it to a local mock so the token-refresh path
+    // can be exercised without reaching the network.
+    let token_url = config
+        .get("token_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or(auth::GOOGLE_TOKEN_URL)
         .to_string();
 
     let drive = match (
@@ -74,10 +106,24 @@ pub fn create_backend(config: &toml::Value) -> anyhow::Result<Box<dyn Backend>> 
     let initial_tokens = config
         .get("access_token")
         .and_then(|v| v.as_str())
-        .map(|token| auth::AuthTokens {
-            access_token: token.to_string(),
-            refresh_token: String::new(),
-            expires_at: chrono::Utc::now() + chrono::Duration::hours(24),
+        .map(|token| {
+            let lifetime = config
+                .get("expires_in_secs")
+                .and_then(toml::Value::as_integer)
+                .map_or_else(
+                    || chrono::Duration::hours(DEFAULT_TOKEN_LIFETIME_HOURS),
+                    chrono::Duration::seconds,
+                );
+            let refresh_token = config
+                .get("refresh_token")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            auth::AuthTokens {
+                access_token: token.to_string(),
+                refresh_token,
+                expires_at: chrono::Utc::now() + lifetime,
+            }
         });
 
     let instance_id = format!("gdrive-{account}");
@@ -87,9 +133,11 @@ pub fn create_backend(config: &toml::Value) -> anyhow::Result<Box<dyn Backend>> 
         oauth: auth::OAuthConfig {
             client_id,
             client_secret,
+            token_url,
         },
         account,
         instance_id,
+        token_store,
         tokens: Arc::new(Mutex::new(initial_tokens)),
         shared_drive_ids: Arc::new(RwLock::new(HashSet::new())),
         folder_drive_ids: Arc::new(RwLock::new(HashMap::new())),
@@ -106,6 +154,9 @@ pub struct GdriveBackend {
     account: String,
     /// Per-instance backend ID, e.g. "gdrive-personal".
     instance_id: String,
+    /// Durable persistence for refreshed tokens (Keychain/file in production,
+    /// in-memory under test).
+    token_store: Arc<dyn TokenStore>,
     tokens: Arc<Mutex<Option<AuthTokens>>>,
     /// IDs of shared drives this user is a member of.
     /// Populated on first `list_children("__shared_drives")` call.
@@ -128,6 +179,9 @@ pub struct GdriveBackend {
 impl GdriveBackend {
     /// Get a valid access token, refreshing if necessary.
     async fn access_token(&self) -> anyhow::Result<String> {
+        /// Per-request timeout for the `OAuth2` token-refresh call.
+        const REFRESH_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
         // Fast path: check if token is still valid without holding the lock
         // across an await.
         {
@@ -139,16 +193,28 @@ impl GdriveBackend {
             }
         }
 
-        // Slow path: acquire the lock, extract the refresh token, then drop the
-        // guard before making any network calls. Holding a tokio MutexGuard
-        // across an `.await` and then calling `.lock()` again on the same mutex
-        // deadlocks the task — the guard must be released first.
+        // If we have no in-memory tokens yet, try the durable store before
+        // taking the lock. The store load is itself an `.await`, so it must
+        // happen without the guard held — holding a tokio MutexGuard across an
+        // `.await` and then re-locking the same mutex deadlocks the task.
+        let loaded = {
+            let have_tokens = self.tokens.lock().await.is_some();
+            if have_tokens {
+                None
+            } else {
+                self.token_store.load(&self.account).await?
+            }
+        };
+
+        // Slow path: acquire the lock, fold in anything we loaded, extract the
+        // refresh token, then drop the guard before making any network calls.
         let refresh_token = {
             let mut guard = self.tokens.lock().await;
 
-            // Try loading from Keychain if we don't have tokens yet.
+            // Adopt store-loaded tokens only if another task hasn't populated
+            // them in the meantime.
             if guard.is_none() {
-                *guard = auth::load_tokens(&self.account)?;
+                *guard = loaded;
             }
 
             let token_ref = guard.as_mut().ok_or_else(|| {
@@ -167,15 +233,12 @@ impl GdriveBackend {
         // Same per-request, unpooled, HTTP/1.1-only client as the Drive API
         // path. See the extended rationale on `DriveClient::http` in client.rs
         // for why pooling and HTTP/2 stay disabled: it is the confirmed
-        // workaround for the WebDAV-path TLS hang, not an oversight.
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .pool_max_idle_per_host(0)
-            .http1_only()
-            .build()
-            .unwrap_or_default();
+        // workaround for the WebDAV-path TLS hang, not an oversight. The builder
+        // error is propagated, never swallowed — a default client would
+        // silently re-enable pooling and HTTP/2.
+        let http = client::build_unpooled_http1_client(REFRESH_REQUEST_TIMEOUT)?;
         let refreshed = auth::refresh_access_token(&http, &self.oauth, &refresh_token).await?;
-        auth::save_tokens(&self.account, &refreshed)?;
+        self.token_store.save(&self.account, &refreshed).await?;
 
         let mut guard = self.tokens.lock().await;
         *guard = Some(refreshed);

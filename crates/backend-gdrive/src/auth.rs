@@ -29,6 +29,13 @@ const DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive";
 /// Device code flow scope: limited to per-file access (Google restriction).
 const DEVICE_CODE_SCOPE: &str = "https://www.googleapis.com/auth/drive.file";
 
+/// Google's `OAuth2` token endpoint.
+///
+/// Used to exchange auth/device codes and to refresh access tokens. Held as a
+/// field on [`OAuthConfig`] so integration tests can redirect the token traffic
+/// at a local mock server; production callers use this constant unchanged.
+pub const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+
 /// Compile-time credentials. `None` if the env vars weren't set during build.
 pub const DEFAULT_CLIENT_ID: Option<&str> = option_env!("CASCADE_GDRIVE_CLIENT_ID");
 pub const DEFAULT_CLIENT_SECRET: Option<&str> = option_env!("CASCADE_GDRIVE_CLIENT_SECRET");
@@ -75,6 +82,10 @@ impl AuthTokens {
 pub struct OAuthConfig {
     pub client_id: String,
     pub client_secret: String,
+    /// `OAuth2` token endpoint. Defaults to [`GOOGLE_TOKEN_URL`] in production;
+    /// integration tests override it to point the refresh/exchange traffic at a
+    /// local mock server.
+    pub token_url: String,
 }
 
 impl std::fmt::Debug for OAuthConfig {
@@ -82,6 +93,7 @@ impl std::fmt::Debug for OAuthConfig {
         f.debug_struct("OAuthConfig")
             .field("client_id", &self.client_id)
             .field("client_secret", &"[REDACTED]")
+            .field("token_url", &self.token_url)
             .finish()
     }
 }
@@ -109,6 +121,7 @@ pub fn resolve_credentials(
     Ok(OAuthConfig {
         client_id,
         client_secret,
+        token_url: GOOGLE_TOKEN_URL.to_string(),
     })
 }
 
@@ -237,7 +250,7 @@ async fn exchange_code(
     redirect_uri: &str,
 ) -> anyhow::Result<AuthTokens> {
     let resp = http
-        .post("https://oauth2.googleapis.com/token")
+        .post(&config.token_url)
         .form(&[
             ("client_id", config.client_id.as_str()),
             ("client_secret", config.client_secret.as_str()),
@@ -314,7 +327,7 @@ pub async fn poll_for_token(
         tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
 
         let resp = http
-            .post("https://oauth2.googleapis.com/token")
+            .post(&config.token_url)
             .form(&[
                 ("client_id", config.client_id.as_str()),
                 ("client_secret", config.client_secret.as_str()),
@@ -365,7 +378,7 @@ pub async fn refresh_access_token(
     refresh_token: &str,
 ) -> anyhow::Result<AuthTokens> {
     let resp = http
-        .post("https://oauth2.googleapis.com/token")
+        .post(&config.token_url)
         .form(&[
             ("client_id", config.client_id.as_str()),
             ("client_secret", config.client_secret.as_str()),

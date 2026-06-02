@@ -95,6 +95,26 @@ impl RateLimiter {
     }
 }
 
+/// Build the per-request `reqwest` client that the Drive TLS deadlock
+/// workaround mandates: connection pooling disabled and HTTP/1.1 forced.
+///
+/// Both the Drive API request path and the `OAuth2` token-refresh path build
+/// their clients here so the workaround configuration lives in exactly one
+/// place. See the `DriveClient::http` rationale for the full background. The
+/// builder error is propagated rather than swallowed — a fallback to the
+/// default client would silently re-enable pooling and HTTP/2.
+pub fn build_unpooled_http1_client(timeout: Duration) -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        // Disable connection reuse: a pooled connection's second use is the
+        // exact moment the WebDAV-path hang manifested.
+        .pool_max_idle_per_host(0)
+        // Force HTTP/1.1: avoids HTTP/2 stream multiplexing being reused across
+        // the server-response boundary that triggered the wedge.
+        .http1_only()
+        .build()
+}
+
 /// Google Drive API HTTP client.
 pub struct DriveClient {
     rate_limiter: RateLimiter,
@@ -138,10 +158,14 @@ impl DriveClient {
     /// What was investigated and ruled out (see the concurrency test
     /// `concurrent_requests_through_shared_client_do_not_deadlock` in
     /// `tests/gdrive_integration.rs`): nothing inside this crate deadlocks
-    /// under concurrent load. The token `Mutex` in `GdriveBackend::access_token`
-    /// drops its guard before every `.await`, and the `RateLimiter` below is
-    /// lock-free, so neither stalls a task. Driving many concurrent requests
-    /// through one shared backend completes well inside its deadline.
+    /// under concurrent load. That test drives many concurrent requests through
+    /// one shared backend seeded with an *expired* token, so every task races
+    /// into the refresh slow path of `GdriveBackend::access_token` — the one
+    /// place a token `Mutex` guard is dropped before the refresh `.await` and
+    /// the lock is then re-taken. With a deliberately delayed mock token
+    /// endpoint the tasks genuinely contend on that re-acquisition, yet all
+    /// complete well inside the deadline. A guard held across the refresh await
+    /// would wedge them and trip it.
     ///
     /// What remains suspected and could not be reproduced offline: the hang
     /// only ever appeared through the `WebDAV` presenter, where an
@@ -156,17 +180,20 @@ impl DriveClient {
     /// endpoint. Earlier work also tried (and reverted) `native-tls`,
     /// `aws-lc-rs`, manual `serve_connection`, and `block_in_place`; the
     /// per-request, unpooled, HTTP/1.1-only client is the combination that held.
-    fn http() -> reqwest::Client {
-        reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            // Disable connection reuse: a pooled connection's second use is the
-            // exact moment the WebDAV-path hang manifested. See the doc comment.
-            .pool_max_idle_per_host(0)
-            // Force HTTP/1.1: avoids HTTP/2 stream multiplexing being reused
-            // across the server-response boundary that triggered the wedge.
-            .http1_only()
-            .build()
-            .unwrap_or_default()
+    ///
+    /// A builder failure (for example TLS backend initialisation failing) is
+    /// returned, never swallowed: falling back to `reqwest::Client::default()`
+    /// would silently re-enable pooling and HTTP/2 — the exact configuration
+    /// this workaround forbids — so the deadlock could return with no error
+    /// surfaced. Callers propagate the error with `?`.
+    ///
+    /// The client is built by [`build_unpooled_http1_client`], shared with the
+    /// `OAuth2` token-refresh path so the workaround configuration lives in one
+    /// place.
+    fn http() -> reqwest::Result<reqwest::Client> {
+        /// Per-request timeout for Drive API calls.
+        const DRIVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+        build_unpooled_http1_client(DRIVE_REQUEST_TIMEOUT)
     }
 
     /// Construct a client with custom base URLs — used in integration tests
@@ -190,7 +217,7 @@ impl DriveClient {
     ) -> anyhow::Result<reqwest::Response> {
         self.rate_limiter.acquire().await;
         let url = format!("{}/{path}", self.base_url);
-        let resp = Self::http()
+        let resp = Self::http()?
             .get(&url)
             .bearer_auth(token)
             .query(query)
@@ -353,7 +380,7 @@ impl DriveClient {
     ) -> anyhow::Result<reqwest::Response> {
         self.rate_limiter.acquire().await;
         let url = format!("{}/files/{file_id}", self.base_url);
-        let resp = Self::http()
+        let resp = Self::http()?
             .get(&url)
             .bearer_auth(token)
             .query(&[("alt", "media"), ("supportsAllDrives", "true")])
@@ -401,7 +428,7 @@ impl DriveClient {
         let end = offset.saturating_add(u64::from(length)).saturating_sub(1);
         let range_header = format!("bytes={offset}-{end}");
 
-        let resp = Self::http()
+        let resp = Self::http()?
             .get(&url)
             .bearer_auth(token)
             .header(reqwest::header::RANGE, range_header)
@@ -519,7 +546,7 @@ impl DriveClient {
             "{}/files?uploadType=multipart&supportsAllDrives=true&fields=id,name,mimeType,parents,size,modifiedTime,md5Checksum,trashed",
             self.upload_url
         );
-        let resp = Self::http()
+        let resp = Self::http()?
             .post(&url)
             .bearer_auth(token)
             .header(
@@ -551,7 +578,7 @@ impl DriveClient {
             "{}/files/{file_id}?uploadType=media&supportsAllDrives=true&fields=id,name,mimeType,parents,size,modifiedTime,md5Checksum,trashed",
             self.upload_url
         );
-        let resp = Self::http()
+        let resp = Self::http()?
             .patch(&url)
             .bearer_auth(token)
             .header("Content-Type", "application/octet-stream")
@@ -585,7 +612,7 @@ impl DriveClient {
             "mimeType": "application/vnd.google-apps.folder",
             "parents": [parent_id]
         });
-        let resp = Self::http()
+        let resp = Self::http()?
             .post(&url)
             .bearer_auth(token)
             .json(&body)
@@ -608,7 +635,7 @@ impl DriveClient {
             "{}/files/{file_id}?supportsAllDrives=true&fields=id",
             self.base_url
         );
-        let resp = Self::http()
+        let resp = Self::http()?
             .patch(&url)
             .bearer_auth(token)
             .json(&serde_json::json!({"trashed": true}))
@@ -630,7 +657,7 @@ impl DriveClient {
             "{}/files/{file_id}?supportsAllDrives=true&fields=id",
             self.base_url
         );
-        let resp = Self::http()
+        let resp = Self::http()?
             .patch(&url)
             .bearer_auth(token)
             .json(&serde_json::json!({"trashed": false}))
@@ -673,7 +700,7 @@ impl DriveClient {
         }
         let body = serde_json::Value::Object(body);
         let remove_csv = remove_parents.join(",");
-        let resp = Self::http()
+        let resp = Self::http()?
             .patch(&url)
             .bearer_auth(token)
             .query(&[

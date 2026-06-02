@@ -160,6 +160,7 @@ async fn load_token(account: &str) -> anyhow::Result<String> {
     let oauth = auth::OAuthConfig {
         client_id,
         client_secret,
+        token_url: auth::GOOGLE_TOKEN_URL.to_string(),
     };
 
     let tokens = auth::load_tokens(account)?
