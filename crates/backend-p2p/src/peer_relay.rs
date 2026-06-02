@@ -2,26 +2,35 @@
 //!
 //! A node whose detected `NAT` type is `Open` or `FullCone` can volunteer
 //! to bridge two other peers that cannot reach each other directly,
-//! playing exactly the role the operated `cascade-relay-server` plays.
-//! The byte-shuttling core is shared — both paths call
-//! [`cascade_p2p::pipe::shuttle`] — so the in-process relay sees only
-//! opaque ciphertext, just like the operated one.
+//! playing the role the operated `cascade-relay-server` plays. The
+//! volunteer forwards [`cascade_p2p::protocol::BepMessage::RelayData`]
+//! frames between the two bridged BEP sessions without inspecting their
+//! payloads, accounting every forwarded byte against the [`RelayCapacity`]
+//! bandwidth meter.
 //!
 //! Two concerns live here:
 //!
 //! - [`RelayCapacity`] bounds the cost a volunteer takes on: a hard cap on
 //!   concurrent bridged sessions and an aggregate bandwidth budget. New
-//!   sessions past the cap are rejected, never silently dropped.
-//! - [`bridge_sessions`] wires two authenticated endpoints into the shared
-//!   byte-pipe and accounts the relayed bytes against the capacity's
-//!   bandwidth meter.
+//!   sessions past the cap are rejected, never silently dropped. It also
+//!   implements [`cascade_p2p::pipe::ByteMeter`] so the live forwarding
+//!   path meters relayed bytes against the configured ceiling.
+//! - [`PeerRelayTransport`] is the requester- and target-side tunnel: a
+//!   [`cascade_p2p::transport::Transport`] that wraps each outbound inner
+//!   BEP frame into a `RelayData` envelope on the carrying session and
+//!   unwraps inbound `RelayData` payloads back into inner frames. The inner
+//!   BEP session runs over it exactly as the operated-relay path runs a
+//!   session over [`cascade_p2p::transport::RelayTransport`].
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use cascade_p2p::pipe::{ByteMeter, PipeOutcome, shuttle};
-use futures_util::{Sink, Stream};
-use tokio_tungstenite::tungstenite::Message;
+use anyhow::Result;
+use async_trait::async_trait;
+use cascade_p2p::pipe::ByteMeter;
+use cascade_p2p::protocol::BepMessage;
+use cascade_p2p::transport::{Transport, TransportReader, TransportWriter};
+use tokio::sync::mpsc;
 
 /// Why a relay session could not be admitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -142,28 +151,136 @@ impl Drop for RelaySessionGuard {
     }
 }
 
-/// Bridge two authenticated relay endpoints with the shared byte-pipe.
+/// Inner-session tunnel transport for a peer relay's two end nodes.
 ///
-/// `guard` is the admission slot reserved by [`RelayCapacity::admit`]; it
-/// is held for the lifetime of the bridge and released when this future
-/// resolves. Relayed bytes are metered against `capacity`'s bandwidth
-/// total. Returns the per-direction [`PipeOutcome`] pair the shuttle
-/// produced.
-pub async fn bridge_sessions<A, B, E>(
-    a: A,
-    b: B,
-    capacity: &Arc<RelayCapacity>,
-    guard: RelaySessionGuard,
-) -> (PipeOutcome, PipeOutcome)
-where
-    A: Sink<Message> + Stream<Item = Result<Message, E>> + Unpin + Send,
-    B: Sink<Message> + Stream<Item = Result<Message, E>> + Unpin + Send,
-{
-    let outcome = shuttle(a, b, capacity.as_ref()).await;
-    // Release happens on drop, but make the lifetime explicit so the
-    // guard is unambiguously held across the whole shuttle.
-    drop(guard);
-    outcome
+/// Both the requester and the target of a relayed connection run an inner
+/// BEP session over one of these. The transport carries each inner frame
+/// inside a [`BepMessage::RelayData`] envelope:
+///
+/// - the writer half wraps every outbound inner frame into `RelayData` and
+///   pushes it onto the carrying session's outbound channel (the session to
+///   the volunteer), so the volunteer forwards it on to the far end;
+/// - the reader half receives the inner frame bytes the carrying session's
+///   read loop strips out of inbound `RelayData` frames and hands over via
+///   an `mpsc` channel.
+///
+/// This mirrors [`cascade_p2p::transport::RelayTransport`] — the operated
+/// relay's tunnel — so the same [`cascade_p2p::framed::FramedSession`] and
+/// session loop drive a session over either. The volunteer in the middle
+/// only ever sees opaque `RelayData` payloads.
+pub struct PeerRelayTransport {
+    outbound: mpsc::UnboundedSender<BepMessage>,
+    inbound: mpsc::UnboundedReceiver<Vec<u8>>,
+}
+
+impl std::fmt::Debug for PeerRelayTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerRelayTransport").finish_non_exhaustive()
+    }
+}
+
+impl PeerRelayTransport {
+    /// Wrap a carrying session's outbound channel and an inbound payload
+    /// channel into a tunnel transport.
+    ///
+    /// `outbound` is the carrying session's `PeerHandle` sender — outbound
+    /// inner frames are sent on it as `RelayData`. `inbound` receives the
+    /// inner frame bytes the carrying session's read loop extracts from
+    /// inbound `RelayData` frames.
+    #[must_use]
+    pub const fn new(
+        outbound: mpsc::UnboundedSender<BepMessage>,
+        inbound: mpsc::UnboundedReceiver<Vec<u8>>,
+    ) -> Self {
+        Self { outbound, inbound }
+    }
+}
+
+impl Transport for PeerRelayTransport {
+    type Reader = PeerRelayTransportReader;
+    type Writer = PeerRelayTransportWriter;
+
+    fn split(self) -> (Self::Reader, Self::Writer) {
+        (
+            PeerRelayTransportReader {
+                inbound: self.inbound,
+            },
+            PeerRelayTransportWriter {
+                outbound: self.outbound,
+            },
+        )
+    }
+}
+
+/// Read half of [`PeerRelayTransport`].
+#[derive(Debug)]
+pub struct PeerRelayTransportReader {
+    inbound: mpsc::UnboundedReceiver<Vec<u8>>,
+}
+
+#[async_trait]
+impl TransportReader for PeerRelayTransportReader {
+    async fn recv_frame(&mut self) -> Result<Option<Vec<u8>>> {
+        // `None` when the sender drops — the carrying session ended, which
+        // the inner session reads as a clean EOF.
+        Ok(self.inbound.recv().await)
+    }
+}
+
+/// Write half of [`PeerRelayTransport`].
+#[derive(Debug)]
+pub struct PeerRelayTransportWriter {
+    outbound: mpsc::UnboundedSender<BepMessage>,
+}
+
+#[async_trait]
+impl TransportWriter for PeerRelayTransportWriter {
+    async fn send_frame(&mut self, frame: &[u8]) -> Result<()> {
+        self.outbound
+            .send(BepMessage::RelayData {
+                payload: frame.to_vec(),
+            })
+            .map_err(|_| anyhow::anyhow!("peer-relay carrying session closed"))
+    }
+
+    async fn shutdown(&mut self) -> Result<()> {
+        // The carrying session owns the underlying transport's lifetime;
+        // dropping this writer's sender is enough to let the far end see
+        // EOF once the carrying session tears down.
+        Ok(())
+    }
+}
+
+/// A live relay bridge a volunteer is forwarding between two BEP sessions.
+///
+/// The bridge is symmetric: `RelayData` arriving from either bridged device
+/// is forwarded to the other. Created when a [`BepMessage::RelayConnect`] is
+/// admitted; both endpoints are registered so return traffic flows. The
+/// admission slot is held for the bridge's lifetime via `guard`.
+#[derive(Debug)]
+pub struct RelayBridge {
+    /// Device id of the requester that opened the bridge.
+    pub requester: String,
+    /// Device id of the target the requester wants to reach.
+    pub target: String,
+    /// Admission slot, released on drop.
+    pub guard: RelaySessionGuard,
+}
+
+impl RelayBridge {
+    /// Given the device a `RelayData` frame arrived from, return the device
+    /// it should be forwarded to, or `None` if `from` is not part of this
+    /// bridge.
+    #[must_use]
+    pub fn forward_target(&self, from: &str) -> Option<&str> {
+        if from == self.requester {
+            Some(&self.target)
+        } else if from == self.target {
+            Some(&self.requester)
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -171,103 +288,66 @@ where
 mod tests {
     use super::*;
 
-    use std::collections::VecDeque;
-    use std::convert::Infallible;
-    use std::pin::Pin;
-    use std::sync::Mutex;
-    use std::task::{Context, Poll};
-
     use crate::{DEFAULT_MAX_RELAY_BANDWIDTH_BYTES_PER_SEC, DEFAULT_MAX_RELAY_SESSIONS};
 
-    /// In-memory mock endpoint with no real socket. Its stream replays a
-    /// finite inbound script then ends; its sink collects what the bridge
-    /// writes. Mirrors the mock used in `cascade_p2p::pipe`'s tests so the
-    /// peer-relay bridge can be exercised with no I/O.
-    struct MockEndpoint {
-        inbound: VecDeque<Message>,
-        outbound: Arc<Mutex<Vec<Message>>>,
+    #[test]
+    fn relay_capacity_meters_recorded_bytes() {
+        // The live forwarding path calls `record` for every relayed frame.
+        // Drive the meter directly to prove the bytes accrue — the engine
+        // two-hop test in `sync.rs` proves the engine calls it.
+        let capacity = Arc::new(RelayCapacity::new(
+            DEFAULT_MAX_RELAY_SESSIONS,
+            DEFAULT_MAX_RELAY_BANDWIDTH_BYTES_PER_SEC,
+        ));
+        assert_eq!(capacity.bytes_relayed(), 0);
+        capacity.record(64);
+        capacity.record(36);
+        assert_eq!(capacity.bytes_relayed(), 100);
     }
 
-    impl MockEndpoint {
-        fn new(inbound: Vec<Message>) -> (Self, Arc<Mutex<Vec<Message>>>) {
-            let outbound = Arc::new(Mutex::new(Vec::new()));
-            let endpoint = Self {
-                inbound: inbound.into(),
-                outbound: outbound.clone(),
-            };
-            (endpoint, outbound)
-        }
-    }
-
-    impl Stream for MockEndpoint {
-        type Item = Result<Message, Infallible>;
-
-        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-            Poll::Ready(self.inbound.pop_front().map(Ok))
-        }
-    }
-
-    impl Sink<Message> for MockEndpoint {
-        type Error = Infallible;
-
-        fn poll_ready(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn start_send(self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
-            if let Ok(mut out) = self.outbound.lock() {
-                out.push(item);
-            }
-            Ok(())
-        }
-
-        fn poll_flush(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn poll_close(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<Result<(), Self::Error>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    #[tokio::test]
-    async fn peer_relay_bridges_two_mock_endpoints() {
-        let frame_a = Message::Binary(b"a-to-b".to_vec().into());
-        let frame_b = Message::Binary(b"b-to-a".to_vec().into());
-        let (endpoint_a, a_out) = MockEndpoint::new(vec![frame_a.clone()]);
-        let (endpoint_b, b_out) = MockEndpoint::new(vec![frame_b.clone()]);
-
+    #[test]
+    fn relay_bridge_forwards_symmetrically() {
+        // A bridge between requester R and target T forwards R-origin frames
+        // to T and T-origin frames back to R, and ignores a third party.
         let capacity = Arc::new(RelayCapacity::new(
             DEFAULT_MAX_RELAY_SESSIONS,
             DEFAULT_MAX_RELAY_BANDWIDTH_BYTES_PER_SEC,
         ));
         let guard = capacity.admit().unwrap();
-        assert_eq!(capacity.active_sessions(), 1);
+        let bridge = RelayBridge {
+            requester: "R".to_owned(),
+            target: "T".to_owned(),
+            guard,
+        };
+        assert_eq!(bridge.forward_target("R"), Some("T"));
+        assert_eq!(bridge.forward_target("T"), Some("R"));
+        assert_eq!(bridge.forward_target("OTHER"), None);
+    }
 
-        let (outcome_a, outcome_b) =
-            bridge_sessions(endpoint_a, endpoint_b, &capacity, guard).await;
+    #[tokio::test]
+    async fn peer_relay_transport_wraps_and_unwraps_frames() {
+        // The writer wraps an inner frame into RelayData on the carrying
+        // session; the reader surfaces the inner bytes a carrying session
+        // feeds in, and reports EOF when that feed drops.
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let (in_tx, in_rx) = mpsc::unbounded_channel();
+        let transport = PeerRelayTransport::new(out_tx, in_rx);
+        let (mut reader, mut writer) = transport.split();
 
-        // A's frame reached B's sink and vice versa, with a trailing close
-        // on each once the opposite source ended.
-        assert_eq!(b_out.lock().unwrap().first(), Some(&frame_a));
-        assert_eq!(a_out.lock().unwrap().first(), Some(&frame_b));
-        assert_eq!(outcome_a, PipeOutcome::PeerClosed);
-        assert_eq!(outcome_b, PipeOutcome::PeerClosed);
+        writer.send_frame(b"inner-frame").await.unwrap();
+        match out_rx.recv().await.unwrap() {
+            BepMessage::RelayData { payload } => assert_eq!(payload, b"inner-frame"),
+            other => panic!("expected RelayData, got {other:?}"),
+        }
 
-        // Bytes were metered against the capacity, and the session slot was
-        // released when the bridge finished.
-        let expected = b"a-to-b".len() as u64 + b"b-to-a".len() as u64;
-        assert_eq!(capacity.bytes_relayed(), expected);
-        assert_eq!(capacity.active_sessions(), 0);
+        in_tx.send(b"reply-frame".to_vec()).unwrap();
+        assert_eq!(
+            reader.recv_frame().await.unwrap(),
+            Some(b"reply-frame".to_vec())
+        );
+
+        drop(in_tx);
+        assert_eq!(reader.recv_frame().await.unwrap(), None);
     }
 
     #[test]
