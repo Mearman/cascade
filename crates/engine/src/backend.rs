@@ -63,6 +63,32 @@ pub trait Backend: Send + Sync {
         writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
     ) -> anyhow::Result<()>;
 
+    /// Read a byte range of a file's content.
+    ///
+    /// `offset` is the start byte; `length` is the maximum number of
+    /// bytes to return. The returned `Vec` may be shorter than `length`
+    /// at end-of-file, and is empty when `offset` is at or past the end.
+    ///
+    /// The default implementation materialises the whole file via
+    /// [`Backend::download`] and slices it — correct, but not
+    /// range-efficient. Backends with a native range read (HTTP `Range`,
+    /// `seek`+`read`, a block store) should override this so presenters
+    /// can serve arbitrary ranges without downloading and pinning the
+    /// entire file, and without blocking on a large cold transfer.
+    async fn read_range(
+        &self,
+        file: &FileEntry,
+        offset: u64,
+        length: u32,
+    ) -> anyhow::Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        self.download(file, &mut buf).await?;
+        let start = usize::try_from(offset).unwrap_or(usize::MAX).min(buf.len());
+        let len = usize::try_from(length).unwrap_or(usize::MAX);
+        let end = start.saturating_add(len).min(buf.len());
+        Ok(buf.get(start..end).unwrap_or_default().to_vec())
+    }
+
     /// Upload a new file. Does not check for existing files — the caller
     /// should use `update()` when overwriting.
     async fn upload(
@@ -219,5 +245,124 @@ impl Backend for NullBackend {
 
     async fn poll_interval(&self) -> Option<Duration> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ItemId;
+    use tokio::io::AsyncWriteExt as _;
+
+    /// Backend whose `download` writes a fixed buffer; every other method
+    /// is unused. Exercises the default `read_range` (download-and-slice).
+    #[derive(Debug)]
+    struct FixedBackend {
+        content: Vec<u8>,
+    }
+
+    #[async_trait]
+    impl Backend for FixedBackend {
+        fn id(&self) -> &'static str {
+            "fixed"
+        }
+        fn display_name(&self) -> &'static str {
+            "Fixed"
+        }
+        async fn quota(&self) -> anyhow::Result<Option<Quota>> {
+            Ok(None)
+        }
+        async fn changes(&self, _cursor: Option<&Cursor>) -> anyhow::Result<(Vec<Change>, Cursor)> {
+            Ok((vec![], Cursor("fixed".to_string())))
+        }
+        async fn metadata(&self, _path: &Path) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("unused")
+        }
+        async fn download(
+            &self,
+            _file: &FileEntry,
+            writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
+        ) -> anyhow::Result<()> {
+            writer.write_all(&self.content).await?;
+            writer.flush().await?;
+            Ok(())
+        }
+        async fn upload(
+            &self,
+            _path: &Path,
+            _reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+            _parent_id: &FileId,
+        ) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("unused")
+        }
+        async fn update(
+            &self,
+            _file_id: &FileId,
+            _reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+        ) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("unused")
+        }
+        async fn create_dir(&self, _path: &Path) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("unused")
+        }
+        async fn delete(&self, _file: &FileEntry) -> anyhow::Result<()> {
+            anyhow::bail!("unused")
+        }
+        async fn move_entry(&self, _src: &Path, _dst: &Path) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("unused")
+        }
+        async fn move_by_id(
+            &self,
+            _src_id: &FileId,
+            _dst_parent_id: &FileId,
+            _new_name: &str,
+        ) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("unused")
+        }
+        async fn poll_interval(&self) -> Option<Duration> {
+            None
+        }
+    }
+
+    fn entry() -> FileEntry {
+        FileEntry {
+            id: ItemId::new("fixed", "f"),
+            parent_id: ItemId::new("fixed", "root"),
+            name: "f.bin".to_string(),
+            is_dir: false,
+            size: Some(11),
+            mod_time: None,
+            mime_type: None,
+            hash: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn default_read_range_slices_the_downloaded_buffer() {
+        let backend = FixedBackend {
+            content: b"hello world".to_vec(),
+        };
+        let e = entry();
+
+        // Mid-range read.
+        assert_eq!(backend.read_range(&e, 6, 5).await.unwrap(), b"world");
+        // Whole file when length covers it.
+        assert_eq!(backend.read_range(&e, 0, 11).await.unwrap(), b"hello world");
+        // Length past EOF clamps to what's available.
+        assert_eq!(backend.read_range(&e, 6, 999).await.unwrap(), b"world");
+    }
+
+    #[tokio::test]
+    async fn default_read_range_empty_at_or_past_eof() {
+        let backend = FixedBackend {
+            content: b"hello world".to_vec(),
+        };
+        let e = entry();
+        // Offset exactly at EOF -> empty.
+        assert!(backend.read_range(&e, 11, 10).await.unwrap().is_empty());
+        // Offset past EOF -> empty (no panic).
+        assert!(backend.read_range(&e, 1000, 10).await.unwrap().is_empty());
+        // Zero length -> empty.
+        assert!(backend.read_range(&e, 0, 0).await.unwrap().is_empty());
     }
 }
