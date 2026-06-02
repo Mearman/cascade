@@ -394,7 +394,6 @@ impl P2pBackend {
         let cfg_stun_servers = cfg.stun_servers.clone();
         let cfg_announce_servers = cfg.announce_servers.clone();
         let cfg_dht = cfg.dht.clone();
-        let cfg_identity_dir = cfg.identity_dir.clone();
         let bootstrap_cancel = cancel.subscribe();
         let cancel_for_children = cancel.clone();
         tokio::spawn(async move {
@@ -551,17 +550,16 @@ impl P2pBackend {
             // Register the Kademlia/Mainline-DHT source when enabled and the
             // listener is up. The DHT publishes and resolves keyed by device
             // id, so it is only useful once we have a bound port to advertise;
-            // a node whose construction fails (binding the DHT UDP socket, or
-            // loading the BEP44 signing key) is logged and skipped rather than
-            // aborting backend open, exactly like the announce-server source.
-            // The constructed source is cloned: one copy joins the resolver,
-            // the other drives the periodic announce loop below.
+            // a node whose construction fails (binding the DHT UDP socket) is
+            // logged and skipped rather than aborting backend open, exactly
+            // like the announce-server source. The BEP44 keypair is derived
+            // per device id at announce/resolve time, so the node holds no
+            // persisted secret of its own. The constructed source is cloned:
+            // one copy joins the resolver, the other drives the periodic
+            // announce loop below.
             let dht_source = match (cfg_dht.as_ref(), bound_port.is_some()) {
                 (Some(dht_cfg), true) => {
-                    match cascade_p2p::discovery::MainlineDht::open(
-                        &cfg_identity_dir,
-                        &dht_cfg.bootstrap_nodes,
-                    ) {
+                    match cascade_p2p::discovery::MainlineDht::open(&dht_cfg.bootstrap_nodes) {
                         Ok(node) => {
                             let source = cascade_p2p::discovery::DhtDiscovery::new(node);
                             discovery.register(Box::new(source.clone()));
