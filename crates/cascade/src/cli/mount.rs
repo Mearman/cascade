@@ -250,6 +250,7 @@ async fn try_fskit(
         cache_dir: None,
         enable_p2p,
         p2p_data_dir: None,
+        backend_factory: Some(cli_backend_factory()),
     };
     let engine = Arc::new(Engine::new(engine_config)?);
     // Wire the management-plane dispatcher into every backend that serves
@@ -404,6 +405,7 @@ async fn try_fileprovider(
         cache_dir: None,
         enable_p2p,
         p2p_data_dir: None,
+        backend_factory: Some(cli_backend_factory()),
     };
     let engine = Arc::new(Engine::new(engine_config)?);
     // Wire the management-plane dispatcher into every backend that serves
@@ -526,6 +528,7 @@ async fn try_projfs(
         cache_dir: None,
         enable_p2p,
         p2p_data_dir: None,
+        backend_factory: Some(cli_backend_factory()),
     };
     let engine = Arc::new(Engine::new(engine_config)?);
     // Wire the management-plane dispatcher into every backend that serves
@@ -655,6 +658,7 @@ async fn try_webdav(
         cache_dir: None,
         enable_p2p,
         p2p_data_dir: None,
+        backend_factory: Some(cli_backend_factory()),
     };
     let engine = Arc::new(Engine::new(engine_config)?);
     // Wire the management-plane dispatcher into every backend that serves
@@ -778,6 +782,7 @@ async fn try_fuse(
         cache_dir: None,
         enable_p2p,
         p2p_data_dir: None,
+        backend_factory: Some(cli_backend_factory()),
     };
     let engine = Arc::new(Engine::new(engine_config)?);
     // Wire the management-plane dispatcher into every backend that serves
@@ -859,6 +864,7 @@ async fn try_nfs(
         cache_dir: None,
         enable_p2p,
         p2p_data_dir: None,
+        backend_factory: Some(cli_backend_factory()),
     };
     let engine = Arc::new(Engine::new(engine_config)?);
     // Wire the management-plane dispatcher into every backend that serves
@@ -1124,6 +1130,33 @@ pub fn stop(_ctx: &CliContext) -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// The daemon's [`BackendFactory`](cascade_engine::backend::BackendFactory)
+/// implementation — the composition-edge adapter that lets the engine build a
+/// backend at runtime (the management-plane `BackendAdd` path) without depending
+/// on any concrete backend crate. It parses the supplied TOML fragment and
+/// routes to the same per-type [`create_backend`] factories the daemon uses at
+/// startup.
+struct CliBackendFactory;
+
+impl cascade_engine::backend::BackendFactory for CliBackendFactory {
+    fn create(
+        &self,
+        name: &str,
+        backend_type: &str,
+        config_toml: &str,
+    ) -> Result<Arc<dyn cascade_engine::backend::Backend>> {
+        let config: toml::Value = toml::from_str(config_toml)
+            .with_context(|| format!("parsing config for backend `{name}`"))?;
+        let backend = create_backend(name, backend_type, &config)?;
+        Ok(Arc::from(backend))
+    }
+}
+
+/// A shared [`CliBackendFactory`] for injection into an [`EngineConfig`].
+fn cli_backend_factory() -> Arc<dyn cascade_engine::backend::BackendFactory> {
+    Arc::new(CliBackendFactory)
+}
 
 /// Instantiate a backend by type, using its per-backend TOML config.
 fn create_backend(

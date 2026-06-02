@@ -30,7 +30,9 @@ use cascade_engine::manage::{
     run_dispatch,
 };
 use cascade_p2p::identity::DeviceIdentity;
-use cascade_p2p::protocol::{ManageCommand, ManageErrorKind, ManageResult, ManageScope};
+use cascade_p2p::protocol::{
+    ManageCommand, ManageConfigFormat, ManageErrorKind, ManageResult, ManageScope,
+};
 use cascade_p2p::store::BlockStore;
 use chrono::{DateTime, Utc};
 use tempfile::TempDir;
@@ -106,6 +108,76 @@ impl ManageCommandExecutor for TestNode {
     async fn manage_cache_evict(&self) -> anyhow::Result<String> {
         self.record("evict");
         Ok("evicted 0 files".to_owned())
+    }
+
+    async fn manage_cache_warm(&self, path_glob: &str) -> anyhow::Result<String> {
+        self.record(&format!("warm {path_glob}"));
+        Ok(format!("warmed {path_glob}"))
+    }
+
+    async fn manage_config_push(
+        &self,
+        format: ManageConfigFormat,
+        folder: &str,
+        _body: &str,
+    ) -> anyhow::Result<String> {
+        self.record(&format!("config_push {format:?} {folder}"));
+        Ok(format!("pushed into {folder}"))
+    }
+
+    async fn manage_policy_set(
+        &self,
+        path_glob: &str,
+        max_age_secs: Option<i64>,
+        max_file_size: Option<i64>,
+        priority: i32,
+    ) -> anyhow::Result<String> {
+        self.record(&format!(
+            "policy_set {path_glob} {max_age_secs:?} {max_file_size:?} {priority}"
+        ));
+        Ok(format!("policy set for {path_glob}"))
+    }
+
+    async fn manage_backend_add(
+        &self,
+        name: &str,
+        backend_type: &str,
+        mount_path: &str,
+        _config_toml: &str,
+    ) -> anyhow::Result<String> {
+        self.record(&format!("backend_add {name} {backend_type} {mount_path}"));
+        Ok(format!("backend {name} added"))
+    }
+
+    async fn manage_backend_remove(&self, name: &str, mount_path: &str) -> anyhow::Result<String> {
+        self.record(&format!("backend_remove {name} {mount_path}"));
+        Ok(format!("backend {name} removed"))
+    }
+
+    async fn manage_restart(&self) -> anyhow::Result<String> {
+        self.record("restart");
+        Ok("restarted".to_owned())
+    }
+
+    async fn manage_stop(&self) -> anyhow::Result<String> {
+        self.record("stop");
+        Ok("stopped".to_owned())
+    }
+
+    async fn manage_grant_add(&self, grant: &Grant) -> anyhow::Result<String> {
+        self.record(&format!(
+            "grant_add {} {} {:?} {}",
+            grant.grantee,
+            grant.capability.as_wire(),
+            grant.scope,
+            grant.granted_by,
+        ));
+        Ok("grant added".to_owned())
+    }
+
+    async fn manage_grant_revoke(&self, grant_id: i64) -> anyhow::Result<String> {
+        self.record(&format!("grant_revoke {grant_id}"));
+        Ok(format!("grant {grant_id} revoked"))
     }
 }
 
