@@ -571,7 +571,14 @@ impl P2pBackend {
             // announce loop below.
             let dht_source = match (cfg_dht.as_ref(), bound_port.is_some()) {
                 (Some(dht_cfg), true) => {
-                    match cascade_p2p::discovery::MainlineDht::open(&dht_cfg.bootstrap_nodes) {
+                    // `MainlineDht::open` is a blocking constructor: it resolves
+                    // the bootstrap host:port set with synchronous `getaddrinfo`
+                    // and binds the DHT UDP socket on the calling thread. Run it
+                    // off the runtime via `spawn_blocking` so a slow or
+                    // unreachable resolver cannot stall this worker, mirroring
+                    // `resolve_first`'s off-thread DNS.
+                    let bootstrap = dht_cfg.bootstrap_nodes.clone();
+                    match open_dht_off_thread(bootstrap).await {
                         Ok(node) => {
                             let source = cascade_p2p::discovery::DhtDiscovery::new(node);
                             discovery.register(Box::new(source.clone()));
@@ -743,7 +750,7 @@ impl P2pBackend {
             return resolve_first(&peer.address).await;
         }
 
-        let discovery = self.compose_resolution_discovery();
+        let discovery = self.compose_resolution_discovery().await;
         let candidates = discovery.resolve(device_id).await;
         candidates
             .into_iter()
@@ -761,7 +768,7 @@ impl P2pBackend {
     /// the exact channels the data plane already uses. A source whose
     /// construction fails is logged and skipped rather than aborting the
     /// resolution, matching the backend's startup behaviour.
-    fn compose_resolution_discovery(&self) -> DiscoveryService {
+    async fn compose_resolution_discovery(&self) -> DiscoveryService {
         let mut discovery = DiscoveryService::new();
         if self.cfg.enable_wan_gossip {
             discovery.register(Box::new(GossipDiscovery::new(
@@ -783,7 +790,12 @@ impl P2pBackend {
             }
         }
         if let Some(dht_cfg) = self.cfg.dht.as_ref() {
-            match cascade_p2p::discovery::MainlineDht::open(&dht_cfg.bootstrap_nodes) {
+            // `MainlineDht::open` blocks on `getaddrinfo` for the bootstrap set
+            // and the UDP socket bind, so it runs off the runtime — this method
+            // sits on the management-plane dial path and must not stall a worker
+            // on DNS. See `open_dht_off_thread`.
+            let bootstrap = dht_cfg.bootstrap_nodes.clone();
+            match open_dht_off_thread(bootstrap).await {
                 Ok(node) => {
                     discovery.register(Box::new(cascade_p2p::discovery::DhtDiscovery::new(node)));
                 }
@@ -1492,6 +1504,23 @@ async fn resolve_first(raw: &str) -> Result<std::net::SocketAddr> {
         .into_iter()
         .next()
         .with_context(|| format!("`{raw}` resolved to no records"))
+}
+
+/// Construct a Mainline-DHT node off the tokio runtime.
+///
+/// `MainlineDht::open` is a blocking constructor: it resolves the bootstrap
+/// set with synchronous `getaddrinfo` (for the default case those are public
+/// router *hostnames*, not pre-resolved addresses) and binds the DHT UDP
+/// socket, all on the calling thread. Running it directly on a runtime worker
+/// would stall that worker for the duration of resolution under a slow or
+/// unreachable resolver, so it goes through `spawn_blocking` exactly like
+/// [`resolve_first`]'s DNS does.
+async fn open_dht_off_thread(
+    bootstrap_nodes: Vec<std::net::SocketAddr>,
+) -> Result<cascade_p2p::discovery::MainlineDht> {
+    tokio::task::spawn_blocking(move || cascade_p2p::discovery::MainlineDht::open(&bootstrap_nodes))
+        .await
+        .context("DHT open task panicked")?
 }
 
 /// Local preference for the single LAN host candidate this device
@@ -2786,8 +2815,11 @@ mod tests {
     /// cadence, and both honour the shutdown watch. We confirm the spawned tasks
     /// observe cancellation, proving the DHT publish loop exits cleanly like
     /// every other background task. The default bootstrap nodes are real public
-    /// routers, but `open` only binds the local UDP socket — it does not block
-    /// on reaching them — so this stays an offline test.
+    /// router hostnames, which `open` resolves with blocking `getaddrinfo`; the
+    /// backend runs that resolution off the runtime via `spawn_blocking`, and a
+    /// resolver miss is swallowed best-effort, so the node still binds its local
+    /// UDP socket and this stays an offline test that neither blocks a worker
+    /// nor depends on reaching the routers.
     #[tokio::test]
     async fn dht_enabled_backend_opens_and_shuts_down() {
         let dir = tempdir().unwrap();
