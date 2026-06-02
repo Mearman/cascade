@@ -6,5 +6,6 @@ pattern = "debug.log"
 negated = true
 
 [cache]
-max_size = "50000000000"
-max_age = "604800"
+max_size = "50GB"
+max_age = "7d"
+default_state = "auto"
