@@ -5,7 +5,7 @@
 //! trait. Resolution is a pure read of what gossip has already learned:
 //! the most recently advertised remote candidates for a device, falling
 //! back to host candidates synthesised from the peer's known reachable
-//! addresses when no candidate exchange has happened yet.
+//! addresses whenever no non-empty candidate set has been advertised yet.
 //!
 //! This source does not change gossip semantics. It neither initiates
 //! nor merges gossip frames — that machinery lives in [`crate::wan`] and
@@ -50,12 +50,19 @@ impl Discovery for GossipDiscovery {
     /// Return the candidates gossip already knows for `device_id`.
     ///
     /// Prefers the remote candidate set the peer last advertised over a
-    /// `BepMessage::Candidates` exchange. When no exchange has happened,
-    /// falls back to host candidates built from the peer's known
-    /// reachable addresses. An unknown device yields no candidates.
+    /// `BepMessage::Candidates` exchange. An empty advertised set counts
+    /// as nothing advertised: a punch entry may exist with no candidates
+    /// (a hole-punch agreement is recorded before any `Candidates` frame
+    /// arrives) or a peer may send an explicitly empty `Candidates` frame,
+    /// and in both cases the host-address fallback must still fire. So the
+    /// remote set short-circuits only when it is non-empty; otherwise this
+    /// falls back to host candidates built from the peer's known reachable
+    /// addresses. An unknown device yields no candidates.
     async fn resolve(&self, device_id: &str) -> Vec<Candidate> {
         let book = self.peer_book.read().await;
-        if let Some(candidates) = book.remote_candidates(device_id) {
+        if let Some(candidates) = book.remote_candidates(device_id)
+            && !candidates.is_empty()
+        {
             return candidates.to_vec();
         }
         book.get(device_id).map_or_else(Vec::new, |peer| {
@@ -114,5 +121,48 @@ mod tests {
     async fn resolve_unknown_device_is_empty() {
         let source = GossipDiscovery::new(Arc::new(RwLock::new(PeerBook::new())));
         assert!(source.resolve("UNKNOWN").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_falls_back_when_punch_negotiated_without_candidate_exchange() {
+        use crate::traversal::SyncPunchAgreement;
+
+        // A hole-punch agreement is recorded before any `Candidates`
+        // frame arrives, which creates a punch entry whose candidate
+        // vector is empty. The host-address fallback must still fire.
+        let mut book = PeerBook::new();
+        book.add_peer("DEVICE-A".to_string(), vec![addr(22000), addr(22001)]);
+        book.start_punch_with(
+            "DEVICE-A",
+            SyncPunchAgreement {
+                nonce: 7,
+                deadline_unix_ms: 1_700_000_000_000,
+            },
+        );
+
+        let source = GossipDiscovery::new(Arc::new(RwLock::new(book)));
+        let resolved = source.resolve("DEVICE-A").await;
+        assert_eq!(resolved.len(), 2);
+        assert!(resolved.iter().all(|c| c.kind == CandidateKind::Host));
+        let ports: Vec<u16> = resolved.iter().map(|c| c.address.port()).collect();
+        assert!(ports.contains(&22000));
+        assert!(ports.contains(&22001));
+    }
+
+    #[tokio::test]
+    async fn resolve_falls_back_when_remote_advertises_empty_candidates() {
+        // A peer (buggy or hostile) may send an explicitly empty
+        // `Candidates` frame. An empty advertised set is treated as
+        // nothing advertised, so the host-address fallback still fires
+        // rather than returning an empty result.
+        let mut book = PeerBook::new();
+        book.add_peer("DEVICE-A".to_string(), vec![addr(22000)]);
+        book.set_remote_candidates("DEVICE-A", vec![]);
+
+        let source = GossipDiscovery::new(Arc::new(RwLock::new(book)));
+        let resolved = source.resolve("DEVICE-A").await;
+        assert_eq!(resolved.len(), 1);
+        assert!(resolved.iter().all(|c| c.kind == CandidateKind::Host));
+        assert_eq!(resolved.first().map(|c| c.address.port()), Some(22000));
     }
 }
