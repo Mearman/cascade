@@ -144,8 +144,11 @@ mod tests {
     async fn register_then_lookup_returns_same_candidates() {
         let directory = AnnounceDirectory::new();
         let host = WireCandidate::from(Candidate::new(addr(22000), CandidateKind::Host, 65_535));
-        let srflx =
-            WireCandidate::from(Candidate::new(addr(33000), CandidateKind::ServerReflexive, 0));
+        let srflx = WireCandidate::from(Candidate::new(
+            addr(33000),
+            CandidateKind::ServerReflexive,
+            0,
+        ));
         directory
             .register("DEVICE-A".to_string(), vec![host, srflx])
             .await;
