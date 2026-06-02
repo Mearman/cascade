@@ -2026,7 +2026,7 @@ mod tests {
         assert_eq!(custom.mount_point(), Path::new("/tmp/custom-mount"));
     }
 
-    /// On non-macOS the FSKit presenter is not compiled into the binary
+    /// On non-macOS the `FSKit` presenter is not compiled into the binary
     /// path — confirm that the default NFS path is used instead.
     #[cfg(not(target_os = "macos"))]
     #[test]
