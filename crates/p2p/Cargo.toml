@@ -22,8 +22,17 @@ futures-util = "0.3.32"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 rustls-pemfile = "2"
 if-addrs = { workspace = true }
+reqwest = { workspace = true, optional = true }
 
 [features]
+## Enable the announce-server discovery client ([`discovery::announce::AnnounceDiscovery`]).
+##
+## Pulls in `reqwest` for the JSON HTTP round-trips. The serialisable wire
+## types ([`discovery::announce::WireCandidate`] and friends) are always
+## compiled so the relay-server can depend on them without the client weight;
+## only the HTTP client is gated behind this feature.
+announce = ["dep:reqwest"]
+
 ## Enable the Linux netns NAT integration tests.
 ##
 ## Requires root / CAP_NET_ADMIN, `ip`, and `iptables`. The tests skip
