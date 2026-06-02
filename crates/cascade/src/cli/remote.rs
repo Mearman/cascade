@@ -12,12 +12,27 @@
 //! a parallel transport. A grant the target has not conferred surfaces as a
 //! typed authorisation denial from the node, distinct from a transport failure.
 
+use std::path::Path;
+
 use anyhow::{Context as _, Result};
 use cascade_backend_p2p::P2pBackend;
-use cascade_p2p::protocol::{ManageCommand, ManageErrorKind, ManageResult, ManageScope};
+use cascade_p2p::protocol::{
+    ManageCommand, ManageConfigFormat, ManageErrorKind, ManageGrant, ManageResult, ManageScope,
+};
 
 use super::CliContext;
 use super::init::CascadeConfig;
+
+/// The wildcard scope token an operator may pass to mean "node-wide" — every
+/// path on the node. Mirrors the local `grant add --scope *` spelling so the
+/// manager and managed sides accept the same vocabulary.
+const SCOPE_WILDCARD: &str = "*";
+
+/// The leading path component used to confine a glob, or root when the glob
+/// has no fixed prefix. The managed node re-derives the same prefix from the
+/// command payload; advertising it here keeps the wire scope aligned with what
+/// the node authorises over, but the node's value is the one that binds.
+const ROOT_SCOPE: &str = "/";
 
 /// A remote-administration subcommand, parsed from the clap command tree into
 /// the wire [`ManageCommand`] plus the [`ManageScope`] it targets.
@@ -47,10 +62,98 @@ pub enum RemoteCommand {
         /// The path to warm.
         path: String,
     },
+    /// Push a `.cascade` config fragment to merge into the node's rule set,
+    /// rooted at `folder`.
+    ConfigPush {
+        /// The folder the fragment applies to — the scope the push targets.
+        folder: String,
+        /// The serialisation format of `body`, derived from the source file's
+        /// extension.
+        format: ManageConfigFormat,
+        /// The raw config fragment.
+        body: String,
+    },
+    /// Set a lifecycle policy on the node over a path glob.
+    PolicySet {
+        /// The path glob the policy applies to — also the scope it targets.
+        path_glob: String,
+        /// Maximum file age before eviction, in seconds. Absent leaves the
+        /// dimension unbounded.
+        max_age_secs: Option<i64>,
+        /// Maximum file size before eviction, in bytes. Absent leaves the
+        /// dimension unbounded.
+        max_file_size: Option<i64>,
+        /// Priority — higher wins when policies overlap.
+        priority: i32,
+    },
+    /// Register a backend on the node, mounted at `mount_path`.
+    BackendAdd {
+        /// The backend name (its identifier and config file stem).
+        name: String,
+        /// The backend type (`gdrive`, `s3`, `p2p`, …).
+        backend_type: String,
+        /// The VFS mount path the backend is mounted at — the scope this
+        /// command targets.
+        mount_path: String,
+        /// The backend's TOML config fragment, as a literal TOML document.
+        config_toml: String,
+    },
+    /// Remove a registered backend by name.
+    BackendRemove {
+        /// The backend name to remove.
+        name: String,
+        /// The VFS mount path the backend occupied — the scope this command
+        /// targets.
+        mount_path: String,
+    },
+    /// Restart the node's background workers, confined to a folder scope.
+    Restart {
+        /// The folder scope the dangerous `lifecycle:control` capability is
+        /// authorised over. A dangerous capability is never satisfied by a
+        /// node-wide grant, so this names an explicit folder.
+        scope: String,
+    },
+    /// Stop the node's background workers, confined to a folder scope.
+    Stop {
+        /// The folder scope the dangerous `lifecycle:control` capability is
+        /// authorised over.
+        scope: String,
+    },
+    /// Delegate a grant to another device. Advertises `grant:admin`; the node
+    /// enforces the subset rule, refusing any attempt to escalate beyond the
+    /// caller's own authority.
+    GrantAdd {
+        /// The device the grant authorises, by device ID.
+        grantee: String,
+        /// The capability conferred, in its colon-delimited wire form.
+        capability: String,
+        /// The scope the capability applies over, as a folder path or the
+        /// wildcard token.
+        scope: String,
+        /// When the grant expires, as an RFC 3339 timestamp. Absent means
+        /// never.
+        expires: Option<String>,
+    },
+    /// Revoke a grant by its row id, advertising the folder scope the caller
+    /// holds `grant:admin` over. The node re-resolves the revoked grant's real
+    /// stored scope and authorises over that, so this advertised scope cannot
+    /// widen the revocation.
+    GrantRevoke {
+        /// The row id of the grant to revoke (as shown by the node's
+        /// `grant list`).
+        grant_id: i64,
+        /// The folder scope the caller's `grant:admin` grant covers.
+        scope: String,
+    },
 }
 
 impl RemoteCommand {
     /// The wire [`ManageCommand`] this subcommand sends.
+    ///
+    /// `cache warm` maps to a recursive pin — the same wire command the local
+    /// `cache warm` produces — rather than a [`ManageCommand::CacheWarm`], so a
+    /// warmed path is kept offline by a pin rule. Every other verb maps to its
+    /// matching `ManageCommand` variant one-to-one.
     #[must_use]
     pub fn to_wire(&self) -> ManageCommand {
         match self {
@@ -63,6 +166,60 @@ impl RemoteCommand {
                 path_glob: path.clone(),
             },
             Self::CacheEvict => ManageCommand::CacheEvict,
+            Self::ConfigPush {
+                folder,
+                format,
+                body,
+            } => ManageCommand::ConfigPush {
+                format: *format,
+                folder: folder.clone(),
+                body: body.clone(),
+            },
+            Self::PolicySet {
+                path_glob,
+                max_age_secs,
+                max_file_size,
+                priority,
+            } => ManageCommand::PolicySet {
+                path_glob: path_glob.clone(),
+                max_age_secs: *max_age_secs,
+                max_file_size: *max_file_size,
+                priority: *priority,
+            },
+            Self::BackendAdd {
+                name,
+                backend_type,
+                mount_path,
+                config_toml,
+            } => ManageCommand::BackendAdd {
+                name: name.clone(),
+                backend_type: backend_type.clone(),
+                mount_path: mount_path.clone(),
+                config_toml: config_toml.clone(),
+            },
+            Self::BackendRemove { name, mount_path } => ManageCommand::BackendRemove {
+                name: name.clone(),
+                mount_path: mount_path.clone(),
+            },
+            Self::Restart { .. } => ManageCommand::Restart,
+            Self::Stop { .. } => ManageCommand::Stop,
+            Self::GrantAdd {
+                grantee,
+                capability,
+                scope,
+                expires,
+            } => ManageCommand::GrantAdd {
+                grant: ManageGrant {
+                    grantee: grantee.clone(),
+                    capability: capability.clone(),
+                    scope: scope_from_arg(scope),
+                    expires: expires.clone(),
+                },
+            },
+            Self::GrantRevoke { grant_id, scope } => ManageCommand::GrantRevoke {
+                grant_id: *grant_id,
+                scope: scope_from_arg(scope),
+            },
         }
     }
 
@@ -74,6 +231,12 @@ impl RemoteCommand {
     /// scope the command's payload actually touches and authorises over both,
     /// so a path advertised here cannot widen what the command may do — it is a
     /// best-effort declaration the node cross-checks, not a source of authority.
+    ///
+    /// The dangerous-capability commands ([`Self::Restart`], [`Self::Stop`],
+    /// [`Self::BackendAdd`], [`Self::BackendRemove`], [`Self::GrantAdd`],
+    /// [`Self::GrantRevoke`]) advertise an explicit folder scope: a dangerous
+    /// capability is never satisfied by a node-wide grant, so a node-wide scope
+    /// could never authorise them.
     #[must_use]
     pub fn wire_scope(&self) -> ManageScope {
         match self {
@@ -81,8 +244,115 @@ impl RemoteCommand {
             Self::Pin { path } | Self::Unpin { path } | Self::CacheWarm { path } => {
                 ManageScope::Folder { path: path.clone() }
             }
+            Self::ConfigPush { folder, .. } => ManageScope::Folder {
+                path: folder.clone(),
+            },
+            Self::PolicySet { path_glob, .. } => ManageScope::Folder {
+                path: path_glob.clone(),
+            },
+            Self::BackendAdd { mount_path, .. } | Self::BackendRemove { mount_path, .. } => {
+                ManageScope::Folder {
+                    path: mount_path.clone(),
+                }
+            }
+            Self::Restart { scope }
+            | Self::Stop { scope }
+            | Self::GrantAdd { scope, .. }
+            | Self::GrantRevoke { scope, .. } => scope_from_arg(scope),
         }
     }
+}
+
+/// Map a `--scope` argument string to a wire [`ManageScope`].
+///
+/// The wildcard token [`SCOPE_WILDCARD`] maps to [`ManageScope::Node`]; any
+/// other value is a folder path prefix. Mirrors the local `grant add` scope
+/// parsing so the two sides share one spelling.
+#[must_use]
+fn scope_from_arg(raw: &str) -> ManageScope {
+    if raw == SCOPE_WILDCARD {
+        ManageScope::Node
+    } else {
+        ManageScope::Folder {
+            path: raw.to_owned(),
+        }
+    }
+}
+
+/// Derive the [`ManageConfigFormat`] of a `.cascade` fragment from its source
+/// file's extension.
+///
+/// A `.toml`, `.yaml`/`.yml`, or `.json` extension selects the matching
+/// structured format; anything else — including a bare `.cascade` file with no
+/// extension — is treated as the gitignore-style format, matching the parser's
+/// own default for an extensionless `.cascade` file.
+#[must_use]
+fn config_format_from_path(path: &Path) -> ManageConfigFormat {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("toml") => ManageConfigFormat::Toml,
+        Some("yaml" | "yml") => ManageConfigFormat::Yaml,
+        Some("json") => ManageConfigFormat::Json,
+        _ => ManageConfigFormat::Gitignore,
+    }
+}
+
+/// Read a `.cascade` config fragment from `path`, returning the body and the
+/// format inferred from its extension.
+///
+/// The file must exist and be readable; a missing or unreadable file fails
+/// loudly rather than pushing an empty fragment.
+fn read_config_fragment(path: &Path) -> Result<(ManageConfigFormat, String)> {
+    let body = std::fs::read_to_string(path)
+        .with_context(|| format!("reading config fragment {}", path.display()))?;
+    Ok((config_format_from_path(path), body))
+}
+
+/// Build a [`RemoteCommand::ConfigPush`] from a local fragment file.
+///
+/// Reads `file` and infers its format from the extension. `scope` is the folder
+/// the fragment applies to; when absent it defaults to the node root, matching
+/// the engine's rooting of an unscoped fragment.
+///
+/// # Errors
+///
+/// Returns an error when the fragment file cannot be read.
+pub fn config_push(file: &Path, scope: Option<&str>) -> Result<RemoteCommand> {
+    let (format, body) = read_config_fragment(file)?;
+    let folder = scope.unwrap_or(ROOT_SCOPE).to_owned();
+    Ok(RemoteCommand::ConfigPush {
+        folder,
+        format,
+        body,
+    })
+}
+
+/// Build a [`RemoteCommand::BackendAdd`] from a local backend config file.
+///
+/// Reads the backend's TOML config fragment from `config` so the managed node
+/// registers it exactly as the local wizard would.
+///
+/// # Errors
+///
+/// Returns an error when the config file cannot be read.
+pub fn backend_add(
+    name: String,
+    backend_type: String,
+    mount_path: String,
+    config: &Path,
+) -> Result<RemoteCommand> {
+    let config_toml = std::fs::read_to_string(config)
+        .with_context(|| format!("reading backend config {}", config.display()))?;
+    Ok(RemoteCommand::BackendAdd {
+        name,
+        backend_type,
+        mount_path,
+        config_toml,
+    })
 }
 
 /// Resolve and open the first configured P2P backend, returning the typed
@@ -266,5 +536,110 @@ mod tests {
         };
         let err = render("PEER", &result).unwrap_err();
         assert!(format!("{err:#}").contains("failed"));
+    }
+
+    #[test]
+    fn scope_from_arg_maps_wildcard_to_node() {
+        assert_eq!(scope_from_arg("*"), ManageScope::Node);
+        assert_eq!(
+            scope_from_arg("/work"),
+            ManageScope::Folder {
+                path: "/work".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn config_format_from_path_infers_by_extension() {
+        assert_eq!(
+            config_format_from_path(Path::new("rules.toml")),
+            ManageConfigFormat::Toml
+        );
+        assert_eq!(
+            config_format_from_path(Path::new("rules.yaml")),
+            ManageConfigFormat::Yaml
+        );
+        assert_eq!(
+            config_format_from_path(Path::new("rules.yml")),
+            ManageConfigFormat::Yaml
+        );
+        assert_eq!(
+            config_format_from_path(Path::new("rules.json")),
+            ManageConfigFormat::Json
+        );
+        // Case-insensitive.
+        assert_eq!(
+            config_format_from_path(Path::new("RULES.TOML")),
+            ManageConfigFormat::Toml
+        );
+        // An extensionless `.cascade` file — and anything unrecognised — is the
+        // gitignore-style default.
+        assert_eq!(
+            config_format_from_path(Path::new(".cascade")),
+            ManageConfigFormat::Gitignore
+        );
+        assert_eq!(
+            config_format_from_path(Path::new("rules.txt")),
+            ManageConfigFormat::Gitignore
+        );
+    }
+
+    #[test]
+    fn config_push_reads_body_and_defaults_scope_to_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("rules.yaml");
+        std::fs::write(&file, "ignore:\n  - \"*.tmp\"\n").unwrap();
+
+        let cmd = config_push(&file, None).unwrap();
+        assert_eq!(
+            cmd,
+            RemoteCommand::ConfigPush {
+                folder: ROOT_SCOPE.to_owned(),
+                format: ManageConfigFormat::Yaml,
+                body: "ignore:\n  - \"*.tmp\"\n".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn config_push_missing_file_is_error() {
+        assert!(config_push(Path::new("/nonexistent/rules.toml"), Some("/work")).is_err());
+    }
+
+    #[test]
+    fn backend_add_reads_config_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("s3.toml");
+        std::fs::write(&config, "type = \"s3\"\n").unwrap();
+
+        let cmd = backend_add(
+            "store".to_owned(),
+            "s3".to_owned(),
+            "/Archive".to_owned(),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(
+            cmd,
+            RemoteCommand::BackendAdd {
+                name: "store".to_owned(),
+                backend_type: "s3".to_owned(),
+                mount_path: "/Archive".to_owned(),
+                config_toml: "type = \"s3\"\n".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn backend_add_missing_config_is_error() {
+        assert!(
+            backend_add(
+                "store".to_owned(),
+                "s3".to_owned(),
+                "/Archive".to_owned(),
+                Path::new("/nonexistent/s3.toml"),
+            )
+            .is_err()
+        );
     }
 }

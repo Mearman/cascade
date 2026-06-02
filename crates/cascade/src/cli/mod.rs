@@ -374,6 +374,46 @@ pub enum RemoteCommands {
         #[command(subcommand)]
         command: RemoteCacheCommands,
     },
+
+    /// Push a .cascade config fragment to the remote node
+    Config {
+        #[command(subcommand)]
+        command: RemoteConfigCommands,
+    },
+
+    /// Lifecycle policy management on the remote node
+    Policy {
+        #[command(subcommand)]
+        command: RemotePolicyCommands,
+    },
+
+    /// Backend management on the remote node
+    Backend {
+        #[command(subcommand)]
+        command: RemoteBackendCommands,
+    },
+
+    /// Restart the remote node's background workers
+    Restart {
+        /// Folder scope the lifecycle:control grant covers (no wildcard — a
+        /// dangerous capability needs an explicit folder)
+        #[arg(long)]
+        scope: String,
+    },
+
+    /// Stop the remote node's background workers
+    Stop {
+        /// Folder scope the lifecycle:control grant covers (no wildcard — a
+        /// dangerous capability needs an explicit folder)
+        #[arg(long)]
+        scope: String,
+    },
+
+    /// Delegate or revoke grants on the remote node
+    Grant {
+        #[command(subcommand)]
+        command: RemoteGrantCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -386,6 +426,174 @@ pub enum RemoteCacheCommands {
         /// Path to warm
         path: String,
     },
+}
+
+#[derive(Subcommand)]
+pub enum RemoteConfigCommands {
+    /// Push a .cascade fragment file, merging it into the node's rule set
+    Push {
+        /// Path to the local .cascade fragment file (its extension selects the
+        /// format: .toml/.yaml/.json, else gitignore-style)
+        file: PathBuf,
+
+        /// Folder the fragment applies to (defaults to the node root)
+        #[arg(long)]
+        scope: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RemotePolicyCommands {
+    /// Set a lifecycle policy over a path glob on the remote node
+    Set {
+        /// Path glob the policy applies to
+        path: String,
+
+        /// Maximum file age before eviction, in seconds
+        #[arg(long)]
+        max_age_secs: Option<i64>,
+
+        /// Maximum file size before eviction, in bytes
+        #[arg(long)]
+        max_file_size: Option<i64>,
+
+        /// Priority — higher wins when policies overlap
+        #[arg(long, default_value_t = 0)]
+        priority: i32,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RemoteBackendCommands {
+    /// Register a backend on the remote node
+    Add {
+        /// Backend name (its identifier and config file stem)
+        name: String,
+
+        /// Backend type (gdrive, s3, p2p, …)
+        backend_type: String,
+
+        /// VFS mount path the backend is mounted at (the authorised scope)
+        #[arg(long)]
+        mount_path: String,
+
+        /// Path to the local TOML config fragment for the backend
+        #[arg(long = "config-file")]
+        config_file: PathBuf,
+    },
+
+    /// Remove a registered backend from the remote node
+    Remove {
+        /// Backend name to remove
+        name: String,
+
+        /// VFS mount path the backend occupied (the authorised scope)
+        #[arg(long)]
+        mount_path: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RemoteGrantCommands {
+    /// Delegate a grant to another device on the remote node
+    Add {
+        /// Device ID of the grantee
+        grantee: String,
+
+        /// Capability to confer, in its wire form (e.g. status:read)
+        #[arg(long)]
+        cap: String,
+
+        /// Scope: a folder path, or `*` for node-wide
+        #[arg(long)]
+        scope: String,
+
+        /// Optional RFC 3339 expiry timestamp
+        #[arg(long)]
+        expires: Option<String>,
+    },
+
+    /// Revoke a grant on the remote node by its row id
+    Revoke {
+        /// Grant row id (as shown by the node's `grant list`)
+        grant_id: i64,
+
+        /// Folder scope the caller's grant:admin grant covers
+        #[arg(long)]
+        scope: String,
+    },
+}
+
+impl RemoteCommands {
+    /// Map a parsed remote subcommand into the transport-side
+    /// [`remote::RemoteCommand`].
+    ///
+    /// The file-bearing variants (`config push`, `backend add`) read their
+    /// fragment from disk here, so a missing or unreadable file fails before
+    /// any transport is opened.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a referenced fragment file cannot be read.
+    pub fn into_remote_command(self) -> Result<remote::RemoteCommand> {
+        let command = match self {
+            Self::Status => remote::RemoteCommand::Status,
+            Self::Pin { path } => remote::RemoteCommand::Pin { path },
+            Self::Unpin { path } => remote::RemoteCommand::Unpin { path },
+            Self::Cache { command } => match command {
+                RemoteCacheCommands::Evict => remote::RemoteCommand::CacheEvict,
+                RemoteCacheCommands::Warm { path } => remote::RemoteCommand::CacheWarm { path },
+            },
+            Self::Config { command } => match command {
+                RemoteConfigCommands::Push { file, scope } => {
+                    remote::config_push(&file, scope.as_deref())?
+                }
+            },
+            Self::Policy { command } => match command {
+                RemotePolicyCommands::Set {
+                    path,
+                    max_age_secs,
+                    max_file_size,
+                    priority,
+                } => remote::RemoteCommand::PolicySet {
+                    path_glob: path,
+                    max_age_secs,
+                    max_file_size,
+                    priority,
+                },
+            },
+            Self::Backend { command } => match command {
+                RemoteBackendCommands::Add {
+                    name,
+                    backend_type,
+                    mount_path,
+                    config_file,
+                } => remote::backend_add(name, backend_type, mount_path, &config_file)?,
+                RemoteBackendCommands::Remove { name, mount_path } => {
+                    remote::RemoteCommand::BackendRemove { name, mount_path }
+                }
+            },
+            Self::Restart { scope } => remote::RemoteCommand::Restart { scope },
+            Self::Stop { scope } => remote::RemoteCommand::Stop { scope },
+            Self::Grant { command } => match command {
+                RemoteGrantCommands::Add {
+                    grantee,
+                    cap,
+                    scope,
+                    expires,
+                } => remote::RemoteCommand::GrantAdd {
+                    grantee,
+                    capability: cap,
+                    scope,
+                    expires,
+                },
+                RemoteGrantCommands::Revoke { grant_id, scope } => {
+                    remote::RemoteCommand::GrantRevoke { grant_id, scope }
+                }
+            },
+        };
+        Ok(command)
+    }
 }
 
 #[derive(Subcommand)]
@@ -535,19 +743,759 @@ impl Cli {
                 GrantCommands::Audit => grant::audit(ctx),
             },
             Commands::Remote { device_id, command } => {
-                let remote_command = match command {
-                    RemoteCommands::Status => remote::RemoteCommand::Status,
-                    RemoteCommands::Pin { path } => remote::RemoteCommand::Pin { path },
-                    RemoteCommands::Unpin { path } => remote::RemoteCommand::Unpin { path },
-                    RemoteCommands::Cache { command } => match command {
-                        RemoteCacheCommands::Evict => remote::RemoteCommand::CacheEvict,
-                        RemoteCacheCommands::Warm { path } => {
-                            remote::RemoteCommand::CacheWarm { path }
-                        }
-                    },
-                };
+                let remote_command = command.into_remote_command()?;
                 remote::run(ctx, &device_id, remote_command).await
             }
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+mod tests {
+    use cascade_p2p::protocol::{ManageCommand, ManageConfigFormat, ManageGrant, ManageScope};
+    use clap::Parser as _;
+
+    use super::*;
+
+    /// Parse a full `cascade remote <device-id> …` invocation and return the
+    /// device id plus the mapped transport-side command. Fails the test if the
+    /// arguments do not parse or do not resolve to a `Remote` subcommand.
+    fn parse_remote(args: &[&str]) -> (String, remote::RemoteCommand) {
+        let cli = Cli::try_parse_from(args).expect("arguments should parse");
+        match cli.command {
+            Commands::Remote { device_id, command } => {
+                (device_id, command.into_remote_command().unwrap())
+            }
+            _ => panic!("expected a remote subcommand"),
+        }
+    }
+
+    #[test]
+    fn parse_remote_status() {
+        let (device, cmd) = parse_remote(&["cascade", "remote", "PEER", "status"]);
+        assert_eq!(device, "PEER");
+        assert_eq!(cmd, remote::RemoteCommand::Status);
+        assert_eq!(cmd.to_wire(), ManageCommand::StatusRead);
+        assert_eq!(cmd.wire_scope(), ManageScope::Node);
+    }
+
+    #[test]
+    fn parse_remote_cache_warm() {
+        let (_device, cmd) =
+            parse_remote(&["cascade", "remote", "PEER", "cache", "warm", "/media"]);
+        assert_eq!(
+            cmd,
+            remote::RemoteCommand::CacheWarm {
+                path: "/media".to_owned(),
+            }
+        );
+        // `cache warm` rides a recursive pin, the same wire command the local
+        // `cache warm` produces.
+        assert_eq!(
+            cmd.to_wire(),
+            ManageCommand::Pin {
+                path_glob: "/media".to_owned(),
+                recursive: true,
+            }
+        );
+        assert_eq!(
+            cmd.wire_scope(),
+            ManageScope::Folder {
+                path: "/media".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_remote_config_push_infers_format_and_default_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("rules.toml");
+        std::fs::write(&file, "ignore = [\"*.tmp\"]\n").unwrap();
+        let file_arg = file.to_str().unwrap();
+
+        let (_device, cmd) =
+            parse_remote(&["cascade", "remote", "PEER", "config", "push", file_arg]);
+        assert_eq!(
+            cmd,
+            remote::RemoteCommand::ConfigPush {
+                folder: "/".to_owned(),
+                format: ManageConfigFormat::Toml,
+                body: "ignore = [\"*.tmp\"]\n".to_owned(),
+            }
+        );
+        assert_eq!(
+            cmd.to_wire(),
+            ManageCommand::ConfigPush {
+                format: ManageConfigFormat::Toml,
+                folder: "/".to_owned(),
+                body: "ignore = [\"*.tmp\"]\n".to_owned(),
+            }
+        );
+        // An unscoped push targets the node root.
+        assert_eq!(
+            cmd.wire_scope(),
+            ManageScope::Folder {
+                path: "/".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_remote_config_push_with_scope_and_gitignore_format() {
+        let dir = tempfile::tempdir().unwrap();
+        // An extensionless `.cascade` file is gitignore-style.
+        let file = dir.path().join(".cascade");
+        std::fs::write(&file, "*.log\n").unwrap();
+        let file_arg = file.to_str().unwrap();
+
+        let (_device, cmd) = parse_remote(&[
+            "cascade", "remote", "PEER", "config", "push", file_arg, "--scope", "/work",
+        ]);
+        assert_eq!(
+            cmd,
+            remote::RemoteCommand::ConfigPush {
+                folder: "/work".to_owned(),
+                format: ManageConfigFormat::Gitignore,
+                body: "*.log\n".to_owned(),
+            }
+        );
+        assert_eq!(
+            cmd.wire_scope(),
+            ManageScope::Folder {
+                path: "/work".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_remote_policy_set() {
+        let (_device, cmd) = parse_remote(&[
+            "cascade",
+            "remote",
+            "PEER",
+            "policy",
+            "set",
+            "/work/*.iso",
+            "--max-age-secs",
+            "86400",
+            "--max-file-size",
+            "1048576",
+            "--priority",
+            "5",
+        ]);
+        assert_eq!(
+            cmd,
+            remote::RemoteCommand::PolicySet {
+                path_glob: "/work/*.iso".to_owned(),
+                max_age_secs: Some(86_400),
+                max_file_size: Some(1_048_576),
+                priority: 5,
+            }
+        );
+        assert_eq!(
+            cmd.to_wire(),
+            ManageCommand::PolicySet {
+                path_glob: "/work/*.iso".to_owned(),
+                max_age_secs: Some(86_400),
+                max_file_size: Some(1_048_576),
+                priority: 5,
+            }
+        );
+        assert_eq!(
+            cmd.wire_scope(),
+            ManageScope::Folder {
+                path: "/work/*.iso".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_remote_policy_set_defaults_priority_and_unbounded_dimensions() {
+        let (_device, cmd) = parse_remote(&["cascade", "remote", "PEER", "policy", "set", "/work"]);
+        assert_eq!(
+            cmd,
+            remote::RemoteCommand::PolicySet {
+                path_glob: "/work".to_owned(),
+                max_age_secs: None,
+                max_file_size: None,
+                priority: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_remote_backend_add_reads_config_fragment() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("gdrive.toml");
+        std::fs::write(&config, "type = \"gdrive\"\nname = \"work\"\n").unwrap();
+        let config_arg = config.to_str().unwrap();
+
+        let (_device, cmd) = parse_remote(&[
+            "cascade",
+            "remote",
+            "PEER",
+            "backend",
+            "add",
+            "work",
+            "gdrive",
+            "--mount-path",
+            "/Work",
+            "--config-file",
+            config_arg,
+        ]);
+        assert_eq!(
+            cmd,
+            remote::RemoteCommand::BackendAdd {
+                name: "work".to_owned(),
+                backend_type: "gdrive".to_owned(),
+                mount_path: "/Work".to_owned(),
+                config_toml: "type = \"gdrive\"\nname = \"work\"\n".to_owned(),
+            }
+        );
+        assert_eq!(
+            cmd.to_wire(),
+            ManageCommand::BackendAdd {
+                name: "work".to_owned(),
+                backend_type: "gdrive".to_owned(),
+                mount_path: "/Work".to_owned(),
+                config_toml: "type = \"gdrive\"\nname = \"work\"\n".to_owned(),
+            }
+        );
+        assert_eq!(
+            cmd.wire_scope(),
+            ManageScope::Folder {
+                path: "/Work".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_remote_backend_remove() {
+        let (_device, cmd) = parse_remote(&[
+            "cascade",
+            "remote",
+            "PEER",
+            "backend",
+            "remove",
+            "work",
+            "--mount-path",
+            "/Work",
+        ]);
+        assert_eq!(
+            cmd,
+            remote::RemoteCommand::BackendRemove {
+                name: "work".to_owned(),
+                mount_path: "/Work".to_owned(),
+            }
+        );
+        assert_eq!(
+            cmd.wire_scope(),
+            ManageScope::Folder {
+                path: "/Work".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_remote_restart_and_stop_carry_their_scope() {
+        let (_device, restart) =
+            parse_remote(&["cascade", "remote", "PEER", "restart", "--scope", "/work"]);
+        assert_eq!(
+            restart,
+            remote::RemoteCommand::Restart {
+                scope: "/work".to_owned(),
+            }
+        );
+        assert_eq!(restart.to_wire(), ManageCommand::Restart);
+        // A dangerous capability is never node-wide, so the advertised scope is
+        // the explicit folder the operator named.
+        assert_eq!(
+            restart.wire_scope(),
+            ManageScope::Folder {
+                path: "/work".to_owned(),
+            }
+        );
+
+        let (_device, stop) =
+            parse_remote(&["cascade", "remote", "PEER", "stop", "--scope", "/work"]);
+        assert_eq!(stop.to_wire(), ManageCommand::Stop);
+        assert_eq!(
+            stop.wire_scope(),
+            ManageScope::Folder {
+                path: "/work".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_remote_grant_add_advertises_grant_admin_scope() {
+        let (_device, cmd) = parse_remote(&[
+            "cascade",
+            "remote",
+            "PEER",
+            "grant",
+            "add",
+            "GRANTEE",
+            "--cap",
+            "status:read",
+            "--scope",
+            "/work",
+            "--expires",
+            "2026-12-31T00:00:00Z",
+        ]);
+        assert_eq!(
+            cmd,
+            remote::RemoteCommand::GrantAdd {
+                grantee: "GRANTEE".to_owned(),
+                capability: "status:read".to_owned(),
+                scope: "/work".to_owned(),
+                expires: Some("2026-12-31T00:00:00Z".to_owned()),
+            }
+        );
+        assert_eq!(
+            cmd.to_wire(),
+            ManageCommand::GrantAdd {
+                grant: ManageGrant {
+                    grantee: "GRANTEE".to_owned(),
+                    capability: "status:read".to_owned(),
+                    scope: ManageScope::Folder {
+                        path: "/work".to_owned(),
+                    },
+                    expires: Some("2026-12-31T00:00:00Z".to_owned()),
+                },
+            }
+        );
+        // The grant command itself is authorised over the grant's scope.
+        assert_eq!(
+            cmd.wire_scope(),
+            ManageScope::Folder {
+                path: "/work".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_remote_grant_add_wildcard_scope_maps_to_node() {
+        let (_device, cmd) = parse_remote(&[
+            "cascade",
+            "remote",
+            "PEER",
+            "grant",
+            "add",
+            "GRANTEE",
+            "--cap",
+            "status:read",
+            "--scope",
+            "*",
+        ]);
+        assert_eq!(
+            cmd.to_wire(),
+            ManageCommand::GrantAdd {
+                grant: ManageGrant {
+                    grantee: "GRANTEE".to_owned(),
+                    capability: "status:read".to_owned(),
+                    scope: ManageScope::Node,
+                    expires: None,
+                },
+            }
+        );
+        assert_eq!(cmd.wire_scope(), ManageScope::Node);
+    }
+
+    #[test]
+    fn parse_remote_grant_revoke() {
+        let (_device, cmd) = parse_remote(&[
+            "cascade", "remote", "PEER", "grant", "revoke", "7", "--scope", "/work",
+        ]);
+        assert_eq!(
+            cmd,
+            remote::RemoteCommand::GrantRevoke {
+                grant_id: 7,
+                scope: "/work".to_owned(),
+            }
+        );
+        assert_eq!(
+            cmd.to_wire(),
+            ManageCommand::GrantRevoke {
+                grant_id: 7,
+                scope: ManageScope::Folder {
+                    path: "/work".to_owned(),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_remote_config_push_missing_file_fails() {
+        let cli = Cli::try_parse_from([
+            "cascade",
+            "remote",
+            "PEER",
+            "config",
+            "push",
+            "/nonexistent/rules.toml",
+        ])
+        .expect("arguments should parse");
+        let Commands::Remote { command, .. } = cli.command else {
+            panic!("expected a remote subcommand");
+        };
+        // A fragment file that cannot be read fails before any transport opens.
+        assert!(command.into_remote_command().is_err());
+    }
+
+    #[test]
+    fn parse_remote_restart_requires_scope() {
+        // The dangerous restart command has no default scope; omitting --scope
+        // is a parse error rather than a silent node-wide attempt.
+        assert!(Cli::try_parse_from(["cascade", "remote", "PEER", "restart"]).is_err());
+    }
+
+    // ── In-process loopback round-trip ──────────────────────────────────────
+    //
+    // A manager-side `SyncEngine` drives a managed node through a newly-wired
+    // command (`policy set`) end to end over loopback TCP + mutual TLS — the
+    // same wire path the daemon uses, with no real network. The manager builds
+    // the wire frame exactly as `cascade remote <id> policy set …` does: parse
+    // the CLI, map it to `RemoteCommand`, and send `to_wire()` + `wire_scope()`.
+    // The managed node authorises + audits + runs it through the real dispatch
+    // core, and the typed reply is correlated back to the caller.
+
+    mod loopback {
+        use std::sync::{Arc, Mutex};
+
+        use async_trait::async_trait;
+        use cascade_backend_p2p::index::FolderIndex;
+        use cascade_backend_p2p::sync::{Peer, SyncEngine};
+        use cascade_engine::db::AuditEntry;
+        use cascade_engine::manage::{
+            Capability, DeviceId, Grant, ManageCommandExecutor, ManageDispatch, ManageGrantStore,
+            Scope, run_dispatch,
+        };
+        use cascade_p2p::identity::DeviceIdentity;
+        use cascade_p2p::protocol::{
+            ManageCommand, ManageConfigFormat, ManageErrorKind, ManageResult, ManageScope,
+        };
+        use cascade_p2p::store::BlockStore;
+        use chrono::{DateTime, Utc};
+        use clap::Parser as _;
+        use tempfile::TempDir;
+
+        use crate::cli::{Cli, Commands, remote::RemoteCommand};
+
+        /// In-memory grant store + audit sink + recording executor: the
+        /// in-process double standing in for the daemon's `Engine`, so the
+        /// round-trip exercises the real authorise → audit → execute core
+        /// without a database or live filesystem.
+        struct TestNode {
+            grants: Vec<Grant>,
+            audit: Mutex<Vec<AuditEntry>>,
+            calls: Mutex<Vec<String>>,
+        }
+
+        impl TestNode {
+            fn new(grants: Vec<Grant>) -> Self {
+                Self {
+                    grants,
+                    audit: Mutex::new(Vec::new()),
+                    calls: Mutex::new(Vec::new()),
+                }
+            }
+
+            fn calls(&self) -> Vec<String> {
+                self.calls.lock().map(|c| c.clone()).unwrap_or_default()
+            }
+
+            fn audit_outcomes(&self) -> Vec<String> {
+                self.audit
+                    .lock()
+                    .map(|rows| rows.iter().map(|r| r.outcome.clone()).collect())
+                    .unwrap_or_default()
+            }
+
+            fn record(&self, call: &str) {
+                if let Ok(mut calls) = self.calls.lock() {
+                    calls.push(call.to_owned());
+                }
+            }
+        }
+
+        impl ManageGrantStore for TestNode {
+            fn manage_grants(&self) -> anyhow::Result<Vec<Grant>> {
+                Ok(self.grants.clone())
+            }
+
+            fn manage_grant_scope(&self, _grant_id: i64) -> anyhow::Result<Option<Scope>> {
+                Ok(None)
+            }
+
+            fn manage_append_audit(&self, entry: &AuditEntry) -> anyhow::Result<()> {
+                self.audit
+                    .lock()
+                    .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?
+                    .push(entry.clone());
+                Ok(())
+            }
+        }
+
+        #[async_trait]
+        impl ManageCommandExecutor for TestNode {
+            async fn manage_status(&self) -> anyhow::Result<String> {
+                self.record("status");
+                Ok("ok".to_owned())
+            }
+
+            async fn manage_pin(&self, path_glob: &str, recursive: bool) -> anyhow::Result<String> {
+                self.record(&format!("pin {path_glob} {recursive}"));
+                Ok(format!("pinned {path_glob}"))
+            }
+
+            async fn manage_unpin(&self, path_glob: &str) -> anyhow::Result<String> {
+                self.record(&format!("unpin {path_glob}"));
+                Ok(format!("unpinned {path_glob}"))
+            }
+
+            async fn manage_cache_evict(&self) -> anyhow::Result<String> {
+                self.record("evict");
+                Ok("evicted".to_owned())
+            }
+
+            async fn manage_cache_warm(&self, path_glob: &str) -> anyhow::Result<String> {
+                self.record(&format!("warm {path_glob}"));
+                Ok(format!("warmed {path_glob}"))
+            }
+
+            async fn manage_config_push(
+                &self,
+                format: ManageConfigFormat,
+                folder: &str,
+                _body: &str,
+            ) -> anyhow::Result<String> {
+                self.record(&format!("config_push {format:?} {folder}"));
+                Ok(format!("pushed into {folder}"))
+            }
+
+            async fn manage_policy_set(
+                &self,
+                path_glob: &str,
+                max_age_secs: Option<i64>,
+                max_file_size: Option<i64>,
+                priority: i32,
+            ) -> anyhow::Result<String> {
+                self.record(&format!(
+                    "policy_set {path_glob} {max_age_secs:?} {max_file_size:?} {priority}"
+                ));
+                Ok(format!("policy set for {path_glob}"))
+            }
+
+            async fn manage_backend_add(
+                &self,
+                name: &str,
+                backend_type: &str,
+                mount_path: &str,
+                _config_toml: &str,
+            ) -> anyhow::Result<String> {
+                self.record(&format!("backend_add {name} {backend_type} {mount_path}"));
+                Ok(format!("backend {name} added"))
+            }
+
+            async fn manage_backend_remove(
+                &self,
+                name: &str,
+                mount_path: &str,
+            ) -> anyhow::Result<String> {
+                self.record(&format!("backend_remove {name} {mount_path}"));
+                Ok(format!("backend {name} removed"))
+            }
+
+            async fn manage_restart(&self) -> anyhow::Result<String> {
+                self.record("restart");
+                Ok("restarted".to_owned())
+            }
+
+            async fn manage_stop(&self) -> anyhow::Result<String> {
+                self.record("stop");
+                Ok("stopped".to_owned())
+            }
+
+            async fn manage_grant_add(&self, grant: &Grant) -> anyhow::Result<String> {
+                self.record(&format!(
+                    "grant_add {} {}",
+                    grant.grantee,
+                    grant.capability.as_wire()
+                ));
+                Ok("grant added".to_owned())
+            }
+
+            async fn manage_grant_revoke(&self, grant_id: i64) -> anyhow::Result<String> {
+                self.record(&format!("grant_revoke {grant_id}"));
+                Ok(format!("grant {grant_id} revoked"))
+            }
+        }
+
+        #[async_trait]
+        impl ManageDispatch for TestNode {
+            async fn dispatch(
+                &self,
+                caller: &DeviceId,
+                command: ManageCommand,
+                scope: ManageScope,
+                now: DateTime<Utc>,
+            ) -> ManageResult {
+                run_dispatch(self, self, caller, command, scope, now).await
+            }
+        }
+
+        /// A bare `SyncEngine` backed by a fresh tempdir index + block store and
+        /// a freshly generated device identity. The tempdir outlives the engine.
+        fn make_engine(folder_id: &str) -> (TempDir, SyncEngine) {
+            let dir = tempfile::tempdir().unwrap();
+            let index = Arc::new(FolderIndex::open(&dir.path().join("index.db")).unwrap());
+            let blocks = Arc::new(BlockStore::new(&dir.path().join("blocks")).unwrap());
+            let identity = DeviceIdentity::load_or_generate(&dir.path().join("identity")).unwrap();
+            let engine = SyncEngine::new(folder_id.to_owned(), index, blocks, identity);
+            (dir, engine)
+        }
+
+        fn grant(grantee: &str, capability: Capability, scope: Scope) -> Grant {
+            Grant {
+                grantee: DeviceId::new(grantee.to_owned()),
+                capability,
+                scope,
+                granted_by: DeviceId::new("OWNER"),
+                expires: None,
+            }
+        }
+
+        #[tokio::test]
+        async fn manager_cli_drives_policy_set_over_loopback() {
+            // The manager builds the wire frame exactly as the CLI does: parse
+            // `cascade remote <id> policy set …`, map to RemoteCommand, send its
+            // to_wire()/wire_scope().
+            let cli = Cli::try_parse_from([
+                "cascade",
+                "remote",
+                "TARGET",
+                "policy",
+                "set",
+                "/work/reports",
+                "--max-age-secs",
+                "3600",
+                "--priority",
+                "2",
+            ])
+            .unwrap();
+            let Commands::Remote { command, .. } = cli.command else {
+                panic!("expected remote subcommand");
+            };
+            let remote_command = command.into_remote_command().unwrap();
+            assert_eq!(
+                remote_command,
+                RemoteCommand::PolicySet {
+                    path_glob: "/work/reports".to_owned(),
+                    max_age_secs: Some(3600),
+                    max_file_size: None,
+                    priority: 2,
+                }
+            );
+
+            let (_manager_dir, manager) = make_engine("shared");
+            let manager_id = manager.device_id().to_owned();
+
+            // The node grants the manager policy:set over /work — exactly what
+            // `cascade grant add MANAGER --cap policy:set --scope /work` persists.
+            let node = Arc::new(TestNode::new(vec![grant(
+                &manager_id,
+                Capability::PolicySet,
+                Scope::folder("/work"),
+            )]));
+
+            let (_target_dir, target) = make_engine("shared");
+            let dispatch: Arc<dyn ManageDispatch> = node.clone();
+            let target = target.with_manage_dispatch(dispatch);
+            let target_id = target.device_id().to_owned();
+
+            target.trust(manager_id.clone()).await;
+            manager.trust(target_id.clone()).await;
+
+            let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            let (addr, _task) = target
+                .start_listener("127.0.0.1:0".parse().unwrap(), cancel_rx)
+                .await
+                .unwrap();
+            manager
+                .connect_to(Peer {
+                    device_id: target_id.clone(),
+                    address: addr,
+                })
+                .await
+                .unwrap();
+
+            for _ in 0..100 {
+                if manager.has_peer(&target_id).await {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(
+                manager.has_peer(&target_id).await,
+                "manager never established a session with the target node",
+            );
+
+            // Drive the newly-wired policy set end to end.
+            let result = manager
+                .send_manage_request(
+                    &target_id,
+                    remote_command.to_wire(),
+                    remote_command.wire_scope(),
+                )
+                .await
+                .expect("policy set round-trip should not fail at the transport");
+            assert!(
+                matches!(result, ManageResult::Ok { .. }),
+                "authorised policy:set should succeed, got {result:?}",
+            );
+            assert_eq!(
+                node.calls(),
+                vec!["policy_set /work/reports Some(3600) None 2".to_owned()],
+                "the node must have run the policy set with the wired arguments",
+            );
+            assert_eq!(node.audit_outcomes(), vec!["allowed".to_owned()]);
+
+            // A policy set OUTSIDE the granted scope is refused by the node —
+            // the same CLI mapping, a different path.
+            let outside = Cli::try_parse_from([
+                "cascade",
+                "remote",
+                "TARGET",
+                "policy",
+                "set",
+                "/personal/secret",
+            ])
+            .unwrap();
+            let Commands::Remote { command, .. } = outside.command else {
+                panic!("expected remote subcommand");
+            };
+            let outside = command.into_remote_command().unwrap();
+            let denied = manager
+                .send_manage_request(&target_id, outside.to_wire(), outside.wire_scope())
+                .await
+                .expect("an unauthorised policy set still returns a typed reply");
+            assert!(
+                matches!(
+                    denied,
+                    ManageResult::Err {
+                        kind: ManageErrorKind::Unauthorised,
+                        ..
+                    }
+                ),
+                "a policy set outside the granted scope must be refused, got {denied:?}",
+            );
+            assert_eq!(
+                node.calls().len(),
+                1,
+                "the denied policy set must not have run a side effect",
+            );
         }
     }
 }
