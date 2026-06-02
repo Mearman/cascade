@@ -118,10 +118,14 @@ cascade/
 │   │       │   ├── xdr.rs        # XDR encode/decode (BEP uses XDR)
 │   │       │   └── hello.rs      # ClusterConfig exchange
 │   │       ├── discovery/
-│   │       │   ├── mod.rs
-│   │       │   ├── local.rs      # UDP multicast (LAN)
-│   │       │   ├── global.rs     # Global discovery server client
-│   │       │   └── relay.rs      # Relay connection
+│   │       │   ├── mod.rs        # Discovery trait + DiscoveryService (concurrent fan-out, dedupe, priority order)
+│   │       │   ├── lan.rs        # UDP multicast (LAN, zero config)
+│   │       │   ├── gossip.rs     # Introducer-gossip source (reads the PeerBook)
+│   │       │   └── announce.rs   # Announce-server source + shared wire types (behind the `announce` feature)
+│   │       ├── relay.rs          # WebSocket relay client (blind byte-pipe, TLS through the tunnel)
+│   │       ├── traversal.rs      # Connectivity strategy + hole-punch state machine
+│   │       ├── nat.rs            # STUN binding requests, NAT-type detection, candidate gathering
+│   │       ├── candidate.rs      # ICE-style candidates and RFC 8445 priority arithmetic
 │   │       ├── block/
 │   │       │   ├── mod.rs
 │   │       │   ├── store.rs      # BlockStore — split, hash, reassemble
@@ -1007,20 +1011,32 @@ Cloud remains the authority for cloud-backed folders. P2P is an optimisation for
 
 ### Peer discovery
 
-| Method | How | Scope |
-|--------|-----|-------|
-| Local | UDP multicast on port 21027 | LAN, zero config |
-| Global | Announce to discovery server (self-hosted or default) | WAN |
-| Configured | Static addresses in config | Any |
-| Relay | Route through relay server when both peers behind NAT | WAN (fallback) |
+Discovery turns a peer's device ID into a set of reachable [candidates](#nat-traversal). Each mechanism implements the `Discovery` trait and is composed behind `DiscoveryService`, which fans every source out concurrently, deduplicates the union by `(address, kind)`, and orders the survivors by descending RFC 8445 priority. The engine depends only on the trait, never on a concrete source. The sources live under `crates/p2p/src/discovery/`:
+
+| Source | Module | How | Needs an operated server? |
+|--------|--------|-----|---------------------------|
+| LAN multicast | `lan.rs` | UDP multicast group on port 21027 | No — serverless, zero config |
+| Introducer gossip | `gossip.rs` | Reads the `PeerBook` that introducer gossip fills, so peers learned transitively through trusted devices surface without any directory | No — serverless |
+| Announce server | `announce.rs` | A rendezvous directory: a device registers its candidates keyed by device ID (`POST <base>/announce/<id>`), any other device looks them up (`GET <base>/announce/<id>`) | Yes — an operated announce endpoint (behind the `announce` cargo feature) |
+
+LAN multicast and gossip cover peers that share a network segment or a trust path; neither reaches two devices that have never met and sit on different networks. The announce server closes that gap. It stores and serves only candidate sets — it never carries payload traffic — so a looker-up connects directly (or via a relay) using the connectivity stack once it holds the candidates. A DHT — Syncthing's global-discovery model — is the planned serverless replacement for the announce server's "find an unknown peer" role, deferred as a follow-on because of its operational weight; the `Discovery` trait already accommodates it as another source.
 
 ### Device identity
 
-Each device generates a TLS certificate on first run. The device ID is the SHA-256 of the certificate, encoded as a base32 string (same as Syncthing). All P2P connections are TLS-encrypted and authenticated by device ID.
+Each device generates a TLS certificate on first run. The device ID is the SHA-256 of the certificate, encoded as a base32 string (same as Syncthing). All P2P connections are TLS-encrypted and authenticated by device ID — trusted fingerprints are pinned at the rustls verifier so the handshake fails for any unapproved peer before a byte is exchanged.
 
 ### NAT traversal
 
-v1 supports hole punching via STUN (works for most NAT types) and static addresses. Relay fallback for uncooperative NATs can come later.
+Once discovery yields candidates, the connectivity ladder climbs from the cheapest, fully serverless path to the most operationally heavy, stopping at the first rung that works:
+
+1. **LAN multicast** — devices on the same segment find and dial each other directly. Serverless.
+2. **Static / gossip candidates** — addresses configured statically or learned through introducer gossip, dialled directly. Serverless.
+3. **Observed (server-reflexive) direct** — a STUN binding request (`nat.rs`, RFC 5389; full NAT-type classification via the RFC 5780 two-server probe) reveals the device's externally observed mapping, advertised as a server-reflexive candidate so a peer can dial the mapping directly. STUN is a query-only echo, not a relay — but it is an operated endpoint.
+4. **Hole punch** — when both ends sit behind punchable NATs, `traversal.rs` runs a synchronised, deterministic probe burst (ICE-style pairing per RFC 8445, coordinated over the existing gossip channel à la libp2p DCUtR). Serverless apart from the STUN endpoint already used to gather candidates.
+5. **Peer relay** — an `Open`- or `FullCone`-typed device whose volunteer policy permits it advertises itself as a relay (`BepMessage::RelayOffer`); a stuck pair bridges through it (`BepMessage::RelayConnect`, `RelayRoute::Peer`). Serverless — the relay is just another participating device.
+6. **Operated relay** — last resort. Traffic tunnels through a configured relay server (`relay.rs`, `RelayRoute::Operated`) as a blind byte-pipe: the two ends negotiate TLS *through* the tunnel, so the operator sees only opaque ciphertext. This is the one rung that requires a dedicated operated server (`crates/relay-server/`).
+
+`decide_connectivity` (`traversal.rs`) picks the strategy from the local and remote NAT types and the remote's advertised candidates, preferring a volunteering peer relay over an operated one whenever a punch is not viable. So the only rungs that depend on an operated server are the optional announce-server discovery source, the STUN endpoint used to observe reflexive mappings, and the operated-relay fallback; everything else — LAN multicast, static/gossip candidates, hole punching, and peer relays — is fully serverless.
 
 The [`stun-rs`](https://crates.io/crates/stun-rs) crate handles STUN binding requests.
 
