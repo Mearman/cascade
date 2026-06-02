@@ -17,7 +17,7 @@ use cascade_backend_gdrive::create_backend;
 use cascade_engine::backend::Backend;
 use cascade_engine::types::{FileId, ItemId};
 use serde_json::json;
-use wiremock::matchers::{method, path, query_param};
+use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ── Test helpers ─────────────────────────────────────────────────────────────
@@ -354,6 +354,91 @@ async fn download_writes_file_content() {
     let writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send) = &mut buf;
     backend.download(&entry, writer).await.unwrap();
     assert_eq!(buf, b"hello drive");
+}
+
+// ── read_range ──────────────────────────────────────────────────────────────────
+
+/// Build a non-directory `FileEntry` for the range-read tests.
+fn range_entry(native_id: &str, size: u64) -> cascade_engine::types::FileEntry {
+    cascade_engine::types::FileEntry {
+        id: ItemId::new("gdrive-test-account", native_id),
+        parent_id: ItemId::new("gdrive-test-account", "root"),
+        name: "file.txt".to_string(),
+        is_dir: false,
+        size: Some(size),
+        mod_time: None,
+        mime_type: Some("text/plain".to_string()),
+        hash: None,
+    }
+}
+
+#[tokio::test]
+async fn read_range_returns_partial_content_slice() {
+    // A compliant server honours the Range header and replies 206 with exactly
+    // the requested window. read_range must return it verbatim.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/files/file-rr"))
+        .and(query_param("alt", "media"))
+        .and(header("range", "bytes=6-10"))
+        .respond_with(ResponseTemplate::new(206).set_body_bytes(b"world"))
+        .mount(&server)
+        .await;
+
+    let backend = make_backend(&server);
+    let entry = range_entry("file-rr", 11);
+    let bytes = backend.read_range(&entry, 6, 5).await.unwrap();
+    assert_eq!(bytes, b"world");
+}
+
+#[tokio::test]
+async fn read_range_slices_when_server_ignores_range() {
+    // A server that ignores the Range header replies 200 with the whole body.
+    // read_range must slice [offset, offset + length) client-side so the
+    // contract still holds.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/files/file-full"))
+        .and(query_param("alt", "media"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello world"))
+        .mount(&server)
+        .await;
+
+    let backend = make_backend(&server);
+    let entry = range_entry("file-full", 11);
+    // Mid-range slice from the full body.
+    assert_eq!(backend.read_range(&entry, 6, 5).await.unwrap(), b"world");
+    // Length past EOF clamps to what's available.
+    assert_eq!(backend.read_range(&entry, 6, 999).await.unwrap(), b"world");
+}
+
+#[tokio::test]
+async fn read_range_empty_when_offset_past_eof() {
+    // The offset lies at or past the end of the file. Drive answers 416 Range
+    // Not Satisfiable, which read_range maps to an empty result, not an error.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/files/file-eof"))
+        .and(query_param("alt", "media"))
+        .respond_with(ResponseTemplate::new(416))
+        .mount(&server)
+        .await;
+
+    let backend = make_backend(&server);
+    let entry = range_entry("file-eof", 11);
+    let bytes = backend.read_range(&entry, 100, 10).await.unwrap();
+    assert!(bytes.is_empty());
+}
+
+#[tokio::test]
+async fn read_range_zero_length_makes_no_request() {
+    // A zero-length read returns empty without issuing any HTTP request — the
+    // mock server has no routes registered, so a request would 404 and fail.
+    let server = MockServer::start().await;
+    let backend = make_backend(&server);
+    let entry = range_entry("file-zero", 11);
+    let bytes = backend.read_range(&entry, 0, 0).await.unwrap();
+    assert!(bytes.is_empty());
 }
 
 // ── create_dir ────────────────────────────────────────────────────────────────

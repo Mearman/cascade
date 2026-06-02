@@ -685,6 +685,30 @@ impl Backend for GdriveBackend {
         Ok(())
     }
 
+    async fn read_range(
+        &self,
+        file: &FileEntry,
+        offset: u64,
+        length: u32,
+    ) -> anyhow::Result<Vec<u8>> {
+        let token = self.access_token().await?;
+        let remote_id = file.id.native_id();
+
+        let bytes = self
+            .drive
+            .download_range(remote_id, &token, offset, length)
+            .await?;
+
+        tracing::debug!(
+            file = %file.id,
+            offset,
+            length,
+            returned = bytes.len(),
+            "read range",
+        );
+        Ok(bytes)
+    }
+
     async fn upload(
         &self,
         path: &Path,
