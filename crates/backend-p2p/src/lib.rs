@@ -284,6 +284,28 @@ pub struct DhtConfig {
     pub bootstrap_nodes: Vec<std::net::SocketAddr>,
 }
 
+/// A configured announce server: its base URL and the shared secret this
+/// device authenticates its writes to it with.
+///
+/// The announce directory is a soft-state rendezvous that only holders of a
+/// shared secret may write to — both carriers (the relay-server endpoint and
+/// the Cloudflare Worker) reject a `POST` whose `HMAC` write tag is missing or
+/// wrong. The secret is therefore not optional: an announce server configured
+/// without it could resolve peers but never publish this device's candidates,
+/// which would leave the device undiscoverable through that server. Modelling
+/// the secret as a required field makes that misconfiguration a parse error
+/// rather than a silent runtime `401`. The 32-byte width matches the shared
+/// `HMAC` key length.
+#[derive(Debug, Clone)]
+pub struct AnnounceServer {
+    /// Scheme-and-authority root of the announce server (e.g.
+    /// `https://announce.example`). The `/announce/<device_id>` path is
+    /// appended per request.
+    pub base_url: String,
+    /// 32-byte shared secret keying the `HMAC` write tag on every register.
+    pub secret: [u8; cascade_p2p::discovery::announce::SHARED_SECRET_LEN],
+}
+
 /// Configuration for a P2P backend instance.
 #[derive(Debug)]
 pub struct P2pBackendConfig {
@@ -321,16 +343,17 @@ pub struct P2pBackendConfig {
     /// that responds wins on the single-server path, and the first two feed
     /// the RFC 5780 two-server path.
     pub stun_servers: Vec<String>,
-    /// Announce-server base URLs (scheme-and-authority roots, e.g.
-    /// `https://announce.example`). When non-empty, an
+    /// Announce servers — each a base URL paired with the shared secret this
+    /// device authenticates its writes with. When non-empty, an
     /// [`cascade_p2p::discovery::announce::AnnounceDiscovery`] source is
-    /// registered for each, so the device publishes its candidates to and
-    /// resolves peers against those servers. Empty disables announce-server
-    /// discovery — the device relies on LAN multicast and introducer gossip
-    /// alone. Whether the configured servers are actually contacted is
-    /// governed by the [`exposure`](Self::exposure) posture, which must be
-    /// [`DiscoveryReach::Public`] for any global-directory publication.
-    pub announce_servers: Vec<String>,
+    /// registered for each, so the device publishes its candidates to (using
+    /// the secret as the `HMAC` write key) and resolves peers against those
+    /// servers. Empty disables announce-server discovery — the device relies on
+    /// LAN multicast and introducer gossip alone. Whether the configured servers
+    /// are actually contacted is governed by the [`exposure`](Self::exposure)
+    /// posture, which must be [`DiscoveryReach::Public`] for any global-directory
+    /// publication.
+    pub announce_servers: Vec<AnnounceServer>,
     /// Kademlia/Mainline-DHT discovery configuration — *where to point* the
     /// DHT source. A [`cascade_p2p::discovery::DhtDiscovery`] backed by the
     /// `BitTorrent` Mainline DHT publishes this device's candidate set into
@@ -649,20 +672,24 @@ impl P2pBackend {
             // is constructed or run.
             let publish_globally = cfg_exposure.permits_global_directory();
 
-            // Register an announce-server source for each configured base
-            // URL. Self-activates only at `Public` posture with a configured
-            // server; a client that fails to construct (HTTP/TLS backend
-            // init) is logged and skipped rather than aborting backend open,
-            // so the other discovery sources still function.
+            // Register an announce-server source for each configured server.
+            // Self-activates only at `Public` posture with a configured
+            // server; each source carries its server's shared secret so its
+            // registrations carry a verifying `HMAC` write tag. A client that
+            // fails to construct (HTTP/TLS backend init) is logged and skipped
+            // rather than aborting backend open, so the other discovery sources
+            // still function.
             if publish_globally {
-                for base_url in &cfg_announce_servers {
-                    match cascade_p2p::discovery::announce::AnnounceDiscovery::new(base_url.clone())
-                    {
+                for server in &cfg_announce_servers {
+                    match cascade_p2p::discovery::announce::AnnounceDiscovery::new(
+                        server.base_url.clone(),
+                        server.secret,
+                    ) {
                         Ok(source) => discovery.register(Box::new(source)),
                         Err(e) => tracing::warn!(
                             target: "cascade::backend::p2p",
                             instance = %cfg_instance_id,
-                            announce_server = %base_url,
+                            announce_server = %server.base_url,
                             error = %e,
                             "could not construct announce-server discovery client; skipping",
                         ),
@@ -889,12 +916,15 @@ impl P2pBackend {
         // LAN multicast is permitted at every posture — it is the floor.
         discovery.register(Box::new(LanDiscovery::new()));
         if self.cfg.exposure.permits_global_directory() {
-            for base_url in &self.cfg.announce_servers {
-                match cascade_p2p::discovery::announce::AnnounceDiscovery::new(base_url.clone()) {
+            for server in &self.cfg.announce_servers {
+                match cascade_p2p::discovery::announce::AnnounceDiscovery::new(
+                    server.base_url.clone(),
+                    server.secret,
+                ) {
                     Ok(source) => discovery.register(Box::new(source)),
                     Err(e) => tracing::warn!(
                         target: "cascade::backend::p2p",
-                        announce_server = %base_url,
+                        announce_server = %server.base_url,
                         error = %e,
                         "could not construct announce-server discovery client for management resolution; skipping",
                     ),
@@ -1706,22 +1736,26 @@ const ANNOUNCE_PUBLISH_INTERVAL: std::time::Duration = std::time::Duration::from
 /// Exits as soon as `cancel` flips to `true`.
 async fn announce_server_publish_loop(
     instance_id: &str,
-    announce_servers: Vec<String>,
+    announce_servers: Vec<AnnounceServer>,
     sync: SyncEngine,
     mut cancel: tokio::sync::watch::Receiver<bool>,
 ) {
-    // Build the clients once. A client whose construction fails is logged
-    // and omitted — the others still publish.
+    // Build the clients once, each holding its server's shared secret so its
+    // registrations carry a verifying write tag. A client whose construction
+    // fails is logged and omitted — the others still publish.
     let clients: Vec<cascade_p2p::discovery::announce::AnnounceDiscovery> = announce_servers
         .iter()
-        .filter_map(|base_url| {
-            match cascade_p2p::discovery::announce::AnnounceDiscovery::new(base_url.clone()) {
+        .filter_map(|server| {
+            match cascade_p2p::discovery::announce::AnnounceDiscovery::new(
+                server.base_url.clone(),
+                server.secret,
+            ) {
                 Ok(client) => Some(client),
                 Err(e) => {
                     tracing::warn!(
                         target: "cascade::backend::p2p",
                         instance = %instance_id,
-                        announce_server = %base_url,
+                        announce_server = %server.base_url,
                         error = %e,
                         "could not construct announce-server client for publish loop; skipping",
                     );
@@ -1894,10 +1928,13 @@ async fn discovery_listen_loop(
 ///   the public defaults ([`DEFAULT_PUBLIC_STUN_SERVERS`]) so NAT detection
 ///   works out of the box; supplying a non-empty list overrides them; an
 ///   explicit empty list disables STUN.
-/// - `announce_servers` (optional) — array of announce-server base URLs
-///   (e.g. `https://announce.example`) — *where to point* the announce
-///   source. It self-activates only at `public` exposure with at least one
-///   server configured.
+/// - `announce_servers` (optional) — array of announce-server tables, each
+///   `{ url = "https://announce.example", shared_secret = "<64 hex>" }`: `url`
+///   is the scheme-and-authority root — *where to point* the announce source —
+///   and `shared_secret` is the 64-char hex `HMAC` write key the device
+///   authenticates its registrations with (both carriers reject a write without
+///   a verifying tag). The source self-activates only at `public` exposure with
+///   at least one server configured.
 /// - `dht_bootstrap_nodes` (optional) — array of `host:port` Mainline-DHT
 ///   bootstrap nodes used to join the DHT. Omitted or explicitly empty falls
 ///   back to the named public default
@@ -1958,8 +1995,7 @@ pub fn open_from_config(config: &toml::Value) -> Result<P2pBackend> {
     // silently disable NAT detection out of the box.
     let configured_stun_servers = parse_string_list(config.get("stun_servers"), "stun_servers")?;
     let stun_servers = resolve_stun_servers(configured_stun_servers);
-    let announce_servers =
-        parse_string_list(config.get("announce_servers"), "announce_servers")?.unwrap_or_default();
+    let announce_servers = parse_announce_servers(config.get("announce_servers"))?;
     let dht = parse_dht_config(config)?;
     let relay_endpoints = config
         .get("relay_endpoints")
@@ -2181,6 +2217,47 @@ fn parse_exposure(input: &str) -> Result<DiscoveryReach> {
             anyhow::bail!("exposure must be one of `lan-only`, `private`, `public`, got `{other}`")
         }
     }
+}
+
+/// Parse the `announce_servers` config into [`AnnounceServer`] entries.
+///
+/// Each entry is a table `{ url = "...", shared_secret = "<64 hex>" }`. The
+/// secret is required, not optional: the announce write contract is
+/// authenticated on both carriers, so an entry without a secret could only ever
+/// resolve, never publish, leaving this device undiscoverable through that
+/// server. Surfacing that as a parse error is louder and more useful than a
+/// runtime `401`. The hex secret is decoded by the shared
+/// [`cascade_announce_wire::auth::parse_shared_secret_hex`] primitive — the same
+/// one the relay handshake and the Worker use — so all surfaces agree on the key
+/// width and the hex form. An absent key yields an empty list (announce-server
+/// discovery off); a present-but-not-an-array value, a non-table entry, a
+/// missing field, or a malformed secret are all errors.
+fn parse_announce_servers(value: Option<&toml::Value>) -> Result<Vec<AnnounceServer>> {
+    let Some(raw) = value else {
+        return Ok(Vec::new());
+    };
+    let arr = raw
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("announce_servers must be an array of tables"))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for (idx, item) in arr.iter().enumerate() {
+        let table = item
+            .as_table()
+            .ok_or_else(|| anyhow::anyhow!("announce_servers[{idx}] must be a table"))?;
+        let base_url = table
+            .get("url")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("announce_servers[{idx}].url required"))?
+            .to_string();
+        let hex_secret = table
+            .get("shared_secret")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("announce_servers[{idx}].shared_secret required"))?;
+        let secret = cascade_p2p::discovery::announce::parse_shared_secret_hex(hex_secret)
+            .map_err(|e| anyhow::anyhow!("announce_servers[{idx}].shared_secret invalid: {e}"))?;
+        out.push(AnnounceServer { base_url, secret });
+    }
+    Ok(out)
 }
 
 /// Parse the `relay_volunteer` policy from its lowercase string form.
@@ -2708,7 +2785,7 @@ mod tests {
         // An absent key must stay `None` so callers can apply their own
         // defaults rather than seeing an empty list.
         let value = toml::from_str::<toml::Value>(r#"name = "x""#).unwrap();
-        let parsed = parse_string_list(value.get("announce_servers"), "announce_servers").unwrap();
+        let parsed = parse_string_list(value.get("stun_servers"), "stun_servers").unwrap();
         assert!(parsed.is_none());
     }
 
@@ -2717,23 +2794,20 @@ mod tests {
         // A present-but-empty array is distinct from absent: it yields
         // `Some(vec![])` so the absent-versus-configured-empty distinction
         // survives the TOML boundary.
-        let value = toml::from_str::<toml::Value>("name = \"x\"\nannounce_servers = []").unwrap();
-        let parsed = parse_string_list(value.get("announce_servers"), "announce_servers").unwrap();
+        let value = toml::from_str::<toml::Value>("name = \"x\"\nstun_servers = []").unwrap();
+        let parsed = parse_string_list(value.get("stun_servers"), "stun_servers").unwrap();
         assert_eq!(parsed, Some(Vec::new()));
     }
 
     #[test]
     fn parse_string_list_rejects_non_string_entry() {
         // A non-string array entry must fail loudly with its index rather
-        // than being silently dropped, which would leave a configured
-        // rendezvous server quietly uncontacted.
-        let value = toml::from_str::<toml::Value>(
-            "name = \"x\"\nannounce_servers = [\"https://a.example\", 42]",
-        )
-        .unwrap();
-        let err = parse_string_list(value.get("announce_servers"), "announce_servers")
+        // than being silently dropped.
+        let value =
+            toml::from_str::<toml::Value>("name = \"x\"\nstun_servers = [\"a:1\", 42]").unwrap();
+        let err = parse_string_list(value.get("stun_servers"), "stun_servers")
             .expect_err("non-string entry must error");
-        assert!(err.to_string().contains("announce_servers[1]"));
+        assert!(err.to_string().contains("stun_servers[1]"));
     }
 
     #[test]
@@ -2744,6 +2818,79 @@ mod tests {
         let err = parse_string_list(value.get("stun_servers"), "stun_servers")
             .expect_err("non-array value must error");
         assert!(err.to_string().contains("stun_servers must be an array"));
+    }
+
+    /// 64-char hex string for a secret whose bytes are all `0xAB`.
+    fn hex_secret() -> String {
+        "ab".repeat(cascade_p2p::discovery::announce::SHARED_SECRET_LEN)
+    }
+
+    #[test]
+    fn parse_announce_servers_absent_is_empty() {
+        let value = toml::from_str::<toml::Value>(r#"name = "x""#).unwrap();
+        let parsed = parse_announce_servers(value.get("announce_servers")).unwrap();
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn parse_announce_servers_reads_url_and_secret() {
+        let cfg = format!(
+            "name = \"x\"\n[[announce_servers]]\nurl = \"https://a.example\"\nshared_secret = \"{}\"\n",
+            hex_secret()
+        );
+        let value = toml::from_str::<toml::Value>(&cfg).unwrap();
+        let parsed = parse_announce_servers(value.get("announce_servers")).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].base_url, "https://a.example");
+        assert_eq!(
+            parsed[0].secret,
+            [0xAB; cascade_p2p::discovery::announce::SHARED_SECRET_LEN]
+        );
+    }
+
+    #[test]
+    fn parse_announce_servers_requires_a_secret() {
+        // A URL with no secret could only resolve, never publish — a silent
+        // half-broken state. The parser must reject it loudly instead.
+        let cfg = "name = \"x\"\n[[announce_servers]]\nurl = \"https://a.example\"\n";
+        let value = toml::from_str::<toml::Value>(cfg).unwrap();
+        let err = parse_announce_servers(value.get("announce_servers"))
+            .expect_err("missing secret must error");
+        assert!(err.to_string().contains("shared_secret required"));
+    }
+
+    #[test]
+    fn parse_announce_servers_requires_a_url() {
+        let cfg = format!(
+            "name = \"x\"\n[[announce_servers]]\nshared_secret = \"{}\"\n",
+            hex_secret()
+        );
+        let value = toml::from_str::<toml::Value>(&cfg).unwrap();
+        let err = parse_announce_servers(value.get("announce_servers"))
+            .expect_err("missing url must error");
+        assert!(err.to_string().contains("url required"));
+    }
+
+    #[test]
+    fn parse_announce_servers_rejects_a_malformed_secret() {
+        let cfg = "name = \"x\"\n[[announce_servers]]\nurl = \"https://a.example\"\nshared_secret = \"nothex\"\n";
+        let value = toml::from_str::<toml::Value>(cfg).unwrap();
+        let err = parse_announce_servers(value.get("announce_servers"))
+            .expect_err("malformed secret must error");
+        assert!(err.to_string().contains("shared_secret invalid"));
+    }
+
+    #[test]
+    fn parse_announce_servers_rejects_a_non_table_entry() {
+        let value =
+            toml::from_str::<toml::Value>("name = \"x\"\nannounce_servers = [\"https://a\"]")
+                .unwrap();
+        let err = parse_announce_servers(value.get("announce_servers"))
+            .expect_err("non-table entry must error");
+        assert!(
+            err.to_string()
+                .contains("announce_servers[0] must be a table")
+        );
     }
 
     #[test]
@@ -3034,8 +3181,12 @@ mod tests {
             // configured server.
             exposure: DiscoveryReach::Public,
             // An address with no server listening — the publish loop's
-            // register calls fail and are swallowed best-effort.
-            announce_servers: vec!["http://127.0.0.1:1".to_string()],
+            // register calls fail and are swallowed best-effort. The secret is
+            // immaterial here since no carrier ever receives the request.
+            announce_servers: vec![AnnounceServer {
+                base_url: "http://127.0.0.1:1".to_string(),
+                secret: [0u8; cascade_p2p::discovery::announce::SHARED_SECRET_LEN],
+            }],
             ..Default::default()
         };
         let backend = P2pBackend::open(cfg).unwrap();
