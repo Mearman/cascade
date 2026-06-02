@@ -243,39 +243,14 @@ pub fn backend_add(
         "p2p" => {
             println!("\nP2P configuration:");
 
-            let initial_listen_addr = read_input("Listen address (host:port, blank to disable)")?;
+            let listen_addr = read_input("Listen address (host:port, blank to disable)")?;
             let display_name = read_input("Display name (blank for backend name)")?;
             let device_name = read_input(
                 "Device name (friendly name for THIS device, blank to use the 8-char device ID)",
             )?;
             let data_dir =
                 read_input("Data directory (blank for default ~/.config/cascade/p2p-<name>)")?;
-            let enable_discovery_raw = read_input("Enable LAN discovery? (y/N)")?;
-            let initial_enable_discovery = matches!(
-                enable_discovery_raw.to_ascii_lowercase().as_str(),
-                "y" | "yes"
-            );
-
-            // Discovery is inert without a listen address. Re-prompt the user
-            // before silently disabling so the config matches their intent.
-            let follow_up_listen_addr =
-                if initial_enable_discovery && initial_listen_addr.is_empty() {
-                    eprintln!(
-                        "LAN discovery requires a listen address — the BEP listener is what \
-                         responds to multicast announcements."
-                    );
-                    read_input("Set listen_addr now? (host:port, blank to disable discovery)")?
-                } else {
-                    String::new()
-                };
-            let (listen_addr, enable_discovery) = reconcile_discovery(
-                &initial_listen_addr,
-                initial_enable_discovery,
-                &follow_up_listen_addr,
-            );
-            if initial_enable_discovery && !enable_discovery {
-                eprintln!("Discovery disabled (no listen address provided).");
-            }
+            let exposure = prompt_exposure()?;
 
             let mut peers: Vec<(String, String, Option<String>)> = Vec::new();
             loop {
@@ -335,8 +310,13 @@ pub fn backend_add(
             if !listen_addr.is_empty() {
                 full_config.insert("listen_addr".to_string(), toml::Value::String(listen_addr));
             }
-            if enable_discovery {
-                full_config.insert("enable_discovery".to_string(), toml::Value::Boolean(true));
+            // Only emit `exposure` when it differs from the Private default,
+            // so a default-posture config stays clean.
+            if let Some(value) = exposure {
+                full_config.insert(
+                    "exposure".to_string(),
+                    toml::Value::String(value.to_string()),
+                );
             }
             let config_str = render_p2p_config(&full_config, &peers)?;
             std::fs::write(&config_path, &config_str)?;
@@ -475,30 +455,35 @@ fn read_input(prompt: &str) -> Result<String> {
     Ok(input.trim().to_string())
 }
 
-/// Resolve the listen address and discovery flag for the p2p wizard.
+/// Prompt for the p2p exposure posture, returning the TOML value to emit, or
+/// `None` to leave the key out (the Private default).
 ///
-/// `enable_discovery && listen_addr.is_some()` is the contract `P2pBackend`
-/// enforces — discovery without a listen address is silently inert. This
-/// function reconciles the initial wizard inputs with the follow-up prompt
-/// shown when the user asked for discovery without a listen address:
-///
-/// - Discovery disabled, or listen address already set: pass through.
-/// - Discovery requested with blank listen address and a non-empty follow-up:
-///   adopt the follow-up address and keep discovery on.
-/// - Discovery requested with blank listen address and a blank follow-up:
-///   disable discovery.
-fn reconcile_discovery(
-    initial_listen_addr: &str,
-    enable_discovery: bool,
-    follow_up_listen_addr: &str,
-) -> (String, bool) {
-    if !enable_discovery || !initial_listen_addr.is_empty() {
-        return (initial_listen_addr.to_string(), enable_discovery);
+/// The posture decides how far the device reaches out for peers: `lan-only`
+/// confines it to the segment, `private` (the default) adds gossip, hole
+/// punch, and peer relay among trusted peers, and `public` additionally
+/// publishes to the DHT and announce servers. An unrecognised answer falls
+/// back to the default rather than rejecting input mid-wizard. `None` is
+/// returned for the default so a default-posture config omits the key.
+fn prompt_exposure() -> Result<Option<&'static str>> {
+    let raw =
+        read_input("Exposure posture — lan-only / private / public (blank for private default)")?;
+    let lowered = raw.to_ascii_lowercase();
+    if exposure_from_input(&lowered).is_none() && !lowered.is_empty() && lowered != "private" {
+        eprintln!("Unrecognised posture `{raw}`; defaulting to private.");
     }
-    if follow_up_listen_addr.is_empty() {
-        (String::new(), false)
-    } else {
-        (follow_up_listen_addr.to_string(), true)
+    Ok(exposure_from_input(&lowered))
+}
+
+/// Map a lowercased posture answer to the TOML value to emit, or `None` for
+/// the Private default (blank, `private`, or anything unrecognised).
+///
+/// Pure mapping split out from [`prompt_exposure`] so the wizard's
+/// posture-to-config decision is unit-testable without driving stdin.
+fn exposure_from_input(lowered: &str) -> Option<&'static str> {
+    match lowered {
+        "lan-only" => Some("lan-only"),
+        "public" => Some("public"),
+        _ => None,
     }
 }
 
@@ -938,42 +923,27 @@ mod tests {
         );
     }
 
-    // ── reconcile_discovery ──
+    // ── exposure_from_input ──
 
-    /// Discovery off: `listen_addr` passes through unchanged, discovery stays off.
+    /// Blank or `private` → the default posture, emitted as no key.
     #[test]
-    fn reconcile_discovery_off_is_passthrough() {
-        assert_eq!(reconcile_discovery("", false, ""), (String::new(), false),);
-        assert_eq!(
-            reconcile_discovery("0.0.0.0:22000", false, ""),
-            ("0.0.0.0:22000".to_string(), false),
-        );
+    fn exposure_from_input_blank_or_private_omits_key() {
+        assert_eq!(exposure_from_input(""), None);
+        assert_eq!(exposure_from_input("private"), None);
     }
 
-    /// Discovery on with a `listen_addr` already set: pass through.
+    /// The non-default postures map to their kebab-case TOML values.
     #[test]
-    fn reconcile_discovery_on_with_listen_addr_is_passthrough() {
-        assert_eq!(
-            reconcile_discovery("0.0.0.0:22000", true, ""),
-            ("0.0.0.0:22000".to_string(), true),
-        );
+    fn exposure_from_input_maps_non_default_postures() {
+        assert_eq!(exposure_from_input("lan-only"), Some("lan-only"));
+        assert_eq!(exposure_from_input("public"), Some("public"));
     }
 
-    /// Discovery requested without a `listen_addr` and the user provides one
-    /// via the follow-up prompt: adopt the follow-up address.
+    /// An unrecognised answer falls back to the default rather than emitting a
+    /// bogus key — the wizard separately warns the user.
     #[test]
-    fn discovery_without_listen_addr_is_corrected() {
-        assert_eq!(
-            reconcile_discovery("", true, "0.0.0.0:22000"),
-            ("0.0.0.0:22000".to_string(), true),
-        );
-    }
-
-    /// Discovery requested without a `listen_addr` and the user leaves the
-    /// follow-up prompt blank: discovery is disabled rather than written as
-    /// silently-inert config.
-    #[test]
-    fn discovery_without_listen_addr_disables_when_followup_blank() {
-        assert_eq!(reconcile_discovery("", true, ""), (String::new(), false),);
+    fn exposure_from_input_unknown_falls_back_to_default() {
+        assert_eq!(exposure_from_input("publik"), None);
+        assert_eq!(exposure_from_input("lanonly"), None);
     }
 }

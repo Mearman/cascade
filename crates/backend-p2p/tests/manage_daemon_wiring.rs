@@ -92,16 +92,16 @@ async fn daemon_wired_node_accepts_authorised_management_over_the_wire() {
             address: "127.0.0.1:0".to_owned(),
             name: None,
         }],
-        // Keep the test hermetic: no discovery, gossip, STUN, or DHT.
-        enable_discovery: false,
+        // Keep the test hermetic: LanOnly confines the node to the segment —
+        // no gossip, hole punch, peer relay, or global-directory publication.
+        // No STUN servers and no announce/DHT config either.
+        exposure: cascade_backend_p2p::DiscoveryReach::LanOnly,
         device_name: None,
-        enable_wan_gossip: false,
         stun_servers: Vec::new(),
         announce_servers: Vec::new(),
-        dht: None,
+        dht: cascade_backend_p2p::DhtConfig::default(),
         relay_endpoints: Vec::new(),
         relay_shared_secret: None,
-        enable_hole_punch: false,
         relay_volunteer: cascade_backend_p2p::RelayVolunteer::Off,
         max_relay_sessions: cascade_backend_p2p::DEFAULT_MAX_RELAY_SESSIONS,
         max_relay_bandwidth: cascade_backend_p2p::DEFAULT_MAX_RELAY_BANDWIDTH_BYTES_PER_SEC,

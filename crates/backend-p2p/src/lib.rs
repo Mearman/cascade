@@ -20,16 +20,25 @@
 //! costs blocks once. Peer sync is a follow-up that wires the existing
 //! `cascade_p2p::BepMessage` machinery onto this index.
 //!
-//! ## LAN discovery
+//! ## Exposure posture
 //!
-//! UDP-multicast LAN discovery is opt-in via `enable_discovery = true`
-//! in the per-backend TOML. When enabled (and a `listen_addr` is set),
-//! the backend periodically broadcasts its device ID and listening port
-//! on the discovery multicast group, and listens for announcements from
-//! other devices. Discovered peers that are in the trusted set and not
-//! already connected get an outbound BEP connection attempt. With
-//! discovery disabled, peer connectivity relies entirely on the static
-//! `[[peers]]` config list.
+//! A single [`DiscoveryReach`] posture governs how far this device
+//! reaches out for peers. Rather than a scatter of independent on/off
+//! flags, the posture names an intent — `LanOnly`, `Private`, or
+//! `Public` — and each discovery and traversal source self-activates
+//! when (the posture permits its exposure level) AND (the source has
+//! what it needs to run). See [`DiscoveryReach`] for the exposure
+//! levels and the self-activation rule.
+//!
+//! UDP-multicast LAN discovery, for instance, runs at every posture
+//! (LAN is the floor) but only once a `listen_addr` is bound — without
+//! a bound BEP port there is no inbound path for a discovered peer to
+//! dial, so the source stays idle. Introducer gossip, hole punch, and
+//! peer relay require at least `Private`; publication to the Mainline
+//! DHT and announce servers requires `Public`. The server lists
+//! (`stun_servers`, `announce_servers`, `relay_endpoints`) and the DHT
+//! configuration say *where to point* a source — the posture decides
+//! *whether* the source runs.
 
 pub mod index;
 pub mod peer_relay;
@@ -157,6 +166,84 @@ pub enum RelayVolunteer {
     Auto,
 }
 
+/// How far this device reaches out to discover and connect to peers.
+///
+/// The posture is an intent, not a bundle of switches: it names the
+/// furthest exposure level the operator is comfortable with, and every
+/// discovery and traversal source self-activates when the posture
+/// permits its level *and* the source has what it needs to run (a bound
+/// listener for LAN, configured-or-default bootstrap for the DHT, a
+/// configured server for announce). The server lists and DHT config say
+/// *where to point* a source; the posture decides *whether* it runs.
+///
+/// The levels are ordered by how far traffic about this device travels:
+/// `LanOnly` ⊂ `Private` ⊂ `Public`. Each level permits everything the
+/// level below it does, plus its own additions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DiscoveryReach {
+    /// LAN segment only. UDP-multicast LAN discovery and direct dialling
+    /// of statically-configured peers are the only ways this device finds
+    /// or reaches others; nothing about it leaves the local segment. No
+    /// introducer gossip, no hole punch, no peer relay, and no
+    /// publication to any global directory.
+    LanOnly,
+    /// Trusted private mesh — the default. Everything `LanOnly` permits,
+    /// plus introducer gossip among trusted peers, NAT hole punching, and
+    /// acting as (or using) a peer relay. Still publishes nothing to a
+    /// global directory: no DHT publish or query, no announce-server
+    /// registration. A device at this posture is discoverable only by
+    /// peers it already shares a segment, an introducer, or a relay with.
+    #[default]
+    Private,
+    /// Open to the wider internet. Everything `Private` permits, plus
+    /// publishing to and querying the Mainline DHT and any configured
+    /// announce servers, so never-met peers can resolve this device by
+    /// its device id for zero-config WAN discovery.
+    Public,
+}
+
+impl DiscoveryReach {
+    /// Whether introducer (WAN) gossip may run at this posture.
+    ///
+    /// Gossip shares the local peer book with trusted peers so devices
+    /// learn about one another transitively. Permitted from `Private`
+    /// upward; `LanOnly` keeps the peer book to itself.
+    #[must_use]
+    pub const fn permits_gossip(self) -> bool {
+        matches!(self, Self::Private | Self::Public)
+    }
+
+    /// Whether NAT hole punching may run at this posture.
+    ///
+    /// Hole punching coordinates a simultaneous UDP burst to traverse
+    /// NATs. Permitted from `Private` upward; `LanOnly` never punches.
+    #[must_use]
+    pub const fn permits_hole_punch(self) -> bool {
+        matches!(self, Self::Private | Self::Public)
+    }
+
+    /// Whether peer relaying may run at this posture.
+    ///
+    /// Covers both volunteering as a relay and dialling through one.
+    /// Permitted from `Private` upward; `LanOnly` neither offers nor
+    /// uses a relay.
+    #[must_use]
+    pub const fn permits_peer_relay(self) -> bool {
+        matches!(self, Self::Private | Self::Public)
+    }
+
+    /// Whether this device may publish to and query a global directory —
+    /// the Mainline DHT and announce servers.
+    ///
+    /// Permitted only at `Public`. This is the line between a private
+    /// mesh and zero-config WAN discovery of never-met peers.
+    #[must_use]
+    pub const fn permits_global_directory(self) -> bool {
+        matches!(self, Self::Public)
+    }
+}
+
 /// Statically-configured peer entry.
 ///
 /// The address is stored as a `host:port` string and re-resolved on
@@ -175,18 +262,23 @@ pub struct ConfiguredPeer {
     pub name: Option<String>,
 }
 
-/// Kademlia/Mainline-DHT discovery configuration.
+/// Kademlia/Mainline-DHT discovery configuration — *where to point* the
+/// DHT source, not *whether* it runs.
 ///
-/// Its presence is the enable switch: a [`P2pBackendConfig`] carries
-/// `Some(DhtConfig)` to register the DHT discovery source and `None` to leave
-/// it off, modelling "DHT disabled" as the absence of configuration rather than
-/// a separate boolean flag.
+/// Activation is governed by the [`DiscoveryReach`] posture: the DHT
+/// source self-activates only at [`DiscoveryReach::Public`] (and once a
+/// listener is bound to advertise). This config is always present — it
+/// carries the bootstrap set the source uses when the posture permits it
+/// — so an empty `bootstrap_nodes` means "use the built-in public set",
+/// never "DHT disabled". Disabling the DHT is a posture choice, not the
+/// absence of this config.
 #[derive(Debug, Clone, Default)]
 pub struct DhtConfig {
     /// Bootstrap nodes used to join the Mainline DHT, as resolved socket
     /// addresses. Empty falls back to the named public default
-    /// ([`cascade_p2p::discovery::DEFAULT_DHT_BOOTSTRAP_NODES`]), so an operator
-    /// can enable the DHT without supplying their own bootstrap nodes; a
+    /// ([`cascade_p2p::discovery::DEFAULT_DHT_BOOTSTRAP_NODES`]) — which the
+    /// crate resolves on the DHT actor thread — so the DHT works at `Public`
+    /// posture without an operator supplying their own bootstrap nodes; a
     /// non-empty list pins exactly those nodes and the public default is not
     /// mixed in.
     pub bootstrap_nodes: Vec<std::net::SocketAddr>,
@@ -209,31 +301,19 @@ pub struct P2pBackendConfig {
     pub listen_addr: Option<std::net::SocketAddr>,
     /// Static peer list — connection attempts run in the background.
     pub peers: Vec<ConfiguredPeer>,
-    /// Enable UDP-multicast LAN discovery. Default `false` so the
-    /// existing static-peer story is opt-out.
-    pub enable_discovery: bool,
+    /// How far this device reaches out to discover and connect to peers.
+    /// Governs which discovery and traversal sources may run; each source
+    /// then self-activates only when it also has what it needs (a bound
+    /// listener, configured server, etc.). Defaults to
+    /// [`DiscoveryReach::Private`] — a trusted mesh with no publication to
+    /// any global directory.
+    pub exposure: DiscoveryReach,
     /// Friendly name for the LOCAL device. Used by the sync engine when
     /// stamping conflict-copy paths so the displaced side is identified
     /// by a human-readable label (e.g. `report.conflict-work-laptop-…`)
     /// rather than the opaque first eight characters of the device id.
     /// `None` falls back to the short device id.
     pub device_name: Option<String>,
-    /// Enable WAN peer gossip. When `true`, the backend broadcasts a
-    /// snapshot of its known peer list to every connected peer every
-    /// 60 seconds via a `BepMessage::Gossip` frame, and merges any
-    /// gossip frames it receives into its own peer book.
-    ///
-    /// The peers carried in gossip are the ones the local peer book
-    /// has learned about through past connections (static peer config
-    /// and inbound connections that completed the TLS handshake).
-    /// External NAT-derived addresses are not yet folded in — that is
-    /// a follow-up that needs the NAT-detection signal to thread
-    /// through into the peer book.
-    ///
-    /// The local [`SyncEngine`] maintains its `PeerBook` unconditionally
-    /// (useful for future relay-candidate selection and NAT-traversal
-    /// hints); this flag only controls whether gossip frames flow.
-    pub enable_wan_gossip: bool,
     /// STUN servers used for NAT type detection at startup, after the
     /// default-versus-override rule in [`resolve_stun_servers`] has been
     /// applied. Empty means no NAT detection runs (the operator explicitly
@@ -247,15 +327,19 @@ pub struct P2pBackendConfig {
     /// registered for each, so the device publishes its candidates to and
     /// resolves peers against those servers. Empty disables announce-server
     /// discovery — the device relies on LAN multicast and introducer gossip
-    /// alone.
+    /// alone. Whether the configured servers are actually contacted is
+    /// governed by the [`exposure`](Self::exposure) posture, which must be
+    /// [`DiscoveryReach::Public`] for any global-directory publication.
     pub announce_servers: Vec<String>,
-    /// Kademlia/Mainline-DHT discovery configuration, or `None` to leave the
-    /// DHT source off. When `Some`, a [`cascade_p2p::discovery::DhtDiscovery`]
-    /// backed by the `BitTorrent` Mainline DHT is registered, so the device
-    /// publishes its candidate set into and resolves peers out of the DHT keyed
-    /// by device id — the serverless equivalent of the announce server. `None`
-    /// by default so the existing LAN/gossip/announce story is opt-in.
-    pub dht: Option<DhtConfig>,
+    /// Kademlia/Mainline-DHT discovery configuration — *where to point* the
+    /// DHT source. A [`cascade_p2p::discovery::DhtDiscovery`] backed by the
+    /// `BitTorrent` Mainline DHT publishes this device's candidate set into
+    /// and resolves peers out of the DHT keyed by device id — the serverless
+    /// equivalent of the announce server. Whether it runs is governed by the
+    /// [`exposure`](Self::exposure) posture (it self-activates only at
+    /// [`DiscoveryReach::Public`], once a listener is bound), not by the
+    /// presence of this config.
+    pub dht: DhtConfig,
     /// Known relay endpoints, in preference order. Fed into
     /// [`cascade_p2p::decide_connectivity`] as the relay pool when the
     /// strategy table calls for relayed transport. Empty disables the
@@ -268,18 +352,14 @@ pub struct P2pBackendConfig {
     /// strategy will skip the dial without a secret.
     /// The 32-byte width matches the cascade relay's HMAC key length.
     pub relay_shared_secret: Option<[u8; 32]>,
-    /// Hole-punching opt-out. When `false`, [`cascade_p2p::decide_connectivity`]
-    /// is still consulted but the chosen `HolePunch` strategy is
-    /// downgraded to direct-or-relay before any UDP burst is emitted.
-    /// Defaults to `true` so production deployments get the full path
-    /// out of the box.
-    pub enable_hole_punch: bool,
     /// Whether this node volunteers as a peer relay. When not
     /// [`RelayVolunteer::Off`] and the detected `NAT` type is `Open` or
     /// `FullCone`, the node advertises itself as a relay candidate to
     /// trusted peers it shares a folder with via a
     /// [`cascade_p2p::protocol::BepMessage::RelayOffer`]. Defaults to
-    /// [`RelayVolunteer::Auto`].
+    /// [`RelayVolunteer::Auto`]. Peer relaying is additionally gated by the
+    /// [`exposure`](Self::exposure) posture — it runs only from
+    /// [`DiscoveryReach::Private`] upward, regardless of this setting.
     pub relay_volunteer: RelayVolunteer,
     /// Ceiling on concurrent relay sessions this node bridges while
     /// volunteering. New requests past the cap are rejected rather than
@@ -302,19 +382,17 @@ impl Default for P2pBackendConfig {
             folder_id: String::new(),
             listen_addr: None,
             peers: Vec::new(),
-            enable_discovery: false,
+            // Private: a trusted mesh with LAN discovery, gossip, hole
+            // punch, and peer relay, but no publication to any global
+            // directory. Never default to Public — that would opt a node
+            // into DHT/announce publication without the operator asking.
+            exposure: DiscoveryReach::Private,
             device_name: None,
-            enable_wan_gossip: false,
             stun_servers: Vec::new(),
             announce_servers: Vec::new(),
-            dht: None,
+            dht: DhtConfig::default(),
             relay_endpoints: Vec::new(),
             relay_shared_secret: None,
-            // Hole-punching is enabled by default — operators opt OUT by
-            // setting `enable_hole_punch = false`, mirroring the way
-            // `enable_discovery` and `enable_wan_gossip` are opt-IN flags
-            // for behaviour with a real operational cost.
-            enable_hole_punch: true,
             // Volunteering is on by default but gated on NAT type: only
             // `Open`/`FullCone` nodes ever actually advertise an offer, so
             // a default of `Auto` costs nothing on the restrictive nodes
@@ -384,10 +462,25 @@ impl P2pBackend {
             identity,
         )
         .with_local_device_name(cfg.device_name.clone())
-        .with_relay_endpoints(cfg.relay_endpoints.clone())
+        // Peer relay (endpoints + volunteering) self-activates only from
+        // `Private` upward. At `LanOnly` the relay pool and volunteer
+        // policy are left empty/off so neither dialling through a relay
+        // nor offering to be one ever happens.
+        .with_relay_endpoints(if cfg.exposure.permits_peer_relay() {
+            cfg.relay_endpoints.clone()
+        } else {
+            Vec::new()
+        })
         .with_relay_shared_secret(cfg.relay_shared_secret)
-        .with_hole_punch_enabled(cfg.enable_hole_punch)
-        .with_relay_volunteer(cfg.relay_volunteer)
+        // Hole punch self-activates only from `Private` upward; at
+        // `LanOnly` a chosen `HolePunch` strategy is downgraded before any
+        // UDP burst leaves the segment.
+        .with_hole_punch_enabled(cfg.exposure.permits_hole_punch())
+        .with_relay_volunteer(if cfg.exposure.permits_peer_relay() {
+            cfg.relay_volunteer
+        } else {
+            RelayVolunteer::Off
+        })
         .with_relay_session_caps(cfg.max_relay_sessions, cfg.max_relay_bandwidth);
 
         // Cancellation channel for all background tasks. `false` =
@@ -401,8 +494,7 @@ impl P2pBackend {
         let cfg_listen_addr = cfg.listen_addr;
         let cfg_instance_id = cfg.instance_id.clone();
         let cfg_peers = cfg.peers.clone();
-        let cfg_enable_discovery = cfg.enable_discovery;
-        let cfg_enable_wan_gossip = cfg.enable_wan_gossip;
+        let cfg_exposure = cfg.exposure;
         let cfg_stun_servers = cfg.stun_servers.clone();
         let cfg_announce_servers = cfg.announce_servers.clone();
         let cfg_dht = cfg.dht.clone();
@@ -434,7 +526,11 @@ impl P2pBackend {
             // The gossip task observes the same cancellation watch as
             // the rest of the children so it exits cleanly when the
             // backend is dropped.
-            if cfg_enable_wan_gossip {
+            //
+            // Introducer gossip self-activates from `Private` upward — it
+            // needs nothing beyond the peer book the engine already keeps,
+            // so the posture permission is the whole gate.
+            if cfg_exposure.permits_gossip() {
                 tracing::info!(
                     target: "cascade::backend::p2p",
                     instance = %cfg_instance_id,
@@ -523,79 +619,92 @@ impl P2pBackend {
                 });
             }
 
-            // Compose the discovery sources into a single service. The
-            // two sources registered here are exactly the two the backend
-            // already ran: LAN multicast behind `enable_discovery`, and
-            // introducer gossip behind `enable_wan_gossip`. The service
-            // is the structural home for discovery — the loops below feed
-            // their I/O through the registered `LanDiscovery` source so
-            // the wire behaviour is unchanged.
+            // Compose the discovery sources into a single service, each
+            // gated by the exposure posture and its own self-activation
+            // requirement. The service is the structural home for
+            // discovery — the loops below feed their I/O through the
+            // registered `LanDiscovery` source so the wire behaviour is
+            // unchanged.
             let mut discovery = DiscoveryService::new();
-            if cfg_enable_wan_gossip {
+
+            // Introducer gossip: permitted from `Private` upward and needs
+            // only the peer book the engine already keeps.
+            if cfg_exposure.permits_gossip() {
                 discovery.register(Box::new(GossipDiscovery::new(
                     sync_for_listener.peer_book().clone(),
                 )));
             }
-            let lan_source = (cfg_enable_discovery && bound_port.is_some()).then(LanDiscovery::new);
+
+            // LAN multicast: permitted at every posture (LAN is the floor)
+            // but self-activates only once a listener is bound — without an
+            // inbound port a discovered peer would have nothing to dial.
+            let lan_source = bound_port.is_some().then(LanDiscovery::new);
             if let Some(lan) = lan_source {
                 discovery.register(Box::new(lan));
             }
 
+            // Global directory — announce servers and the Mainline DHT —
+            // is permitted only at `Public`. Below that posture this device
+            // publishes nothing to any global directory, so neither source
+            // is constructed or run.
+            let publish_globally = cfg_exposure.permits_global_directory();
+
             // Register an announce-server source for each configured base
-            // URL. Only registered when `announce_servers` is non-empty —
-            // an operator who has not opted in pays no announce-server cost.
-            // A client that fails to construct (HTTP/TLS backend init) is
-            // logged and skipped rather than aborting backend open; the
-            // other discovery sources still function.
-            for base_url in &cfg_announce_servers {
-                match cascade_p2p::discovery::announce::AnnounceDiscovery::new(base_url.clone()) {
-                    Ok(source) => discovery.register(Box::new(source)),
-                    Err(e) => tracing::warn!(
-                        target: "cascade::backend::p2p",
-                        instance = %cfg_instance_id,
-                        announce_server = %base_url,
-                        error = %e,
-                        "could not construct announce-server discovery client; skipping",
-                    ),
-                }
-            }
-            // Register the Kademlia/Mainline-DHT source when enabled and the
-            // listener is up. The DHT publishes and resolves keyed by device
-            // id, so it is only useful once we have a bound port to advertise;
-            // a node whose construction fails (binding the DHT UDP socket) is
-            // logged and skipped rather than aborting backend open, exactly
-            // like the announce-server source. The BEP44 keypair is derived
-            // per device id at announce/resolve time, so the node holds no
-            // persisted secret of its own. The constructed source is cloned:
-            // one copy joins the resolver, the other drives the periodic
-            // announce loop below.
-            let dht_source = match (cfg_dht.as_ref(), bound_port.is_some()) {
-                (Some(dht_cfg), true) => {
-                    // `MainlineDht::open` is a blocking constructor: it resolves
-                    // the bootstrap host:port set with synchronous `getaddrinfo`
-                    // and binds the DHT UDP socket on the calling thread. Run it
-                    // off the runtime via `spawn_blocking` so a slow or
-                    // unreachable resolver cannot stall this worker, mirroring
-                    // `resolve_first`'s off-thread DNS.
-                    let bootstrap = dht_cfg.bootstrap_nodes.clone();
-                    match open_dht_off_thread(bootstrap).await {
-                        Ok(node) => {
-                            let source = cascade_p2p::discovery::DhtDiscovery::new(node);
-                            discovery.register(Box::new(source.clone()));
-                            Some(source)
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                target: "cascade::backend::p2p",
-                                instance = %cfg_instance_id,
-                                error = %e,
-                                "could not construct Mainline-DHT discovery node; skipping",
-                            );
-                            None
-                        }
+            // URL. Self-activates only at `Public` posture with a configured
+            // server; a client that fails to construct (HTTP/TLS backend
+            // init) is logged and skipped rather than aborting backend open,
+            // so the other discovery sources still function.
+            if publish_globally {
+                for base_url in &cfg_announce_servers {
+                    match cascade_p2p::discovery::announce::AnnounceDiscovery::new(base_url.clone())
+                    {
+                        Ok(source) => discovery.register(Box::new(source)),
+                        Err(e) => tracing::warn!(
+                            target: "cascade::backend::p2p",
+                            instance = %cfg_instance_id,
+                            announce_server = %base_url,
+                            error = %e,
+                            "could not construct announce-server discovery client; skipping",
+                        ),
                     }
                 }
-                _ => None,
+            }
+            // Register the Kademlia/Mainline-DHT source. Self-activates only
+            // at `Public` posture and once the listener is up: the DHT
+            // publishes and resolves keyed by device id, so it is useful only
+            // with a bound port to advertise. A node whose construction fails
+            // (binding the DHT UDP socket) is logged and skipped rather than
+            // aborting backend open, exactly like the announce-server source.
+            // The BEP44 keypair is derived per device id at announce/resolve
+            // time, so the node holds no persisted secret of its own. The
+            // constructed source is cloned: one copy joins the resolver, the
+            // other drives the periodic announce loop below.
+            let dht_source = if publish_globally && bound_port.is_some() {
+                // `MainlineDht::open` is a blocking constructor: it resolves
+                // the bootstrap host:port set with synchronous `getaddrinfo`
+                // and binds the DHT UDP socket on the calling thread. Run it
+                // off the runtime via `spawn_blocking` so a slow or
+                // unreachable resolver cannot stall this worker, mirroring
+                // `resolve_first`'s off-thread DNS.
+                let bootstrap = cfg_dht.bootstrap_nodes.clone();
+                match open_dht_off_thread(bootstrap).await {
+                    Ok(node) => {
+                        let source = cascade_p2p::discovery::DhtDiscovery::new(node);
+                        discovery.register(Box::new(source.clone()));
+                        Some(source)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "cascade::backend::p2p",
+                            instance = %cfg_instance_id,
+                            error = %e,
+                            "could not construct Mainline-DHT discovery node; skipping",
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
             };
 
             tracing::debug!(
@@ -623,7 +732,7 @@ impl P2pBackend {
             // we share no LAN segment and no introducer. The loop builds a
             // fresh AnnounceDiscovery per server (the composed `discovery`
             // service owns its boxed copies and is consumed by resolution).
-            if !cfg_announce_servers.is_empty() && bound_port.is_some() {
+            if publish_globally && !cfg_announce_servers.is_empty() && bound_port.is_some() {
                 let announce_sync = sync_for_listener.clone();
                 let announce_servers = cfg_announce_servers.clone();
                 let announce_cancel = cancel_for_children.subscribe();
@@ -762,39 +871,41 @@ impl P2pBackend {
     /// Compose a [`DiscoveryService`] from this backend's configured discovery
     /// sources, for one-shot peer resolution.
     ///
-    /// Registers the same source families the backend runs continuously —
-    /// introducer gossip (over the live peer book), LAN multicast, announce
-    /// servers, and the Mainline DHT — so a manager resolves a target through
-    /// the exact channels the data plane already uses. A source whose
-    /// construction fails is logged and skipped rather than aborting the
+    /// Registers the same source families the backend runs continuously,
+    /// each gated by the exposure posture exactly as backend open gates them:
+    /// LAN multicast at every posture, introducer gossip from `Private`
+    /// upward, and announce servers plus the Mainline DHT only at `Public`.
+    /// Resolving through the same channels the data plane uses keeps the
+    /// manager's reachability consistent with the node's posture. A source
+    /// whose construction fails is logged and skipped rather than aborting the
     /// resolution, matching the backend's startup behaviour.
     async fn compose_resolution_discovery(&self) -> DiscoveryService {
         let mut discovery = DiscoveryService::new();
-        if self.cfg.enable_wan_gossip {
+        if self.cfg.exposure.permits_gossip() {
             discovery.register(Box::new(GossipDiscovery::new(
                 self.sync.peer_book().clone(),
             )));
         }
-        if self.cfg.enable_discovery {
-            discovery.register(Box::new(LanDiscovery::new()));
-        }
-        for base_url in &self.cfg.announce_servers {
-            match cascade_p2p::discovery::announce::AnnounceDiscovery::new(base_url.clone()) {
-                Ok(source) => discovery.register(Box::new(source)),
-                Err(e) => tracing::warn!(
-                    target: "cascade::backend::p2p",
-                    announce_server = %base_url,
-                    error = %e,
-                    "could not construct announce-server discovery client for management resolution; skipping",
-                ),
+        // LAN multicast is permitted at every posture — it is the floor.
+        discovery.register(Box::new(LanDiscovery::new()));
+        if self.cfg.exposure.permits_global_directory() {
+            for base_url in &self.cfg.announce_servers {
+                match cascade_p2p::discovery::announce::AnnounceDiscovery::new(base_url.clone()) {
+                    Ok(source) => discovery.register(Box::new(source)),
+                    Err(e) => tracing::warn!(
+                        target: "cascade::backend::p2p",
+                        announce_server = %base_url,
+                        error = %e,
+                        "could not construct announce-server discovery client for management resolution; skipping",
+                    ),
+                }
             }
-        }
-        if let Some(dht_cfg) = self.cfg.dht.as_ref() {
             // `MainlineDht::open` blocks on `getaddrinfo` for the bootstrap set
             // and the UDP socket bind, so it runs off the runtime — this method
             // sits on the management-plane dial path and must not stall a worker
-            // on DNS. See `open_dht_off_thread`.
-            let bootstrap = dht_cfg.bootstrap_nodes.clone();
+            // on DNS. See `open_dht_off_thread`. The DHT is posture-gated by the
+            // `permits_global_directory()` check above, not by config presence.
+            let bootstrap = self.cfg.dht.bootstrap_nodes.clone();
             match open_dht_off_thread(bootstrap).await {
                 Ok(node) => {
                     discovery.register(Box::new(cascade_p2p::discovery::DhtDiscovery::new(node)));
@@ -1773,31 +1884,28 @@ async fn discovery_listen_loop(
 /// - `peers` (optional) — array of `{ device_id = "...", address = "host:port", name = "..." }`.
 ///   `name` is optional; when present it is used in conflict-copy paths
 ///   generated by that peer.
-/// - `enable_discovery` (optional, default `false`) — opt in to
-///   UDP-multicast LAN peer discovery. Requires `listen_addr` to be set.
-/// - `enable_wan_gossip` (optional, default `false`) — broadcast the
-///   local peer book to every connected peer every 60s and merge
-///   inbound gossip into the local peer book, so devices learn about
-///   each other transitively
+/// - `exposure` (optional, default `private`) — how far this device reaches
+///   out for peers: `lan-only`, `private`, or `public`. Governs which
+///   discovery and traversal sources may run (see [`DiscoveryReach`]); each
+///   source then self-activates only when it also has what it needs (a bound
+///   `listen_addr` for LAN, a configured server for announce, etc.).
 /// - `stun_servers` (optional) — array of `host:port` STUN servers used
 ///   for NAT type detection at startup. Omitting the key entirely applies
 ///   the public defaults ([`DEFAULT_PUBLIC_STUN_SERVERS`]) so NAT detection
 ///   works out of the box; supplying a non-empty list overrides them; an
 ///   explicit empty list disables STUN.
 /// - `announce_servers` (optional) — array of announce-server base URLs
-///   (e.g. `https://announce.example`). When non-empty, the device publishes
-///   its candidates to and resolves peers against those servers via the
-///   announce-server discovery source. Empty (or omitted) disables it.
-/// - `enable_dht` (optional, default `false`) — opt in to the
-///   Kademlia/Mainline-DHT discovery source, the serverless equivalent of the
-///   announce server. Requires `listen_addr` to be set (the DHT advertises the
-///   bound port).
+///   (e.g. `https://announce.example`) — *where to point* the announce
+///   source. It self-activates only at `public` exposure with at least one
+///   server configured.
 /// - `dht_bootstrap_nodes` (optional) — array of `host:port` Mainline-DHT
 ///   bootstrap nodes used to join the DHT. Omitted or explicitly empty falls
 ///   back to the named public default
 ///   ([`cascade_p2p::discovery::DEFAULT_DHT_BOOTSTRAP_NODES`]) so the DHT works
 ///   out of the box; supplying a non-empty list pins exactly those nodes (the
-///   public default is then not used). Ignored when `enable_dht` is `false`.
+///   public default is then not used). These say *where to point* the DHT
+///   source — the source itself self-activates only at `public` exposure with
+///   a bound `listen_addr`.
 pub fn create_backend(config: &toml::Value) -> Result<Box<dyn Backend>> {
     Ok(Box::new(open_from_config(config)?))
 }
@@ -1834,18 +1942,16 @@ pub fn open_from_config(config: &toml::Value) -> Result<P2pBackend> {
         })
         .transpose()?;
     let peers = parse_peers(config.get("peers"))?;
-    let enable_discovery = config
-        .get("enable_discovery")
-        .and_then(toml::Value::as_bool)
-        .unwrap_or(false);
+    let exposure = config
+        .get("exposure")
+        .and_then(|v| v.as_str())
+        .map(parse_exposure)
+        .transpose()?
+        .unwrap_or_default();
     let device_name = config
         .get("device_name")
         .and_then(|v| v.as_str())
         .map(str::to_string);
-    let enable_wan_gossip = config
-        .get("enable_wan_gossip")
-        .and_then(toml::Value::as_bool)
-        .unwrap_or(false);
     // Distinguish "not configured" (key absent → public defaults apply)
     // from "configured empty" (key present but empty → STUN disabled). A
     // bare `unwrap_or_default` would collapse both to an empty list and
@@ -1874,10 +1980,6 @@ pub fn open_from_config(config: &toml::Value) -> Result<P2pBackend> {
         .and_then(|v| v.as_str())
         .map(parse_relay_shared_secret)
         .transpose()?;
-    let enable_hole_punch = config
-        .get("enable_hole_punch")
-        .and_then(toml::Value::as_bool)
-        .unwrap_or(true);
     let relay_volunteer = config
         .get("relay_volunteer")
         .and_then(|v| v.as_str())
@@ -1911,15 +2013,13 @@ pub fn open_from_config(config: &toml::Value) -> Result<P2pBackend> {
         identity_dir: data_dir.join("identity"),
         listen_addr,
         peers,
-        enable_discovery,
+        exposure,
         device_name,
-        enable_wan_gossip,
         stun_servers,
         announce_servers,
         dht,
         relay_endpoints,
         relay_shared_secret,
-        enable_hole_punch,
         relay_volunteer,
         max_relay_sessions,
         max_relay_bandwidth,
@@ -1955,13 +2055,14 @@ pub fn device_id_from_config(config: &toml::Value) -> Result<String> {
 /// Parse the Kademlia/Mainline-DHT discovery configuration from a backend's
 /// TOML.
 ///
-/// Returns `Some(DhtConfig)` when `enable_dht` is truthy and `None` otherwise,
-/// so "DHT disabled" is the absence of configuration rather than a flag paired
-/// with ignored bootstrap nodes. `dht_bootstrap_nodes` is parsed regardless of
-/// the flag — a malformed `host:port` entry fails loudly with the offending
-/// value, matching the loud-failure parsing of `relay_endpoints` — but is only
-/// retained when the DHT is enabled.
-fn parse_dht_config(config: &toml::Value) -> Result<Option<DhtConfig>> {
+/// This parses only *where to point* the DHT — its bootstrap set. Whether the
+/// DHT source runs is governed by the [`DiscoveryReach`] exposure posture, not
+/// by this config, so a [`DhtConfig`] is always produced. `dht_bootstrap_nodes`
+/// is parsed when present — a malformed `host:port` entry fails loudly with the
+/// offending value, matching the loud-failure parsing of `relay_endpoints` —
+/// and an empty or omitted list falls back to the `mainline` crate's built-in
+/// public bootstrap set at announce/resolve time.
+fn parse_dht_config(config: &toml::Value) -> Result<DhtConfig> {
     let bootstrap_nodes = config
         .get("dht_bootstrap_nodes")
         .and_then(toml::Value::as_array)
@@ -1976,11 +2077,7 @@ fn parse_dht_config(config: &toml::Value) -> Result<Option<DhtConfig>> {
         })
         .transpose()?
         .unwrap_or_default();
-    let enabled = config
-        .get("enable_dht")
-        .and_then(toml::Value::as_bool)
-        .unwrap_or(false);
-    Ok(enabled.then_some(DhtConfig { bootstrap_nodes }))
+    Ok(DhtConfig { bootstrap_nodes })
 }
 
 /// Parse a TOML array of strings, preserving the absent-vs-present distinction.
@@ -2066,6 +2163,24 @@ fn parse_relay_shared_secret(input: &str) -> Result<[u8; 32]> {
             .with_context(|| format!("invalid hex pair `{pair}` in relay_shared_secret"))?;
     }
     Ok(out)
+}
+
+/// Parse the `exposure` posture from its kebab-case string form.
+///
+/// Accepts exactly `lan-only`, `private`, or `public`. Any other value is a
+/// configuration error rather than a silent fallback to the default — an
+/// operator who typed `publik` deserves to be told, not to discover the node
+/// quietly confined to the LAN when they meant to open it to the WAN (or the
+/// reverse, publishing to a global directory they never intended).
+fn parse_exposure(input: &str) -> Result<DiscoveryReach> {
+    match input {
+        "lan-only" => Ok(DiscoveryReach::LanOnly),
+        "private" => Ok(DiscoveryReach::Private),
+        "public" => Ok(DiscoveryReach::Public),
+        other => {
+            anyhow::bail!("exposure must be one of `lan-only`, `private`, `public`, got `{other}`")
+        }
+    }
 }
 
 /// Parse the `relay_volunteer` policy from its lowercase string form.
@@ -2658,35 +2773,99 @@ mod tests {
     }
 
     #[test]
-    fn p2p_backend_config_default_enables_hole_punch() {
-        // Hole-punching is the only flag whose default differs from the
-        // derived `Default` — this test guards the manual `Default` impl
-        // against accidental regression to a derived all-false default
-        // if someone re-adds `#[derive(Default)]`.
+    fn p2p_backend_config_default_is_private() {
+        // The default posture is `Private` — a trusted mesh that never
+        // publishes to a global directory. This guards the manual `Default`
+        // impl against regressing to either extreme: confining the node to
+        // the LAN, or opting it into DHT/announce publication unasked.
         let cfg = P2pBackendConfig::default();
-        assert!(cfg.enable_hole_punch);
-        assert!(!cfg.enable_discovery);
-        assert!(!cfg.enable_wan_gossip);
-        assert!(cfg.dht.is_none());
+        assert_eq!(cfg.exposure, DiscoveryReach::Private);
         assert!(cfg.relay_endpoints.is_empty());
         assert!(cfg.relay_shared_secret.is_none());
+        assert!(cfg.dht.bootstrap_nodes.is_empty());
     }
 
     #[test]
-    fn parse_dht_config_absent_is_disabled() {
-        // No `enable_dht` key → the DHT source is off, modelled as `None`.
+    fn discovery_reach_capability_truth_table() {
+        // The posture-gated activation truth table: each capability is on or
+        // off per posture. This is the single source of truth the backend's
+        // source registration consults.
+        use DiscoveryReach::{LanOnly, Private, Public};
+
+        // Gossip, hole punch, and peer relay: off at LanOnly, on from
+        // Private upward.
+        for (reach, want) in [(LanOnly, false), (Private, true), (Public, true)] {
+            assert_eq!(reach.permits_gossip(), want, "gossip @ {reach:?}");
+            assert_eq!(reach.permits_hole_punch(), want, "hole punch @ {reach:?}");
+            assert_eq!(reach.permits_peer_relay(), want, "peer relay @ {reach:?}");
+        }
+
+        // Global directory (DHT + announce): only at Public.
+        for (reach, want) in [(LanOnly, false), (Private, false), (Public, true)] {
+            assert_eq!(
+                reach.permits_global_directory(),
+                want,
+                "global directory @ {reach:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn parse_exposure_accepts_each_posture() {
+        assert_eq!(parse_exposure("lan-only").unwrap(), DiscoveryReach::LanOnly);
+        assert_eq!(parse_exposure("private").unwrap(), DiscoveryReach::Private);
+        assert_eq!(parse_exposure("public").unwrap(), DiscoveryReach::Public);
+    }
+
+    #[test]
+    fn parse_exposure_rejects_unknown_posture() {
+        // A typo must fail loudly rather than silently falling back to the
+        // default — getting the posture wrong is a security-relevant mistake
+        // in either direction.
+        let err = parse_exposure("publik").expect_err("unknown posture must error");
+        assert!(err.to_string().contains("publik"));
+    }
+
+    #[test]
+    fn open_from_config_absent_exposure_defaults_to_private() {
+        // Omitting the `exposure` key resolves to the default posture,
+        // Private — a trusted mesh with no global-directory publication.
         let value = toml::from_str::<toml::Value>(r#"name = "x""#).unwrap();
-        assert!(parse_dht_config(&value).unwrap().is_none());
+        let parsed = value
+            .get("exposure")
+            .and_then(|v| v.as_str())
+            .map(parse_exposure)
+            .transpose()
+            .unwrap()
+            .unwrap_or_default();
+        assert_eq!(parsed, DiscoveryReach::Private);
     }
 
     #[test]
-    fn parse_dht_config_enabled_without_bootstrap_uses_empty_set() {
-        // Enabling without bootstrap nodes is valid — the live node falls
-        // back to the named public default set — so the parsed config carries
-        // an empty bootstrap list rather than failing. The empty list is the
-        // signal `MainlineDht::open` reads as "use DEFAULT_DHT_BOOTSTRAP_NODES".
-        let value = toml::from_str::<toml::Value>("name = \"x\"\nenable_dht = true").unwrap();
-        let dht = parse_dht_config(&value).unwrap().expect("DHT enabled");
+    fn open_from_config_parses_exposure_key() {
+        // The new `exposure` key round-trips through the TOML boundary to the
+        // matching posture.
+        let value = toml::from_str::<toml::Value>("name = \"x\"\nexposure = \"public\"").unwrap();
+        let parsed = value
+            .get("exposure")
+            .and_then(|v| v.as_str())
+            .map(parse_exposure)
+            .transpose()
+            .unwrap()
+            .unwrap_or_default();
+        assert_eq!(parsed, DiscoveryReach::Public);
+    }
+
+    #[test]
+    fn parse_dht_config_without_bootstrap_uses_empty_set() {
+        // No bootstrap nodes is valid — the live node falls back to the named
+        // public default set ([`DEFAULT_DHT_BOOTSTRAP_NODES`]) — so the parsed
+        // config carries an empty bootstrap list rather than failing. The empty
+        // list is the signal `MainlineDht::open` reads as "use the public
+        // default". Whether the DHT runs at all is a posture decision, not a
+        // property of this config.
+        let value = toml::from_str::<toml::Value>(r#"name = "x""#).unwrap();
+        let dht = parse_dht_config(&value).unwrap();
         assert!(dht.bootstrap_nodes.is_empty());
     }
 
@@ -2697,9 +2876,9 @@ mod tests {
         // which the node resolves to the public default. This pins the
         // "empty override falls back to the default" contract at the config
         // layer.
-        let toml_src = "name = \"x\"\nenable_dht = true\ndht_bootstrap_nodes = []";
+        let toml_src = "name = \"x\"\ndht_bootstrap_nodes = []";
         let value = toml::from_str::<toml::Value>(toml_src).unwrap();
-        let dht = parse_dht_config(&value).unwrap().expect("DHT enabled");
+        let dht = parse_dht_config(&value).unwrap();
         assert!(dht.bootstrap_nodes.is_empty());
     }
 
@@ -2707,38 +2886,30 @@ mod tests {
     fn parse_dht_config_override_is_preserved_verbatim() {
         // A non-empty override is carried through unchanged, so the node pins
         // exactly those nodes rather than the public default.
-        let toml_src = "name = \"x\"\nenable_dht = true\n\
+        let toml_src = "name = \"x\"\n\
              dht_bootstrap_nodes = [\"203.0.113.1:6881\"]";
         let value = toml::from_str::<toml::Value>(toml_src).unwrap();
-        let dht = parse_dht_config(&value).unwrap().expect("DHT enabled");
+        let dht = parse_dht_config(&value).unwrap();
         assert_eq!(dht.bootstrap_nodes.len(), 1);
         assert_eq!(dht.bootstrap_nodes[0].port(), 6881);
     }
 
     #[test]
-    fn parse_dht_config_enabled_parses_bootstrap_nodes() {
-        let toml_src = "name = \"x\"\nenable_dht = true\n\
+    fn parse_dht_config_parses_bootstrap_nodes() {
+        let toml_src = "name = \"x\"\n\
              dht_bootstrap_nodes = [\"127.0.0.1:6881\", \"10.0.0.1:6882\"]";
         let value = toml::from_str::<toml::Value>(toml_src).unwrap();
-        let dht = parse_dht_config(&value).unwrap().expect("DHT enabled");
+        let dht = parse_dht_config(&value).unwrap();
         assert_eq!(dht.bootstrap_nodes.len(), 2);
         assert_eq!(dht.bootstrap_nodes[0].port(), 6881);
         assert_eq!(dht.bootstrap_nodes[1].port(), 6882);
     }
 
     #[test]
-    fn parse_dht_config_disabled_ignores_bootstrap_nodes() {
-        // Bootstrap nodes present but `enable_dht` absent → still disabled.
-        let toml_src = "name = \"x\"\ndht_bootstrap_nodes = [\"127.0.0.1:6881\"]";
-        let value = toml::from_str::<toml::Value>(toml_src).unwrap();
-        assert!(parse_dht_config(&value).unwrap().is_none());
-    }
-
-    #[test]
     fn parse_dht_config_rejects_malformed_bootstrap_node() {
         // A bootstrap entry that is not a valid `host:port` must fail loudly
         // with the offending value rather than being silently dropped.
-        let toml_src = "name = \"x\"\nenable_dht = true\n\
+        let toml_src = "name = \"x\"\n\
              dht_bootstrap_nodes = [\"not-a-socket-addr\"]";
         let value = toml::from_str::<toml::Value>(toml_src).unwrap();
         let err = parse_dht_config(&value).expect_err("malformed node must error");
@@ -2764,7 +2935,8 @@ mod tests {
             block_store_root: dir.path().join("blocks"),
             identity_dir: dir.path().join("identity"),
             listen_addr: Some("127.0.0.1:0".parse().unwrap()),
-            enable_discovery: true,
+            // LAN multicast self-activates at the default Private posture
+            // once a listener is bound — no separate enable flag.
             ..Default::default()
         };
         let backend = P2pBackend::open(cfg).unwrap();
@@ -2774,6 +2946,68 @@ mod tests {
         drop(backend);
         // After drop, the cancel watch must have fired; spawned tasks
         // will observe `true` on their next tick and exit.
+        cancel_rx.changed().await.unwrap();
+        assert!(*cancel_rx.borrow());
+    }
+
+    /// Self-activation: a source that is *permitted* by the posture but
+    /// lacks what it needs to run must stay idle. Here the posture is
+    /// `Public` — which permits the DHT and announce sources — but no
+    /// `listen_addr` is set, so the DHT (which needs a bound port to
+    /// advertise) and the LAN source never come up. The backend must still
+    /// open and shut down cleanly, proving the AND half of the
+    /// self-activation rule: permission alone does not start a source.
+    #[tokio::test]
+    async fn public_posture_without_listener_keeps_global_sources_idle() {
+        let dir = tempdir().unwrap();
+        let cfg = P2pBackendConfig {
+            instance_id: "p2p-idle".to_string(),
+            folder_id: "p2p-idle".to_string(),
+            display_name: "Idle".to_string(),
+            index_path: dir.path().join("index.db"),
+            block_store_root: dir.path().join("blocks"),
+            identity_dir: dir.path().join("identity"),
+            // No listen_addr — the bound-port requirement is unmet.
+            exposure: DiscoveryReach::Public,
+            // DHT bootstrap configured, but the source still cannot run
+            // without a listener to advertise.
+            dht: DhtConfig {
+                bootstrap_nodes: vec!["127.0.0.1:6881".parse().unwrap()],
+            },
+            ..Default::default()
+        };
+        let backend = P2pBackend::open(cfg).unwrap();
+        let mut cancel_rx = backend.cancel.subscribe();
+        assert!(!*cancel_rx.borrow());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(backend);
+        cancel_rx.changed().await.unwrap();
+        assert!(*cancel_rx.borrow());
+    }
+
+    /// `LanOnly` posture with a bound listener: LAN multicast self-activates
+    /// (it is permitted at every posture and the listener requirement is
+    /// met), but gossip, hole punch, peer relay, and any global directory
+    /// stay off. The backend must open and shut down cleanly.
+    #[tokio::test]
+    async fn lan_only_posture_with_listener_opens_and_shuts_down() {
+        let dir = tempdir().unwrap();
+        let cfg = P2pBackendConfig {
+            instance_id: "p2p-lan-only".to_string(),
+            folder_id: "p2p-lan-only".to_string(),
+            display_name: "LanOnly".to_string(),
+            index_path: dir.path().join("index.db"),
+            block_store_root: dir.path().join("blocks"),
+            identity_dir: dir.path().join("identity"),
+            listen_addr: Some("127.0.0.1:0".parse().unwrap()),
+            exposure: DiscoveryReach::LanOnly,
+            ..Default::default()
+        };
+        let backend = P2pBackend::open(cfg).unwrap();
+        let mut cancel_rx = backend.cancel.subscribe();
+        assert!(!*cancel_rx.borrow());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(backend);
         cancel_rx.changed().await.unwrap();
         assert!(*cancel_rx.borrow());
     }
@@ -2795,6 +3029,10 @@ mod tests {
             block_store_root: dir.path().join("blocks"),
             identity_dir: dir.path().join("identity"),
             listen_addr: Some("127.0.0.1:0".parse().unwrap()),
+            // Public posture so the announce source and its publish loop
+            // actually run — at Private they would stay idle regardless of a
+            // configured server.
+            exposure: DiscoveryReach::Public,
             // An address with no server listening — the publish loop's
             // register calls fail and are swallowed best-effort.
             announce_servers: vec!["http://127.0.0.1:1".to_string()],
@@ -2809,17 +3047,18 @@ mod tests {
         assert!(*cancel_rx.borrow());
     }
 
-    /// Enabling the DHT (via `Some(DhtConfig)`) with no operator-supplied
-    /// bootstrap nodes must not block or panic on backend open: the node joins
-    /// the public default set, the publish loop comes up on the BEP44 republish
-    /// cadence, and both honour the shutdown watch. We confirm the spawned tasks
-    /// observe cancellation, proving the DHT publish loop exits cleanly like
-    /// every other background task. The default bootstrap nodes are real public
-    /// router hostnames, which `open` resolves with blocking `getaddrinfo`; the
-    /// backend runs that resolution off the runtime via `spawn_blocking`, and a
-    /// resolver miss is swallowed best-effort, so the node still binds its local
-    /// UDP socket and this stays an offline test that neither blocks a worker
-    /// nor depends on reaching the routers.
+    /// A `Public`-posture backend with no operator-supplied bootstrap nodes
+    /// must not block or panic on backend open: the DHT source self-activates
+    /// (the posture permits global publication and a listener is bound), the
+    /// node joins the public default set, the publish loop comes up on the
+    /// BEP44 republish cadence, and both honour the shutdown watch. We confirm
+    /// the spawned tasks observe cancellation, proving the DHT publish loop
+    /// exits cleanly like every other background task. The default bootstrap
+    /// nodes are real public router hostnames, which `open` resolves with
+    /// blocking `getaddrinfo`; the backend runs that resolution off the runtime
+    /// via `spawn_blocking`, and a resolver miss is swallowed best-effort, so
+    /// the node still binds its local UDP socket and this stays an offline test
+    /// that neither blocks a worker nor depends on reaching the routers.
     #[tokio::test]
     async fn dht_enabled_backend_opens_and_shuts_down() {
         let dir = tempdir().unwrap();
@@ -2831,9 +3070,12 @@ mod tests {
             block_store_root: dir.path().join("blocks"),
             identity_dir: dir.path().join("identity"),
             listen_addr: Some("127.0.0.1:0".parse().unwrap()),
-            // Presence of the config is the enable switch; an empty bootstrap
-            // list falls back to the named public default inside the node.
-            dht: Some(DhtConfig::default()),
+            // The posture is the on/off switch: `Public` permits global-
+            // directory publication, so the DHT source self-activates. An empty
+            // bootstrap list falls back to the named public default inside the
+            // node.
+            exposure: DiscoveryReach::Public,
+            dht: DhtConfig::default(),
             ..Default::default()
         };
         let backend = P2pBackend::open(cfg).unwrap();

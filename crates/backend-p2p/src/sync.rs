@@ -531,9 +531,9 @@ pub struct SyncEngine {
     /// [`BepMessage::ObservedAddress`] frame. Populated by
     /// [`Self::set_observed_external_addr`] and folded into both the
     /// local candidate set advertised over `BepMessage::Candidates` and
-    /// the self entry gossiped to peers, closing the gap the
-    /// `enable_wan_gossip` docstring records: `NAT`-derived external
-    /// addresses must land in the peer book and propagate via gossip.
+    /// the self entry gossiped to peers, so `NAT`-derived external
+    /// addresses land in the peer book and propagate via introducer gossip
+    /// (active from [`crate::DiscoveryReach::Private`] upward).
     observed_external_candidates: Arc<RwLock<Vec<Candidate>>>,
     /// Known relay endpoints, in preference order. Fed verbatim into
     /// [`decide_connectivity`]. Empty means the relay strategy is
@@ -1174,10 +1174,12 @@ impl SyncEngine {
     /// goal here is to prove the wiring, not to drive a full session
     /// over the new transport.
     ///
-    /// `enable_hole_punch = false` downgrades a chosen `HolePunch`
-    /// strategy to direct-or-relay before any UDP burst is emitted, so
-    /// privacy-conscious deployments can take that path out of the
-    /// equation without removing `decide_connectivity` from the loop.
+    /// The engine's hole-punch flag (fed from the
+    /// [`crate::DiscoveryReach`] exposure posture — off at `LanOnly`)
+    /// downgrades a chosen `HolePunch` strategy to direct-or-relay before
+    /// any UDP burst is emitted, so a LAN-confined deployment takes that
+    /// path out of the equation without removing `decide_connectivity`
+    /// from the loop.
     pub async fn connect_to_with_strategy(&self, peer: Peer) -> Result<()> {
         let trusted = self.trusted.lock().await.clone();
         if !trusted.contains(&peer.device_id) {
@@ -2682,9 +2684,9 @@ impl SyncEngine {
     /// (`NAT`-derived) addresses — from `STUN` detection or peer-as-`STUN`
     /// observation — a self entry carrying those addresses is included so
     /// connected peers can relay our reachability to their own peers.
-    /// This closes the gap the `enable_wan_gossip` docstring records:
-    /// external addresses must fold into the peer book and propagate via
-    /// gossip. The self entry is stamped with the current time as a
+    /// Folding external addresses into the peer book lets them propagate
+    /// via introducer gossip (active from [`crate::DiscoveryReach::Private`]
+    /// upward). The self entry is stamped with the current time as a
     /// fresh-contact tie-breaker.
     ///
     /// Returns an empty vector when no peers are known and the local

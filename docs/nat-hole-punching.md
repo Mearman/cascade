@@ -206,7 +206,7 @@ quotas live on the relay server.
 | Modify: full RFC 5780 detection (two-server) with single-server fallback | `crates/p2p/src/nat.rs` | M |
 | Modify: hook `decide_connectivity` between peer-lookup and dial | `crates/backend-p2p/src/sync.rs` | L |
 | Modify: reconnect loop requests strategy from coordinator on failure | `crates/backend-p2p/src/lib.rs` | S |
-| Modify: add `relay_endpoints` and `enable_hole_punch` to config | `crates/backend-p2p/src/lib.rs` | S |
+| Modify: add `relay_endpoints` to config; gate hole punch on the `exposure` posture (`DiscoveryReach`) | `crates/backend-p2p/src/lib.rs` | S |
 | Modify: `PeerBook` carries `last_known_nat_type` and `relay_endpoint` | `crates/p2p/src/wan.rs` | S |
 | Modify: cross-link P2P traversal section | `docs/design.md` | S |
 | Test: mock NAT topology harness | `crates/p2p/tests/nat_traversal.rs` | M |
