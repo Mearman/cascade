@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.52](https://github.com/Mearman/cascade/compare/cascade-v0.1.51...cascade-v0.1.52) - 2026-06-02
+
+### Other
+
+- *(presenter-nfs)* type the NFS cache mode as an enum
+- *(cascade)* use human-readable cache values in TOML fixture
+- *(cascade-config)* type cache posture and quantity settings
+- *(backend-p2p)* collapse connectivity flags into a DiscoveryReach posture
+
 ## [0.1.51](https://github.com/Mearman/cascade/compare/cascade-v0.1.50...cascade-v0.1.51) - 2026-06-02
 
 ### Added
