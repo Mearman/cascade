@@ -126,10 +126,44 @@ impl DriveClient {
         )
     }
 
+    /// Build the HTTP client used for a single Drive API request.
+    ///
+    /// A fresh client per request with connection pooling disabled
+    /// (`pool_max_idle_per_host(0)`) and HTTP/1.1 only (`http1_only`) is a
+    /// deliberate workaround for a hang first seen on the `WebDAV` write path,
+    /// not an oversight. **Do not** restore pooling or HTTP/2 here without a
+    /// confirmed root cause and a passing reproduction — the standing rule is
+    /// recorded in `docs/design.md` ("Google Drive TLS deadlock workaround").
+    ///
+    /// What was investigated and ruled out (see the concurrency test
+    /// `concurrent_requests_through_shared_client_do_not_deadlock` in
+    /// `tests/gdrive_integration.rs`): nothing inside this crate deadlocks
+    /// under concurrent load. The token `Mutex` in `GdriveBackend::access_token`
+    /// drops its guard before every `.await`, and the `RateLimiter` below is
+    /// lock-free, so neither stalls a task. Driving many concurrent requests
+    /// through one shared backend completes well inside its deadline.
+    ///
+    /// What remains suspected and could not be reproduced offline: the hang
+    /// only ever appeared through the `WebDAV` presenter, where an
+    /// `axum`/`hyper`-1.x *server* and a `reqwest`/`hyper`-1.x *client* share
+    /// one `tokio` runtime. A new backend TLS handshake opened while the server
+    /// was mid-response never completed, so a pooled connection's second use
+    /// (or an HTTP/2 stream reused across that boundary) wedged the task. A
+    /// plain-HTTP mock cannot exercise that TLS handshake, which is why the test
+    /// above stays green and yet the workaround stays in place: the cause lives
+    /// at the `hyper` server+client boundary, outside this crate, and removing
+    /// the per-request client reintroduces the freeze on the real Drive
+    /// endpoint. Earlier work also tried (and reverted) `native-tls`,
+    /// `aws-lc-rs`, manual `serve_connection`, and `block_in_place`; the
+    /// per-request, unpooled, HTTP/1.1-only client is the combination that held.
     fn http() -> reqwest::Client {
         reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
+            // Disable connection reuse: a pooled connection's second use is the
+            // exact moment the WebDAV-path hang manifested. See the doc comment.
             .pool_max_idle_per_host(0)
+            // Force HTTP/1.1: avoids HTTP/2 stream multiplexing being reused
+            // across the server-response boundary that triggered the wedge.
             .http1_only()
             .build()
             .unwrap_or_default()

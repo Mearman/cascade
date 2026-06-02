@@ -1398,6 +1398,14 @@ Uses the [Drive API Changes stream](https://developers.google.com/drive/api/v3/r
 
 Google Drive allows ~10,000 requests per 100 seconds per user. The backend implements a token-bucket rate limiter. Batch operations use batch requests where possible.
 
+### Google Drive TLS deadlock workaround
+
+The HTTP client is built fresh for every request with connection pooling disabled (`pool_max_idle_per_host(0)`) and HTTP/1.1 forced (`http1_only`), in both `DriveClient::http` and the token-refresh path. This is a deliberate workaround, not an oversight, and it must not be reverted without a confirmed root cause and a passing reproduction.
+
+The hang it works around was only ever observed through the WebDAV presenter, where an axum/hyper-1.x server and a reqwest/hyper-1.x client share one tokio runtime. A backend TLS handshake opened while the server was mid-response never completed, so the second use of a pooled connection (or an HTTP/2 stream reused across that boundary) wedged the task. The WebDAV presenter independently carries the matching half of the workaround — it forces `Connection: close` on every response and runs the backend write on an isolated thread with its own runtime.
+
+The investigation ruled out everything internal to the backend. Nothing in this crate holds a lock across an `.await`: the token `Mutex` in `GdriveBackend::access_token` drops its guard before the refresh call, and the token-bucket rate limiter is lock-free. The integration test `concurrent_requests_through_shared_client_do_not_deadlock` drives many concurrent requests through one shared backend against a mock server and completes well inside a deadline, proving the backend does not deadlock on its own. Because the mock speaks plain HTTP, it cannot exercise the TLS handshake that is the suspected trigger — that the test stays green is the evidence that the remaining cause sits at the hyper server+client boundary, outside this crate. Earlier work also tried and reverted native-tls, aws-lc-rs, manual `serve_connection`, and `block_in_place`; the per-request, unpooled, HTTP/1.1-only client is the combination that held.
+
 ## Conflict resolution
 
 When the same file is modified in two places simultaneously:

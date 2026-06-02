@@ -164,6 +164,10 @@ impl GdriveBackend {
             // guard is dropped here — mutex released before the HTTP call.
         };
 
+        // Same per-request, unpooled, HTTP/1.1-only client as the Drive API
+        // path. See the extended rationale on `DriveClient::http` in client.rs
+        // for why pooling and HTTP/2 stay disabled: it is the confirmed
+        // workaround for the WebDAV-path TLS hang, not an oversight.
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .pool_max_idle_per_host(0)
