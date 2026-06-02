@@ -79,6 +79,13 @@ impl ManageGrantStore for TestNode {
         Ok(self.grants.clone())
     }
 
+    fn manage_grant_scope(&self, _grant_id: i64) -> anyhow::Result<Option<Scope>> {
+        // This double holds no row-addressable grants — the round-trip test
+        // exercises status and pin commands, never GrantRevoke — so no stored
+        // scope resolves by id.
+        Ok(None)
+    }
+
     fn manage_append_audit(&self, entry: &AuditEntry) -> anyhow::Result<()> {
         self.audit
             .lock()
