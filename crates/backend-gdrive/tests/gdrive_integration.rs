@@ -12,11 +12,16 @@
 //! (camelCase field mapping) without touching the real Drive API or the macOS Keychain.
 
 use std::path::Path;
+use std::sync::Arc;
 
-use cascade_backend_gdrive::create_backend;
+use async_trait::async_trait;
+use cascade_backend_gdrive::auth::AuthTokens;
+use cascade_backend_gdrive::token_store::TokenStore;
+use cascade_backend_gdrive::{create_backend, create_backend_with_store};
 use cascade_engine::backend::Backend;
 use cascade_engine::types::{FileId, ItemId};
 use serde_json::json;
+use tokio::sync::Mutex;
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -549,7 +554,7 @@ async fn poll_interval_is_sixty_seconds() {
     assert_eq!(interval, Some(std::time::Duration::from_mins(1)));
 }
 
-// ── concurrent client path (TLS-deadlock investigation harness) ────────────────
+// ── concurrent refresh path (TLS-deadlock regression guard) ────────────────────
 //
 // Background: the Drive backend carries a long-standing workaround for a hang
 // that the project memory describes as a "TLS deadlock" — a fresh per-request
@@ -561,49 +566,125 @@ async fn poll_interval_is_sixty_seconds() {
 // HTTP echo server never reproduced it; only the real handler against the real
 // TLS endpoint did.
 //
-// This test pins down what the Drive backend can be held responsible for: that
-// nothing *inside* this crate deadlocks under concurrency. It drives many
-// requests through the shared backend at once, exercising the two internal
-// synchronisation points that could plausibly stall a task —
+// What this test *can* pin down: the one place inside the crate where a tokio
+// MutexGuard sits near an `.await` is the slow refresh path of
+// `GdriveBackend::access_token` — it locks the token mutex, clones the refresh
+// token, drops the guard, awaits the OAuth2 refresh, then re-locks to store the
+// result. If that guard were ever held across the refresh await, a second task
+// arriving at the lock could never acquire it and the task would wedge.
 //
-//   * the token `Mutex` in `GdriveBackend::access_token` (lib.rs), which must
-//     drop its guard before the refresh `.await`, and
-//   * the lock-free token-bucket `RateLimiter` in client.rs, whose `acquire`
-//     loop sleeps between attempts —
+// To exercise that path for real the backend is seeded with an *already
+// expired* access token plus a refresh token, and the OAuth2 token endpoint is
+// pointed at a deliberately delayed mock. Every concurrent caller therefore
+// misses the fast path, races into the refresh branch, and contends on the
+// mutex re-acquisition. An in-memory token store stands in for the Keychain so
+// the refresh's `save` never touches the host. All callers must still complete
+// within the deadline; a guard held across the refresh await would trip it.
 //
-// and asserts they all complete well inside a deadline. wiremock speaks plain
-// HTTP with no TLS handshake, so this harness deliberately cannot reach the
-// suspected hyper server+client TLS interaction; that it stays green is the
-// evidence that the remaining cause lives outside this crate, not within it.
-// If a future change reintroduced a guard held across an `.await`, this test
-// would hang and trip the deadline rather than passing silently.
+// wiremock speaks plain HTTP with no TLS handshake, so this harness still
+// cannot reach the suspected hyper server+client TLS interaction — that lives
+// outside this crate. What it proves is the narrower, load-bearing claim the
+// workaround comments make: the refresh-path lock discipline does not deadlock.
+
+/// In-memory [`TokenStore`] for tests: keeps the refresh path off the host
+/// Keychain and config directory while still recording what was persisted.
+#[derive(Debug, Default)]
+struct InMemoryTokenStore {
+    slot: Mutex<Option<AuthTokens>>,
+}
+
+#[async_trait]
+impl TokenStore for InMemoryTokenStore {
+    async fn load(&self, _account: &str) -> anyhow::Result<Option<AuthTokens>> {
+        Ok(self.slot.lock().await.clone())
+    }
+
+    async fn save(&self, _account: &str, tokens: &AuthTokens) -> anyhow::Result<()> {
+        *self.slot.lock().await = Some(tokens.clone());
+        Ok(())
+    }
+}
+
+/// Build a backend whose seeded access token is already expired and whose
+/// `OAuth2` token endpoint points at `server`, so any access-token use is forced
+/// down the refresh slow path. The in-memory store keeps refreshes off the host.
+fn make_backend_forcing_refresh(server: &MockServer) -> Box<dyn Backend> {
+    let uri = server.uri();
+    let mut table = toml::map::Map::new();
+    table.insert(
+        "client_id".to_string(),
+        toml::Value::String("test-id".to_string()),
+    );
+    table.insert(
+        "client_secret".to_string(),
+        toml::Value::String("test-secret".to_string()),
+    );
+    table.insert(
+        "account".to_string(),
+        toml::Value::String("test-account".to_string()),
+    );
+    table.insert("base_url".to_string(), toml::Value::String(uri.clone()));
+    table.insert("upload_url".to_string(), toml::Value::String(uri.clone()));
+    // Route OAuth2 token refreshes at the mock instead of Google.
+    table.insert("token_url".to_string(), toml::Value::String(uri));
+    table.insert(
+        "access_token".to_string(),
+        toml::Value::String("stale-token".to_string()),
+    );
+    table.insert(
+        "refresh_token".to_string(),
+        toml::Value::String("refresh-token".to_string()),
+    );
+    // Inside is_expired()'s 60-second buffer, so the seeded token reads as
+    // expired immediately and every caller takes the refresh path.
+    table.insert("expires_in_secs".to_string(), toml::Value::Integer(0));
+
+    create_backend_with_store(
+        &toml::Value::Table(table),
+        Arc::new(InMemoryTokenStore::default()),
+    )
+    .unwrap()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_requests_through_shared_client_do_not_deadlock() {
-    use std::sync::Arc;
+async fn concurrent_refresh_through_shared_client_does_not_deadlock() {
     use std::time::Duration;
 
     let server = MockServer::start().await;
 
-    // Every request lists the same folder. A small artificial delay on the
-    // mock keeps several requests in flight simultaneously so the shared token
-    // mutex and rate limiter are genuinely contended, not serialised by luck.
-    Mock::given(method("GET"))
-        .and(path("/files"))
+    // The OAuth2 token endpoint is a POST to the configured token_url, which we
+    // pointed at the server root. A deliberate delay keeps several refreshes in
+    // flight at once so the mutex re-acquisition is genuinely contended.
+    Mock::given(method("POST"))
+        .and(path("/"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_delay(Duration::from_millis(20))
                 .set_body_json(json!({
-                    "files": [file_json("f1", "a.txt", "shared-parent", 1)]
+                    "access_token": "fresh-token",
+                    "refresh_token": "refresh-token",
+                    "expires_in": 3600,
+                    "token_type": "Bearer"
                 })),
         )
         .mount(&server)
         .await;
 
-    let backend: Arc<dyn Backend> = Arc::from(make_backend(&server));
+    // The Drive list call each task makes once it holds a fresh token.
+    Mock::given(method("GET"))
+        .and(path("/files"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "files": [file_json("f1", "a.txt", "shared-parent", 1)]
+        })))
+        .mount(&server)
+        .await;
 
-    // Enough concurrency to overlap many in-flight requests through the one
+    let backend: Arc<dyn Backend> = Arc::from(make_backend_forcing_refresh(&server));
+
+    // Enough concurrency to overlap many in-flight refreshes through the one
     // backend. The exact count is not load-bearing; it only has to be large
-    // enough that requests genuinely overlap given the 20ms mock delay.
+    // enough that callers genuinely contend on the refresh mutex given the
+    // 20ms mock delay.
     let concurrency = 32;
     let mut handles = Vec::with_capacity(concurrency);
     for _ in 0..concurrency {
@@ -613,12 +694,11 @@ async fn concurrent_requests_through_shared_client_do_not_deadlock() {
         }));
     }
 
-    // A generous deadline: 32 requests at a 20ms mock delay across 4 worker
-    // threads complete in well under a second even fully serialised, so two
-    // seconds leaves ample slack while still failing fast on a real deadlock.
-    // Each task is awaited under the same shared deadline; a true deadlock
-    // leaves at least one task pending and trips the timeout below.
-    let deadline = Duration::from_secs(2);
+    // A guard held across the refresh await would leave every task after the
+    // first unable to acquire the token mutex, so at least one would never
+    // complete and the timeout below would fire. With the guard correctly
+    // dropped before the await, all tasks finish well inside this deadline.
+    let deadline = Duration::from_secs(5);
     let drained = tokio::time::timeout(deadline, async move {
         let mut entries_per_task = Vec::with_capacity(handles.len());
         for handle in handles {
@@ -631,7 +711,7 @@ async fn concurrent_requests_through_shared_client_do_not_deadlock() {
         entries_per_task
     })
     .await
-    .expect("concurrent requests deadlocked: in-flight tasks did not complete in time");
+    .expect("concurrent refreshes deadlocked: in-flight tasks did not complete in time");
 
     for entries in drained {
         assert_eq!(entries.len(), 1);
