@@ -144,3 +144,148 @@ impl DiscoveryService {
         candidates
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn addr(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    /// A stub source that returns a fixed candidate list and records how
+    /// many times it was resolved/announced — used to prove fan-out and
+    /// merge behaviour without touching the network.
+    struct StubSource {
+        candidates: Vec<Candidate>,
+        resolve_calls: Arc<AtomicUsize>,
+        announce_calls: Arc<AtomicUsize>,
+    }
+
+    impl StubSource {
+        fn new(candidates: Vec<Candidate>) -> Self {
+            Self {
+                candidates,
+                resolve_calls: Arc::new(AtomicUsize::new(0)),
+                announce_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Discovery for StubSource {
+        async fn resolve(&self, _device_id: &str) -> Vec<Candidate> {
+            self.resolve_calls.fetch_add(1, Ordering::SeqCst);
+            self.candidates.clone()
+        }
+
+        async fn announce(&self, _self_id: &str, _candidates: &[Candidate]) {
+            self.announce_calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_service_resolves_to_nothing() {
+        let service = DiscoveryService::new();
+        assert!(service.is_empty());
+        assert!(service.resolve("DEVICE-A").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_unions_candidates_from_all_sources() {
+        let a = Candidate::new(addr(22000), CandidateKind::Host, 100);
+        let b = Candidate::new(addr(22001), CandidateKind::ServerReflexive, 0);
+        let mut service = DiscoveryService::new();
+        service.register(Box::new(StubSource::new(vec![a])));
+        service.register(Box::new(StubSource::new(vec![b])));
+        assert_eq!(service.len(), 2);
+
+        let resolved = service.resolve("DEVICE-A").await;
+        assert_eq!(resolved.len(), 2);
+        assert!(resolved.contains(&a));
+        assert!(resolved.contains(&b));
+    }
+
+    #[tokio::test]
+    async fn resolve_dedups_identical_address_and_kind() {
+        // The same reachable endpoint reported by two sources must count
+        // once. Both are host candidates at the same address, so the
+        // priority is identical and the pair collapses.
+        let shared = Candidate::new(addr(22000), CandidateKind::Host, 1024);
+        let mut service = DiscoveryService::new();
+        service.register(Box::new(StubSource::new(vec![shared])));
+        service.register(Box::new(StubSource::new(vec![shared])));
+
+        let resolved = service.resolve("DEVICE-A").await;
+        assert_eq!(resolved, vec![shared]);
+    }
+
+    #[tokio::test]
+    async fn resolve_keeps_same_address_with_different_kind() {
+        // Same address but different kind is a distinct candidate: a host
+        // address and a server-reflexive mapping to the same port reach
+        // the peer through different paths and must both survive dedup.
+        let host = Candidate::new(addr(22000), CandidateKind::Host, 0);
+        let srflx = Candidate::new(addr(22000), CandidateKind::ServerReflexive, 0);
+        let mut service = DiscoveryService::new();
+        service.register(Box::new(StubSource::new(vec![host])));
+        service.register(Box::new(StubSource::new(vec![srflx])));
+
+        let resolved = service.resolve("DEVICE-A").await;
+        assert_eq!(resolved.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn resolve_orders_by_descending_priority() {
+        // Host outranks server-reflexive outranks relayed by RFC 8445
+        // type preference, independent of registration order. Register
+        // them low-to-high to prove the service re-orders.
+        let relayed = Candidate::new(addr(22002), CandidateKind::Relayed, u16::MAX);
+        let srflx = Candidate::new(addr(22001), CandidateKind::ServerReflexive, 0);
+        let host = Candidate::new(addr(22000), CandidateKind::Host, 0);
+        let mut service = DiscoveryService::new();
+        service.register(Box::new(StubSource::new(vec![relayed])));
+        service.register(Box::new(StubSource::new(vec![srflx])));
+        service.register(Box::new(StubSource::new(vec![host])));
+
+        let resolved = service.resolve("DEVICE-A").await;
+        assert_eq!(resolved, vec![host, srflx, relayed]);
+        // The ordering must follow the candidates' own priorities.
+        assert!(resolved[0].priority >= resolved[1].priority);
+        assert!(resolved[1].priority >= resolved[2].priority);
+    }
+
+    #[tokio::test]
+    async fn resolve_consults_every_source() {
+        let source_a = StubSource::new(vec![]);
+        let source_b = StubSource::new(vec![]);
+        let calls_a = source_a.resolve_calls.clone();
+        let calls_b = source_b.resolve_calls.clone();
+        let mut service = DiscoveryService::new();
+        service.register(Box::new(source_a));
+        service.register(Box::new(source_b));
+
+        let _ = service.resolve("DEVICE-A").await;
+        assert_eq!(calls_a.load(Ordering::SeqCst), 1);
+        assert_eq!(calls_b.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn announce_fans_out_to_every_source() {
+        let source_a = StubSource::new(vec![]);
+        let source_b = StubSource::new(vec![]);
+        let announce_a = source_a.announce_calls.clone();
+        let announce_b = source_b.announce_calls.clone();
+        let mut service = DiscoveryService::new();
+        service.register(Box::new(source_a));
+        service.register(Box::new(source_b));
+
+        let candidate = Candidate::new(addr(22000), CandidateKind::Host, 0);
+        service.announce("SELF", &[candidate]).await;
+        assert_eq!(announce_a.load(Ordering::SeqCst), 1);
+        assert_eq!(announce_b.load(Ordering::SeqCst), 1);
+    }
+}
