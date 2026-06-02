@@ -46,7 +46,7 @@ use cascade_p2p::block::{BlockHash, split_data};
 use cascade_p2p::candidate::{Candidate, CandidateKind};
 use cascade_p2p::discovery::{Discovery, DiscoveryService, GossipDiscovery, LanDiscovery};
 use cascade_p2p::identity::DeviceIdentity;
-use cascade_p2p::protocol::Version;
+use cascade_p2p::protocol::{ManageCommand, ManageResult, ManageScope, Version};
 use cascade_p2p::store::BlockStore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -60,6 +60,16 @@ use crate::sync::SyncEngine;
 /// poll. We keep the interval short (1 s) so peer-pushed files appear
 /// in WebDAV/FUSE listings without user-visible lag.
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Maximum time a manager-side dial waits for the session loop to register
+/// the peer handle before a management request may be sent.
+///
+/// [`SyncEngine::connect_to`] returns once the TLS handshake completes, but the
+/// session loop registers the peer handle on a spawned task a moment later. Ten
+/// seconds is a generous ceiling over the sub-second handshake-plus-register
+/// path on a direct dial; past it the setup is treated as wedged and the manage
+/// call fails loudly rather than racing the send.
+const SESSION_REGISTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Default ceiling on the number of concurrent relay sessions this node
 /// will bridge when volunteering as a peer relay.
@@ -647,6 +657,158 @@ impl P2pBackend {
     #[must_use]
     pub const fn sync(&self) -> &SyncEngine {
         &self.sync
+    }
+
+    /// Manager side: administer a remote node by device id.
+    ///
+    /// Resolves `device_id` to a reachable address, opens (or reuses) an
+    /// authenticated session over the connectivity ladder, sends the
+    /// `command`, and returns the managed node's typed [`ManageResult`].
+    ///
+    /// Resolution prefers a statically-configured peer's address (the device is
+    /// already paired, so its endpoint is known without a directory lookup) and
+    /// otherwise falls back to the [`DiscoveryService`] composed from this
+    /// backend's configured sources — exactly the sources the backend already
+    /// runs (LAN multicast, introducer gossip, announce servers, the Mainline
+    /// DHT). The transport is the same TLS-direct dial the data plane uses; this
+    /// method never opens a parallel transport.
+    ///
+    /// The connection must reach the management plane over a TLS-verified
+    /// session — the managed node refuses a `ManageRequest` on a relayed or
+    /// post-hole-punch session whose peer identity is merely asserted on the
+    /// wire — so this method connects directly via the dial ladder rather than
+    /// the strategy chooser that may select a relay.
+    ///
+    /// An authorisation denial on the managed node surfaces inside the returned
+    /// `Ok(ManageResult::Err { kind: Unauthorised, .. })`; a transport failure
+    /// (unresolvable device, dial failure, dropped session, timeout) is the
+    /// `Err` arm of the outer `Result`.
+    pub async fn manage_remote(
+        &self,
+        device_id: &str,
+        command: ManageCommand,
+        scope: ManageScope,
+    ) -> Result<ManageResult> {
+        // Reuse an existing session if one is already live — the data plane may
+        // already hold a connection to this device.
+        if !self.sync.has_peer(device_id).await {
+            let address = self
+                .resolve_remote_address(device_id)
+                .await
+                .with_context(|| format!("resolving management target {device_id}"))?;
+            // The managed node only honours management commands from a
+            // TLS-verified peer, so trust the device and dial it directly over
+            // the TCP+TLS ladder rather than the strategy chooser that might
+            // route through a relay (which the managed node refuses).
+            self.sync.trust(device_id.to_owned()).await;
+            self.sync
+                .connect_to(crate::sync::Peer {
+                    device_id: device_id.to_owned(),
+                    address,
+                })
+                .await
+                .with_context(|| {
+                    format!("connecting to management target {device_id} at {address}")
+                })?;
+            // `connect_to` spawns the session loop; wait for the handle to
+            // register before sending so the request does not race the
+            // session setup.
+            self.await_session(device_id)
+                .await
+                .with_context(|| format!("waiting for session to management target {device_id}"))?;
+        }
+
+        self.sync
+            .send_manage_request(device_id, command, scope)
+            .await
+    }
+
+    /// Resolve a peer device id to a reachable socket address.
+    ///
+    /// A statically-configured peer wins — its address is known without a
+    /// directory lookup — and is re-resolved through DNS so a hostname that was
+    /// not routable at startup still works. Otherwise the device is resolved
+    /// through the [`DiscoveryService`] composed from this backend's configured
+    /// discovery sources, returning the highest-priority candidate address.
+    async fn resolve_remote_address(&self, device_id: &str) -> Result<std::net::SocketAddr> {
+        if let Some(peer) = self.cfg.peers.iter().find(|p| p.device_id == device_id) {
+            return resolve_first(&peer.address).await;
+        }
+
+        let discovery = self.compose_resolution_discovery();
+        let candidates = discovery.resolve(device_id).await;
+        candidates
+            .into_iter()
+            .next()
+            .map(|candidate| candidate.address)
+            .with_context(|| format!("no discovery source resolved device {device_id}"))
+    }
+
+    /// Compose a [`DiscoveryService`] from this backend's configured discovery
+    /// sources, for one-shot peer resolution.
+    ///
+    /// Registers the same source families the backend runs continuously —
+    /// introducer gossip (over the live peer book), LAN multicast, announce
+    /// servers, and the Mainline DHT — so a manager resolves a target through
+    /// the exact channels the data plane already uses. A source whose
+    /// construction fails is logged and skipped rather than aborting the
+    /// resolution, matching the backend's startup behaviour.
+    fn compose_resolution_discovery(&self) -> DiscoveryService {
+        let mut discovery = DiscoveryService::new();
+        if self.cfg.enable_wan_gossip {
+            discovery.register(Box::new(GossipDiscovery::new(
+                self.sync.peer_book().clone(),
+            )));
+        }
+        if self.cfg.enable_discovery {
+            discovery.register(Box::new(LanDiscovery::new()));
+        }
+        for base_url in &self.cfg.announce_servers {
+            match cascade_p2p::discovery::announce::AnnounceDiscovery::new(base_url.clone()) {
+                Ok(source) => discovery.register(Box::new(source)),
+                Err(e) => tracing::warn!(
+                    target: "cascade::backend::p2p",
+                    announce_server = %base_url,
+                    error = %e,
+                    "could not construct announce-server discovery client for management resolution; skipping",
+                ),
+            }
+        }
+        if let Some(dht_cfg) = self.cfg.dht.as_ref() {
+            match cascade_p2p::discovery::MainlineDht::open(&dht_cfg.bootstrap_nodes) {
+                Ok(node) => {
+                    discovery.register(Box::new(cascade_p2p::discovery::DhtDiscovery::new(node)));
+                }
+                Err(e) => tracing::warn!(
+                    target: "cascade::backend::p2p",
+                    error = %e,
+                    "could not construct Mainline-DHT discovery node for management resolution; skipping",
+                ),
+            }
+        }
+        discovery
+    }
+
+    /// Wait for a session to `device_id` to register in the peer map.
+    ///
+    /// [`SyncEngine::connect_to`] completes the TLS handshake then spawns the
+    /// session loop, which registers the peer handle asynchronously. Poll until
+    /// the handle appears (so a following management request finds a live
+    /// session) or the bounded wait elapses, failing loudly rather than racing
+    /// the send against session setup.
+    async fn await_session(&self, device_id: &str) -> Result<()> {
+        // The handshake plus first registration is sub-second on a direct dial;
+        // poll a short interval up to a bounded total so a wedged setup fails
+        // loudly rather than hanging.
+        let poll_interval = std::time::Duration::from_millis(50);
+        let max_waits = SESSION_REGISTER_TIMEOUT.as_millis() / poll_interval.as_millis();
+        for _ in 0..max_waits {
+            if self.sync.has_peer(device_id).await {
+                return Ok(());
+            }
+            tokio::time::sleep(poll_interval).await;
+        }
+        anyhow::bail!("session to {device_id} did not register within the connect window")
     }
 
     /// Convert a `FolderIndex` row into a `FileEntry` keyed under this
@@ -1574,6 +1736,18 @@ async fn discovery_listen_loop(
 ///   `mainline` crate's built-in public bootstrap set. Ignored when
 ///   `enable_dht` is `false`.
 pub fn create_backend(config: &toml::Value) -> Result<Box<dyn Backend>> {
+    Ok(Box::new(open_from_config(config)?))
+}
+
+/// Parse a backend TOML table into a [`P2pBackend`], returning the concrete
+/// type rather than a boxed [`Backend`].
+///
+/// [`create_backend`] wraps this in a `Box<dyn Backend>` for the engine's
+/// backend registry. Callers that need the concrete type — for example the
+/// manager-side CLI driving [`P2pBackend::manage_remote`] over the connectivity
+/// ladder — open the backend through here so the management entry points are in
+/// reach. The accepted keys are documented on [`create_backend`].
+pub fn open_from_config(config: &toml::Value) -> Result<P2pBackend> {
     let name = config
         .get("name")
         .and_then(|v| v.as_str())
@@ -1688,8 +1862,31 @@ pub fn create_backend(config: &toml::Value) -> Result<Box<dyn Backend>> {
         max_relay_bandwidth,
     };
 
-    let backend = P2pBackend::open(cfg)?;
-    Ok(Box::new(backend))
+    P2pBackend::open(cfg)
+}
+
+/// Read (or generate) the local device identity for a P2P backend config,
+/// returning its device id without opening the full backend.
+///
+/// Resolves the `data_dir` / `identity` directory the same way
+/// [`open_from_config`] does, then loads the persistent device identity from
+/// it. Used by the management-plane CLI to stamp a locally-issued grant's
+/// `granted_by` with this device's own id — the node owner — without spinning
+/// up the listener, discovery, and reconnect tasks a full backend open starts.
+pub fn device_id_from_config(config: &toml::Value) -> Result<String> {
+    let name = config
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("p2p backend requires 'name'"))?
+        .to_string();
+    let data_dir = config
+        .get("data_dir")
+        .and_then(|v| v.as_str())
+        .map_or_else(|| default_data_dir(&name), PathBuf::from);
+    let identity_dir = data_dir.join("identity");
+    let identity = DeviceIdentity::load_or_generate(&identity_dir)
+        .context("loading P2P backend identity for management grant")?;
+    Ok(identity.device_id)
 }
 
 /// Parse the Kademlia/Mainline-DHT discovery configuration from a backend's

@@ -229,6 +229,13 @@ const FILE_TYPE_DIR: u32 = 1;
 /// Wall-clock timeout for a block request to a single peer.
 const BLOCK_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Wall-clock timeout for a management request to a single peer. A managed
+/// command runs the same handlers the local CLI drives, so it can take longer
+/// than a single block fetch; the ceiling is set well above the block timeout
+/// so a slow-but-honest command is not cut off, while a wedged peer still
+/// fails loudly rather than hanging the manager indefinitely.
+const MANAGE_REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
+
 /// [`MAX_RELAY_OFFER_ADDRESSES`] as a `usize` for length comparisons when
 /// building an offer. Derived from the protocol constant so the volunteer's
 /// self-imposed cap can never drift from the encoder's ceiling.
@@ -354,7 +361,16 @@ struct PeerHandle {
     /// the matching Response so the entry can be removed and the payload
     /// delivered to the right waiter.
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<u8>>>>>,
-    /// Source of fresh `request_id` values for outbound Request frames.
+    /// Outstanding management requests, keyed by the `request_id` allocated
+    /// when the [`BepMessage::ManageRequest`] frame was sent. The managed
+    /// node echoes the id in its [`BepMessage::ManageResponse`] so the entry
+    /// can be removed and the typed [`ManageResult`] delivered to the
+    /// waiting manager-side caller. Kept separate from `pending` because the
+    /// two reply frames carry different payload types.
+    manage_pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ManageResult>>>>,
+    /// Source of fresh `request_id` values for outbound Request and
+    /// `ManageRequest` frames. Shared across both frame families so a manage
+    /// request can never collide with a concurrent block request id.
     next_request_id: Arc<AtomicU64>,
 }
 
@@ -399,6 +415,50 @@ impl PeerHandle {
                 let mut pending = self.pending.lock().await;
                 pending.remove(&request_id);
                 anyhow::bail!("peer block request timed out");
+            }
+        }
+    }
+
+    /// Send a [`BepMessage::ManageRequest`] and await the managed node's
+    /// matching [`BepMessage::ManageResponse`], correlated by the
+    /// `request_id` carried in both frames.
+    ///
+    /// Returns the typed [`ManageResult`] the node reported — an authorisation
+    /// denial surfaces as [`ManageResult::Err`] with
+    /// [`ManageErrorKind::Unauthorised`], not as a transport error, so the
+    /// caller can distinguish "you may not" from a command that ran and
+    /// failed. A dropped session or a wedged peer fails loudly rather than
+    /// hanging: the waiter is removed and a transport error is returned.
+    async fn send_manage(
+        &self,
+        command: ManageCommand,
+        scope: ManageScope,
+    ) -> Result<ManageResult> {
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = self.manage_pending.lock().await;
+            pending.insert(request_id, tx);
+        }
+        self.outbound
+            .send(BepMessage::ManageRequest {
+                request_id,
+                command,
+                scope,
+            })
+            .map_err(|_| anyhow::anyhow!("peer outbound channel closed"))?;
+
+        match tokio::time::timeout(MANAGE_REQUEST_TIMEOUT, rx).await {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(_)) => {
+                let mut pending = self.manage_pending.lock().await;
+                pending.remove(&request_id);
+                anyhow::bail!("peer session dropped before responding to management request");
+            }
+            Err(_) => {
+                let mut pending = self.manage_pending.lock().await;
+                pending.remove(&request_id);
+                anyhow::bail!("peer management request timed out");
             }
         }
     }
@@ -1827,6 +1887,8 @@ impl SyncEngine {
         let (tx, mut rx) = mpsc::unbounded_channel::<BepMessage>();
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<u8>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let manage_pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ManageResult>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let next_request_id = Arc::new(AtomicU64::new(0));
 
         // Register handle.
@@ -1837,6 +1899,7 @@ impl SyncEngine {
                 PeerHandle {
                     outbound: tx.clone(),
                     pending: pending.clone(),
+                    manage_pending: manage_pending.clone(),
                     next_request_id: next_request_id.clone(),
                 },
             );
@@ -1937,7 +2000,7 @@ impl SyncEngine {
                 Err(e) => break Err(e),
             };
             if let Err(e) = self
-                .handle_message(&device_id, caller_auth, msg, &tx, &pending)
+                .handle_message(&device_id, caller_auth, msg, &tx, &pending, &manage_pending)
                 .await
             {
                 break Err(e);
@@ -2005,6 +2068,7 @@ impl SyncEngine {
         msg: BepMessage,
         outbound: &mpsc::UnboundedSender<BepMessage>,
         pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<u8>>>>>,
+        manage_pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<ManageResult>>>>,
     ) -> Result<()> {
         match msg {
             BepMessage::ClusterConfig { .. } | BepMessage::Ping => Ok(()),
@@ -2220,18 +2284,33 @@ impl SyncEngine {
                 .await;
                 Ok(())
             }
-            BepMessage::ManageResponse { request_id, .. } => {
-                // A managed node only ever sends ManageResponse; it does not
-                // expect to receive one. A frame arriving here means the peer is
-                // confused or this node initiated a manage call elsewhere that
-                // is not routed through this session loop. Log and ignore rather
-                // than tear the session down for an out-of-place reply.
-                debug!(
-                    target: "cascade::backend::p2p",
-                    peer = %peer_device_id,
-                    request_id,
-                    "dropping unexpected ManageResponse on managed-node session",
-                );
+            BepMessage::ManageResponse { request_id, result } => {
+                // The manager side: route the reply to the waiter registered by
+                // `PeerHandle::send_manage` for this `request_id`. A frame whose
+                // id has no waiter is either a duplicate, a reply that arrived
+                // after its caller timed out, or a node that sent a response we
+                // never asked for — log and drop rather than tear the session
+                // down for an out-of-place reply.
+                let waiter = {
+                    let mut pending = manage_pending.lock().await;
+                    pending.remove(&request_id)
+                };
+                match waiter {
+                    Some(tx) => {
+                        // The receiver may already be gone if the caller timed
+                        // out between the remove above and this send; that is a
+                        // benign race, so the send error is ignored.
+                        tx.send(result).ok();
+                    }
+                    None => {
+                        debug!(
+                            target: "cascade::backend::p2p",
+                            peer = %peer_device_id,
+                            request_id,
+                            "dropping ManageResponse with no waiting manage request",
+                        );
+                    }
+                }
                 Ok(())
             }
         }
@@ -2781,6 +2860,7 @@ impl SyncEngine {
                         PeerHandle {
                             outbound: h.outbound.clone(),
                             pending: h.pending.clone(),
+                            manage_pending: h.manage_pending.clone(),
                             next_request_id: h.next_request_id.clone(),
                         },
                     )
@@ -2807,6 +2887,46 @@ impl SyncEngine {
             }
         }
         None
+    }
+
+    /// Manager side: send a [`ManageCommand`] to the connected peer identified
+    /// by `device_id` and return the managed node's typed [`ManageResult`].
+    ///
+    /// The peer must already hold a live session in the engine's peer map — the
+    /// caller establishes it first via [`Self::connect_to`] /
+    /// [`Self::connect_to_with_strategy`] over the connectivity ladder, so this
+    /// method never opens a parallel transport of its own. The command rides the
+    /// existing TLS-direct (or post-punch / relay) session as a
+    /// [`BepMessage::ManageRequest`] frame, and the reply is the same
+    /// [`BepMessage::ManageResponse`] the managed node's dispatcher produces.
+    ///
+    /// An authorisation denial on the managed node surfaces inside the returned
+    /// `Ok(ManageResult::Err { kind: Unauthorised, .. })` — it is the node's
+    /// considered answer, not a transport failure. A genuine transport failure
+    /// (no session, dropped connection, timeout) is the `Err` arm of the outer
+    /// `Result`.
+    pub async fn send_manage_request(
+        &self,
+        device_id: &str,
+        command: ManageCommand,
+        scope: ManageScope,
+    ) -> Result<ManageResult> {
+        // Clone the handle out under the lock so the request — which awaits a
+        // reply for up to `MANAGE_REQUEST_TIMEOUT` — does not hold the peer map
+        // locked for the whole round-trip.
+        let handle = {
+            let peers = self.peers.lock().await;
+            peers.get(device_id).map(|h| PeerHandle {
+                outbound: h.outbound.clone(),
+                pending: h.pending.clone(),
+                manage_pending: h.manage_pending.clone(),
+                next_request_id: h.next_request_id.clone(),
+            })
+        };
+        let Some(handle) = handle else {
+            anyhow::bail!("no live session to device {device_id}");
+        };
+        handle.send_manage(command, scope).await
     }
 }
 
@@ -4780,6 +4900,8 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<u8>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let manage_pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ManageResult>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
         let remote_addr: SocketAddr = "203.0.113.1:22001".parse().unwrap();
         let candidates = vec![Candidate::new(remote_addr, CandidateKind::Host, 1024)];
@@ -4792,6 +4914,7 @@ mod tests {
                 },
                 &tx,
                 &pending,
+                &manage_pending,
             )
             .await
             .unwrap();
@@ -4812,6 +4935,8 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<u8>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let manage_pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ManageResult>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
         engine
             .handle_message(
@@ -4823,6 +4948,7 @@ mod tests {
                 },
                 &tx,
                 &pending,
+                &manage_pending,
             )
             .await
             .unwrap();
