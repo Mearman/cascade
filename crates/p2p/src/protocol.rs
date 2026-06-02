@@ -55,11 +55,15 @@ const MAX_GOSSIP_PEERS: u32 = 10_000;
 const MAX_GOSSIP_ADDRESSES_PER_PEER: u32 = 32;
 
 /// Maximum number of reachable addresses a [`BepMessage::RelayOffer`] may
-/// advertise. A volunteering relay realistically exposes a single public
-/// `host:port`, occasionally a small handful (dual-stack, multiple
-/// interfaces). The cap bounds receiver allocation against a malicious or
-/// buggy offer without constraining any legitimate deployment.
-const MAX_RELAY_OFFER_ADDRESSES: u32 = 8;
+/// advertise.
+///
+/// A volunteering relay realistically exposes a single public `host:port`,
+/// occasionally a small handful (dual-stack, multiple interfaces). The cap
+/// bounds receiver allocation against a malicious or buggy offer without
+/// constraining any legitimate deployment. Exposed so a volunteer building an
+/// offer caps its own advertised set to the same ceiling the encoder
+/// enforces, rather than hardcoding a parallel number.
+pub const MAX_RELAY_OFFER_ADDRESSES: u32 = 8;
 
 // ── XDR primitives ──
 
