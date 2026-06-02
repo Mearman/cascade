@@ -42,6 +42,8 @@ use async_trait::async_trait;
 use cascade_engine::backend::Backend;
 use cascade_engine::types::{Change, Cursor, FileEntry, FileId, ItemId, Quota};
 use cascade_p2p::block::{BlockHash, split_data};
+use cascade_p2p::candidate::{Candidate, CandidateKind};
+use cascade_p2p::discovery::{Discovery, DiscoveryService, GossipDiscovery, LanDiscovery};
 use cascade_p2p::identity::DeviceIdentity;
 use cascade_p2p::protocol::Version;
 use cascade_p2p::store::BlockStore;
@@ -360,16 +362,41 @@ impl P2pBackend {
                     keep_peer_connected(sync_clone, peer, peer_cancel).await;
                 });
             }
-            if cfg_enable_discovery && let Some(listen_port) = bound_port {
+
+            // Compose the discovery sources into a single service. The
+            // two sources registered here are exactly the two the backend
+            // already ran: LAN multicast behind `enable_discovery`, and
+            // introducer gossip behind `enable_wan_gossip`. The service
+            // is the structural home for discovery — the loops below feed
+            // their I/O through the registered `LanDiscovery` source so
+            // the wire behaviour is unchanged.
+            let mut discovery = DiscoveryService::new();
+            if cfg_enable_wan_gossip {
+                discovery.register(Box::new(GossipDiscovery::new(
+                    sync_for_listener.peer_book().clone(),
+                )));
+            }
+            let lan_source = (cfg_enable_discovery && bound_port.is_some()).then(LanDiscovery::new);
+            if let Some(lan) = lan_source {
+                discovery.register(Box::new(lan));
+            }
+            tracing::debug!(
+                target: "cascade::backend::p2p",
+                instance = %cfg_instance_id,
+                sources = discovery.len(),
+                "discovery service composed",
+            );
+
+            if let (Some(lan), Some(listen_port)) = (lan_source, bound_port) {
                 let announce_sync = sync_for_listener.clone();
                 let announce_cancel = cancel_for_children.subscribe();
                 tokio::spawn(async move {
-                    discovery_announce_loop(announce_sync, listen_port, announce_cancel).await;
+                    discovery_announce_loop(lan, announce_sync, listen_port, announce_cancel).await;
                 });
                 let listen_sync = sync_for_listener.clone();
                 let listen_cancel = cancel_for_children.subscribe();
                 tokio::spawn(async move {
-                    discovery_listen_loop(listen_sync, listen_cancel).await;
+                    discovery_listen_loop(lan, listen_sync, listen_cancel).await;
                 });
             }
         });
@@ -1045,39 +1072,44 @@ async fn resolve_first(raw: &str) -> Result<std::net::SocketAddr> {
         .with_context(|| format!("`{raw}` resolved to no records"))
 }
 
+/// Local preference for the single LAN host candidate this device
+/// advertises. LAN announcements carry exactly one BEP listen port, so
+/// there is no interface ranking to encode; the maximum value matches
+/// the value [`LanDiscovery`] assigns to discovered LAN peers, keeping
+/// the two sides symmetric.
+const LAN_ANNOUNCE_LOCAL_PREFERENCE: u16 = u16::MAX;
+
+/// Build the single host candidate carried in a LAN announcement. The
+/// announcement wire shape conveys only the device ID and BEP listen
+/// port; [`LanDiscovery::announce`] extracts the port from the
+/// highest-priority host candidate, so the address IP is irrelevant and
+/// the wildcard is used.
+fn lan_announce_candidate(listen_port: u16) -> Candidate {
+    let address = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, listen_port));
+    Candidate::new(address, CandidateKind::Host, LAN_ANNOUNCE_LOCAL_PREFERENCE)
+}
+
 /// Periodically broadcast our presence on the LAN discovery multicast
-/// group.
+/// group via the [`LanDiscovery`] source.
 ///
-/// `cascade_p2p::discovery::announce` is a blocking std-net call, so we
-/// hop onto `spawn_blocking` for each tick. Errors are logged and
-/// swallowed — discovery is best-effort.
+/// The announce itself is a blocking std-net call hopped onto
+/// `spawn_blocking` inside [`LanDiscovery::announce`]; errors there are
+/// logged and swallowed — discovery is best-effort.
 ///
 /// Exits as soon as `cancel` flips to `true`.
 async fn discovery_announce_loop(
+    lan: LanDiscovery,
     sync: SyncEngine,
     listen_port: u16,
     mut cancel: tokio::sync::watch::Receiver<bool>,
 ) {
     let device_id = sync.device_id().to_string();
+    let candidate = [lan_announce_candidate(listen_port)];
     loop {
         if *cancel.borrow() {
             return;
         }
-        let id = device_id.clone();
-        let result =
-            tokio::task::spawn_blocking(move || cascade_p2p::discovery::announce(&id, listen_port))
-                .await;
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::debug!(
-                target: "cascade::backend::p2p",
-                "LAN discovery announce failed: {e:#}",
-            ),
-            Err(e) => tracing::debug!(
-                target: "cascade::backend::p2p",
-                "LAN discovery announce task panicked: {e:#}",
-            ),
-        }
+        lan.announce(&device_id, &candidate).await;
         tokio::select! {
             () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
             res = cancel.changed() => {
@@ -1089,27 +1121,35 @@ async fn discovery_announce_loop(
     }
 }
 
-/// Listen for peer announcements on the LAN and, for any trusted device
-/// we don't already have a session to, kick off an outbound connect.
+/// Window each [`LanDiscovery::listen_all`] call listens for before
+/// returning the peers seen. Matches the timeout the loop used before
+/// discovery moved behind the trait.
+const LAN_LISTEN_WINDOW: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Listen for peer announcements on the LAN via the [`LanDiscovery`]
+/// source and, for any trusted device we don't already have a session
+/// to, kick off an outbound connect.
 ///
-/// `cascade_p2p::discovery::listen` is blocking; each call runs on
-/// `spawn_blocking` with a 15 s timeout. Errors are logged and the loop
-/// continues.
+/// Each listen runs on `spawn_blocking` inside [`LanDiscovery::listen_all`]
+/// with a 15 s window. Listen errors are logged and swallowed there,
+/// surfacing as an empty peer set so the loop simply continues.
 ///
 /// Exits as soon as `cancel` flips to `true`. The outer task races
-/// `cancel.changed()` against the in-flight `listen` future, so
-/// shutdown is observed immediately rather than waiting up to the 15 s
-/// blocking timeout. The detached `spawn_blocking` thread will finish
-/// on its own when the std-net call times out, but the async task no
-/// longer blocks on it.
-async fn discovery_listen_loop(sync: SyncEngine, mut cancel: tokio::sync::watch::Receiver<bool>) {
+/// `cancel.changed()` against the in-flight listen future, so shutdown
+/// is observed immediately rather than waiting up to the 15 s blocking
+/// timeout. The detached `spawn_blocking` thread will finish on its own
+/// when the std-net call times out, but the async task no longer blocks
+/// on it.
+async fn discovery_listen_loop(
+    lan: LanDiscovery,
+    sync: SyncEngine,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+) {
     loop {
         if *cancel.borrow() {
             return;
         }
-        let listen_fut = tokio::task::spawn_blocking(|| {
-            cascade_p2p::discovery::listen(std::time::Duration::from_secs(15))
-        });
+        let listen_fut = lan.listen_all(LAN_LISTEN_WINDOW);
         let peers = tokio::select! {
             res = cancel.changed() => {
                 if res.is_err() || *cancel.borrow() {
@@ -1121,25 +1161,7 @@ async fn discovery_listen_loop(sync: SyncEngine, mut cancel: tokio::sync::watch:
                 }
                 continue;
             }
-            result = listen_fut => {
-                match result {
-                    Ok(Ok(peers)) => peers,
-                    Ok(Err(e)) => {
-                        tracing::debug!(
-                            target: "cascade::backend::p2p",
-                            "LAN discovery listen failed: {e:#}",
-                        );
-                        continue;
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            target: "cascade::backend::p2p",
-                            "LAN discovery listen task panicked: {e:#}",
-                        );
-                        continue;
-                    }
-                }
-            }
+            peers = listen_fut => peers,
         };
         for peer in peers {
             // Skip ourselves — multicast loopback can deliver our own
