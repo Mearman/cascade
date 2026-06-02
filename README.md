@@ -35,7 +35,7 @@ The bet is that one filesystem client that works the same on every laptop is mor
     - **rustup (recommended)** — the project pins its Rust toolchain in `rust-toolchain.toml`. Install rustup from <https://rustup.rs/> so local builds, the pre-push hook, and CI all use the same compiler.
 - macOS: Xcode Command Line Tools (for Swift File Provider and FSKit extensions). FSKit requires macOS 15.4+ (Sequoia).
 - Linux: `libfuse3` runtime libraries for the FUSE presenter (`apt install libfuse3-dev` on Debian/Ubuntu, `yum install fuse3-devel` on RHEL/Fedora). NFS fallback additionally needs root to bind a privileged port.
-- Windows: the built-in `WebClient` service for the WebDAV mount. It ships with Windows but is often set to manual start — `sc config WebClient start= auto` (in an elevated shell) makes it come up automatically. A native ProjFS presenter (`presenter-projfs`) is scaffolded and tried first by `cascade start`, but its callback table is still stubbed so the mount appears empty and the daemon falls back to WebDAV in practice.
+- Windows: the built-in `WebClient` service for the WebDAV mount. It ships with Windows but is often set to manual start — `sc config WebClient start= auto` (in an elevated shell) makes it come up automatically. A native ProjFS presenter (`presenter-projfs`) is implemented and tried first by `cascade start` — it serves directory browsing and on-demand file reads through an engine-backed content provider — with WebDAV as the fallback if ProjFS cannot start (for example when the Client-ProjFS optional feature is disabled).
 
 ### Install
 
@@ -123,7 +123,7 @@ The design is documented in full at [`docs/design.md`](docs/design.md). This sec
 │  macOS:   FSKit (15.4+) · WebDAV · NFS                   │
 │  (File Provider planned — see roadmap)                   │
 │  Linux:   FUSE · NFS (root)                              │
-│  Windows: ProjFS (scaffolded) · WebDAV via WebClient     │
+│  Windows: ProjFS · WebDAV via WebClient                  │
 │  Universal fallback: NFS server · WebDAV server          │
 └────────────────────┬─────────────────────────────────────┘
                      │ VfsPresenter trait
@@ -134,7 +134,7 @@ The design is documented in full at [`docs/design.md`](docs/design.md). This sec
 └──────────────────────────────────────────────────────────┘
 ```
 
-`cascade start` tries the platform-preferred presenters in order and falls back as each one fails: on macOS that's FSKit → WebDAV → NFS; on Linux it's FUSE → NFS; on Windows it's ProjFS → WebDAV (mounted via `net use *` against the built-in `WebClient` service). The Windows ProjFS presenter is currently a scaffold — the callback table is stubbed, so the mount appears empty and the daemon falls back to WebDAV in practice. See `crates/presenter-projfs/` for the follow-up callback list.
+`cascade start` tries the platform-preferred presenters in order and falls back as each one fails: on macOS that's FSKit → WebDAV → NFS; on Linux it's FUSE → NFS; on Windows it's ProjFS → WebDAV (mounted via `net use *` against the built-in `WebClient` service). The Windows ProjFS presenter implements the full callback table — directory enumeration, placeholder info, file-name queries, on-demand reads, notifications, and cancellation — and serves file contents through an engine-backed content provider. WebDAV remains the fallback for when ProjFS cannot start (for example when the Client-ProjFS optional feature is disabled on the machine).
 
 Communication between the platform layer and the engine uses a Unix domain socket with a length-prefixed JSON protocol, shared by the CLI, the macOS File Provider and FSKit extensions, and any future GUI.
 
@@ -154,7 +154,7 @@ crates/
   presenter-webdav/       WebDAV server presenter (cross-platform)
   presenter-fileprovider/ macOS File Provider bridge (Rust side)
   presenter-fskit/        macOS FSKit bridge (Rust side, macOS 15.4+)
-  presenter-projfs/       Windows ProjFS presenter (scaffold — callbacks stubbed)
+  presenter-projfs/       Windows ProjFS presenter
   cascade/                Binary crate (CLI entry point and daemon)
 swift/
   CascadeFileProvider/    macOS File Provider extension
@@ -211,7 +211,7 @@ SQLite at `~/.config/cascade/state.db`. Tables: `files`, `backends`, `pin_rules`
 | v5 | macOS File Provider presenter (Swift extension) |
 | v6 | Adopt existing directories (local backend, adopt-and-sync, adopt-in-place) |
 | v7 | P2P block sharing (LAN) |
-| v8 | Windows WinFSP/ProjFS presenter (Linux FUSE delivered earlier) |
+| v8 | Windows native ProjFS presenter, implemented (Linux FUSE delivered earlier) |
 | v9 | Full P2P (WAN discovery, NAT traversal) |
 
 Full timeline estimates, dependency list, and reference implementations in [`docs/design.md`](docs/design.md).

@@ -32,7 +32,7 @@ A cross-platform cloud storage filesystem client built in Rust. Combines on-dema
 │                                                          │
 │  macOS: File Provider extension (Swift)                  │
 │  Linux: FUSE (fuser)                                     │
-│  Windows: WinFSP / ProjFS                                │
+│  Windows: native ProjFS                                  │
 │  Fallback: NFS server (all platforms)                    │
 └────────────────────┬─────────────────────────────────────┘
                      │ VfsPresenter trait
@@ -156,7 +156,7 @@ cascade/
 │   │   └── src/
 │   │       ├── lib.rs
 │   │       └── bridge.rs         # Unix domain socket server for Swift extension
-│   ├── presenter-winfsp/         # Windows WinFSP / ProjFS presenter
+│   ├── presenter-projfs/         # Windows ProjFS presenter (native, via windows crate Win32_Storage_ProjectedFileSystem)
 │   └── cascade/                  # Binary crate
 │       └── src/
 │           ├── main.rs           # CLI entry point, presenter selection
@@ -500,7 +500,7 @@ fn create_presenter(engine: EngineHandle) -> Box<dyn VfsPresenter> {
 
 #[cfg(target_os = "windows")]
 fn create_presenter(engine: EngineHandle) -> Box<dyn VfsPresenter> {
-    Box::new(WinFspPresenter::new(engine))  // ProjFS or FUSE via WinFSP
+    Box::new(ProjFsPresenter::new(mount_point))  // native ProjFS; wired via try_projfs in crates/cascade/src/cli/mount.rs
 }
 ```
 
@@ -1442,7 +1442,7 @@ cargo test -p backend-gdrive
 | v5 | macOS File Provider presenter (Swift extension) | +4-6 weeks | +1,500 |
 | v6 | Adopt existing directories (local backend, adopt-and-sync, adopt-in-place) | +4-6 weeks | +2,000 |
 | v7 | P2P block sharing (LAN) | +10-14 weeks | +6,000 |
-| v8 | Linux FUSE presenter + Windows WinFSP presenter | +4-6 weeks | +2,000 |
+| v8 | Linux FUSE presenter + Windows native ProjFS presenter (implemented) | +4-6 weeks | +2,000 |
 | v9 | Full P2P (WAN discovery, NAT traversal) | +8-12 weeks | +4,000 |
 
 ## Dependencies
@@ -1459,7 +1459,7 @@ cargo test -p backend-gdrive
 | `reqwest` | HTTP client (backends) | v1 |
 | `rustls` | TLS (P2P connections, HTTPS backends) | v1 |
 | `fuser` | FUSE presenter (Linux) | v8 |
-| `winfsp` | WinFSP presenter (Windows) | v8 |
+| `windows` (Win32_Storage_ProjectedFileSystem) | Native ProjFS presenter (Windows) | v8 |
 | `stun-rs` | STUN NAT traversal | v9 |
 | `base32` | Device ID encoding | v7 |
 | `sha2` | SHA-256 block hashing | v7 |
@@ -1472,4 +1472,4 @@ cargo test -p backend-gdrive
 - **rclone** — NFS server, VFS caching, Google Drive backend, mount management. Go. [GitHub](https://github.com/rclone/rclone)
 - **Syncthing** — BEP protocol, peer discovery, NAT traversal, block-level delta sync, conflict resolution. Go. [GitHub](https://github.com/syncthing/syncthing)
 - **go-nfs** — NFSv3 server in Go. Reference for XDR codec and procedure handlers. [GitHub](https://github.com/willscott/go-nfs)
-- **WinFSP** — Windows virtual filesystem. Rust bindings available. [GitHub](https://github.com/winfsp/winfsp)
+- **Projected File System (ProjFS)** — Windows native virtualisation API, used directly through the `windows` crate's `Win32_Storage_ProjectedFileSystem` module. [Win32 docs](https://learn.microsoft.com/en-us/windows/win32/projfs/projected-file-system)
