@@ -22,8 +22,22 @@
 //! - `POST <base>/announce/<device_id>` with an [`AnnounceRequest`] body —
 //!   replaces the stored candidate set for `device_id`.
 //! - `GET  <base>/announce/<device_id>` — returns a [`LookupResponse`] with
-//!   the most recently registered candidate set, or an empty set when the id
-//!   is unknown.
+//!   the most recently registered candidate set, or nothing when the id is
+//!   unknown.
+//!
+//! ## Self-certifying candidate sets
+//!
+//! The candidate set is carried inside a [`SignedCandidates`] envelope:
+//! the announcing device signs its candidates, the claimed device id, and an
+//! expiry with the ed25519 key derived from its device id (the same key the
+//! DHT BEP44 path signs with). The announce server is therefore a *blind,
+//! untrusted carrier* — it stores and serves the signed blob verbatim and never
+//! inspects, vouches for, or could forge it. The client verifies the signature
+//! on read: the signer must be the device being resolved, the payload must be
+//! untampered, and the expiry must be unexpired, otherwise the result is
+//! rejected. A malicious server (or a man in the middle) can withhold or
+//! corrupt a set, but it cannot fabricate one or substitute another device's
+//! addresses.
 //!
 //! The wire types ([`WireCandidate`], [`AnnounceRequest`], [`LookupResponse`])
 //! are serde-serialisable and shared by the relay-server's announce endpoint,
@@ -36,6 +50,7 @@ use std::net::SocketAddr;
 use serde::{Deserialize, Serialize};
 
 use crate::candidate::{Candidate, CandidateKind};
+use crate::discovery::signing::SignedCandidates;
 
 /// Maximum number of candidates accepted in a single announce request or
 /// returned from a lookup.
@@ -103,27 +118,31 @@ impl WireCandidate {
 
 /// Body of a `POST <base>/announce/<device_id>` request.
 ///
-/// Carries the candidate set the announcing device is currently reachable
-/// on. A subsequent announce for the same id replaces the set in full —
-/// candidates are not accumulated, matching the replace-in-full semantics of
-/// [`crate::wan::PeerBook::set_remote_candidates`].
+/// Carries the signed candidate set the announcing device is currently
+/// reachable on. A subsequent announce for the same id replaces the set in
+/// full — candidates are not accumulated, matching the replace-in-full
+/// semantics of [`crate::wan::PeerBook::set_remote_candidates`].
+///
+/// The server stores the [`SignedCandidates`] verbatim and never inspects it;
+/// the looking-up client is the only party that verifies the signature.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnnounceRequest {
-    /// Candidates the device is reachable on, in announcer-computed priority
-    /// order (the server preserves order but does not rely on it).
-    pub candidates: Vec<WireCandidate>,
+    /// The device's self-signed candidate set.
+    pub signed: SignedCandidates,
 }
 
 /// Body of a `GET <base>/announce/<device_id>` response.
 ///
-/// An unknown device id yields an empty `candidates` vector rather than a
-/// `404`, so the client models absence as "no candidates" — the same way
-/// every [`super::Discovery`] source treats a peer it knows nothing about.
+/// An unknown device id yields `signed: None` rather than a `404`, so the
+/// client models absence as "no candidates" — the same way every
+/// [`super::Discovery`] source treats a peer it knows nothing about. A known
+/// id returns the signed blob exactly as it was registered, for the client to
+/// verify.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LookupResponse {
-    /// Candidates last registered for the looked-up device id, or empty when
-    /// the id is unknown.
-    pub candidates: Vec<WireCandidate>,
+    /// The signed candidate set last registered for the looked-up device id,
+    /// or `None` when the id is unknown.
+    pub signed: Option<SignedCandidates>,
 }
 
 #[cfg(feature = "announce")]
@@ -131,6 +150,7 @@ pub use client::AnnounceDiscovery;
 
 #[cfg(feature = "announce")]
 mod client {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use async_trait::async_trait;
@@ -139,6 +159,8 @@ mod client {
     use super::{AnnounceRequest, LookupResponse, MAX_ANNOUNCE_CANDIDATES, WireCandidate};
     use crate::candidate::Candidate;
     use crate::discovery::Discovery;
+    use crate::discovery::signing::{self, SignedCandidates};
+    use crate::traversal::{Clock, SystemClock};
 
     /// Wall-clock ceiling on a single announce or lookup round-trip.
     ///
@@ -147,6 +169,16 @@ mod client {
     /// generous for a JSON round-trip while still bounding how long a hung
     /// server can hold the discovery task.
     const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// How long an announced candidate set stays valid after it is signed.
+    ///
+    /// The expiry bounds how long a captured signed set can be replayed by a
+    /// hostile carrier: once it lapses, the resolver rejects the envelope and
+    /// the device must have re-announced a fresh one. The window is set well
+    /// above the announce loop's republish cadence so a live device's set is
+    /// always replaced before it expires, but short enough that a stale capture
+    /// is useless within an hour.
+    const ANNOUNCE_TTL: Duration = Duration::from_hours(1);
 
     /// Announce-server discovery client.
     ///
@@ -160,10 +192,19 @@ mod client {
     /// best-effort: `resolve` returns no candidates and `announce` logs and
     /// moves on, exactly as the LAN source treats a missed multicast. A
     /// single source failing must never abort the composed resolution.
-    #[derive(Debug, Clone)]
+    #[derive(Clone)]
     pub struct AnnounceDiscovery {
         base_url: String,
         client: Client,
+        clock: Arc<dyn Clock>,
+    }
+
+    impl std::fmt::Debug for AnnounceDiscovery {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("AnnounceDiscovery")
+                .field("base_url", &self.base_url)
+                .finish_non_exhaustive()
+        }
     }
 
     impl AnnounceDiscovery {
@@ -171,12 +212,27 @@ mod client {
         ///
         /// `base_url` is the scheme-and-authority root (e.g.
         /// `https://announce.example`); the `/announce/<device_id>` path is
-        /// appended per request. A trailing slash is tolerated.
+        /// appended per request. A trailing slash is tolerated. The wall clock
+        /// used to stamp announce expiries and check freshness on lookup is the
+        /// real [`SystemClock`]; tests inject a virtualised clock via
+        /// [`Self::with_clock`].
         ///
         /// Returns an error only if the underlying HTTP client cannot be
         /// constructed (TLS backend initialisation), which is a process-level
         /// failure rather than a per-request one.
         pub fn new(base_url: impl Into<String>) -> anyhow::Result<Self> {
+            Self::with_clock(base_url, Arc::new(SystemClock))
+        }
+
+        /// Create a client with an injected [`Clock`].
+        ///
+        /// Identical to [`Self::new`] but lets a caller (the tests) supply a
+        /// deterministic clock so signing expiries and freshness checks are
+        /// reproducible.
+        pub fn with_clock(
+            base_url: impl Into<String>,
+            clock: Arc<dyn Clock>,
+        ) -> anyhow::Result<Self> {
             let client = Client::builder()
                 .timeout(REQUEST_TIMEOUT)
                 .build()
@@ -184,6 +240,7 @@ mod client {
             Ok(Self {
                 base_url: base_url.into(),
                 client,
+                clock,
             })
         }
 
@@ -234,13 +291,32 @@ mod client {
                     return Vec::new();
                 }
             };
-            // Drop any candidate whose kind tag is unknown — a hostile or
-            // buggy directory entry must not coerce into a wrong kind.
-            body.candidates
-                .into_iter()
-                .take(MAX_ANNOUNCE_CANDIDATES)
-                .filter_map(WireCandidate::to_candidate)
-                .collect()
+            // Unknown id: nothing stored. Modelled as "no candidates".
+            let Some(signed) = body.signed else {
+                return Vec::new();
+            };
+            // The server is an untrusted carrier: verify the signature before
+            // trusting a single address. The signer must be the device being
+            // resolved, the payload untampered, and the expiry unexpired. Any
+            // failure is rejected loudly and yields no candidates — never a
+            // silent acceptance, never a panic.
+            let now = signing::now_unix_ms(self.clock.as_ref());
+            match signed.verify_to_candidates(device_id, now) {
+                Ok(candidates) => candidates
+                    .into_iter()
+                    .take(MAX_ANNOUNCE_CANDIDATES)
+                    .collect(),
+                Err(err) => {
+                    tracing::warn!(
+                        target: "cascade::p2p::discovery::announce",
+                        %url,
+                        device_id = %device_id,
+                        error = %err,
+                        "rejecting announce lookup: signature verification failed",
+                    );
+                    Vec::new()
+                }
+            }
         }
 
         async fn announce(&self, self_id: &str, candidates: &[Candidate]) {
@@ -250,8 +326,10 @@ mod client {
                 .copied()
                 .map(WireCandidate::from)
                 .collect();
+            let expires_at = signing::expiry_from_now(self.clock.as_ref(), ANNOUNCE_TTL);
+            let signed = SignedCandidates::sign(self_id, wire, expires_at);
             let url = self.endpoint(self_id);
-            let body = AnnounceRequest { candidates: wire };
+            let body = AnnounceRequest { signed };
             match self.client.post(&url).json(&body).send().await {
                 Ok(response) if response.status().is_success() => {}
                 Ok(response) => tracing::debug!(
@@ -285,14 +363,41 @@ mod client {
         use super::AnnounceDiscovery;
         use crate::candidate::{Candidate, CandidateKind};
         use crate::discovery::Discovery;
+        use crate::discovery::signing::SignedCandidates;
+        use crate::traversal::Clock;
 
         fn addr(port: u16) -> SocketAddr {
             SocketAddr::from(([127, 0, 0, 1], port))
         }
 
-        /// In-memory store keyed by device id, mirroring the directory the
-        /// real announce server keeps.
-        type Store = Arc<Mutex<HashMap<String, Vec<WireCandidate>>>>;
+        /// A fixed-time [`Clock`] so signing expiries and freshness checks are
+        /// deterministic across the round-trip. The monotonic `now` is unused
+        /// by the announce path, so it returns a constant instant.
+        struct FixedClock {
+            unix_ms: u64,
+        }
+
+        impl Clock for FixedClock {
+            fn now(&self) -> std::time::Instant {
+                std::time::Instant::now()
+            }
+
+            fn now_unix_ms(&self) -> u64 {
+                self.unix_ms
+            }
+        }
+
+        const NOW_MS: u64 = 1_700_000_000_000;
+
+        fn fixed_clock() -> Arc<dyn Clock> {
+            Arc::new(FixedClock { unix_ms: NOW_MS })
+        }
+
+        /// In-memory store of the opaque signed blob keyed by device id,
+        /// mirroring the directory the real announce server keeps. The server
+        /// stores and serves the [`SignedCandidates`] verbatim — it never
+        /// inspects it.
+        type Store = Arc<Mutex<HashMap<String, SignedCandidates>>>;
 
         /// Read one HTTP request off `stream` and return
         /// `(method, device_id, body)`. The mock parses only the request
@@ -380,17 +485,14 @@ mod client {
                             "POST" => {
                                 let request: AnnounceRequest =
                                     serde_json::from_slice(&body).unwrap();
-                                store.lock().await.insert(device_id, request.candidates);
+                                // Store the signed blob verbatim — the carrier
+                                // never inspects or validates it.
+                                store.lock().await.insert(device_id, request.signed);
                                 write_json_response(&mut stream, b"{}").await;
                             }
                             "GET" => {
-                                let candidates = store
-                                    .lock()
-                                    .await
-                                    .get(&device_id)
-                                    .cloned()
-                                    .unwrap_or_default();
-                                let response = LookupResponse { candidates };
+                                let signed = store.lock().await.get(&device_id).cloned();
+                                let response = LookupResponse { signed };
                                 let json = serde_json::to_vec(&response).unwrap();
                                 write_json_response(&mut stream, &json).await;
                             }
@@ -406,7 +508,7 @@ mod client {
         async fn register_then_lookup_round_trips_candidates() {
             let store: Store = Arc::new(Mutex::new(HashMap::new()));
             let base = spawn_mock_server(store).await;
-            let client = AnnounceDiscovery::new(base).unwrap();
+            let client = AnnounceDiscovery::with_clock(base, fixed_clock()).unwrap();
 
             let host = Candidate::new(addr(22000), CandidateKind::Host, 65_535);
             let srflx = Candidate::new(addr(33000), CandidateKind::ServerReflexive, 0);
@@ -422,7 +524,7 @@ mod client {
         async fn lookup_unknown_device_yields_no_candidates() {
             let store: Store = Arc::new(Mutex::new(HashMap::new()));
             let base = spawn_mock_server(store).await;
-            let client = AnnounceDiscovery::new(base).unwrap();
+            let client = AnnounceDiscovery::with_clock(base, fixed_clock()).unwrap();
 
             assert!(client.resolve("NEVER-REGISTERED").await.is_empty());
         }
@@ -434,7 +536,65 @@ mod client {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let bound = listener.local_addr().unwrap();
             drop(listener);
-            let client = AnnounceDiscovery::new(format!("http://{bound}")).unwrap();
+            let client =
+                AnnounceDiscovery::with_clock(format!("http://{bound}"), fixed_clock()).unwrap();
+            assert!(client.resolve("DEVICE-A").await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn carrier_serving_a_tampered_blob_is_rejected_on_resolve() {
+            // The carrier holds a valid set, then a byte is flipped after the
+            // device signed it. The client must reject the lookup, not surface
+            // a forged address.
+            let store: Store = Arc::new(Mutex::new(HashMap::new()));
+            let host = WireCandidate::from(Candidate::new(addr(22000), CandidateKind::Host, 1));
+            let mut signed = SignedCandidates::sign(
+                "DEVICE-A",
+                vec![host],
+                i64::try_from(NOW_MS).unwrap() + 1000,
+            );
+            signed.candidates[0].priority ^= 0x01;
+            store.lock().await.insert("DEVICE-A".to_owned(), signed);
+            let base = spawn_mock_server(store).await;
+
+            let client = AnnounceDiscovery::with_clock(base, fixed_clock()).unwrap();
+            assert!(client.resolve("DEVICE-A").await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn carrier_serving_a_blob_for_another_device_is_rejected() {
+            // The carrier stores DEVICE-B's validly-signed set under DEVICE-A's
+            // key (substitution). Resolving DEVICE-A must reject it.
+            let store: Store = Arc::new(Mutex::new(HashMap::new()));
+            let host = WireCandidate::from(Candidate::new(addr(22000), CandidateKind::Host, 1));
+            let signed = SignedCandidates::sign(
+                "DEVICE-B",
+                vec![host],
+                i64::try_from(NOW_MS).unwrap() + 1000,
+            );
+            store.lock().await.insert("DEVICE-A".to_owned(), signed);
+            let base = spawn_mock_server(store).await;
+
+            let client = AnnounceDiscovery::with_clock(base, fixed_clock()).unwrap();
+            assert!(client.resolve("DEVICE-A").await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn expired_blob_from_the_carrier_is_rejected() {
+            // The carrier replays a set whose expiry has lapsed. Even though it
+            // is correctly signed for DEVICE-A, the client must reject it.
+            let store: Store = Arc::new(Mutex::new(HashMap::new()));
+            let host = WireCandidate::from(Candidate::new(addr(22000), CandidateKind::Host, 1));
+            // Expiry one second before the fixed clock's "now".
+            let signed = SignedCandidates::sign(
+                "DEVICE-A",
+                vec![host],
+                i64::try_from(NOW_MS).unwrap() - 1000,
+            );
+            store.lock().await.insert("DEVICE-A".to_owned(), signed);
+            let base = spawn_mock_server(store).await;
+
+            let client = AnnounceDiscovery::with_clock(base, fixed_clock()).unwrap();
             assert!(client.resolve("DEVICE-A").await.is_empty());
         }
     }
@@ -486,14 +646,18 @@ mod tests {
     #[test]
     fn announce_request_round_trips_through_json() {
         let request = AnnounceRequest {
-            candidates: vec![
-                WireCandidate::from(Candidate::new(addr(22000), CandidateKind::Host, 65_535)),
-                WireCandidate::from(Candidate::new(
-                    addr(33000),
-                    CandidateKind::ServerReflexive,
-                    0,
-                )),
-            ],
+            signed: SignedCandidates::sign(
+                "DEVICE-A",
+                vec![
+                    WireCandidate::from(Candidate::new(addr(22000), CandidateKind::Host, 65_535)),
+                    WireCandidate::from(Candidate::new(
+                        addr(33000),
+                        CandidateKind::ServerReflexive,
+                        0,
+                    )),
+                ],
+                1_700_000_000_000,
+            ),
         };
         let json = serde_json::to_string(&request).expect("serialise");
         let decoded: AnnounceRequest = serde_json::from_str(&json).expect("deserialise");
@@ -503,14 +667,27 @@ mod tests {
     #[test]
     fn lookup_response_round_trips_through_json() {
         let response = LookupResponse {
-            candidates: vec![WireCandidate::from(Candidate::new(
-                addr(22000),
-                CandidateKind::Host,
-                1,
-            ))],
+            signed: Some(SignedCandidates::sign(
+                "DEVICE-A",
+                vec![WireCandidate::from(Candidate::new(
+                    addr(22000),
+                    CandidateKind::Host,
+                    1,
+                ))],
+                1_700_000_000_000,
+            )),
         };
         let json = serde_json::to_string(&response).expect("serialise");
         let decoded: LookupResponse = serde_json::from_str(&json).expect("deserialise");
         assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn lookup_response_models_unknown_id_as_none() {
+        let response = LookupResponse { signed: None };
+        let json = serde_json::to_string(&response).expect("serialise");
+        let decoded: LookupResponse = serde_json::from_str(&json).expect("deserialise");
+        assert_eq!(decoded, response);
+        assert!(decoded.signed.is_none());
     }
 }

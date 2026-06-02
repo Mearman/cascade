@@ -450,6 +450,7 @@ dependencies = [
  "cascade-relay-server",
  "chrono",
  "data-encoding",
+ "ed25519-dalek",
  "futures-util",
  "hmac",
  "if-addrs",
@@ -774,6 +775,7 @@ dependencies = [
  "fiat-crypto",
  "rustc_version",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -922,6 +924,7 @@ dependencies = [
  "ed25519",
  "sha2 0.11.0",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]

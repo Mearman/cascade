@@ -27,6 +27,7 @@ pub mod announce;
 pub mod dht;
 pub mod gossip;
 pub mod lan;
+pub mod signing;
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -50,7 +51,12 @@ pub use announce::AnnounceDiscovery;
 
 pub use dht::{
     DHT_KEY_LEN, DHT_REPUBLISH_INTERVAL, DHT_RESOLVE_TIMEOUT, DhtDiscovery, DhtGetOutcome, DhtKey,
-    DhtNode, StoredCandidates,
+    DhtNode,
+};
+
+pub use signing::{
+    SignedCandidates, VerifyError, keypair_for_device, signing_key_for_seed,
+    verifying_key_for_device,
 };
 
 #[cfg(feature = "dht")]

@@ -57,18 +57,27 @@
 //! behind `announce`: the contract, the resolver, and the key mapping are
 //! always compiled; only the network-facing backend is gated.
 //!
-//! The stored value reuses the announce directory's serialisable candidate
-//! shape ([`WireCandidate`]) wrapped in a [`StoredCandidates`] envelope, so the
-//! DHT and the announce server agree on how a candidate set is encoded — there
-//! is one serialisation home, not two that can drift.
+//! The stored value is the same self-certifying [`SignedCandidates`] envelope
+//! the announce server carries: the announcing device signs its candidate set,
+//! claimed
+//! device id, and expiry with the BEP44 key derived from the device id, and the
+//! resolver verifies that signature before trusting an address. The DHT is thus
+//! a blind carrier exactly as the announce server is — a storing node, or a
+//! node that returns a substituted value, cannot forge a candidate set, because
+//! it holds no signing key. There is one signing home and one verify path,
+//! shared with the announce client.
+
+use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::Discovery;
 use super::announce::WireCandidate;
+use super::signing::{self, SignedCandidates};
 use crate::candidate::Candidate;
+use crate::traversal::{Clock, SystemClock};
 
 /// Width of the device-id-derived ed25519 seed in bytes.
 ///
@@ -187,86 +196,89 @@ pub const DHT_REPUBLISH_INTERVAL: std::time::Duration =
 /// stored.
 const BEP44_MAX_VALUE_LEN: usize = 1000;
 
-/// Serialisable envelope for a candidate set stored under a DHT key.
+/// Sign `candidates` for `device_id` (expiring at `expires_at_unix_ms`) and
+/// encode the [`SignedCandidates`] envelope into the opaque bytes stored in the
+/// DHT, guaranteed to fit the BEP44 1000-byte value ceiling.
 ///
-/// Reuses [`WireCandidate`] — the announce directory's serialisable candidate
-/// projection — so the DHT and the announce server encode a candidate set the
-/// same way. The envelope carries the candidates as a JSON array; the DHT
-/// stores the encoded bytes opaquely and hands them back verbatim on lookup.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoredCandidates {
-    /// Candidates the announcing device is reachable on, in announcer-computed
-    /// priority order.
-    pub candidates: Vec<WireCandidate>,
+/// The stored value is the same self-certifying envelope the announce server
+/// carries, so the DHT and the announce server share one encoding *and* one
+/// verification path. The candidate count is the wrong thing to cap against: a
+/// BEP44 value is capped at 1000 bytes, and even a couple of dozen candidates
+/// plus the signature serialise past it. So this bounds the *encoded length*
+/// instead. Candidates are sorted by descending priority (highest first) and
+/// the lowest-priority entries are dropped one at a time, re-signing the trimmed
+/// set each time, until the JSON encoding fits [`BEP44_MAX_VALUE_LEN`]. The
+/// signature must cover exactly the bytes that are stored, so the set is signed
+/// *after* it is trimmed, never before.
+///
+/// Returns the JSON-encoded bytes, or the serialisation error (which only
+/// arises on an allocator failure for this shape). An empty candidate set
+/// encodes to a signed empty-array envelope, which is well within the ceiling.
+fn encode_signed(
+    device_id: &str,
+    candidates: &[Candidate],
+    expires_at_unix_ms: i64,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let mut wire: Vec<WireCandidate> = candidates
+        .iter()
+        .copied()
+        .map(WireCandidate::from)
+        .collect();
+    // Highest priority first, so dropping from the tail removes the
+    // least-useful candidates. The input is already announcer-ordered, but
+    // sorting here makes the byte-budget trim correct regardless of caller.
+    wire.sort_unstable_by_key(|c| std::cmp::Reverse(c.priority));
+
+    loop {
+        // Sign the current (possibly trimmed) set, then measure. The signature
+        // covers exactly these candidates, so a value that fits is a value that
+        // also verifies.
+        let signed = SignedCandidates::sign(device_id, wire.clone(), expires_at_unix_ms);
+        let encoded = serde_json::to_vec(&signed)?;
+        if encoded.len() <= BEP44_MAX_VALUE_LEN || wire.is_empty() {
+            if encoded.len() > BEP44_MAX_VALUE_LEN {
+                // Only reachable when even the signed empty-array envelope
+                // exceeds the ceiling, which cannot happen for this fixed
+                // shape; surfacing it loudly beats silently announcing a value
+                // the network will drop.
+                tracing::warn!(
+                    target: "cascade::p2p::discovery::dht",
+                    encoded_len = encoded.len(),
+                    limit = BEP44_MAX_VALUE_LEN,
+                    "DHT candidate value exceeds the BEP44 ceiling even when empty",
+                );
+            }
+            return Ok(encoded);
+        }
+        // Drop the lowest-priority candidate and re-sign.
+        wire.pop();
+    }
 }
 
-impl StoredCandidates {
-    /// Encode a candidate set into the opaque bytes stored in the DHT,
-    /// guaranteed to fit the BEP44 1000-byte value ceiling.
-    ///
-    /// The candidate count is the wrong thing to cap against: the announce
-    /// directory's HTTP path has no size limit, but a BEP44 value does, and
-    /// even a couple of dozen candidates serialise past 1000 bytes. So this
-    /// bounds the *encoded length* instead. Candidates are sorted by descending
-    /// priority (highest first) and the lowest-priority entries are dropped one
-    /// at a time until the JSON encoding fits [`BEP44_MAX_VALUE_LEN`], so the
-    /// most useful candidates survive and the stored value is one the network
-    /// will actually accept rather than silently reject.
-    ///
-    /// Returns the JSON-encoded bytes, or the serialisation error (which only
-    /// arises on an allocator failure for this shape). An empty candidate set
-    /// encodes to the empty-array envelope, which is well within the ceiling.
-    fn encode(candidates: &[Candidate]) -> Result<Vec<u8>, serde_json::Error> {
-        let mut wire: Vec<WireCandidate> = candidates
-            .iter()
-            .copied()
-            .map(WireCandidate::from)
-            .collect();
-        // Highest priority first, so dropping from the tail removes the
-        // least-useful candidates. The input is already announcer-ordered, but
-        // sorting here makes the byte-budget trim correct regardless of caller.
-        wire.sort_unstable_by_key(|c| std::cmp::Reverse(c.priority));
-
-        loop {
-            let encoded = serde_json::to_vec(&Self {
-                candidates: wire.clone(),
-            })?;
-            if encoded.len() <= BEP44_MAX_VALUE_LEN || wire.is_empty() {
-                if encoded.len() > BEP44_MAX_VALUE_LEN {
-                    // Only reachable when even the empty-array envelope exceeds
-                    // the ceiling, which cannot happen for this fixed shape;
-                    // surfacing it loudly beats silently announcing a value the
-                    // network will drop.
-                    tracing::warn!(
-                        target: "cascade::p2p::discovery::dht",
-                        encoded_len = encoded.len(),
-                        limit = BEP44_MAX_VALUE_LEN,
-                        "DHT candidate value exceeds the BEP44 ceiling even when empty",
-                    );
-                }
-                return Ok(encoded);
-            }
-            // Drop the lowest-priority candidate and retry.
-            wire.pop();
+/// Decode and verify opaque DHT bytes into in-memory candidates.
+///
+/// The DHT is an untrusted carrier: the bytes must verify as a
+/// [`SignedCandidates`] signed by `expected_device_id`, untampered and
+/// unexpired, before a single address is trusted. A value that does not decode,
+/// does not verify, is for the wrong device, or has expired reads as "no
+/// candidates" — and the rejection is logged loudly — rather than aborting the
+/// lookup or surfacing a forged address.
+fn decode_signed(bytes: &[u8], expected_device_id: &str, now_unix_ms: i64) -> Vec<Candidate> {
+    let signed: SignedCandidates = match serde_json::from_slice(bytes) {
+        Ok(parsed) => parsed,
+        Err(_) => return Vec::new(),
+    };
+    match signed.verify_to_candidates(expected_device_id, now_unix_ms) {
+        Ok(candidates) => candidates,
+        Err(err) => {
+            tracing::warn!(
+                target: "cascade::p2p::discovery::dht",
+                device_id = %expected_device_id,
+                error = %err,
+                "rejecting DHT value: signature verification failed",
+            );
+            Vec::new()
         }
-    }
-
-    /// Decode opaque DHT bytes into in-memory candidates.
-    ///
-    /// Drops any candidate whose kind tag is unknown — a malformed or hostile
-    /// stored value must not coerce into a wrong kind. Returns an empty vector
-    /// when the bytes do not decode to a [`StoredCandidates`], so a corrupt
-    /// value reads as "no candidates" rather than aborting the lookup.
-    fn decode(bytes: &[u8]) -> Vec<Candidate> {
-        let parsed: Self = match serde_json::from_slice(bytes) {
-            Ok(parsed) => parsed,
-            Err(_) => return Vec::new(),
-        };
-        parsed
-            .candidates
-            .into_iter()
-            .filter_map(WireCandidate::to_candidate)
-            .collect()
     }
 }
 
@@ -329,21 +341,50 @@ pub trait DhtNode: Send + Sync {
     async fn get(&self, key: DhtKey) -> DhtGetOutcome;
 }
 
+/// How long a DHT-announced candidate set stays valid after it is signed.
+///
+/// Bounds replay of a captured signed value by a hostile storing node: once it
+/// lapses, the resolver rejects the envelope. Matches the announce server's
+/// window so the two transports expire a set on the same cadence; set well above
+/// the publish loop's interval so a live device always re-announces before its
+/// value expires.
+const DHT_ANNOUNCE_TTL: Duration = Duration::from_hours(1);
+
 /// DHT-backed discovery source.
 ///
 /// Generic over the [`DhtNode`] contract so the [`Discovery`] behaviour is
 /// exercised against an in-memory node in tests and the live `mainline` node in
 /// production without changing the resolver. Composes behind
 /// [`super::DiscoveryService`] alongside the LAN, gossip and announce sources.
-#[derive(Debug, Clone)]
+///
+/// Holds an injectable [`Clock`] used to stamp the signed set's expiry on
+/// announce and to check its freshness on resolve, so the verification is
+/// deterministic under test.
+#[derive(Clone)]
 pub struct DhtDiscovery<N: DhtNode> {
     node: N,
+    clock: Arc<dyn Clock>,
+}
+
+impl<N: DhtNode> std::fmt::Debug for DhtDiscovery<N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DhtDiscovery").finish_non_exhaustive()
+    }
 }
 
 impl<N: DhtNode> DhtDiscovery<N> {
-    /// Wrap a DHT node as a discovery source.
-    pub const fn new(node: N) -> Self {
-        Self { node }
+    /// Wrap a DHT node as a discovery source, using the real [`SystemClock`]
+    /// to stamp and check signed-set expiries.
+    #[must_use]
+    pub fn new(node: N) -> Self {
+        Self::with_clock(node, Arc::new(SystemClock))
+    }
+
+    /// Wrap a DHT node with an injected [`Clock`], so signing expiries and
+    /// freshness checks are reproducible under test.
+    #[must_use]
+    pub fn with_clock(node: N, clock: Arc<dyn Clock>) -> Self {
+        Self { node, clock }
     }
 }
 
@@ -367,10 +408,19 @@ impl<N: DhtNode> Discovery for DhtDiscovery<N> {
     async fn resolve(&self, device_id: &str) -> Vec<Candidate> {
         let key = DhtKey::from_device_id(device_id);
         match self.node.get(key).await {
-            DhtGetOutcome::Found(values) => values
-                .iter()
-                .flat_map(|bytes| StoredCandidates::decode(bytes))
-                .collect(),
+            DhtGetOutcome::Found(values) => {
+                // The DHT is an untrusted carrier: each stored value must
+                // verify as a `SignedCandidates` envelope signed by this device
+                // id, untampered and unexpired, before a single address is
+                // trusted. `decode_signed` enforces that and logs any rejection
+                // loudly. The verifier's "now" is read once from the injected
+                // clock so the freshness check is deterministic under test.
+                let now = signing::now_unix_ms(self.clock.as_ref());
+                values
+                    .iter()
+                    .flat_map(|bytes| decode_signed(bytes, device_id, now))
+                    .collect()
+            }
             DhtGetOutcome::NotFound => {
                 tracing::debug!(
                     target: "cascade::p2p::discovery::dht",
@@ -394,12 +444,15 @@ impl<N: DhtNode> Discovery for DhtDiscovery<N> {
     /// Store this device's `candidates` under its DHT key so peers can resolve
     /// it by device id.
     ///
+    /// The set is signed with the device's BEP44 key and stamped with an expiry
+    /// before storage, so a storing node cannot forge or usefully replay it.
     /// Encoding failures are logged and swallowed — announce is best-effort and
     /// runs on a background loop, so a serialisation failure must not abort the
     /// composed announce fan-out.
     async fn announce(&self, self_id: &str, candidates: &[Candidate]) {
         let key = DhtKey::from_device_id(self_id);
-        match StoredCandidates::encode(candidates) {
+        let expires_at = signing::expiry_from_now(self.clock.as_ref(), DHT_ANNOUNCE_TTL);
+        match encode_signed(self_id, candidates, expires_at) {
             Ok(bytes) => self.node.put(key, bytes).await,
             Err(err) => tracing::debug!(
                 target: "cascade::p2p::discovery::dht",
@@ -420,8 +473,9 @@ mod live {
 
     use anyhow::Result;
     use async_trait::async_trait;
-    use mainline::{DEFAULT_BOOTSTRAP_NODES, Dht, MutableItem, SigningKey};
+    use mainline::{DEFAULT_BOOTSTRAP_NODES, Dht, MutableItem};
 
+    use super::signing::signing_key_for_seed;
     use super::{DHT_RESOLVE_TIMEOUT, DhtGetOutcome, DhtKey, DhtNode};
 
     /// The default Mainline-DHT bootstrap nodes used when an operator supplies
@@ -569,23 +623,16 @@ mod live {
         }
     }
 
-    /// Build the BEP44 signing keypair from a device-id-derived [`DhtKey`].
-    ///
-    /// The [`DhtKey`] *is* the ed25519 seed (`SHA-256` of a domain prefix and
-    /// the device id), so `SigningKey::from_bytes` reconstructs the identical
-    /// keypair on every node that knows the id. This is the whole mechanism that
-    /// makes the BEP44 target `SHA-1(public_key)` shared across devices.
-    fn signing_key_for(key: DhtKey) -> SigningKey {
-        SigningKey::from_bytes(key.as_bytes())
-    }
-
     #[async_trait]
     impl DhtNode for MainlineDht {
         async fn put(&self, key: DhtKey, value: Vec<u8>) {
             let seq = unix_millis();
             // No salt: the device id is already encoded in the keypair, so the
-            // target is SHA-1(public_key), which the resolver reproduces.
-            let item = MutableItem::new(signing_key_for(key), &value, seq, None);
+            // target is SHA-1(public_key), which the resolver reproduces. The
+            // BEP44 signing key is the shared seed→keypair derivation, the same
+            // one the announce signing path uses, so the two transports sign
+            // with one key.
+            let item = MutableItem::new(signing_key_for_seed(&key), &value, seq, None);
             let dht = self.dht.clone();
             if let Err(err) = dht.put_mutable(item, None).await {
                 tracing::debug!(
@@ -600,7 +647,7 @@ mod live {
             // Derive the announcer's public key from the queried device id and
             // read the most-recent item under SHA-1(public_key) — the exact
             // target the announcer wrote to. No salt, matching the put path.
-            let public_key = signing_key_for(key).verifying_key().to_bytes();
+            let public_key = signing_key_for_seed(&key).verifying_key().to_bytes();
             let dht = self.dht.clone();
             // Bound the iterative lookup: `get_mutable_most_recent` returns
             // `None` for a clean not-found, but a partitioned or wedged lookup
@@ -673,9 +720,41 @@ mod tests {
     use tokio::sync::Mutex;
 
     use crate::candidate::CandidateKind;
+    use crate::traversal::Clock;
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    /// A fixed-time [`Clock`] so signing expiries and freshness checks are
+    /// deterministic. The monotonic `now` is unused by the DHT path.
+    struct FixedClock {
+        unix_ms: u64,
+    }
+
+    impl Clock for FixedClock {
+        fn now(&self) -> std::time::Instant {
+            std::time::Instant::now()
+        }
+
+        fn now_unix_ms(&self) -> u64 {
+            self.unix_ms
+        }
+    }
+
+    const NOW_MS: u64 = 1_700_000_000_000;
+    /// The fixed clock's "now" as signed milliseconds, for encode/decode tests
+    /// that supply the timestamps directly.
+    const NOW_MS_I64: i64 = 1_700_000_000_000;
+    /// Expiry comfortably ahead of the fixed clock for the encode/decode tests.
+    const EXPIRY_MS: i64 = NOW_MS_I64 + 3_600_000;
+
+    fn fixed_clock() -> Arc<dyn Clock> {
+        Arc::new(FixedClock { unix_ms: NOW_MS })
+    }
+
+    fn fixed_discovery<N: DhtNode>(node: N) -> DhtDiscovery<N> {
+        DhtDiscovery::with_clock(node, fixed_clock())
     }
 
     /// In-memory [`DhtNode`] keyed by [`DhtKey`], mirroring the distributed
@@ -780,8 +859,8 @@ mod tests {
     fn stored_candidates_round_trip_through_encode_decode() {
         let host = Candidate::new(addr(22000), CandidateKind::Host, 65_535);
         let srflx = Candidate::new(addr(33000), CandidateKind::ServerReflexive, 0);
-        let bytes = StoredCandidates::encode(&[host, srflx]).unwrap();
-        let decoded = StoredCandidates::decode(&bytes);
+        let bytes = encode_signed("DEVICE-A", &[host, srflx], EXPIRY_MS).unwrap();
+        let decoded = decode_signed(&bytes, "DEVICE-A", NOW_MS_I64);
         assert_eq!(decoded.len(), 2);
         assert!(decoded.contains(&host));
         assert!(decoded.contains(&srflx));
@@ -789,26 +868,58 @@ mod tests {
 
     #[test]
     fn decode_of_corrupt_bytes_yields_no_candidates() {
-        assert!(StoredCandidates::decode(b"not json at all").is_empty());
+        assert!(decode_signed(b"not json at all", "DEVICE-A", NOW_MS_I64).is_empty());
+    }
+
+    #[test]
+    fn decode_rejects_a_value_signed_for_another_device() {
+        // A storing node serves DEVICE-B's value when DEVICE-A is queried. The
+        // signature is valid for DEVICE-B but the resolver wants DEVICE-A, so
+        // it must be rejected — the DHT cannot substitute one device's set.
+        let host = Candidate::new(addr(22000), CandidateKind::Host, 0);
+        let bytes = encode_signed("DEVICE-B", &[host], EXPIRY_MS).unwrap();
+        assert!(decode_signed(&bytes, "DEVICE-A", NOW_MS_I64).is_empty());
+    }
+
+    #[test]
+    fn decode_rejects_a_tampered_value() {
+        let host = Candidate::new(addr(22000), CandidateKind::Host, 1);
+        let mut bytes = encode_signed("DEVICE-A", &[host], EXPIRY_MS).unwrap();
+        // Flip a byte in the middle of the serialised envelope: either the
+        // signature no longer matches or the JSON no longer parses; both read
+        // as no candidates.
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0x01;
+        assert!(decode_signed(&bytes, "DEVICE-A", NOW_MS_I64).is_empty());
+    }
+
+    #[test]
+    fn decode_rejects_an_expired_value() {
+        let host = Candidate::new(addr(22000), CandidateKind::Host, 0);
+        // Expiry one second before the queried "now".
+        let bytes = encode_signed("DEVICE-A", &[host], NOW_MS_I64 - 1000).unwrap();
+        assert!(decode_signed(&bytes, "DEVICE-A", NOW_MS_I64).is_empty());
     }
 
     #[test]
     fn encode_keeps_a_large_set_within_the_bep44_value_ceiling() {
         // Far more candidates than will fit in 1000 bytes. The encoder must
-        // drop the lowest-priority ones until the value fits, never emit a
-        // value the network would silently reject.
+        // drop the lowest-priority ones until the value (including the
+        // signature) fits, never emit a value the network would silently reject.
         let many: Vec<Candidate> = (0..256u32)
             .map(|i| {
                 let port = u16::try_from(20_000 + i).unwrap_or(u16::MAX);
                 Candidate::new(addr(port), CandidateKind::Host, port)
             })
             .collect();
-        let bytes = StoredCandidates::encode(&many).unwrap();
+        let bytes = encode_signed("DEVICE-A", &many, EXPIRY_MS).unwrap();
         assert!(
             bytes.len() <= BEP44_MAX_VALUE_LEN,
             "encoded value {} exceeds BEP44 ceiling {BEP44_MAX_VALUE_LEN}",
             bytes.len(),
         );
+        // And what survived must still verify — the trim re-signs the set.
+        assert!(!decode_signed(&bytes, "DEVICE-A", NOW_MS_I64).is_empty());
     }
 
     #[test]
@@ -828,9 +939,9 @@ mod tests {
         let mut set = vec![top];
         set.extend(lesser);
 
-        let bytes = StoredCandidates::encode(&set).unwrap();
+        let bytes = encode_signed("DEVICE-A", &set, EXPIRY_MS).unwrap();
         assert!(bytes.len() <= BEP44_MAX_VALUE_LEN);
-        let decoded = StoredCandidates::decode(&bytes);
+        let decoded = decode_signed(&bytes, "DEVICE-A", NOW_MS_I64);
         assert!(
             decoded.contains(&top),
             "the highest-priority candidate must survive the byte-budget trim",
@@ -843,15 +954,15 @@ mod tests {
 
     #[test]
     fn encode_of_empty_set_is_well_within_the_ceiling() {
-        let bytes = StoredCandidates::encode(&[]).unwrap();
+        let bytes = encode_signed("DEVICE-A", &[], EXPIRY_MS).unwrap();
         assert!(bytes.len() <= BEP44_MAX_VALUE_LEN);
-        assert!(StoredCandidates::decode(&bytes).is_empty());
+        assert!(decode_signed(&bytes, "DEVICE-A", NOW_MS_I64).is_empty());
     }
 
     #[tokio::test]
     async fn announce_then_resolve_round_trips_candidates() {
         let node = MockDht::default();
-        let discovery = DhtDiscovery::new(node);
+        let discovery = fixed_discovery(node);
 
         let host = Candidate::new(addr(22000), CandidateKind::Host, 65_535);
         let srflx = Candidate::new(addr(33000), CandidateKind::ServerReflexive, 0);
@@ -865,7 +976,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_unknown_device_yields_no_candidates() {
-        let discovery = DhtDiscovery::new(MockDht::default());
+        let discovery = fixed_discovery(MockDht::default());
         assert!(discovery.resolve("NEVER-ANNOUNCED").await.is_empty());
     }
 
@@ -882,7 +993,7 @@ mod tests {
     async fn get_of_known_key_is_found_with_the_stored_value() {
         let node = MockDht::default();
         let host = Candidate::new(addr(22000), CandidateKind::Host, 0);
-        let bytes = StoredCandidates::encode(&[host]).unwrap();
+        let bytes = encode_signed("DEVICE-A", &[host], EXPIRY_MS).unwrap();
         node.put(DhtKey::from_device_id("DEVICE-A"), bytes.clone())
             .await;
         let outcome = node.get(DhtKey::from_device_id("DEVICE-A")).await;
@@ -927,7 +1038,7 @@ mod tests {
     async fn announce_stores_under_the_device_id_key() {
         // Announcing for one id must not surface under a different id's key.
         let node = MockDht::default();
-        let discovery = DhtDiscovery::new(node);
+        let discovery = fixed_discovery(node);
         let host = Candidate::new(addr(22000), CandidateKind::Host, 0);
         discovery.announce("DEVICE-A", &[host]).await;
 
@@ -946,12 +1057,12 @@ mod tests {
         node.store.lock().await.insert(
             key.0,
             vec![
-                StoredCandidates::encode(&[host]).unwrap(),
-                StoredCandidates::encode(&[srflx]).unwrap(),
+                encode_signed("DEVICE-A", &[host], EXPIRY_MS).unwrap(),
+                encode_signed("DEVICE-A", &[srflx], EXPIRY_MS).unwrap(),
             ],
         );
 
-        let discovery = DhtDiscovery::new(node);
+        let discovery = fixed_discovery(node);
         let resolved = discovery.resolve("DEVICE-A").await;
         assert_eq!(resolved.len(), 2);
         assert!(resolved.contains(&host));
@@ -959,11 +1070,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_rejects_a_substituted_value_for_another_device() {
+        // A hostile storing node returns DEVICE-B's validly-signed set under
+        // DEVICE-A's key. Resolving DEVICE-A must reject it: a self-certifying
+        // set signed by B cannot resolve as A.
+        let node = MockDht::default();
+        let key = DhtKey::from_device_id("DEVICE-A");
+        let host = Candidate::new(addr(22000), CandidateKind::Host, 0);
+        node.store.lock().await.insert(
+            key.0,
+            vec![encode_signed("DEVICE-B", &[host], EXPIRY_MS).unwrap()],
+        );
+
+        let discovery = fixed_discovery(node);
+        assert!(discovery.resolve("DEVICE-A").await.is_empty());
+    }
+
+    #[tokio::test]
     async fn re_announce_replaces_the_stored_set() {
         // A later announce supersedes an earlier one for the same device id,
         // matching the most-recent-wins read of the live node.
         let node = MockDht::default();
-        let discovery = DhtDiscovery::new(node);
+        let discovery = fixed_discovery(node);
         let first = Candidate::new(addr(22000), CandidateKind::Host, 0);
         let second = Candidate::new(addr(44000), CandidateKind::ServerReflexive, 0);
         discovery.announce("DEVICE-A", &[first]).await;
