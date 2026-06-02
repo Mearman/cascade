@@ -274,8 +274,11 @@ mod tests {
         let main = "[backends.shared]\ntype = \"p2p\"\n";
         std::fs::write(ctx.config_dir.join("config.toml"), main).unwrap();
         let data_dir = ctx.config_dir.join("p2p-data");
+        // A TOML literal string (single quotes) so Windows paths — whose
+        // backslashes are escape sequences in a basic string — round-trip
+        // verbatim. This is exactly the case literal strings exist for.
         let backend = format!(
-            "type = \"p2p\"\nname = \"shared\"\ndata_dir = \"{}\"\n",
+            "type = \"p2p\"\nname = \"shared\"\ndata_dir = '{}'\n",
             data_dir.display()
         );
         std::fs::write(ctx.config_dir.join("shared.toml"), backend).unwrap();
