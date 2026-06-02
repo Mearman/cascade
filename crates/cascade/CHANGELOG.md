@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.49](https://github.com/Mearman/cascade/compare/cascade-v0.1.48...cascade-v0.1.49) - 2026-06-02
+
+### Added
+
+- *(cascade)* wire the management dispatcher into daemon backends at startup
+- *(cascade)* add grant and remote management-plane CLI commands
+
+### Fixed
+
+- *(cascade)* use a TOML literal string for the Windows path in grant test seed
+
 ## [0.1.48](https://github.com/Mearman/cascade/compare/cascade-v0.1.47...cascade-v0.1.48) - 2026-06-02
 
 ### Other
