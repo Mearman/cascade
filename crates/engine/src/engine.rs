@@ -28,7 +28,7 @@ use crate::changefeed::ChangeFeed;
 use crate::config::ConfigResolver;
 use crate::db::{AuditEntry, PinRuleRecord, StateDb};
 use crate::manage::{
-    DeviceId, Grant, ManageCommandExecutor, ManageDispatch, ManageGrantStore, run_dispatch,
+    DeviceId, Grant, ManageCommandExecutor, ManageDispatch, ManageGrantStore, Scope, run_dispatch,
 };
 use crate::p2p_bridge::P2pBridge;
 use crate::presenter::VfsPresenter;
@@ -232,6 +232,13 @@ impl Engine {
     /// The caller provides the presenter (typically the platform presenter —
     /// NFS, FUSE, etc.) and is responsible for spawning the runner as a
     /// background task.
+    ///
+    /// The runner subscribes to the engine's cancellation channel, so
+    /// [`Engine::shutdown`] / [`Engine::stop`] stop the sync loop along with the
+    /// cache worker. The runner observes a `false → true` edge on this channel,
+    /// so it must be created while the channel reads `false` (running) — which it
+    /// always does immediately after [`Engine::new`] and after a
+    /// [`Engine::restart`] re-arm.
     pub fn create_sync_runner(&self, presenter: Arc<dyn VfsPresenter>) -> SyncRunner {
         // Collect all backends from the VFS tree.
         let tree = self
@@ -244,8 +251,14 @@ impl Engine {
         }
         drop(tree);
 
-        SyncRunner::new(self.db.clone(), backends, presenter, self.config.clone())
-            .with_change_feed(self.change_feed.clone())
+        SyncRunner::new(
+            self.db.clone(),
+            backends,
+            presenter,
+            self.config.clone(),
+            self.cancel.subscribe(),
+        )
+        .with_change_feed(self.change_feed.clone())
     }
 
     /// Start the engine's background tasks (cache manager).
@@ -267,7 +280,12 @@ impl Engine {
         Ok(EngineHandle { cache_handle })
     }
 
-    /// Graceful shutdown — signals all components to stop.
+    /// Graceful shutdown — signals all background workers to stop.
+    ///
+    /// Sends the cancellation edge every worker subscribed to the engine's
+    /// channel observes: the cache-manager task spawned by [`Engine::start`] and
+    /// the sync runner created by [`Engine::create_sync_runner`] (which
+    /// subscribes this same channel). Both quiesce on the next loop iteration.
     pub fn shutdown(&self) {
         info!("engine shutting down");
         let _ = self.cancel.send(true);
@@ -305,37 +323,63 @@ impl Engine {
     /// The fragment's pin and lifecycle rules are applied to the state database
     /// exactly as the equivalent local config-merge path would: each pin path
     /// becomes a recursive pin rule, and each lifecycle policy is inserted with
-    /// its parsed age/size bounds. Rule paths declared relative to the fragment
-    /// (not absolute) are rooted under `folder` so they land in the subtree the
-    /// push is authorised over. Returns a short summary of what was applied.
+    /// its parsed age/size bounds.
+    ///
+    /// **Scope confinement is load-bearing for authorisation.** The dispatcher
+    /// authorises a `ConfigPush` solely over its declared `folder`, so every
+    /// rule the fragment carries must land inside that subtree — otherwise a
+    /// manager authorised only over `/work` could push `[[pin]] path =
+    /// "/personal"` and pin content it has no grant over. Each rule path is
+    /// therefore rooted under `folder` (an absolute rule path is treated as
+    /// relative to it, never as already node-absolute) and then re-checked:
+    /// the resolved, normalised path must be covered by `Scope::folder(folder)`.
+    /// A rule that escapes the authorised subtree — for example via a `..`
+    /// traversal that climbs out — fails the whole push loudly, and **nothing**
+    /// is applied. The escape check is performed up front so a later rule
+    /// escaping cannot leave earlier rules already written to the database.
     pub fn config_push(
         &self,
         folder: &str,
         config: &cascade_config::CascadeConfig,
     ) -> Result<String> {
-        let mut pins_applied = 0usize;
-        for pin in &config.pin {
-            let path = root_under(folder, &pin.path);
+        let folder_scope = Scope::folder(folder.to_owned());
+
+        // Resolve and confine every rule path before applying any, so a single
+        // escaping rule rejects the entire push without partial application.
+        let pin_paths = config
+            .pin
+            .iter()
+            .map(|pin| confine_rule_path(folder, &pin.path, &folder_scope))
+            .collect::<Result<Vec<_>>>()?;
+
+        let policy_inputs = config
+            .lifecycle
+            .iter()
+            .map(|policy| {
+                let path = confine_rule_path(folder, &policy.path, &folder_scope)?;
+                let max_age = policy
+                    .max_age
+                    .as_deref()
+                    .map(parse_duration_secs)
+                    .transpose()?;
+                let max_file_size = policy
+                    .max_file_size
+                    .as_deref()
+                    .map(parse_size_bytes)
+                    .transpose()?;
+                Ok::<_, anyhow::Error>((path, max_age, max_file_size, policy.priority))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let pins_applied = pin_paths.len();
+        for path in pin_paths {
             self.db.add_pin_rule(&path, true, None)?;
-            pins_applied += 1;
         }
 
-        let mut policies_applied = 0usize;
-        for policy in &config.lifecycle {
-            let path = root_under(folder, &policy.path);
-            let max_age = policy
-                .max_age
-                .as_deref()
-                .map(parse_duration_secs)
-                .transpose()?;
-            let max_file_size = policy
-                .max_file_size
-                .as_deref()
-                .map(parse_size_bytes)
-                .transpose()?;
+        let policies_applied = policy_inputs.len();
+        for (path, max_age, max_file_size, priority) in policy_inputs {
             self.db
-                .add_lifecycle_policy(&path, max_age, max_file_size, policy.priority, None)?;
-            policies_applied += 1;
+                .add_lifecycle_policy(&path, max_age, max_file_size, priority, None)?;
         }
 
         Ok(format!(
@@ -405,25 +449,35 @@ impl Engine {
         })
     }
 
-    /// Restart the engine's background workers.
+    /// Restart the engine's cache-manager worker.
     ///
     /// Signals the current workers to stop, re-arms the cancellation channel,
-    /// and spawns a fresh worker set — the in-process equivalent of the daemon
-    /// `cascade restart`. The returned handle owns the new background tasks.
+    /// and spawns a fresh cache-manager task; the returned handle owns it.
+    ///
+    /// The sync runner is **not** revived here. It is created and spawned by the
+    /// daemon (it needs the platform presenter, which the engine does not own),
+    /// and once its `run()` future observes the stop edge it returns and cannot
+    /// be respawned from inside the engine. Reviving the full worker set requires
+    /// a daemon-level process restart. The re-arm therefore un-cancels the
+    /// channel so the freshly spawned cache worker does not see a stale shutdown
+    /// signal, but a sync runner that already returned stays stopped.
     pub fn restart(&self) -> Result<EngineHandle> {
         let _ = self.cancel.send(true);
         // Re-arm: a freshly subscribed receiver reads `false` (running) so the
-        // new worker set does not see a stale shutdown signal.
+        // new cache worker does not see a stale shutdown signal.
         let _ = self.cancel.send(false);
         self.start()
     }
 
     /// Stop the engine's background workers — an alias of [`Engine::shutdown`]
     /// returning a summary for the management plane.
+    ///
+    /// This signals both the cache-manager task and the sync runner (both
+    /// subscribe the engine's cancellation channel) to quiesce.
     #[must_use]
     pub fn stop(&self) -> String {
         self.shutdown();
-        "daemon workers signalled to stop".to_owned()
+        "daemon background workers (cache eviction and backend sync) signalled to stop".to_owned()
     }
 
     /// Insert a capability grant into the store.
@@ -510,6 +564,10 @@ impl ManageGrantStore for Engine {
             .into_iter()
             .map(|record| record.grant)
             .collect())
+    }
+
+    fn manage_grant_scope(&self, grant_id: i64) -> Result<Option<Scope>> {
+        self.db.grant_scope(grant_id)
     }
 
     fn manage_append_audit(&self, entry: &AuditEntry) -> Result<()> {
@@ -602,12 +660,13 @@ impl ManageCommandExecutor for Engine {
     }
 
     async fn manage_restart(&self) -> Result<String> {
-        // The returned handle owns freshly spawned background tasks. The daemon
-        // keeps the engine alive past this call, so detaching the handle lets
-        // the new workers run for the daemon's lifetime exactly as the initial
-        // `start()` handle does.
+        // The returned handle owns the freshly spawned cache-manager task. The
+        // daemon keeps the engine alive past this call, so detaching the handle
+        // lets the new worker run for the daemon's lifetime exactly as the
+        // initial `start()` handle does. The sync runner is owned by the daemon
+        // and not revived here — see `Engine::restart`.
         let _handle = self.restart()?;
-        Ok("daemon workers restarted".to_owned())
+        Ok("daemon cache-manager worker restarted (sync runner unaffected — full restart requires restarting the daemon)".to_owned())
     }
 
     async fn manage_stop(&self) -> Result<String> {
@@ -689,22 +748,44 @@ pub struct CacheStatsSnapshot {
     pub total_bytes: u64,
 }
 
-/// Root a config rule's path under the fragment's target folder.
+/// Root a config rule's path under the fragment's target folder, joining
+/// unconditionally.
 ///
-/// A rule whose path is absolute (begins with `/`) is taken as already
-/// node-absolute and left untouched. A relative rule path is joined beneath
-/// `folder` so a pushed fragment's rules land in the subtree the push is
-/// authorised over, never leaking outside it.
+/// A rule path is always interpreted relative to `folder`: a leading `/` is
+/// stripped so an absolute-looking rule path (`/personal`) is rooted *under*
+/// the pushed folder (`/work/personal`) rather than escaping to node-absolute
+/// `/personal`. This is the documented intent — a pushed fragment's rules live
+/// in the subtree the push is authorised over. A `..` segment is left in the
+/// joined string for the caller's containment check to fold and reject; this
+/// function only performs the join.
 fn root_under(folder: &str, rule_path: &str) -> String {
-    if rule_path.starts_with('/') {
-        return rule_path.to_owned();
-    }
     let folder = folder.trim_end_matches('/');
     let rule = rule_path.trim_start_matches('/');
     if folder.is_empty() {
         format!("/{rule}")
     } else {
         format!("{folder}/{rule}")
+    }
+}
+
+/// Root a config rule's path under `folder` and confine it to that subtree.
+///
+/// Returns the rooted path when it normalises to a location covered by
+/// `folder_scope`. Fails loudly when the rule escapes the authorised subtree
+/// (for example a `..` traversal that climbs above `folder`), so a `ConfigPush`
+/// authorised only over `folder` can never plant a rule outside it. The
+/// containment test reuses [`Scope::covers`], which normalises `.`/`..`/empty
+/// segments and matches on path components, so the same defence the authz layer
+/// applies to scopes is applied to every rule path.
+fn confine_rule_path(folder: &str, rule_path: &str, folder_scope: &Scope) -> Result<String> {
+    let rooted = root_under(folder, rule_path);
+    if folder_scope.covers(&Scope::folder(rooted.clone())) {
+        Ok(rooted)
+    } else {
+        anyhow::bail!(
+            "config push rule path {rule_path:?} escapes the authorised folder {folder:?} \
+             (resolved to {rooted:?}); the whole push is refused",
+        )
     }
 }
 
@@ -1171,13 +1252,44 @@ mod tests {
     }
 
     #[test]
-    fn root_under_roots_relative_and_preserves_absolute() {
+    fn root_under_always_roots_relative_to_folder() {
         assert_eq!(root_under("/work", "reports"), "/work/reports");
         assert_eq!(root_under("/work/", "reports"), "/work/reports");
-        // An absolute rule path is left untouched.
-        assert_eq!(root_under("/work", "/personal/secret"), "/personal/secret");
+        // An absolute-looking rule path is rooted UNDER the folder, never
+        // treated as node-absolute — this is what stops a fragment escaping.
+        assert_eq!(
+            root_under("/work", "/personal/secret"),
+            "/work/personal/secret"
+        );
         // Empty folder roots at the filesystem root.
         assert_eq!(root_under("", "reports"), "/reports");
+    }
+
+    #[test]
+    fn confine_rule_path_roots_absolute_paths_under_the_folder() {
+        // The scope-escape blocker: an absolute rule path inside an authorised
+        // `/work` push is confined to `/work/personal`, not leaked to a
+        // node-absolute `/personal`. Confinement succeeds and returns the
+        // rooted-under path.
+        let scope = Scope::folder("/work".to_owned());
+        let confined = confine_rule_path("/work", "/personal/secret", &scope).unwrap();
+        assert_eq!(confined, "/work/personal/secret");
+        assert!(scope.covers(&Scope::folder(confined)));
+    }
+
+    #[test]
+    fn confine_rule_path_rejects_parent_traversal_escape() {
+        // A `..` traversal that climbs out of the authorised folder must be
+        // refused loudly rather than silently clamped or applied.
+        let scope = Scope::folder("/work".to_owned());
+        let err = confine_rule_path("/work", "../personal", &scope)
+            .expect_err("a traversal escaping the folder must be refused");
+        assert!(
+            err.to_string().contains("escapes the authorised folder"),
+            "error should name the escape, got {err}",
+        );
+        // A deeper climb that lands above the root is equally refused.
+        assert!(confine_rule_path("/work", "../../etc", &scope).is_err());
     }
 
     // ── Engine-level command entry points against the real state DB ──
@@ -1212,6 +1324,69 @@ mod tests {
         assert_eq!(policy.max_age, Some(7 * 86_400));
         assert_eq!(policy.max_file_size, Some(1024 * 1024));
         assert_eq!(policy.priority, 3);
+    }
+
+    #[test]
+    fn config_push_roots_absolute_rule_paths_under_the_folder() {
+        // Scope-escape blocker, end to end: a fragment authorised over /work
+        // carries an absolute pin path `/personal` and an absolute lifecycle
+        // path `/`. Both must be rooted UNDER /work — no `/personal` or bare
+        // `/` row may land in the DB.
+        let engine = make_test_engine();
+        let body = r#"
+            [[pin]]
+            path = "/personal"
+
+            [[lifecycle]]
+            path = "/"
+            max_age = "1d"
+            priority = 1
+        "#;
+        let config = cascade_config::parse::toml::parse(body).unwrap();
+        engine.config_push("/work", &config).unwrap();
+
+        let pins = engine.db().list_pin_rules().unwrap();
+        assert!(
+            pins.iter().all(|p| p.path_glob.starts_with("/work")),
+            "no pin rule may escape the authorised /work subtree, got {pins:?}",
+        );
+        assert!(
+            pins.iter().any(|p| p.path_glob == "/work/personal"),
+            "the absolute /personal path must be rooted under /work, got {pins:?}",
+        );
+
+        let policies = engine.db().list_lifecycle_policies().unwrap();
+        assert!(
+            policies.iter().all(|p| p.path_glob.starts_with("/work")),
+            "no lifecycle policy may escape the authorised /work subtree, got {policies:?}",
+        );
+    }
+
+    #[test]
+    fn config_push_with_traversal_escape_applies_nothing() {
+        // A fragment whose rule path climbs out of the authorised folder via
+        // `..` must reject the whole push and apply nothing — not even the
+        // earlier, well-behaved rules in the same fragment.
+        let engine = make_test_engine();
+        let body = r#"
+            [[pin]]
+            path = "reports"
+
+            [[pin]]
+            path = "../personal"
+        "#;
+        let config = cascade_config::parse::toml::parse(body).unwrap();
+        let err = engine
+            .config_push("/work", &config)
+            .expect_err("a traversal escape must reject the push");
+        assert!(
+            err.to_string().contains("escapes the authorised folder"),
+            "error should name the escape, got {err}",
+        );
+        assert!(
+            engine.db().list_pin_rules().unwrap().is_empty(),
+            "no rule may be applied when any rule in the fragment escapes",
+        );
     }
 
     #[test]

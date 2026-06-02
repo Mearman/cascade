@@ -33,7 +33,11 @@ pub struct SyncRunner {
     /// batch is also filed here so presenters can serve per-parent
     /// `enumerateChanges` deltas without running a second poll loop.
     change_feed: Option<Arc<ChangeFeed>>,
-    cancel_tx: watch::Sender<bool>,
+    /// Cancellation signal the runner observes. This is the engine's shared
+    /// channel, handed in at construction, so a management-plane Stop (which
+    /// signals the engine's [`Engine::shutdown`]) actually quiesces the sync
+    /// loop — not just the cache worker. The runner never owns a private
+    /// channel; if it did, the engine's cancel could never reach it.
     cancel_rx: watch::Receiver<bool>,
 }
 
@@ -48,13 +52,19 @@ impl std::fmt::Debug for SyncRunner {
 
 impl SyncRunner {
     /// Create a new sync runner.
+    ///
+    /// `cancel_rx` is the engine's shared cancellation receiver
+    /// ([`Engine::create_sync_runner`](crate::engine::Engine::create_sync_runner)
+    /// subscribes the engine's channel and passes it in). The runner watches
+    /// this receiver so an engine-wide shutdown — including the management-plane
+    /// Stop command — stops the sync loop alongside the cache worker.
     pub fn new(
         db: Arc<StateDb>,
         backends: Vec<Arc<dyn Backend>>,
         presenter: Arc<dyn VfsPresenter>,
         config: Arc<ConfigResolver>,
+        cancel_rx: watch::Receiver<bool>,
     ) -> Self {
-        let (cancel_tx, cancel_rx) = watch::channel(false);
         Self {
             db,
             backends,
@@ -62,7 +72,6 @@ impl SyncRunner {
             config,
             p2p: None,
             change_feed: None,
-            cancel_tx,
             cancel_rx,
         }
     }
@@ -153,12 +162,6 @@ impl SyncRunner {
             // Remote changes are applied first, then local writes are uploaded.
             self.flush_dirty_files().await;
         }
-    }
-
-    /// Signal the runner to stop. The `run()` future will return on the next
-    /// iteration.
-    pub fn stop(&self) {
-        let _ = self.cancel_tx.send(true);
     }
 
     /// Sync a single backend: fetch changes, apply to DB, notify presenter.
@@ -506,9 +509,16 @@ mod tests {
         let presenter = Arc::new(MockPresenter::default());
         let config = Arc::new(ConfigResolver::new(std::path::PathBuf::from("/tmp/test")));
 
-        let runner = SyncRunner::new(db.clone(), vec![backend], presenter.clone(), config);
         // Stop immediately — the runner will do one initial sync then exit.
-        runner.stop();
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let runner = SyncRunner::new(
+            db.clone(),
+            vec![backend],
+            presenter.clone(),
+            config,
+            cancel_rx,
+        );
+        let _ = cancel_tx.send(true);
         let result = runner.run().await;
         assert!(result.is_ok());
     }
@@ -640,7 +650,14 @@ mod tests {
         let presenter = Arc::new(MockPresenter::default());
         let config = Arc::new(ConfigResolver::new(std::path::PathBuf::from("/tmp/test")));
 
-        let runner = SyncRunner::new(db.clone(), vec![mock_backend.clone()], presenter, config);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let runner = SyncRunner::new(
+            db.clone(),
+            vec![mock_backend.clone()],
+            presenter,
+            config,
+            cancel_rx,
+        );
 
         let flushed = runner.flush_dirty_files().await;
         assert_eq!(flushed, 1);
@@ -679,7 +696,8 @@ mod tests {
         let presenter = Arc::new(MockPresenter::default());
         let config = Arc::new(ConfigResolver::new(std::path::PathBuf::from("/tmp/test")));
 
-        let runner = SyncRunner::new(db.clone(), vec![null_backend], presenter, config);
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let runner = SyncRunner::new(db.clone(), vec![null_backend], presenter, config, cancel_rx);
 
         let flushed = runner.flush_dirty_files().await;
         assert_eq!(flushed, 0);

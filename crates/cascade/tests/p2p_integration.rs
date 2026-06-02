@@ -107,8 +107,9 @@ async fn sync_runner_with_p2p_bridge() {
         std::path::PathBuf::from("/tmp/test"),
     ));
 
-    let runner = SyncRunner::new(db, vec![backend], presenter, config).with_p2p(bridge);
-    runner.stop();
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let runner = SyncRunner::new(db, vec![backend], presenter, config, cancel_rx).with_p2p(bridge);
+    let _ = cancel_tx.send(true);
     let result = runner.run().await;
     assert!(result.is_ok());
 }
