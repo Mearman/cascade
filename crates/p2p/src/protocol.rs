@@ -27,6 +27,7 @@ const MSG_OBSERVED_ADDRESS: u32 = 10;
 const MSG_RELAY_OFFER: u32 = 11;
 const MSG_RELAY_CONNECT: u32 = 12;
 const MSG_RELAY_DATA: u32 = 13;
+const MSG_RELAY_INBOUND: u32 = 14;
 
 /// Maximum number of candidates carried in a single
 /// [`BepMessage::Candidates`] frame. Bounds the receiver's allocation
@@ -429,15 +430,31 @@ pub enum BepMessage {
         /// relay.
         target_device: String,
     },
-    /// One opaque, end-to-end-encrypted frame travelling through a peer
-    /// relay.
+    /// One opaque relayed frame travelling through a peer relay.
     ///
     /// The volunteering relay forwards the payload verbatim between the two
-    /// bridged sessions without inspecting it — the two endpoints negotiate
-    /// their own TLS through the tunnel, so the relay sees only ciphertext.
+    /// bridged sessions without inspecting it. Each payload is a complete
+    /// inner BEP frame (length prefix plus body) produced by the tunnel
+    /// transport on the requester or target side; the relay treats it as
+    /// opaque bytes.
     RelayData {
-        /// Opaque relayed bytes.
+        /// Opaque relayed bytes — one inner BEP frame.
         payload: Vec<u8>,
+    },
+    /// Notify the target of a peer relay that a requester wants to open a
+    /// tunnelled session through this relay.
+    ///
+    /// Sent by a volunteering relay to the target named in a
+    /// [`BepMessage::RelayConnect`], on the relay's existing session to that
+    /// target, once the bridge has been admitted. It carries the requester's
+    /// device id so the target can stand up an inner BEP session terminal
+    /// keyed by that requester and decapsulate the subsequent
+    /// [`BepMessage::RelayData`] frames into it, rather than forwarding them
+    /// onward. Without this signal the target cannot distinguish a tunnel it
+    /// terminates from one it should relay.
+    RelayInbound {
+        /// Device id of the peer that initiated the relayed connection.
+        source_device: String,
     },
 }
 
@@ -458,6 +475,7 @@ impl BepMessage {
             Self::RelayOffer { .. } => MSG_RELAY_OFFER,
             Self::RelayConnect { .. } => MSG_RELAY_CONNECT,
             Self::RelayData { .. } => MSG_RELAY_DATA,
+            Self::RelayInbound { .. } => MSG_RELAY_INBOUND,
         }
     }
 }
@@ -567,6 +585,9 @@ pub fn encode_message(msg: &BepMessage) -> Result<Vec<u8>> {
         }
         BepMessage::RelayData { payload } => {
             encode_opaque(&mut body, payload)?;
+        }
+        BepMessage::RelayInbound { source_device } => {
+            encode_string(&mut body, source_device)?;
         }
     }
 
@@ -729,6 +750,7 @@ pub fn decode_message(frame: &[u8]) -> Result<BepMessage> {
         MSG_RELAY_OFFER => decode_relay_offer(rest),
         MSG_RELAY_CONNECT => decode_relay_connect(rest),
         MSG_RELAY_DATA => decode_relay_data(rest),
+        MSG_RELAY_INBOUND => decode_relay_inbound(rest),
         _ => anyhow::bail!("unknown message type: {msg_type}"),
     }
 }
@@ -787,6 +809,11 @@ fn decode_relay_data(data: &[u8]) -> Result<BepMessage> {
     Ok(BepMessage::RelayData {
         payload: payload.to_vec(),
     })
+}
+
+fn decode_relay_inbound(data: &[u8]) -> Result<BepMessage> {
+    let (source_device, _) = decode_string(data)?;
+    Ok(BepMessage::RelayInbound { source_device })
 }
 
 fn decode_cluster_config(data: &[u8]) -> Result<BepMessage> {
@@ -1548,6 +1575,13 @@ mod tests {
     #[test]
     fn encode_decode_relay_data_empty() {
         round_trip(BepMessage::RelayData { payload: vec![] });
+    }
+
+    #[test]
+    fn encode_decode_relay_inbound_round_trip() {
+        round_trip(BepMessage::RelayInbound {
+            source_device: "SOURCE-DEVICE-ID".into(),
+        });
     }
 
     #[test]
