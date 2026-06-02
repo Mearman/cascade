@@ -3,6 +3,10 @@ pub mod cache;
 pub mod config;
 pub mod init;
 pub mod mount;
+/// Engine-backed `ContentProvider` for the Windows `ProjFS` presenter.
+/// Only the Windows daemon wires it up, so the module is target-gated.
+#[cfg(target_os = "windows")]
+pub mod projfs_provider;
 pub mod status;
 
 use std::path::PathBuf;

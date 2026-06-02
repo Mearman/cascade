@@ -499,6 +499,11 @@ async fn try_projfs(
     backends: Vec<Arc<dyn cascade_engine::backend::Backend>>,
     enable_p2p: bool,
 ) -> Result<()> {
+    // The backend list is consumed by EngineConfig, so clone it for the
+    // content provider first. Cloning a `Vec<Arc<dyn Backend>>` is cheap —
+    // just Arc reference-count bumps.
+    let backends_for_provider = backends.clone();
+
     let engine_config = EngineConfig {
         db_path: ctx.db_path.clone(),
         mount_point: mount_path.to_path_buf(),
@@ -509,7 +514,35 @@ async fn try_projfs(
     };
     let engine = Engine::new(engine_config)?;
 
-    let presenter = Arc::new(cascade_presenter_projfs::ProjFsPresenter::new(mount_path));
+    // Capture the daemon's multi-thread runtime handle while still on it.
+    // The ProjFS GetFileData callback runs on a kernel thread outside any
+    // runtime; the provider uses this handle to `block_on` the cold-path
+    // download. `try_projfs` is async, so `Handle::current()` here returns
+    // the daemon's #[tokio::main] runtime.
+    let handle = tokio::runtime::Handle::current();
+
+    // The content provider serves on-demand reads. Its cache directory is
+    // a sibling of the state DB under the config root, matching the File
+    // Provider layout.
+    let cache_dir = ctx.config_dir.join("cache");
+    ensure_directory(&cache_dir, "ProjFS cache directory")?;
+    let provider = Arc::new(super::projfs_provider::EngineContentProvider::new(
+        engine.vfs().clone(),
+        engine.db().clone(),
+        backends_for_provider,
+        cache_dir,
+        handle,
+    ));
+
+    // Do not set `with_root`: the sync runner labels each top-level item
+    // with its backend's own root id (e.g. `gdrive:root`), not a single
+    // shared root. Pinning one root id would filter out every backend but
+    // one. Leaving the root unset uses the presenter's loose-root
+    // fallback, treating every item in the map as eligible — which is
+    // exactly what the multi-backend daemon populates.
+    let presenter = Arc::new(
+        cascade_presenter_projfs::ProjFsPresenter::new(mount_path).with_content_provider(provider),
+    );
 
     let sync_runner = engine.create_sync_runner(presenter.clone());
     let sync_handle = tokio::spawn(async move {
