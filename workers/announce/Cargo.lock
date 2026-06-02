@@ -42,7 +42,7 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
 name = "cascade-announce-wire"
-version = "0.1.51"
+version = "0.1.52"
 dependencies = [
  "data-encoding",
  "ed25519-dalek",
