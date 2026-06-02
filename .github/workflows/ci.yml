@@ -107,8 +107,13 @@ jobs:
           restore-keys: nat-integration-
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev iproute2 iptables
-      - name: Build nat-integration test binary
-        run: cargo test -p cascade-p2p --features nat-integration --test nat_integration --no-run
+      - name: Build nat-integration test binaries
+        # Build the operated-relay test and the serverless-rung tests up front
+        # (without sudo) so the sudo invocations below only have to run, not
+        # compile — keeping the privileged surface as small as possible.
+        run: |
+          cargo test -p cascade-p2p --features nat-integration --test nat_integration --no-run
+          cargo test -p cascade-p2p --features nat-integration --test serverless_rungs --no-run
       - name: Run NAT integration tests (requires root for CAP_NET_ADMIN)
         # sudo -E forwards the full environment (including PATH so cargo is
         # found) and HOME so the Cargo registry cache is accessible.
@@ -117,6 +122,18 @@ jobs:
             cargo test -p cascade-p2p \
               --features nat-integration \
               --test nat_integration \
+              -- --test-threads=1 --nocapture
+      - name: Run serverless connectivity-rung tests (peer-as-STUN + peer relay)
+        # Proves the fully serverless rungs of the connectivity ladder with no
+        # operated servers of any kind: (a) a cone-NAT pair connects via
+        # peer-as-STUN observed-address learning plus hole punch, and (b) a
+        # symmetric-NAT pair bridges through a third open peer acting as a peer
+        # relay. Both assert a block transfer completes over the expected rung.
+        run: |
+          sudo -E env "PATH=$PATH" "HOME=$HOME" \
+            cargo test -p cascade-p2p \
+              --features nat-integration \
+              --test serverless_rungs \
               -- --test-threads=1 --nocapture
 
   projfs-probe:
