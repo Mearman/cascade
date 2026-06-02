@@ -374,6 +374,132 @@ pub enum ManageCommand {
     },
     /// Run one cache eviction sweep. Requires the `cache:manage` capability.
     CacheEvict,
+    /// Pre-warm a path glob so matching files are fetched on the next sync.
+    /// Requires the `cache:manage` capability.
+    CacheWarm {
+        /// The path glob to warm.
+        path_glob: String,
+    },
+    /// Push a `.cascade` config fragment to merge into the node's rule set.
+    /// Requires the `config:push` capability over the fragment's target folder.
+    ConfigPush {
+        /// The serialisation format of `body`.
+        format: ManageConfigFormat,
+        /// The folder the fragment applies to — the scope the push targets and
+        /// is authorised over. The fragment's pin and lifecycle rules are
+        /// rooted here.
+        folder: String,
+        /// The raw config fragment in `format`.
+        body: String,
+    },
+    /// Set a lifecycle policy on the node. Requires the `policy:set` capability
+    /// over the policy's path.
+    PolicySet {
+        /// The path glob the policy applies to — also the scope it is
+        /// authorised over.
+        path_glob: String,
+        /// Maximum file age before eviction, in seconds. Absent leaves the
+        /// dimension unbounded.
+        max_age_secs: Option<i64>,
+        /// Maximum file size before eviction, in bytes. Absent leaves the
+        /// dimension unbounded.
+        max_file_size: Option<i64>,
+        /// Priority — higher wins when policies overlap.
+        priority: i32,
+    },
+    /// Register a backend on the node. Requires the dangerous `backend:manage`
+    /// capability, granted explicitly for the backend's mount path (never by a
+    /// node-wide wildcard).
+    BackendAdd {
+        /// The backend name (its identifier and config file stem).
+        name: String,
+        /// The backend type (`gdrive`, `s3`, `p2p`, …).
+        backend_type: String,
+        /// The VFS mount path the backend is mounted at — the scope this
+        /// command is authorised over.
+        mount_path: String,
+        /// The backend's TOML config fragment, as a literal TOML document. The
+        /// node parses and registers it exactly as the local wizard would.
+        config_toml: String,
+    },
+    /// Remove a registered backend by name. Requires the dangerous
+    /// `backend:manage` capability over the backend's mount path.
+    BackendRemove {
+        /// The backend name to remove.
+        name: String,
+        /// The VFS mount path the backend occupied — the scope this command is
+        /// authorised over.
+        mount_path: String,
+    },
+    /// Restart the daemon's background workers. Requires the dangerous
+    /// `lifecycle:control` capability, granted explicitly for a folder scope.
+    Restart,
+    /// Stop the daemon's background workers. Requires the dangerous
+    /// `lifecycle:control` capability, granted explicitly for a folder scope.
+    Stop,
+    /// Delegate a grant to another device. Requires the dangerous
+    /// `grant:admin` capability over the grant's scope, AND the caller must
+    /// itself hold a grant that is a superset of the one being delegated.
+    GrantAdd {
+        /// The grant being delegated.
+        grant: ManageGrant,
+    },
+    /// Revoke a grant by its row id. Requires the dangerous `grant:admin`
+    /// capability over the revoked grant's scope.
+    GrantRevoke {
+        /// The row id of the grant to revoke.
+        grant_id: i64,
+        /// The scope of the grant being revoked — the extent this command is
+        /// authorised over.
+        scope: ManageScope,
+    },
+}
+
+/// The serialisation format of a [`ManageCommand::ConfigPush`] body.
+///
+/// Mirrors the four `.cascade` formats the parser accepts. Kept wire-typed so
+/// the protocol crate stays independent of the config crate; the engine maps
+/// each variant to the matching parser at the dispatch boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManageConfigFormat {
+    /// Gitignore-style `.cascade`.
+    Gitignore,
+    /// `.cascade.toml`.
+    Toml,
+    /// `.cascade.yaml`.
+    Yaml,
+    /// `.cascade.json`.
+    Json,
+}
+
+/// Wire discriminant for [`ManageConfigFormat::Gitignore`].
+const MANAGE_CONFIG_FORMAT_GITIGNORE: u32 = 0;
+/// Wire discriminant for [`ManageConfigFormat::Toml`].
+const MANAGE_CONFIG_FORMAT_TOML: u32 = 1;
+/// Wire discriminant for [`ManageConfigFormat::Yaml`].
+const MANAGE_CONFIG_FORMAT_YAML: u32 = 2;
+/// Wire discriminant for [`ManageConfigFormat::Json`].
+const MANAGE_CONFIG_FORMAT_JSON: u32 = 3;
+
+/// A capability grant as carried on the wire inside a
+/// [`ManageCommand::GrantAdd`].
+///
+/// Mirrors `cascade_engine::manage::Grant` minus the `granted_by` field: a
+/// delegated grant is always issued by the calling manager, so the managed node
+/// stamps `granted_by` with the authenticated caller rather than trusting a
+/// value off the wire. Kept wire-typed (a capability wire string, a
+/// [`ManageScope`], an optional RFC 3339 expiry) so the protocol crate stays
+/// free of the engine's domain enums.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManageGrant {
+    /// The device the grant authorises, by device ID.
+    pub grantee: String,
+    /// The capability conferred, in its colon-delimited wire form.
+    pub capability: String,
+    /// The scope the capability applies over.
+    pub scope: ManageScope,
+    /// When the grant expires, as an RFC 3339 timestamp. Absent means never.
+    pub expires: Option<String>,
 }
 
 /// Wire discriminant for [`ManageCommand::StatusRead`].
@@ -384,6 +510,30 @@ const MANAGE_CMD_PIN: u32 = 1;
 const MANAGE_CMD_UNPIN: u32 = 2;
 /// Wire discriminant for [`ManageCommand::CacheEvict`].
 const MANAGE_CMD_CACHE_EVICT: u32 = 3;
+/// Wire discriminant for [`ManageCommand::CacheWarm`].
+const MANAGE_CMD_CACHE_WARM: u32 = 4;
+/// Wire discriminant for [`ManageCommand::ConfigPush`].
+const MANAGE_CMD_CONFIG_PUSH: u32 = 5;
+/// Wire discriminant for [`ManageCommand::PolicySet`].
+const MANAGE_CMD_POLICY_SET: u32 = 6;
+/// Wire discriminant for [`ManageCommand::BackendAdd`].
+const MANAGE_CMD_BACKEND_ADD: u32 = 7;
+/// Wire discriminant for [`ManageCommand::BackendRemove`].
+const MANAGE_CMD_BACKEND_REMOVE: u32 = 8;
+/// Wire discriminant for [`ManageCommand::Restart`].
+const MANAGE_CMD_RESTART: u32 = 9;
+/// Wire discriminant for [`ManageCommand::Stop`].
+const MANAGE_CMD_STOP: u32 = 10;
+/// Wire discriminant for [`ManageCommand::GrantAdd`].
+const MANAGE_CMD_GRANT_ADD: u32 = 11;
+/// Wire discriminant for [`ManageCommand::GrantRevoke`].
+const MANAGE_CMD_GRANT_REVOKE: u32 = 12;
+
+/// Wire sentinel for an absent optional value (for example a `None` expiry or
+/// an unbounded policy dimension). Paired with [`OPTION_SOME`].
+const OPTION_NONE: u32 = 0;
+/// Wire sentinel for a present optional value.
+const OPTION_SOME: u32 = 1;
 
 /// The outcome of a [`ManageCommand`], carried on the wire inside a
 /// [`BepMessage::ManageResponse`].
@@ -903,7 +1053,108 @@ fn encode_manage_command(buf: &mut Vec<u8>, command: &ManageCommand) -> Result<(
             encode_string(buf, path_glob)?;
         }
         ManageCommand::CacheEvict => encode_u32(buf, MANAGE_CMD_CACHE_EVICT),
+        ManageCommand::CacheWarm { path_glob } => {
+            encode_u32(buf, MANAGE_CMD_CACHE_WARM);
+            encode_string(buf, path_glob)?;
+        }
+        ManageCommand::ConfigPush {
+            format,
+            folder,
+            body,
+        } => {
+            encode_u32(buf, MANAGE_CMD_CONFIG_PUSH);
+            encode_u32(buf, manage_config_format_tag(*format));
+            encode_string(buf, folder)?;
+            encode_string(buf, body)?;
+        }
+        ManageCommand::PolicySet {
+            path_glob,
+            max_age_secs,
+            max_file_size,
+            priority,
+        } => {
+            encode_u32(buf, MANAGE_CMD_POLICY_SET);
+            encode_string(buf, path_glob)?;
+            encode_opt_i64(buf, *max_age_secs);
+            encode_opt_i64(buf, *max_file_size);
+            encode_i32(buf, *priority);
+        }
+        ManageCommand::BackendAdd {
+            name,
+            backend_type,
+            mount_path,
+            config_toml,
+        } => {
+            encode_u32(buf, MANAGE_CMD_BACKEND_ADD);
+            encode_string(buf, name)?;
+            encode_string(buf, backend_type)?;
+            encode_string(buf, mount_path)?;
+            encode_string(buf, config_toml)?;
+        }
+        ManageCommand::BackendRemove { name, mount_path } => {
+            encode_u32(buf, MANAGE_CMD_BACKEND_REMOVE);
+            encode_string(buf, name)?;
+            encode_string(buf, mount_path)?;
+        }
+        ManageCommand::Restart => encode_u32(buf, MANAGE_CMD_RESTART),
+        ManageCommand::Stop => encode_u32(buf, MANAGE_CMD_STOP),
+        ManageCommand::GrantAdd { grant } => {
+            encode_u32(buf, MANAGE_CMD_GRANT_ADD);
+            encode_manage_grant(buf, grant)?;
+        }
+        ManageCommand::GrantRevoke { grant_id, scope } => {
+            encode_u32(buf, MANAGE_CMD_GRANT_REVOKE);
+            encode_i64(buf, *grant_id);
+            encode_manage_scope(buf, scope)?;
+        }
     }
+    Ok(())
+}
+
+/// The wire discriminant for a [`ManageConfigFormat`].
+const fn manage_config_format_tag(format: ManageConfigFormat) -> u32 {
+    match format {
+        ManageConfigFormat::Gitignore => MANAGE_CONFIG_FORMAT_GITIGNORE,
+        ManageConfigFormat::Toml => MANAGE_CONFIG_FORMAT_TOML,
+        ManageConfigFormat::Yaml => MANAGE_CONFIG_FORMAT_YAML,
+        ManageConfigFormat::Json => MANAGE_CONFIG_FORMAT_JSON,
+    }
+}
+
+fn encode_i32(buf: &mut Vec<u8>, val: i32) {
+    buf.extend_from_slice(&val.to_be_bytes());
+}
+
+/// Encode an `Option<i64>` as a one-word presence sentinel followed, when
+/// present, by the value. Keeps an absent dimension distinct from a zero value.
+fn encode_opt_i64(buf: &mut Vec<u8>, val: Option<i64>) {
+    match val {
+        None => encode_u32(buf, OPTION_NONE),
+        Some(v) => {
+            encode_u32(buf, OPTION_SOME);
+            encode_i64(buf, v);
+        }
+    }
+}
+
+/// Encode an `Option<&str>` as a one-word presence sentinel followed, when
+/// present, by the string.
+fn encode_opt_string(buf: &mut Vec<u8>, val: Option<&str>) -> Result<()> {
+    match val {
+        None => encode_u32(buf, OPTION_NONE),
+        Some(s) => {
+            encode_u32(buf, OPTION_SOME);
+            encode_string(buf, s)?;
+        }
+    }
+    Ok(())
+}
+
+fn encode_manage_grant(buf: &mut Vec<u8>, grant: &ManageGrant) -> Result<()> {
+    encode_string(buf, &grant.grantee)?;
+    encode_string(buf, &grant.capability)?;
+    encode_manage_scope(buf, &grant.scope)?;
+    encode_opt_string(buf, grant.expires.as_deref())?;
     Ok(())
 }
 
@@ -1064,8 +1315,132 @@ fn decode_manage_command(data: &[u8]) -> Result<(ManageCommand, &[u8])> {
             Ok((ManageCommand::Unpin { path_glob }, rest))
         }
         MANAGE_CMD_CACHE_EVICT => Ok((ManageCommand::CacheEvict, rest)),
+        MANAGE_CMD_CACHE_WARM => {
+            let (path_glob, rest) = decode_string(rest)?;
+            Ok((ManageCommand::CacheWarm { path_glob }, rest))
+        }
+        MANAGE_CMD_CONFIG_PUSH => {
+            let (format_tag, rest) = decode_u32(rest)?;
+            let format = manage_config_format_from_tag(format_tag)?;
+            let (folder, rest) = decode_string(rest)?;
+            let (body, rest) = decode_string(rest)?;
+            Ok((
+                ManageCommand::ConfigPush {
+                    format,
+                    folder,
+                    body,
+                },
+                rest,
+            ))
+        }
+        MANAGE_CMD_POLICY_SET => {
+            let (path_glob, rest) = decode_string(rest)?;
+            let (max_age_secs, rest) = decode_opt_i64(rest)?;
+            let (max_file_size, rest) = decode_opt_i64(rest)?;
+            let (priority, rest) = decode_i32(rest)?;
+            Ok((
+                ManageCommand::PolicySet {
+                    path_glob,
+                    max_age_secs,
+                    max_file_size,
+                    priority,
+                },
+                rest,
+            ))
+        }
+        MANAGE_CMD_BACKEND_ADD => {
+            let (name, rest) = decode_string(rest)?;
+            let (backend_type, rest) = decode_string(rest)?;
+            let (mount_path, rest) = decode_string(rest)?;
+            let (config_toml, rest) = decode_string(rest)?;
+            Ok((
+                ManageCommand::BackendAdd {
+                    name,
+                    backend_type,
+                    mount_path,
+                    config_toml,
+                },
+                rest,
+            ))
+        }
+        MANAGE_CMD_BACKEND_REMOVE => {
+            let (name, rest) = decode_string(rest)?;
+            let (mount_path, rest) = decode_string(rest)?;
+            Ok((ManageCommand::BackendRemove { name, mount_path }, rest))
+        }
+        MANAGE_CMD_RESTART => Ok((ManageCommand::Restart, rest)),
+        MANAGE_CMD_STOP => Ok((ManageCommand::Stop, rest)),
+        MANAGE_CMD_GRANT_ADD => {
+            let (grant, rest) = decode_manage_grant(rest)?;
+            Ok((ManageCommand::GrantAdd { grant }, rest))
+        }
+        MANAGE_CMD_GRANT_REVOKE => {
+            let (grant_id, rest) = decode_i64(rest)?;
+            let (scope, rest) = decode_manage_scope(rest)?;
+            Ok((ManageCommand::GrantRevoke { grant_id, scope }, rest))
+        }
         other => anyhow::bail!("unknown manage command tag {other}"),
     }
+}
+
+/// Parse a [`ManageConfigFormat`] from its wire discriminant.
+fn manage_config_format_from_tag(tag: u32) -> Result<ManageConfigFormat> {
+    match tag {
+        MANAGE_CONFIG_FORMAT_GITIGNORE => Ok(ManageConfigFormat::Gitignore),
+        MANAGE_CONFIG_FORMAT_TOML => Ok(ManageConfigFormat::Toml),
+        MANAGE_CONFIG_FORMAT_YAML => Ok(ManageConfigFormat::Yaml),
+        MANAGE_CONFIG_FORMAT_JSON => Ok(ManageConfigFormat::Json),
+        other => anyhow::bail!("unknown manage config format tag {other}"),
+    }
+}
+
+fn decode_i32(data: &[u8]) -> Result<(i32, &[u8])> {
+    let (bytes, rest) = data
+        .split_first_chunk::<4>()
+        .ok_or_else(|| anyhow::anyhow!("need 4 bytes for int32"))?;
+    Ok((i32::from_be_bytes(*bytes), rest))
+}
+
+/// Decode an `Option<i64>` written by [`encode_opt_i64`].
+fn decode_opt_i64(data: &[u8]) -> Result<(Option<i64>, &[u8])> {
+    let (tag, rest) = decode_u32(data)?;
+    match tag {
+        OPTION_NONE => Ok((None, rest)),
+        OPTION_SOME => {
+            let (val, rest) = decode_i64(rest)?;
+            Ok((Some(val), rest))
+        }
+        other => anyhow::bail!("invalid option sentinel {other}"),
+    }
+}
+
+/// Decode an `Option<String>` written by [`encode_opt_string`].
+fn decode_opt_string(data: &[u8]) -> Result<(Option<String>, &[u8])> {
+    let (tag, rest) = decode_u32(data)?;
+    match tag {
+        OPTION_NONE => Ok((None, rest)),
+        OPTION_SOME => {
+            let (val, rest) = decode_string(rest)?;
+            Ok((Some(val), rest))
+        }
+        other => anyhow::bail!("invalid option sentinel {other}"),
+    }
+}
+
+fn decode_manage_grant(data: &[u8]) -> Result<(ManageGrant, &[u8])> {
+    let (grantee, rest) = decode_string(data)?;
+    let (capability, rest) = decode_string(rest)?;
+    let (scope, rest) = decode_manage_scope(rest)?;
+    let (expires, rest) = decode_opt_string(rest)?;
+    Ok((
+        ManageGrant {
+            grantee,
+            capability,
+            scope,
+            expires,
+        },
+        rest,
+    ))
 }
 
 fn decode_manage_result(data: &[u8]) -> Result<(ManageResult, &[u8])> {
@@ -1951,6 +2326,200 @@ mod tests {
                 message: "pin matcher rejected glob".into(),
             },
         });
+    }
+
+    #[test]
+    fn encode_decode_manage_request_cache_warm() {
+        round_trip(BepMessage::ManageRequest {
+            request_id: 3,
+            command: ManageCommand::CacheWarm {
+                path_glob: "/work/**".into(),
+            },
+            scope: ManageScope::Folder {
+                path: "/work".into(),
+            },
+        });
+    }
+
+    #[test]
+    fn encode_decode_manage_request_config_push_every_format() {
+        for format in [
+            ManageConfigFormat::Gitignore,
+            ManageConfigFormat::Toml,
+            ManageConfigFormat::Yaml,
+            ManageConfigFormat::Json,
+        ] {
+            round_trip(BepMessage::ManageRequest {
+                request_id: 11,
+                command: ManageCommand::ConfigPush {
+                    format,
+                    folder: "/work".into(),
+                    body: "ignore = []\n".into(),
+                },
+                scope: ManageScope::Folder {
+                    path: "/work".into(),
+                },
+            });
+        }
+    }
+
+    #[test]
+    fn encode_decode_manage_request_policy_set_full_and_unbounded() {
+        round_trip(BepMessage::ManageRequest {
+            request_id: 12,
+            command: ManageCommand::PolicySet {
+                path_glob: "/work/*.tmp".into(),
+                max_age_secs: Some(86_400),
+                max_file_size: Some(1_048_576),
+                priority: 5,
+            },
+            scope: ManageScope::Folder {
+                path: "/work".into(),
+            },
+        });
+        // Both dimensions unbounded — the None sentinels must round-trip
+        // distinctly from a zero value.
+        round_trip(BepMessage::ManageRequest {
+            request_id: 13,
+            command: ManageCommand::PolicySet {
+                path_glob: "/work".into(),
+                max_age_secs: None,
+                max_file_size: None,
+                priority: -3,
+            },
+            scope: ManageScope::Folder {
+                path: "/work".into(),
+            },
+        });
+    }
+
+    #[test]
+    fn encode_decode_manage_request_backend_add() {
+        round_trip(BepMessage::ManageRequest {
+            request_id: 14,
+            command: ManageCommand::BackendAdd {
+                name: "personal".into(),
+                backend_type: "gdrive".into(),
+                mount_path: "/drive".into(),
+                config_toml: "type = \"gdrive\"\nclient_id = \"abc\"\n".into(),
+            },
+            scope: ManageScope::Folder {
+                path: "/drive".into(),
+            },
+        });
+    }
+
+    #[test]
+    fn encode_decode_manage_request_backend_remove() {
+        round_trip(BepMessage::ManageRequest {
+            request_id: 15,
+            command: ManageCommand::BackendRemove {
+                name: "personal".into(),
+                mount_path: "/drive".into(),
+            },
+            scope: ManageScope::Folder {
+                path: "/drive".into(),
+            },
+        });
+    }
+
+    #[test]
+    fn encode_decode_manage_request_restart_and_stop() {
+        round_trip(BepMessage::ManageRequest {
+            request_id: 16,
+            command: ManageCommand::Restart,
+            scope: ManageScope::Folder {
+                path: "/work".into(),
+            },
+        });
+        round_trip(BepMessage::ManageRequest {
+            request_id: 17,
+            command: ManageCommand::Stop,
+            scope: ManageScope::Folder {
+                path: "/work".into(),
+            },
+        });
+    }
+
+    #[test]
+    fn encode_decode_manage_request_grant_add_with_and_without_expiry() {
+        round_trip(BepMessage::ManageRequest {
+            request_id: 18,
+            command: ManageCommand::GrantAdd {
+                grant: ManageGrant {
+                    grantee: "SUBORDINATE".into(),
+                    capability: "pin:write".into(),
+                    scope: ManageScope::Folder {
+                        path: "/work/reports".into(),
+                    },
+                    expires: Some("2026-12-31T00:00:00Z".into()),
+                },
+            },
+            scope: ManageScope::Folder {
+                path: "/work/reports".into(),
+            },
+        });
+        round_trip(BepMessage::ManageRequest {
+            request_id: 19,
+            command: ManageCommand::GrantAdd {
+                grant: ManageGrant {
+                    grantee: "SUBORDINATE".into(),
+                    capability: "status:read".into(),
+                    scope: ManageScope::Node,
+                    expires: None,
+                },
+            },
+            scope: ManageScope::Node,
+        });
+    }
+
+    #[test]
+    fn encode_decode_manage_request_grant_revoke() {
+        round_trip(BepMessage::ManageRequest {
+            request_id: 20,
+            command: ManageCommand::GrantRevoke {
+                grant_id: 42,
+                scope: ManageScope::Folder {
+                    path: "/work".into(),
+                },
+            },
+            scope: ManageScope::Folder {
+                path: "/work".into(),
+            },
+        });
+    }
+
+    #[test]
+    fn decode_manage_request_rejects_unknown_config_format_tag() {
+        let mut body = Vec::new();
+        encode_u32(&mut body, MSG_MANAGE_REQUEST);
+        encode_u64(&mut body, 1);
+        encode_u32(&mut body, MANAGE_CMD_CONFIG_PUSH);
+        encode_u32(&mut body, 99); // unknown config format tag
+        let mut frame = Vec::new();
+        let body_len = u32::try_from(body.len()).unwrap_or(0);
+        encode_u32(&mut frame, body_len);
+        frame.extend_from_slice(&body);
+        let result = decode_message(&frame);
+        assert!(result.is_err(), "unknown config format tag must fail");
+    }
+
+    #[test]
+    fn decode_manage_request_rejects_bad_option_sentinel() {
+        // A PolicySet whose first option sentinel is neither 0 nor 1 must be
+        // rejected rather than mis-parsed.
+        let mut body = Vec::new();
+        encode_u32(&mut body, MSG_MANAGE_REQUEST);
+        encode_u64(&mut body, 1);
+        encode_u32(&mut body, MANAGE_CMD_POLICY_SET);
+        encode_string(&mut body, "/work").unwrap();
+        encode_u32(&mut body, 7); // invalid option sentinel
+        let mut frame = Vec::new();
+        let body_len = u32::try_from(body.len()).unwrap_or(0);
+        encode_u32(&mut frame, body_len);
+        frame.extend_from_slice(&body);
+        let result = decode_message(&frame);
+        assert!(result.is_err(), "invalid option sentinel must fail");
     }
 
     #[test]
