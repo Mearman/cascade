@@ -175,6 +175,50 @@ jobs:
         shell: pwsh
         run: Write-Host "ProjFS is available on this runner — a Windows-only ProjFS integration test is feasible here."
 
+  projfs-live:
+    name: ProjFS live integration (Windows)
+    needs: [check, test]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: projfs-live
+      - name: Verify ProjFS prerequisites
+        shell: pwsh
+        # Re-check the same preconditions the projfs-probe job confirms, so a
+        # regression in the moving windows-latest image fails this job with a
+        # clear message rather than surfacing an opaque PrjStartVirtualizing
+        # HRESULT out of Rust. The separate probe job de-risks the image; this
+        # guard protects this job's own run.
+        run: |
+          $feature = Get-WindowsOptionalFeature -Online -FeatureName Client-ProjFS -ErrorAction SilentlyContinue
+          if ($null -eq $feature -or $feature.State -ne 'Enabled') {
+            $state = if ($null -eq $feature) { 'absent' } else { $feature.State }
+            Write-Error "Client-ProjFS is not Enabled (state: $state) — the live ProjFS test cannot run on this image."
+            exit 1
+          }
+          Write-Host "Client-ProjFS state: $($feature.State)"
+          $loaded = fltmc filters | Select-String -Quiet 'PrjFlt'
+          if (-not $loaded) {
+            Write-Host "PrjFlt not loaded; attempting fltmc load PrjFlt..."
+            fltmc load PrjFlt
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "fltmc load PrjFlt failed (exit $LASTEXITCODE) — the PrjFlt minifilter is not loadable on this image."
+              exit 1
+            }
+          }
+          Write-Host "PrjFlt minifilter is loaded."
+      - name: Build live ProjFS test binary
+        run: cargo test -p cascade-presenter-projfs --features projfs-live --test projfs_live --no-run
+      - name: Run live ProjFS integration test
+        # Single-threaded so the live mount and its OS callbacks are not raced
+        # by parallel test functions. No elevation step is needed beyond what
+        # fltmc requires: GitHub Windows runners run elevated by default, which
+        # is sufficient for PrjStartVirtualizing on a runner-owned directory.
+        run: cargo test -p cascade-presenter-projfs --features projfs-live --test projfs_live -- --test-threads=1 --nocapture
+
   e2e-p2p:
     name: E2E (P2P mesh in Docker Compose)
     needs: [check, test]
