@@ -1,0 +1,24 @@
+[package]
+name = "cascade-announce-wire"
+description = "Wasm-safe announce/DHT wire types, self-certifying signature primitives, and the HMAC client-auth handshake shared by cascade-p2p, the relay-server, and the announce Worker."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+sha2 = "0.11"
+hmac.workspace = true
+ed25519-dalek = { workspace = true }
+data-encoding.workspace = true
+
+[dev-dependencies]
+# Only the host-testable handler tests need an async runtime to drive the
+# `BlobStore` futures; the library itself pulls in no async runtime, so this
+# stays a dev-dependency and never enters the wasm build.
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true

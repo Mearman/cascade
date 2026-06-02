@@ -6,7 +6,11 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 
 /// Length of the shared secret in bytes (256-bit `HMAC` key).
-pub const SHARED_SECRET_LEN: usize = 32;
+///
+/// Re-exported from the shared [`cascade_announce_wire::auth`] primitive so the
+/// relay handshake, the announce write authentication, and this config agree on
+/// exactly one key width.
+pub use cascade_announce_wire::auth::SHARED_SECRET_LEN;
 
 /// Runtime configuration for a relay server instance.
 #[derive(Debug, Clone, Copy)]

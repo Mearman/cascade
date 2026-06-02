@@ -27,7 +27,8 @@
 //!
 //! ## Self-certifying candidate sets
 //!
-//! The candidate set is carried inside a [`SignedCandidates`] envelope:
+//! The candidate set is carried inside a
+//! [`SignedCandidates`](crate::discovery::signing::SignedCandidates) envelope:
 //! the announcing device signs its candidates, the claimed device id, and an
 //! expiry with the ed25519 key derived from its device id (the same key the
 //! DHT BEP44 path signs with). The announce server is therefore a *blind,
@@ -43,111 +44,16 @@
 //! so this construction is a substitution/relabel/replay defence, not a defence
 //! against forgery by a party that knows the id.
 //!
-//! The wire types ([`WireCandidate`], [`AnnounceRequest`], [`LookupResponse`])
-//! are serde-serialisable and shared by the relay-server's announce endpoint,
-//! so the two sides cannot drift. The HTTP client lives behind the `announce`
-//! cargo feature because it pulls in `reqwest`; the wire types are always
-//! compiled so the server can depend on them without the client weight.
+//! The wire types (`WireCandidate`, `AnnounceRequest`, `LookupResponse`) and the
+//! per-device candidate cap (`MAX_ANNOUNCE_CANDIDATES`) are owned by the
+//! wasm-safe [`cascade_announce_wire`] crate so the announce client, the
+//! relay-server's directory endpoint, the DHT, and the Cloudflare Worker all
+//! share one definition and cannot drift. This module re-exports them and adds
+//! the `cascade-p2p`-side HTTP client (behind the `announce` cargo feature, which
+//! pulls in `reqwest`).
 
-use std::net::SocketAddr;
-
-use serde::{Deserialize, Serialize};
-
-use crate::candidate::{Candidate, CandidateKind};
-use crate::discovery::signing::SignedCandidates;
-
-/// Maximum number of candidates accepted in a single announce request or
-/// returned from a lookup.
-///
-/// Mirrors the `MAX_CANDIDATES_PER_FRAME` cap the BEP `Candidates` frame
-/// uses (a device with more than a handful of host, server-reflexive and
-/// relayed addresses is unrealistic), so the announce directory bounds its
-/// per-device storage the same way the wire protocol bounds a frame.
-pub const MAX_ANNOUNCE_CANDIDATES: usize = 64;
-
-/// Serialisable form of a [`Candidate`].
-///
-/// [`Candidate`] itself is the in-memory connectivity type and deliberately
-/// carries no serde derives — its wire form on the BEP path is the
-/// hand-rolled XDR encoding in [`crate::protocol`]. The announce directory is
-/// a JSON API, so it needs an explicit serialisable projection. The `kind` is
-/// carried as its stable wire tag (`0` host, `1` server-reflexive, `2`
-/// relayed) rather than the in-memory enum so the JSON shape is stable across
-/// releases, exactly as the BEP encoding does.
-///
-/// `priority` is carried so the looker-up sees the same RFC 8445 ordering the
-/// announcer computed; an announcer that lies about its priority only
-/// reorders its own candidates, which the [`super::DiscoveryService`] merge
-/// already tolerates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WireCandidate {
-    /// Reachable address (`IPv4` or `IPv6`) plus port.
-    pub address: SocketAddr,
-    /// Candidate kind as the stable wire tag — `0` host, `1`
-    /// server-reflexive, `2` relayed.
-    pub kind: u8,
-    /// Precomputed RFC 8445 priority, carried so the recipient need not
-    /// re-derive it.
-    pub priority: u32,
-}
-
-impl From<Candidate> for WireCandidate {
-    fn from(candidate: Candidate) -> Self {
-        Self {
-            address: candidate.address,
-            kind: candidate.kind.wire_tag(),
-            priority: candidate.priority,
-        }
-    }
-}
-
-impl WireCandidate {
-    /// Convert back to an in-memory [`Candidate`].
-    ///
-    /// Returns `None` when the `kind` tag is not one of the three known
-    /// values so a malformed or hostile directory entry is rejected rather
-    /// than silently coerced. The stored `priority` is preserved exactly —
-    /// the recipient honours the announcer's claimed priority, which the
-    /// merge in [`super::DiscoveryService`] is designed to tolerate.
-    #[must_use]
-    pub fn to_candidate(self) -> Option<Candidate> {
-        let kind = CandidateKind::from_wire_tag(self.kind)?;
-        Some(Candidate {
-            address: self.address,
-            kind,
-            priority: self.priority,
-        })
-    }
-}
-
-/// Body of a `POST <base>/announce/<device_id>` request.
-///
-/// Carries the signed candidate set the announcing device is currently
-/// reachable on. A subsequent announce for the same id replaces the set in
-/// full — candidates are not accumulated, matching the replace-in-full
-/// semantics of [`crate::wan::PeerBook::set_remote_candidates`].
-///
-/// The server stores the [`SignedCandidates`] verbatim and never inspects it;
-/// the looking-up client is the only party that verifies the signature.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AnnounceRequest {
-    /// The device's self-signed candidate set.
-    pub signed: SignedCandidates,
-}
-
-/// Body of a `GET <base>/announce/<device_id>` response.
-///
-/// An unknown device id yields `signed: None` rather than a `404`, so the
-/// client models absence as "no candidates" — the same way every
-/// [`super::Discovery`] source treats a peer it knows nothing about. A known
-/// id returns the signed blob exactly as it was registered, for the client to
-/// verify.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LookupResponse {
-    /// The signed candidate set last registered for the looked-up device id,
-    /// or `None` when the id is unknown.
-    pub signed: Option<SignedCandidates>,
-}
+pub use cascade_announce_wire::WireCandidate;
+pub use cascade_announce_wire::wire::{AnnounceRequest, LookupResponse, MAX_ANNOUNCE_CANDIDATES};
 
 #[cfg(feature = "announce")]
 pub use client::AnnounceDiscovery;
@@ -305,7 +211,7 @@ mod client {
             // failure is rejected loudly and yields no candidates — never a
             // silent acceptance, never a panic.
             let now = signing::now_unix_ms(self.clock.as_ref());
-            match signed.verify_to_candidates(device_id, now) {
+            match signing::verify_to_candidates(&signed, device_id, now) {
                 Ok(candidates) => candidates
                     .into_iter()
                     .take(MAX_ANNOUNCE_CANDIDATES)
@@ -604,94 +510,8 @@ mod client {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::net::SocketAddr;
-
-    fn addr(port: u16) -> SocketAddr {
-        SocketAddr::from(([127, 0, 0, 1], port))
-    }
-
-    #[test]
-    fn wire_candidate_round_trips_every_kind() {
-        for kind in [
-            CandidateKind::Host,
-            CandidateKind::ServerReflexive,
-            CandidateKind::Relayed,
-        ] {
-            let candidate = Candidate::new(addr(22000), kind, 1024);
-            let wire = WireCandidate::from(candidate);
-            assert_eq!(wire.to_candidate(), Some(candidate));
-        }
-    }
-
-    #[test]
-    fn wire_candidate_preserves_priority_exactly() {
-        let candidate = Candidate::new(addr(33000), CandidateKind::ServerReflexive, u16::MAX);
-        let wire = WireCandidate::from(candidate);
-        assert_eq!(wire.priority, candidate.priority);
-        assert_eq!(
-            wire.to_candidate().map(|c| c.priority),
-            Some(candidate.priority)
-        );
-    }
-
-    #[test]
-    fn wire_candidate_rejects_unknown_kind_tag() {
-        let wire = WireCandidate {
-            address: addr(22000),
-            kind: 3,
-            priority: 0,
-        };
-        assert_eq!(wire.to_candidate(), None);
-    }
-
-    #[test]
-    fn announce_request_round_trips_through_json() {
-        let request = AnnounceRequest {
-            signed: SignedCandidates::sign(
-                "DEVICE-A",
-                vec![
-                    WireCandidate::from(Candidate::new(addr(22000), CandidateKind::Host, 65_535)),
-                    WireCandidate::from(Candidate::new(
-                        addr(33000),
-                        CandidateKind::ServerReflexive,
-                        0,
-                    )),
-                ],
-                1_700_000_000_000,
-            ),
-        };
-        let json = serde_json::to_string(&request).expect("serialise");
-        let decoded: AnnounceRequest = serde_json::from_str(&json).expect("deserialise");
-        assert_eq!(decoded, request);
-    }
-
-    #[test]
-    fn lookup_response_round_trips_through_json() {
-        let response = LookupResponse {
-            signed: Some(SignedCandidates::sign(
-                "DEVICE-A",
-                vec![WireCandidate::from(Candidate::new(
-                    addr(22000),
-                    CandidateKind::Host,
-                    1,
-                ))],
-                1_700_000_000_000,
-            )),
-        };
-        let json = serde_json::to_string(&response).expect("serialise");
-        let decoded: LookupResponse = serde_json::from_str(&json).expect("deserialise");
-        assert_eq!(decoded, response);
-    }
-
-    #[test]
-    fn lookup_response_models_unknown_id_as_none() {
-        let response = LookupResponse { signed: None };
-        let json = serde_json::to_string(&response).expect("serialise");
-        let decoded: LookupResponse = serde_json::from_str(&json).expect("deserialise");
-        assert_eq!(decoded, response);
-        assert!(decoded.signed.is_none());
-    }
-}
+// The `WireCandidate` ⇄ `Candidate` conversions are tested in
+// [`crate::candidate`], where they live; the `AnnounceRequest` /
+// `LookupResponse` JSON round-trips are tested in the `cascade-announce-wire`
+// crate that owns those types. This module re-exports them and is exercised by
+// the `announce`-feature client tests below.

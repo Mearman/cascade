@@ -27,18 +27,18 @@
 //! so a forged tag against a different session cannot be replayed across
 //! the rendezvous fabric.
 
-use hmac::{Hmac, KeyInit, Mac};
-use sha2::Sha256;
+use cascade_announce_wire::auth;
 use thiserror::Error;
 
 use crate::config::SHARED_SECRET_LEN;
 
+/// `HMAC-SHA256` tag length in bytes — re-exported from the shared auth
+/// primitive so the handshake frame and the shared HMAC agree on the width.
+pub use cascade_announce_wire::auth::HMAC_TAG_LEN;
+
 /// Wire-format version for the handshake frame. Bumped on incompatible
 /// changes; current servers reject any other value.
 pub const HANDSHAKE_VERSION: u8 = 1;
-
-/// `HMAC-SHA256` tag length in bytes.
-pub const HMAC_TAG_LEN: usize = 32;
 
 /// Maximum permitted length of a device identifier inside the handshake.
 ///
@@ -189,36 +189,30 @@ pub fn verify_handshake(
     })
 }
 
-type HmacSha256 = Hmac<Sha256>;
-
-fn new_mac(secret: &[u8; SHARED_SECRET_LEN]) -> Result<HmacSha256, HandshakeError> {
-    HmacSha256::new_from_slice(secret).map_err(|_| HandshakeError::HmacInit)
-}
-
+/// Compute the handshake tag over `device_id || session_id`.
+///
+/// Delegates to the shared [`cascade_announce_wire::auth::compute_tag`]
+/// primitive (the same HMAC the announce write path uses) so the relay handshake
+/// and the announce directory cannot drift onto different constructions. The
+/// segment order — device id then session id — is the relay handshake's binding.
 fn compute_tag(
     device_id: &[u8],
     session_id: &[u8],
     shared_secret: &[u8; SHARED_SECRET_LEN],
 ) -> Result<[u8; HMAC_TAG_LEN], HandshakeError> {
-    let mut mac = new_mac(shared_secret)?;
-    mac.update(device_id);
-    mac.update(session_id);
-    let bytes = mac.finalize().into_bytes();
-    let mut out = [0u8; HMAC_TAG_LEN];
-    out.copy_from_slice(&bytes);
-    Ok(out)
+    auth::compute_tag(shared_secret, &[device_id, session_id]).map_err(|_| HandshakeError::HmacInit)
 }
 
+/// Verify `candidate` against the handshake tag over `device_id || session_id`,
+/// in constant time, via the shared primitive.
 fn verify_tag(
     device_id: &[u8],
     session_id: &[u8],
     candidate: &[u8],
     shared_secret: &[u8; SHARED_SECRET_LEN],
 ) -> Result<bool, HandshakeError> {
-    let mut mac = new_mac(shared_secret)?;
-    mac.update(device_id);
-    mac.update(session_id);
-    Ok(mac.verify_slice(candidate).is_ok())
+    auth::verify_tag(shared_secret, &[device_id, session_id], candidate)
+        .map_err(|_| HandshakeError::HmacInit)
 }
 
 fn read_u8(frame: &[u8], cursor: &mut usize) -> Result<u8, HandshakeError> {

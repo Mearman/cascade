@@ -17,6 +17,7 @@ members = [
     "crates/presenter-webdav",
     "crates/presenter-projfs",
     "crates/relay-server",
+    "crates/cascade-announce-wire",
 ]
 
 [workspace.package]

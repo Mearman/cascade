@@ -17,6 +17,8 @@
 
 use std::net::SocketAddr;
 
+use cascade_announce_wire::WireCandidate;
+
 /// Kind of address a [`Candidate`] represents.
 ///
 /// The three kinds correspond directly to the ICE taxonomy. `Host`
@@ -156,6 +158,36 @@ impl Candidate {
         let tiebreak = if g > d { 1 } else { 0 };
         (min << 32) + (max << 1) + tiebreak
     }
+
+    /// Convert a [`WireCandidate`] back to an in-memory [`Candidate`].
+    ///
+    /// Returns `None` when the `kind` tag is not one of the three known values
+    /// so a malformed or hostile directory entry is rejected rather than
+    /// silently coerced. The stored `priority` is preserved exactly — the
+    /// recipient honours the announcer's claimed priority, which the discovery
+    /// merge is designed to tolerate. This is the inverse of the
+    /// [`From<Candidate>`] projection; it lives here (not as an inherent method
+    /// on `WireCandidate`) because `WireCandidate` is owned by the shared
+    /// wasm-safe wire crate.
+    #[must_use]
+    pub fn from_wire(wire: WireCandidate) -> Option<Self> {
+        let kind = CandidateKind::from_wire_tag(wire.kind)?;
+        Some(Self {
+            address: wire.address,
+            kind,
+            priority: wire.priority,
+        })
+    }
+}
+
+impl From<Candidate> for WireCandidate {
+    fn from(candidate: Candidate) -> Self {
+        Self {
+            address: candidate.address,
+            kind: candidate.kind.wire_tag(),
+            priority: candidate.priority,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -265,6 +297,40 @@ mod tests {
         assert_eq!(a.priority, b.priority);
         let p = u64::from(a.priority);
         assert_eq!(a.pairing_score(&b), (p << 32) + (p << 1));
+    }
+
+    #[test]
+    fn wire_candidate_round_trips_every_kind() {
+        for kind in [
+            CandidateKind::Host,
+            CandidateKind::ServerReflexive,
+            CandidateKind::Relayed,
+        ] {
+            let candidate = Candidate::new(addr(22000), kind, 1024);
+            let wire = WireCandidate::from(candidate);
+            assert_eq!(Candidate::from_wire(wire), Some(candidate));
+        }
+    }
+
+    #[test]
+    fn wire_candidate_preserves_priority_exactly() {
+        let candidate = Candidate::new(addr(33000), CandidateKind::ServerReflexive, u16::MAX);
+        let wire = WireCandidate::from(candidate);
+        assert_eq!(wire.priority, candidate.priority);
+        assert_eq!(
+            Candidate::from_wire(wire).map(|c| c.priority),
+            Some(candidate.priority)
+        );
+    }
+
+    #[test]
+    fn from_wire_rejects_unknown_kind_tag() {
+        let wire = WireCandidate {
+            address: addr(22000),
+            kind: 3,
+            priority: 0,
+        };
+        assert_eq!(Candidate::from_wire(wire), None);
     }
 
     #[test]

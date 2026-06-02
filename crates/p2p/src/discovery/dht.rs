@@ -75,7 +75,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use sha2::{Digest, Sha256};
+
+pub use cascade_announce_wire::seed::{DHT_KEY_LEN, DhtKey, signing_key_for_seed};
 
 use super::Discovery;
 use super::announce::WireCandidate;
@@ -83,62 +84,10 @@ use super::signing::{self, SignedCandidates};
 use crate::candidate::Candidate;
 use crate::traversal::{Clock, SystemClock};
 
-/// Width of the device-id-derived ed25519 seed in bytes.
-///
-/// A BEP44 mutable item is signed by an ed25519 keypair, and ed25519 keys are
-/// built from a 32-byte seed (`SigningKey::from_bytes`). The device-id mapping
-/// produces exactly that width so the seed feeds the keypair directly, with no
-/// truncation or padding.
-pub const DHT_KEY_LEN: usize = 32;
-
-/// Domain-separation prefix mixed into the device-id hash before it becomes an
-/// ed25519 seed.
-///
-/// The device id is hashed for several unrelated purposes across the codebase
-/// (it is itself a SHA-256 of the TLS certificate). Prefixing the hash input
-/// with a fixed, purpose-specific tag ensures the BEP44 seed cannot collide
-/// with any other use of the same id, so deriving the signing key here never
-/// reuses key material derived elsewhere.
-const DHT_SEED_DOMAIN: &[u8] = b"cascade-dht-bep44-seed-v1";
-
-/// A device-id-derived ed25519 seed for BEP44 addressing.
-///
-/// Derived deterministically from a device id by [`DhtKey::from_device_id`].
-/// Two devices that agree on a device id derive the same seed, hence the same
-/// BEP44 signing keypair and the same DHT target, which is what lets a
-/// looker-up address the announcer's stored candidate set without any prior
-/// contact or shared secret.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct DhtKey(pub [u8; DHT_KEY_LEN]);
-
-impl DhtKey {
-    /// Map a base32 device id to its BEP44 ed25519 seed.
-    ///
-    /// The seed is `SHA-256(DHT_SEED_DOMAIN || device_id)`, whose 256-bit
-    /// digest is exactly the ed25519 seed width. Hashing (rather than using the
-    /// device-id bytes directly) keeps the seed independent of the id's own
-    /// encoding and length, and the domain-separation prefix keeps it distinct
-    /// from any other hash of the same id. The announcer and looker-up derive
-    /// the same seed from the same id, so both compute the same BEP44 keypair
-    /// and target.
-    #[must_use]
-    pub fn from_device_id(device_id: &str) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(DHT_SEED_DOMAIN);
-        hasher.update(device_id.as_bytes());
-        let digest = hasher.finalize();
-        let mut key = [0u8; DHT_KEY_LEN];
-        // SHA-256 produces exactly `DHT_KEY_LEN` bytes, so the copy is total.
-        key.copy_from_slice(&digest);
-        Self(key)
-    }
-
-    /// The raw ed25519 seed bytes.
-    #[must_use]
-    pub const fn as_bytes(&self) -> &[u8; DHT_KEY_LEN] {
-        &self.0
-    }
-}
+// `DhtKey`, `DHT_KEY_LEN`, the device-id → BEP44 seed derivation, and the
+// seed→keypair construction (`signing_key_for_seed`) are owned by the wasm-safe
+// `cascade-announce-wire` crate and re-exported above, so the announce and DHT
+// transports share exactly one derivation and cannot drift onto different keys.
 
 /// How long the resolver waits for a BEP44 `get` before giving up.
 ///
@@ -272,7 +221,7 @@ fn decode_signed(bytes: &[u8], expected_device_id: &str, now_unix_ms: i64) -> Ve
         Ok(parsed) => parsed,
         Err(_) => return Vec::new(),
     };
-    match signed.verify_to_candidates(expected_device_id, now_unix_ms) {
+    match signing::verify_to_candidates(&signed, expected_device_id, now_unix_ms) {
         Ok(candidates) => candidates,
         Err(err) => {
             tracing::warn!(
@@ -848,18 +797,10 @@ mod tests {
         assert_ne!(a, b);
     }
 
-    #[test]
-    fn key_matches_independent_domain_separated_sha256_of_device_id() {
-        // Pin the mapping to SHA-256 of the domain prefix and the id bytes so a
-        // future change to the derivation is caught — both ends, and the BEP44
-        // keypair they each build from it, must agree on exactly this.
-        let mut hasher = Sha256::new();
-        hasher.update(DHT_SEED_DOMAIN);
-        hasher.update(b"DEVICE-A");
-        let expected = hasher.finalize();
-        let key = DhtKey::from_device_id("DEVICE-A");
-        assert_eq!(key.as_bytes().as_slice(), expected.as_slice());
-    }
+    // The byte-for-byte pin of the device-id → seed derivation lives in the
+    // `cascade-announce-wire` `seed` module that owns the derivation; the tests
+    // here cover the DHT's use of the re-exported `DhtKey` (width, determinism,
+    // distinctness) and the encode/decode round-trip.
 
     #[test]
     fn stored_candidates_round_trip_through_encode_decode() {
