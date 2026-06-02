@@ -2227,7 +2227,7 @@ fn parse_exposure(input: &str) -> Result<DiscoveryReach> {
 /// resolve, never publish, leaving this device undiscoverable through that
 /// server. Surfacing that as a parse error is louder and more useful than a
 /// runtime `401`. The hex secret is decoded by the shared
-/// [`cascade_announce_wire::auth::parse_shared_secret_hex`] primitive — the same
+/// `cascade_announce_wire::auth::parse_shared_secret_hex` primitive — the same
 /// one the relay handshake and the Worker use — so all surfaces agree on the key
 /// width and the hex form. An absent key yields an empty list (announce-server
 /// discovery off); a present-but-not-an-array value, a non-table entry, a
