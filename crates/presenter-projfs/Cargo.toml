@@ -21,5 +21,18 @@ windows = { version = "0.59", features = [
     "Win32_Storage_ProjectedFileSystem",
 ] }
 
+[features]
+## Enable the Windows-only live ProjFS integration test.
+##
+## The test drives a real `PrjStartVirtualizing` mount and exercises the
+## kernel callback round-trip, so it only runs on Windows with the
+## Client-ProjFS optional feature enabled and the PrjFlt minifilter
+## loaded. The feature flag keeps it out of the standard `cargo test`
+## run; the dedicated `projfs-live` CI job opts in explicitly.
+projfs-live = []
+
+[dev-dependencies]
+tempfile = "3"
+
 [lints]
 workspace = true
