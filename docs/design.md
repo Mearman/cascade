@@ -1018,8 +1018,11 @@ Discovery turns a peer's device ID into a set of reachable [candidates](#nat-tra
 | LAN multicast | `lan.rs` | UDP multicast group on port 21027 | No — serverless, zero config |
 | Introducer gossip | `gossip.rs` | Reads the `PeerBook` that introducer gossip fills, so peers learned transitively through trusted devices surface without any directory | No — serverless |
 | Announce server | `announce.rs` | A rendezvous directory: a device registers its candidates keyed by device ID (`POST <base>/announce/<id>`), any other device looks them up (`GET <base>/announce/<id>`) | Yes — an operated announce endpoint (behind the `announce` cargo feature) |
+| DHT | `dht.rs` | Stores the candidate set in the BitTorrent Mainline DHT as a BEP44 mutable item, keyed by an ed25519 keypair derived deterministically from the device ID | No — serverless, but uses the public DHT |
 
-LAN multicast and gossip cover peers that share a network segment or a trust path; neither reaches two devices that have never met and sit on different networks. The announce server closes that gap. It stores and serves only candidate sets — it never carries payload traffic — so a looker-up connects directly (or via a relay) using the connectivity stack once it holds the candidates. A DHT — Syncthing's global-discovery model — is the planned serverless replacement for the announce server's "find an unknown peer" role, deferred as a follow-on because of its operational weight; the `Discovery` trait already accommodates it as another source.
+LAN multicast and gossip cover peers that share a network segment or a trust path; neither reaches two devices that have never met and sit on different networks. The announce server closes that gap. It stores and serves only candidate sets — it never carries payload traffic — so a looker-up connects directly (or via a relay) using the connectivity stack once it holds the candidates.
+
+The DHT fills the same "find an unknown peer" role serverlessly, after Syncthing's global-discovery model. Rather than holding the candidate set on an operated directory, a device publishes it into the BitTorrent Mainline DHT as a BEP44 mutable item. BEP44 addresses a mutable item by `SHA-1(public_key || salt)`, so the rendezvous only works if both ends derive the same writer keypair: `DhtKey::from_device_id` seeds an ed25519 keypair from a domain-separated hash of the device ID, so the announcer and the looker-up independently compute the identical BEP44 target with no shared secret and no per-node persisted key. `DhtDiscovery` is generic over a `DhtNode` put/get contract — exercised against an in-memory node in tests — with the live `mainline`-backed node (`MainlineDht`) behind the `dht` cargo feature. The `mainline` crate pulls in the ed25519 BEP44 signing stack.
 
 ### Device identity
 
@@ -1039,6 +1042,8 @@ Once discovery yields candidates, the connectivity ladder climbs from the cheape
 `decide_connectivity` (`traversal.rs`) picks the strategy from the local and remote NAT types and the remote's advertised candidates, preferring a volunteering peer relay over an operated one whenever a punch is not viable. So the only rungs that depend on an operated server are the optional announce-server discovery source, the STUN endpoint used to observe reflexive mappings, and the operated-relay fallback; everything else — LAN multicast, static/gossip candidates, hole punching, and peer relays — is fully serverless.
 
 The [`stun-rs`](https://crates.io/crates/stun-rs) crate handles STUN binding requests.
+
+The connectivity ladder is exercised end to end on Linux network namespaces. The `nat-integration` CI job (`.github/workflows/ci.yml`, behind the `nat-integration` cargo feature) builds the test binaries without privilege, then runs them under `sudo` for `CAP_NET_ADMIN`. The `nat_integration` test drives the operated-relay rung; the `serverless_rungs` test proves the fully serverless rungs with no operated servers of any kind — a cone-NAT pair connecting via peer-as-STUN observed-address learning plus hole punch, and a symmetric-NAT pair bridging through a third open peer acting as a peer relay — each asserting a block transfer completes over the expected rung.
 
 ## State database
 
@@ -1174,6 +1179,20 @@ Commands:
   peer list                     List known P2P peers
   peer add <device-id>          Add a peer
   peer remove <device-id>       Remove a peer
+
+  grant add <device-id>         Grant capabilities to a device
+    --cap <list>                Comma-separated capabilities (e.g. status:read,pin:write)
+    --scope <path|*>            Path prefix, or * for node-wide
+    --expires <rfc3339>         Optional expiry timestamp
+  grant list                    List grants held on this node
+  grant revoke <id>             Revoke a grant by ID
+  grant audit                   Print the management audit log
+
+  remote <device-id> status     Read a remote node's status
+  remote <device-id> pin <path>   Pin a path on a remote node
+  remote <device-id> unpin <path> Unpin a path on a remote node
+  remote <device-id> cache evict  Run cache eviction on a remote node
+  remote <device-id> cache warm <path>  Warm a path on a remote node
 
 Global options:
   --config <path>               Config file path (default: ~/.config/cascade/config.toml)
@@ -1447,15 +1466,11 @@ cargo test --test integration
 cargo test -p backend-gdrive
 ```
 
-## Node management plane (planned)
+## Node management plane
 
-> Not yet implemented. This is a design note for a future phase (v10); it describes intended behaviour, not the current codebase.
+Data-plane trust is flat: `trusted_device_ids` gates whether a peer may sync the folders you share with it, and nothing more, while every administrative command (`pin`, `cache evict`, `stop`) travels a local Unix socket from the CLI to the local daemon. The management plane adds a second, authenticated front-end onto the *same* command handlers the local CLI drives, so a trusted device can administer another. The constraint that keeps it honest: a manager can never do anything to a node that the node could not already do to itself, and no command logic is duplicated.
 
-Cascade has no way for one node to administer another. Trust is flat and data-plane only — `trusted_device_ids` gates whether a peer may sync the folders you share with it, and nothing more — while every administrative command (`pin`, `cache evict`, `stop`) travels a local Unix socket from the CLI to the local daemon. The closest thing to delegated authority is the introducer role, which only lets a trusted device expand your peer list.
-
-The management plane adds a second, authenticated front-end onto the *same* command handlers the local CLI already drives, so a trusted device can administer another. The constraint that keeps it honest: a manager can never do anything to a node that the node could not already do to itself, and no command logic is duplicated.
-
-The principal is the existing [device identity](#device-identity) (the TLS-certificate SHA-256). Authority is modelled as **capabilities, not roles** — each a verb over a scope — held as grants *on the managed node*, mirroring the consent direction of the introducer relationship: you grant authority to a manager; a manager cannot assert it.
+The principal is the existing [device identity](#device-identity) (the TLS-certificate SHA-256), carried as a `DeviceId` newtype in `crates/engine/src/manage/`. Authority is modelled as **capabilities, not roles** — each a verb over a scope — held as grants *on the managed node*, mirroring the consent direction of the introducer relationship: you grant authority to a manager; a manager cannot assert it.
 
 | Capability | Grants |
 |------------|--------|
@@ -1468,11 +1483,15 @@ The principal is the existing [device identity](#device-identity) (the TLS-certi
 | `lifecycle:control` | start / stop / restart the daemon (dangerous) |
 | `grant:admin` | delegate a subset of held grants (dangerous) |
 
-Scope is a folder path prefix or node-wide (`*`). A grant is `{ grantee: DeviceId, capability, scope, granted_by, expires }`, persisted in two new `state.db` tables — `grants` and an append-only `manage_audit` — and optionally declared in the root device config (root-only merge, matching the existing device-config rule) so a fleet provisions declaratively rather than imperatively.
+`Scope` is either node-wide (`Scope::Node`, written `*`) or a folder subtree identified by a path prefix. Coverage matches on normalised path *components*, never raw substrings, so `/work` covers `/work/reports` but not `/workspace`, and a crafted `/work/../personal` target fails to normalise into the granted subtree rather than slipping through. A `Grant` is `{ grantee, capability, scope, granted_by, expires }`. The three dangerous capabilities (`backend:manage`, `lifecycle:control`, `grant:admin`) are never satisfied implicitly by a node-wide grant — including a folder scope that normalises to the root, which is node-wide in everything but name — so each must be granted explicitly for the exact folder it is exercised over. Grants are persisted in two `state.db` tables: `grants` (decomposed into `scope_kind` / `scope_path` columns) and an append-only `manage_audit` log of every command the node processed. The audit table has no `UPDATE` or `DELETE` path in the typed API, so a compromised manager cannot erase its tracks. Grants are optionally declared in the root device config (root-only merge, matching the existing device-config rule), so a fleet provisions declaratively rather than imperatively.
 
-On the wire it is two variants on the existing `BepMessage` enum — `ManageRequest` and `ManageResponse` — carried over the already-TLS-authenticated peer connection, so the caller's device ID is established before a command is read. The managed node resolves the caller's grants, checks the capability covers the target scope and is unexpired, dispatches into the same internal handler the local CLI uses, writes an audit row, and replies. A manager addresses a target by device ID and reaches it over the same `DiscoveryService` and [connectivity ladder](#nat-traversal) as any other connection, so management works across NAT through the existing rungs. "One or more nodes managing one or more others" is just a many-to-many grant relationship; each node owns its own grant list, so the model stays decentralised with no fleet registry.
+On the wire it is two variants on the existing `BepMessage` enum — `ManageRequest` and `ManageResponse` — carried over the already-TLS-authenticated peer connection, so the caller's device ID is established before a command is read. `ManageRequest` carries a `request_id`, a `ManageCommand`, and the `ManageScope` it targets; `ManageResponse` echoes the `request_id` and a `ManageResult` (`Ok { summary }` or a typed `Err` with `ManageErrorKind::Unauthorised` or `Failed`). The wire command surface currently exposes the safe verbs — status read, pin/unpin, cache evict — while the dangerous capabilities are enforced at the authorisation boundary ahead of a wire verb that needs them.
 
-The first cut can keep grants as a local list, with the connection's authenticated device ID as the principal. The longer-term shape issues a capability token signed by the managed node's key, enabling offline issuance, revocation, and bounded delegation — `grant:admin` may delegate only a subset of what the holder itself holds, so there is no privilege escalation. The dangerous capabilities are never covered by a wildcard scope implicitly and want explicit confirmation at grant time; the audit log is append-only so a compromised manager cannot erase its tracks.
+The managed side enforces through a shared dispatch core (`manage::dispatch::run_dispatch`). It resolves the caller's grants, derives both the scope the command's payload actually mutates (the fixed directory prefix of a pin glob) and the wire scope the caller advertised, and authorises the required capability over *both* — closing the scope-escape where a caller pins `/personal` while advertising a `/work` scope it does hold. The audit row is written **before** any side effect, so a change always leaves a trace even if the write that follows fails; a denial is audited too. Only then does it dispatch into the same internal handlers the local CLI uses, via the `ManageCommandExecutor` contract that the engine implements over its existing `pin` / `unpin` / `status` / cache-evict methods — the very ones the CLI calls. The `Backend` trait carries a manage-dispatch seam wired from the engine; the daemon injects the dispatcher into its P2P backend at startup, and a session whose peer identity was not proven by an end-to-end TLS handshake (relayed or post-hole-punch sessions, whose device ID is merely asserted) is refused before reaching the dispatch port.
+
+The CLI exists on both sides. On the managed node, `cascade grant add|list|revoke|audit` administers the capabilities this node confers and reads its audit log. On the manager, `cascade remote <device-id> status|pin|unpin|cache evict|cache warm` sends commands to a target addressed by device ID, reached over the same `DiscoveryService` and [connectivity ladder](#nat-traversal) as any other connection, so management works across NAT through the existing rungs. "One or more nodes managing one or more others" is just a many-to-many grant relationship; each node owns its own grant list, so the model stays decentralised with no fleet registry.
+
+Grants are kept as a local list with the connection's authenticated device ID as the principal. The longer-term shape would issue a capability token signed by the managed node's key, enabling offline issuance, revocation, and bounded delegation — `grant:admin` delegating only a subset of what the holder itself holds, so there is no privilege escalation.
 
 ## Roadmap
 
@@ -1487,7 +1506,7 @@ The first cut can keep grants as a local list, with the connection's authenticat
 | v7 | P2P block sharing (LAN) | +10-14 weeks | +6,000 |
 | v8 | Linux FUSE presenter + Windows native ProjFS presenter (implemented) | +4-6 weeks | +2,000 |
 | v9 | Full P2P (WAN discovery, NAT traversal) | +8-12 weeks | +4,000 |
-| v10 | Node management plane (capability grants, remote administration over BEP) | +6-10 weeks | +3,000 |
+| v10 | Node management plane (capability grants, remote administration over BEP) (implemented) | +6-10 weeks | +3,000 |
 
 ## Dependencies
 

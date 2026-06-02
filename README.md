@@ -145,7 +145,7 @@ crates/
   engine/                 VFS tree, backend trait, cache manager, sync, state DB
   cascade-config/         .cascade parsing (4 formats), merge, directory walk
   expr/                   Conditional expression parser (PEG via pest) and evaluator
-  p2p/                    BEP protocol, peer discovery, block store
+  p2p/                    BEP protocol, peer discovery (LAN, gossip, announce, Mainline DHT), block store
   backend-gdrive/         Google Drive (Drive API v3, OAuth2 device code)
   backend-s3/             S3-compatible
   backend-local/          Local filesystem (adopt-and-sync)
@@ -171,10 +171,11 @@ Integration tests live inside each crate's `tests/` directory rather than at wor
 - **`.cascade` config walk** — like `.gitignore`: files in each directory layer with child-overrides-parent precedence. Four formats (gitignore-style, TOML, YAML, JSON) all deserialise to `CascadeConfig`.
 - **Expression language** — PEG grammar evaluated against `EvalContext` (file, device, disk, network, power, time, peer). Used for conditional rules in `.cascade` files.
 - **P2P engine** — based on Syncthing's BEP v1. Sits between VFS and cache as an optimisation layer, not as a backend. Cloud remains the authority for cloud-backed folders.
+- **Node management plane** — a trusted device administers another over the authenticated peer connection. Authority is modelled as capability grants (verb over scope) held on the managed node; the `ManageRequest` / `ManageResponse` BEP frames carry commands that dispatch into the same handlers the local CLI drives, gated by authorisation and an append-only audit log. `cascade grant` administers the capabilities a node confers; `cascade remote <device-id>` drives a target reached over the discovery and connectivity stack.
 
 ### State database
 
-SQLite at `~/.config/cascade/state.db`. Tables: `files`, `backends`, `pin_rules`, `lifecycle_policies`, `config_cache`, `sync_cursors`, `p2p_peers`, `p2p_block_index`. Full schema in [`docs/design.md`](docs/design.md).
+SQLite at `~/.config/cascade/state.db`. Tables: `files`, `backends`, `pin_rules`, `lifecycle_policies`, `config_cache`, `sync_cursors`, `p2p_peers`, `p2p_block_index`, `grants`, `manage_audit`. Full schema in [`docs/design.md`](docs/design.md).
 
 ## Conventions
 
@@ -213,6 +214,7 @@ SQLite at `~/.config/cascade/state.db`. Tables: `files`, `backends`, `pin_rules`
 | v7 | P2P block sharing (LAN) |
 | v8 | Windows native ProjFS presenter, implemented (Linux FUSE delivered earlier) |
 | v9 | Full P2P (WAN discovery, NAT traversal) |
+| v10 | Node management plane (capability grants, remote administration over BEP), implemented |
 
 Full timeline estimates, dependency list, and reference implementations in [`docs/design.md`](docs/design.md).
 
