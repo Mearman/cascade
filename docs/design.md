@@ -1447,6 +1447,33 @@ cargo test --test integration
 cargo test -p backend-gdrive
 ```
 
+## Node management plane (planned)
+
+> Not yet implemented. This is a design note for a future phase (v10); it describes intended behaviour, not the current codebase.
+
+Cascade has no way for one node to administer another. Trust is flat and data-plane only — `trusted_device_ids` gates whether a peer may sync the folders you share with it, and nothing more — while every administrative command (`pin`, `cache evict`, `stop`) travels a local Unix socket from the CLI to the local daemon. The closest thing to delegated authority is the introducer role, which only lets a trusted device expand your peer list.
+
+The management plane adds a second, authenticated front-end onto the *same* command handlers the local CLI already drives, so a trusted device can administer another. The constraint that keeps it honest: a manager can never do anything to a node that the node could not already do to itself, and no command logic is duplicated.
+
+The principal is the existing [device identity](#device-identity) (the TLS-certificate SHA-256). Authority is modelled as **capabilities, not roles** — each a verb over a scope — held as grants *on the managed node*, mirroring the consent direction of the introducer relationship: you grant authority to a manager; a manager cannot assert it.
+
+| Capability | Grants |
+|------------|--------|
+| `status:read` | read mount status, cache usage, backend health, peer list |
+| `pin:write` | pin / unpin paths |
+| `cache:manage` | evict / warm |
+| `config:push` | merge `.cascade` / device config |
+| `policy:set` | lifecycle and pin policies |
+| `backend:manage` | add / remove backends (dangerous) |
+| `lifecycle:control` | start / stop / restart the daemon (dangerous) |
+| `grant:admin` | delegate a subset of held grants (dangerous) |
+
+Scope is a folder path prefix or node-wide (`*`). A grant is `{ grantee: DeviceId, capability, scope, granted_by, expires }`, persisted in two new `state.db` tables — `grants` and an append-only `manage_audit` — and optionally declared in the root device config (root-only merge, matching the existing device-config rule) so a fleet provisions declaratively rather than imperatively.
+
+On the wire it is two variants on the existing `BepMessage` enum — `ManageRequest` and `ManageResponse` — carried over the already-TLS-authenticated peer connection, so the caller's device ID is established before a command is read. The managed node resolves the caller's grants, checks the capability covers the target scope and is unexpired, dispatches into the same internal handler the local CLI uses, writes an audit row, and replies. A manager addresses a target by device ID and reaches it over the same `DiscoveryService` and [connectivity ladder](#nat-traversal) as any other connection, so management works across NAT through the existing rungs. "One or more nodes managing one or more others" is just a many-to-many grant relationship; each node owns its own grant list, so the model stays decentralised with no fleet registry.
+
+The first cut can keep grants as a local list, with the connection's authenticated device ID as the principal. The longer-term shape issues a capability token signed by the managed node's key, enabling offline issuance, revocation, and bounded delegation — `grant:admin` may delegate only a subset of what the holder itself holds, so there is no privilege escalation. The dangerous capabilities are never covered by a wildcard scope implicitly and want explicit confirmation at grant time; the audit log is append-only so a compromised manager cannot erase its tracks.
+
 ## Roadmap
 
 | Phase | Scope | Time | Lines |
@@ -1460,6 +1487,7 @@ cargo test -p backend-gdrive
 | v7 | P2P block sharing (LAN) | +10-14 weeks | +6,000 |
 | v8 | Linux FUSE presenter + Windows native ProjFS presenter (implemented) | +4-6 weeks | +2,000 |
 | v9 | Full P2P (WAN discovery, NAT traversal) | +8-12 weeks | +4,000 |
+| v10 | Node management plane (capability grants, remote administration over BEP) | +6-10 weeks | +3,000 |
 
 ## Dependencies
 
