@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod cache;
 pub mod config;
+pub mod grant;
 pub mod init;
 pub mod mount;
 /// Engine-backed `ContentProvider` for the Windows `ProjFS` presenter.
@@ -9,6 +10,7 @@ pub mod mount;
 /// compiled under `test` to keep its unit tests running on every host.
 #[cfg(any(target_os = "windows", test))]
 pub mod projfs_provider;
+pub mod remote;
 pub mod status;
 
 use std::path::PathBuf;
@@ -300,6 +302,90 @@ pub enum Commands {
         #[arg(long)]
         device_code: bool,
     },
+
+    /// Administer the capability grants this node confers on remote managers
+    Grant {
+        #[command(subcommand)]
+        command: GrantCommands,
+    },
+
+    /// Administer a remote node by its device ID
+    Remote {
+        /// Device ID of the node to administer
+        device_id: String,
+
+        #[command(subcommand)]
+        command: RemoteCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum GrantCommands {
+    /// Grant capabilities to a device over a scope
+    Add {
+        /// Device ID of the grantee
+        device_id: String,
+
+        /// Comma-separated capabilities (e.g. status:read,pin:write)
+        #[arg(long)]
+        cap: String,
+
+        /// Scope: a path prefix, or `*` for node-wide
+        #[arg(long)]
+        scope: String,
+
+        /// Optional RFC 3339 expiry timestamp
+        #[arg(long)]
+        expires: Option<String>,
+    },
+
+    /// List every grant held on this node
+    List,
+
+    /// Revoke a grant by its ID
+    Revoke {
+        /// Grant ID (as shown by `grant list`)
+        grant_id: i64,
+    },
+
+    /// Print the management audit log
+    Audit,
+}
+
+#[derive(Subcommand)]
+pub enum RemoteCommands {
+    /// Read the remote node's status
+    Status,
+
+    /// Pin a path on the remote node
+    Pin {
+        /// Path to pin
+        path: String,
+    },
+
+    /// Unpin a path on the remote node
+    Unpin {
+        /// Path to unpin
+        path: String,
+    },
+
+    /// Cache management on the remote node
+    Cache {
+        #[command(subcommand)]
+        command: RemoteCacheCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RemoteCacheCommands {
+    /// Run cache eviction on the remote node
+    Evict,
+
+    /// Warm a path on the remote node (pins it so files download)
+    Warm {
+        /// Path to warm
+        path: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -436,6 +522,31 @@ impl Cli {
                     device_code,
                 )
                 .await
+            }
+            Commands::Grant { command } => match command {
+                GrantCommands::Add {
+                    device_id,
+                    cap,
+                    scope,
+                    expires,
+                } => grant::add(ctx, &device_id, &cap, &scope, expires.as_deref()),
+                GrantCommands::List => grant::list(ctx),
+                GrantCommands::Revoke { grant_id } => grant::revoke(ctx, grant_id),
+                GrantCommands::Audit => grant::audit(ctx),
+            },
+            Commands::Remote { device_id, command } => {
+                let remote_command = match command {
+                    RemoteCommands::Status => remote::RemoteCommand::Status,
+                    RemoteCommands::Pin { path } => remote::RemoteCommand::Pin { path },
+                    RemoteCommands::Unpin { path } => remote::RemoteCommand::Unpin { path },
+                    RemoteCommands::Cache { command } => match command {
+                        RemoteCacheCommands::Evict => remote::RemoteCommand::CacheEvict,
+                        RemoteCacheCommands::Warm { path } => {
+                            remote::RemoteCommand::CacheWarm { path }
+                        }
+                    },
+                };
+                remote::run(ctx, &device_id, remote_command).await
             }
         }
     }
