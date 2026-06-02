@@ -343,6 +343,44 @@ impl Backend for LocalBackend {
         Ok(())
     }
 
+    async fn read_range(
+        &self,
+        file: &FileEntry,
+        offset: u64,
+        length: u32,
+    ) -> anyhow::Result<Vec<u8>> {
+        let relative = file.id.native_id();
+        let abs = self.root.join(relative);
+
+        if !abs.exists() {
+            anyhow::bail!("file not found: {}", abs.display());
+        }
+
+        // A zero-length request never touches the file.
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut handle = tokio::fs::File::open(&abs).await?;
+        // Seek past EOF is permitted; the subsequent read simply yields no
+        // bytes, which matches the "empty at or past EOF" contract.
+        tokio::io::AsyncSeekExt::seek(&mut handle, std::io::SeekFrom::Start(offset)).await?;
+
+        let cap = usize::try_from(length).unwrap_or(usize::MAX);
+        let mut buf = Vec::with_capacity(cap);
+        let mut limited = tokio::io::AsyncReadExt::take(handle, u64::from(length));
+        tokio::io::AsyncReadExt::read_to_end(&mut limited, &mut buf).await?;
+
+        tracing::debug!(
+            file = %file.id,
+            offset,
+            length,
+            read = buf.len(),
+            "range read from local"
+        );
+        Ok(buf)
+    }
+
     async fn upload(
         &self,
         path: &Path,
@@ -647,6 +685,106 @@ mod tests {
         backend.download(&entry, &mut writer).await.unwrap();
 
         assert_eq!(buf, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn read_range_mid_range() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("test.txt"), b"hello world")
+            .await
+            .unwrap();
+
+        let config = make_config(dir.path().to_str().unwrap(), &[("id", "test-local")]);
+        let backend = create_backend(&config).unwrap();
+        let entry = backend.metadata(Path::new("test.txt")).await.unwrap();
+
+        assert_eq!(backend.read_range(&entry, 6, 5).await.unwrap(), b"world");
+    }
+
+    #[tokio::test]
+    async fn read_range_whole_file_via_covering_length() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("test.txt"), b"hello world")
+            .await
+            .unwrap();
+
+        let config = make_config(dir.path().to_str().unwrap(), &[("id", "test-local")]);
+        let backend = create_backend(&config).unwrap();
+        let entry = backend.metadata(Path::new("test.txt")).await.unwrap();
+
+        assert_eq!(
+            backend.read_range(&entry, 0, 11).await.unwrap(),
+            b"hello world"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_range_length_past_eof_clamps() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("test.txt"), b"hello world")
+            .await
+            .unwrap();
+
+        let config = make_config(dir.path().to_str().unwrap(), &[("id", "test-local")]);
+        let backend = create_backend(&config).unwrap();
+        let entry = backend.metadata(Path::new("test.txt")).await.unwrap();
+
+        // Length runs past EOF; the result clamps to the available bytes.
+        assert_eq!(backend.read_range(&entry, 6, 999).await.unwrap(), b"world");
+    }
+
+    #[tokio::test]
+    async fn read_range_offset_at_or_past_eof_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("test.txt"), b"hello world")
+            .await
+            .unwrap();
+
+        let config = make_config(dir.path().to_str().unwrap(), &[("id", "test-local")]);
+        let backend = create_backend(&config).unwrap();
+        let entry = backend.metadata(Path::new("test.txt")).await.unwrap();
+
+        // Offset exactly at EOF -> empty.
+        assert!(backend.read_range(&entry, 11, 10).await.unwrap().is_empty());
+        // Offset well past EOF -> empty, no panic.
+        assert!(
+            backend
+                .read_range(&entry, 1000, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn read_range_zero_length_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("test.txt"), b"hello world")
+            .await
+            .unwrap();
+
+        let config = make_config(dir.path().to_str().unwrap(), &[("id", "test-local")]);
+        let backend = create_backend(&config).unwrap();
+        let entry = backend.metadata(Path::new("test.txt")).await.unwrap();
+
+        assert!(backend.read_range(&entry, 0, 0).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_range_missing_file_bails() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(dir.path().join("test.txt"), b"hello world")
+            .await
+            .unwrap();
+
+        let config = make_config(dir.path().to_str().unwrap(), &[("id", "test-local")]);
+        let backend = create_backend(&config).unwrap();
+        let mut entry = backend.metadata(Path::new("test.txt")).await.unwrap();
+        // Point the entry at a path that does not exist.
+        entry.id = ItemId::new("test-local", "missing.txt");
+
+        let err = backend.read_range(&entry, 0, 4).await.err().unwrap();
+        assert!(err.to_string().contains("not found"));
     }
 
     #[tokio::test]
