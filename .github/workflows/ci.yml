@@ -119,6 +119,62 @@ jobs:
               --test nat_integration \
               -- --test-threads=1 --nocapture
 
+  projfs-probe:
+    name: ProjFS availability probe (Windows)
+    needs: [check, test]
+    runs-on: windows-latest
+    steps:
+      # Diagnostic only: confirms whether the Windows Projected File System
+      # (Client-ProjFS) optional feature is enabled on the hosted runner and
+      # whether its PrjFlt filter driver can be brought up without a reboot.
+      # This de-risks implementing the ProjFS read/write callbacks (roadmap
+      # v8) by establishing — empirically, on the exact image CI gets —
+      # whether a real ProjFS integration test could run here at all. The
+      # runner-images toolset lists Client-ProjFS in its windowsFeatures, but
+      # the published manifest can lag the live image and the 2025 migration
+      # trimmed some components, so we check rather than assume.
+      - name: Report Windows build
+        shell: pwsh
+        run: |
+          Get-ComputerInfo -Property OsName, OsVersion, OsBuildNumber |
+            Format-List
+      - name: Probe Client-ProjFS optional feature
+        shell: pwsh
+        run: |
+          $feature = Get-WindowsOptionalFeature -Online -FeatureName Client-ProjFS -ErrorAction SilentlyContinue
+          if ($null -eq $feature) {
+            Write-Error "Client-ProjFS optional feature is not present on this image."
+            exit 1
+          }
+          Write-Host "Client-ProjFS state: $($feature.State)"
+          if ($feature.State -ne 'Enabled') {
+            Write-Error "Client-ProjFS is present but not Enabled (state: $($feature.State)). A ProjFS integration test would need to enable it, which may require a reboot CI cannot perform."
+            exit 1
+          }
+      - name: Probe PrjFlt filter driver
+        shell: pwsh
+        # The projfs callbacks run behind the PrjFlt minifilter. Even with the
+        # optional feature Enabled, confirm the driver is loadable so a future
+        # integration test can attach a virtualization root. `fltmc` needs an
+        # elevated context — GitHub runners run as admin by default.
+        run: |
+          $existing = fltmc filters | Select-String -Quiet 'PrjFlt'
+          if ($existing) {
+            Write-Host "PrjFlt minifilter already loaded."
+          } else {
+            Write-Host "PrjFlt not loaded; attempting fltmc load PrjFlt..."
+            fltmc load PrjFlt
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "fltmc load PrjFlt failed (exit $LASTEXITCODE) — driver not loadable without a reboot on this image."
+              exit 1
+            }
+            Write-Host "PrjFlt loaded successfully."
+          }
+          fltmc filters | Select-String 'PrjFlt'
+      - name: Summary
+        shell: pwsh
+        run: Write-Host "ProjFS is available on this runner — a Windows-only ProjFS integration test is feasible here."
+
   e2e-p2p:
     name: E2E (P2P mesh in Docker Compose)
     needs: [check, test]
