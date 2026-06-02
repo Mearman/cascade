@@ -156,7 +156,8 @@ async fn spawn_announce_endpoint(
 ) -> Result<(Option<SocketAddr>, Option<tokio::task::JoinHandle<()>>)> {
     if let Some(bind) = config.announce_bind {
         let directory = crate::announce::AnnounceDirectory::new();
-        let (addr, handle) = crate::announce::serve_announce(bind, directory).await?;
+        let (addr, handle) =
+            crate::announce::serve_announce(bind, directory, config.shared_secret).await?;
         Ok((Some(addr), Some(handle)))
     } else {
         Ok((None, None))

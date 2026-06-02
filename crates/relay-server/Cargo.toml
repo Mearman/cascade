@@ -24,15 +24,17 @@ http = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"], optional = true }
 cascade-p2p = { path = "../p2p" }
 cascade-announce-wire = { version = "0.1.50", path = "../cascade-announce-wire" }
+serde_json = { workspace = true, optional = true }
 
 [features]
 default = ["metrics"]
 metrics = ["dep:axum"]
 ## Enable the announce/lookup rendezvous directory endpoint
-## ([`announce`]). Pulls in axum for the HTTP surface and reuses the
-## announce wire types from cascade-p2p. The relay can be built without it
-## when only the byte-pipe is wanted.
-announce = ["dep:axum"]
+## ([`announce`]). Pulls in axum for the HTTP surface, serde_json for parsing
+## the authenticated register body, and reuses the announce wire types from
+## cascade-p2p. The relay can be built without it when only the byte-pipe is
+## wanted.
+announce = ["dep:axum", "dep:serde_json"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

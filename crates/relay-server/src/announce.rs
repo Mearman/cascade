@@ -30,6 +30,23 @@
 //! `cascade-p2p` so the client and server cannot drift. This module supplies
 //! only the storage and the HTTP surface.
 //!
+//! ## Write authentication
+//!
+//! Blind on *contents* does not mean open on *writers*. This endpoint and the
+//! Cloudflare Worker host the same announce contract, and both gate the write
+//! path identically: a register must carry an
+//! [`HMAC-SHA256`](cascade_announce_wire::auth) tag over the path device id and
+//! the exact request body in the [`ANNOUNCE_AUTH_HEADER`] header, keyed by the
+//! relay's shared secret — the same secret that
+//! authenticates the byte-pipe handshake. A missing, malformed, or
+//! non-verifying tag is a `401`, and nothing is stored. This keeps the two
+//! hosts of the contract behaviourally identical, so the announce client (which
+//! always stamps the header) succeeds against either carrier and never silently
+//! against one and `401`s against the other. Verifying the *writer* is
+//! orthogonal to trusting the *blob*: the envelope is still self-certifying on
+//! read, and binding the body into the tag stops a man-in-the-middle swapping
+//! one stored blob for another in flight.
+//!
 //! Blind on *contents* does not mean unbounded on *size*. Because the carrier
 //! does not trust whoever posts to it, it cannot assume the candidate count was
 //! capped client-side — a hostile client skips the honest client's
@@ -48,10 +65,12 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use axum::Json;
 use axum::Router;
+use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use cascade_announce_wire::auth::{self, ANNOUNCE_AUTH_HEADER, SHARED_SECRET_LEN};
 use cascade_p2p::discovery::MAX_ANNOUNCE_CANDIDATES;
 use cascade_p2p::discovery::announce::{AnnounceRequest, LookupResponse};
 use cascade_p2p::discovery::signing::SignedCandidates;
@@ -138,6 +157,18 @@ impl AnnounceDirectory {
     }
 }
 
+/// Router state for the announce endpoint: the soft-state directory plus the
+/// shared secret that authenticates writers.
+///
+/// The secret is the relay's existing `HMAC` key — the same one the byte-pipe
+/// handshake uses — so an operator configures one secret for both surfaces. It
+/// is held by value (`Copy`) so the state clones cheaply across requests.
+#[derive(Clone)]
+struct AnnounceState {
+    directory: Arc<AnnounceDirectory>,
+    secret: [u8; SHARED_SECRET_LEN],
+}
+
 /// Bind a small HTTP server on `bind` exposing the announce routes.
 ///
 /// Returns the actual bound address (useful when binding to port 0) and a
@@ -147,6 +178,7 @@ impl AnnounceDirectory {
 pub async fn serve_announce(
     bind: SocketAddr,
     directory: Arc<AnnounceDirectory>,
+    secret: [u8; SHARED_SECRET_LEN],
 ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     let listener = TcpListener::bind(bind)
         .await
@@ -155,11 +187,12 @@ pub async fn serve_announce(
         .local_addr()
         .context("reading local address for bound announce listener")?;
 
+    let state = AnnounceState { directory, secret };
     let app = Router::new()
         .route("/announce/{device_id}", post(register_handler))
         .route("/announce/{device_id}", get(lookup_handler))
         .layer(DefaultBodyLimit::max(MAX_ANNOUNCE_REQUEST_BYTES))
-        .with_state(directory);
+        .with_state(state);
 
     let join = tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, app).await {
@@ -170,10 +203,28 @@ pub async fn serve_announce(
 }
 
 async fn register_handler(
-    State(directory): State<Arc<AnnounceDirectory>>,
+    State(state): State<AnnounceState>,
     Path(device_id): Path<String>,
-    Json(request): Json<AnnounceRequest>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Response {
+    // Authenticate the writer before any parsing or storage. The HMAC binds the
+    // path device id and the exact received body, so a missing tag, a forged
+    // tag, a wrong secret, or a man-in-the-middle body swap all fail. A missing,
+    // malformed, and non-verifying tag collapse to one `401` so an
+    // unauthenticated caller learns nothing about why it failed — identical to
+    // the Worker's `Outcome::Unauthorized`.
+    if !writer_is_authenticated(&state.secret, &device_id, &body, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    // Parse only after authentication: an unauthenticated caller never reaches
+    // the JSON parser. The body bytes are exactly what the tag authenticated.
+    let request: AnnounceRequest = match serde_json::from_slice(&body) {
+        Ok(parsed) => parsed,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+
     // Bound per-device storage by rejecting an oversized registration rather
     // than storing it. Reading `candidates.len()` is the one structural fact the
     // carrier may act on without trusting the envelope's contents: it does not
@@ -196,15 +247,36 @@ async fn register_handler(
     // not even to check the claimed device id against the path — a hostile
     // registration only stores a value that no resolver will accept, because
     // the signature must verify against the *resolved* id.
-    directory.register(device_id, request.signed).await;
+    state.directory.register(device_id, request.signed).await;
     StatusCode::NO_CONTENT.into_response()
 }
 
+/// Verify the write-auth header for a register request against `secret`.
+///
+/// Returns `true` only when the header is present and its hex tag verifies (in
+/// constant time) over the path device id and the exact body. A missing header,
+/// a malformed tag, and a non-verifying tag all return `false` — the caller maps
+/// every one to a single `401`.
+fn writer_is_authenticated(
+    secret: &[u8; SHARED_SECRET_LEN],
+    device_id: &str,
+    body: &[u8],
+    headers: &HeaderMap,
+) -> bool {
+    let Some(header) = headers.get(ANNOUNCE_AUTH_HEADER) else {
+        return false;
+    };
+    let Ok(header) = header.to_str() else {
+        return false;
+    };
+    auth::verify_announce_write(secret, device_id, body, header).unwrap_or(false)
+}
+
 async fn lookup_handler(
-    State(directory): State<Arc<AnnounceDirectory>>,
+    State(state): State<AnnounceState>,
     Path(device_id): Path<String>,
 ) -> Response {
-    let signed = directory.lookup(&device_id).await;
+    let signed = state.directory.lookup(&device_id).await;
     Json(LookupResponse { signed }).into_response()
 }
 
@@ -230,6 +302,38 @@ mod tests {
             .map(|&p| WireCandidate::from(Candidate::new(addr(p), CandidateKind::Host, 0)))
             .collect();
         SignedCandidates::sign(device_id, wire, EXPIRY_MS)
+    }
+
+    /// Deterministic 32-byte shared secret the writer and the carrier agree on.
+    fn secret() -> [u8; SHARED_SECRET_LEN] {
+        let mut s = [0u8; SHARED_SECRET_LEN];
+        for (idx, byte) in s.iter_mut().enumerate() {
+            *byte = u8::try_from(idx).unwrap_or(0);
+        }
+        s
+    }
+
+    /// State wrapping `directory` and the test [`secret`].
+    fn state(directory: &Arc<AnnounceDirectory>) -> AnnounceState {
+        AnnounceState {
+            directory: Arc::clone(directory),
+            secret: secret(),
+        }
+    }
+
+    /// Serialise `signed` into the wire body and the matching write-auth header
+    /// for `device_id`, the way the announce client does.
+    fn register_body(device_id: &str, signed: SignedCandidates) -> (Bytes, String) {
+        let body = serde_json::to_vec(&AnnounceRequest { signed }).unwrap();
+        let tag = auth::announce_write_tag(&secret(), device_id, &body).unwrap();
+        (Bytes::from(body), auth::encode_hex(&tag))
+    }
+
+    /// A [`HeaderMap`] carrying the write-auth header set to `value`.
+    fn auth_headers(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(ANNOUNCE_AUTH_HEADER, value.parse().unwrap());
+        headers
     }
 
     #[tokio::test]
@@ -275,11 +379,13 @@ mod tests {
             .collect();
         assert_eq!(ports.len(), MAX_ANNOUNCE_CANDIDATES + 1);
         let oversized = signed_set("DEVICE-A", &ports);
+        let (body, header) = register_body("DEVICE-A", oversized);
 
         let response = register_handler(
-            State(Arc::clone(&directory)),
+            State(state(&directory)),
             Path("DEVICE-A".to_string()),
-            Json(AnnounceRequest { signed: oversized }),
+            auth_headers(&header),
+            body,
         )
         .await;
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
@@ -299,17 +405,112 @@ mod tests {
             .collect();
         assert_eq!(ports.len(), MAX_ANNOUNCE_CANDIDATES);
         let at_cap = signed_set("DEVICE-A", &ports);
+        let (body, header) = register_body("DEVICE-A", at_cap.clone());
 
         let response = register_handler(
-            State(Arc::clone(&directory)),
+            State(state(&directory)),
             Path("DEVICE-A".to_string()),
-            Json(AnnounceRequest {
-                signed: at_cap.clone(),
-            }),
+            auth_headers(&header),
+            body,
         )
         .await;
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         assert_eq!(directory.lookup("DEVICE-A").await, Some(at_cap));
+    }
+
+    /// An authenticated register is stored; a lookup returns it byte-for-byte.
+    /// This is the happy path through the HMAC gate, proving an honest writer's
+    /// header verifies against the endpoint.
+    #[tokio::test]
+    async fn an_authenticated_register_is_stored_and_looked_up() {
+        let directory = AnnounceDirectory::new();
+        let signed = signed_set("DEVICE-A", &[22000, 33000]);
+        let (body, header) = register_body("DEVICE-A", signed.clone());
+
+        let response = register_handler(
+            State(state(&directory)),
+            Path("DEVICE-A".to_string()),
+            auth_headers(&header),
+            body,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(directory.lookup("DEVICE-A").await, Some(signed));
+    }
+
+    /// A register with no write-auth header is `401` and stores nothing, so the
+    /// endpoint and the Worker reject an unauthenticated writer identically.
+    #[tokio::test]
+    async fn a_register_without_the_auth_header_is_unauthorized_and_stores_nothing() {
+        let directory = AnnounceDirectory::new();
+        let (body, _header) = register_body("DEVICE-A", signed_set("DEVICE-A", &[22000]));
+
+        let response = register_handler(
+            State(state(&directory)),
+            Path("DEVICE-A".to_string()),
+            HeaderMap::new(),
+            body,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(directory.lookup("DEVICE-A").await, None);
+    }
+
+    /// A tag built for one path id, replayed onto another id's path, is `401`:
+    /// the tag binds the device id, so it cannot be lifted onto another key.
+    #[tokio::test]
+    async fn a_tag_for_another_device_id_is_unauthorized() {
+        let directory = AnnounceDirectory::new();
+        // Tag is computed for DEVICE-A's body; posting it to DEVICE-B's path
+        // must fail because the verifier recomputes over the path id.
+        let (body, header) = register_body("DEVICE-A", signed_set("DEVICE-A", &[22000]));
+
+        let response = register_handler(
+            State(state(&directory)),
+            Path("DEVICE-B".to_string()),
+            auth_headers(&header),
+            body,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(directory.lookup("DEVICE-B").await, None);
+    }
+
+    /// A body swapped after the tag was computed fails verification: the tag
+    /// binds the exact bytes, so a man-in-the-middle substitution is `401`.
+    #[tokio::test]
+    async fn a_swapped_body_is_unauthorized() {
+        let directory = AnnounceDirectory::new();
+        let (_body, header) = register_body("DEVICE-A", signed_set("DEVICE-A", &[22000]));
+        let (other_body, _other) = register_body("DEVICE-A", signed_set("DEVICE-A", &[44000]));
+
+        let response = register_handler(
+            State(state(&directory)),
+            Path("DEVICE-A".to_string()),
+            auth_headers(&header),
+            other_body,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(directory.lookup("DEVICE-A").await, None);
+    }
+
+    /// A malformed (non-hex) tag is `401`, not a `400` or a panic — every
+    /// auth-failure reason collapses to one status so the caller learns nothing.
+    #[tokio::test]
+    async fn a_malformed_auth_header_is_unauthorized() {
+        let directory = AnnounceDirectory::new();
+        let (body, _header) = register_body("DEVICE-A", signed_set("DEVICE-A", &[22000]));
+
+        let response = register_handler(
+            State(state(&directory)),
+            Path("DEVICE-A".to_string()),
+            auth_headers("not-hex"),
+            body,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(directory.lookup("DEVICE-A").await, None);
     }
 
     /// The body ceiling is derived from the cap, not hand-picked: it must be
