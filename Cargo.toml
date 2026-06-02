@@ -19,6 +19,15 @@ members = [
     "crates/relay-server",
     "crates/cascade-announce-wire",
 ]
+# The announce Worker (workers/announce) compiles only to
+# wasm32-unknown-unknown — it links the `worker` crate's JS glue — so it is
+# deliberately not a workspace member: a native `cargo build` / `cargo test
+# --workspace` must not try to build it. It declares its own `[workspace]` table
+# so cargo does not walk up into this manifest, and is verified separately with
+# `cargo check --target wasm32-unknown-unknown` from its own directory.
+exclude = [
+    "workers/announce",
+]
 
 [workspace.package]
 version = "0.1.52"

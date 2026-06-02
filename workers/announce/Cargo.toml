@@ -1,0 +1,60 @@
+# Empty `[workspace]` table makes this crate its own workspace root. It is a
+# wasm32-only Worker, deliberately not part of the cascade cargo workspace, so it
+# must not be pulled into the parent workspace's resolver — and because git
+# worktrees live under the main checkout, cargo would otherwise walk up and find
+# the main repo's root manifest. This stops that upward search.
+[workspace]
+
+[package]
+name = "cascade-announce-worker"
+description = "Stateless Cloudflare Worker implementing cascade's announce-server HTTP contract over Workers KV soft state."
+version = "0.1.50"
+edition = "2024"
+license = "MIT"
+
+[package.metadata]
+# This crate compiles only to wasm32-unknown-unknown (it links the `worker`
+# crate's JS glue), so it is deliberately excluded from the cargo workspace via
+# the root manifest's `workspace.exclude`. Verify it with:
+#   cargo check --target wasm32-unknown-unknown -p cascade-announce-worker
+# The host-testable announce logic lives in `cascade-announce-wire::handler` and
+# is covered by `cargo test --workspace`; this crate is the thin KV/Worker glue.
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+cascade-announce-wire = { path = "../../crates/cascade-announce-wire" }
+worker = "0.6"
+
+# Match the cascade workspace lint posture as closely as an out-of-workspace
+# crate can: the root `[workspace.lints]` table is not visible here, so the
+# denials and the project's allow-list are restated.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+string_slice = "deny"
+
+# The cascade workspace's own allow-list (doc/metadata concerns and noisy style
+# lints), restated so this crate does not diverge from the rest of the tree.
+cargo_common_metadata = "allow"
+multiple_crate_versions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+significant_drop_tightening = "allow"
+module_name_repetitions = "allow"
+too_many_arguments = "allow"
+too_many_lines = "allow"
+
+# The Workers runtime is single-threaded and the `worker` crate's JS-backed
+# futures are `!Send` by construction (they wrap `Rc`/`RefCell` JS handles).
+# `future_not_send` therefore cannot be satisfied for any handler that touches a
+# binding — it is an inherent property of the wasm Worker target, not a code
+# smell, so it is relaxed here rather than worked around.
+future_not_send = "allow"

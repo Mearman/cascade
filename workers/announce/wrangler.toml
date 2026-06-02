@@ -1,0 +1,34 @@
+# Cascade announce-server Worker.
+#
+# Hosts the announce-server HTTP contract (POST/GET /announce/<device_id>) on
+# Cloudflare's edge with zero durable state: the directory lives entirely in a
+# Workers KV namespace with per-write expiry, and the handler holds nothing
+# between requests. Deploy with `wrangler deploy` after building the wasm with
+# worker-build (driven by the [build] command below).
+
+name = "cascade-announce"
+main = "build/worker/shim.mjs"
+compatibility_date = "2024-09-23"
+
+[build]
+command = "cargo install -q worker-build && worker-build --release"
+
+# Soft-state directory. Create the namespace once with
+#   wrangler kv:namespace create ANNOUNCE
+# then paste the returned id below. No durability is required — announcers
+# republish, so a lost namespace simply forces a fresh announce on the next tick.
+[[kv_namespaces]]
+binding = "ANNOUNCE"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+[vars]
+# Per-write KV expiry, in seconds. Above the announcer republish cadence so a
+# live device's entry is always refreshed before it lapses; a stale capture ages
+# out within this window. Cloudflare enforces a 60-second floor.
+ANNOUNCE_TTL_SECONDS = "3600"
+
+# The HMAC write key (64 hex chars) is a secret, NOT a var — set it out of band
+# with:
+#   wrangler secret put ANNOUNCE_SHARED_SECRET
+# It must match the secret the announcing clients sign their writes with. A
+# missing or malformed secret fails every write closed (503), never open.
