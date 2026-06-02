@@ -5,7 +5,7 @@
 //! that is **not** part of any Tokio runtime, and the callback is
 //! synchronous. This provider bridges that synchronous, runtime-free
 //! context to the engine's async
-//! [`Backend::download`](cascade_engine::backend::Backend::download) API.
+//! [`Backend::read_range`](cascade_engine::backend::Backend::read_range) API.
 //!
 //! # Why this lives in the binary crate
 //!
@@ -16,92 +16,75 @@
 //! [`ContentProvider`](cascade_presenter_projfs::ContentProvider) trait and
 //! [`ItemId`](cascade_engine::types::ItemId).
 //!
-//! # Read strategy: materialise once, then seek
+//! # Read strategy: bounded ranged fetch
 //!
-//! [`Backend::download`](cascade_engine::backend::Backend::download) streams
-//! an entire file; it has no range API. So
-//! the first time any byte of a file is requested, the provider downloads
-//! the whole file to a versioned cache path and atomically renames it into
-//! place. Every subsequent range read — including every other range of the
-//! same file — is served by a plain synchronous `std::fs` seek + read of
-//! the materialised cache file, touching no runtime at all.
+//! Each `GetFileData` range request resolves the file's metadata
+//! synchronously through the state database, then asks the owning backend
+//! for exactly the requested slice via
+//! [`Backend::read_range`](cascade_engine::backend::Backend::read_range).
+//! Only the bytes in `[offset, offset + length)` are fetched; the file is
+//! never materialised in full, so a first touch of a large file no longer
+//! downloads or pins the whole thing. Backends with a native range API
+//! (HTTP `Range`, `seek` + `read`, a block store) serve the slice directly;
+//! those without one fall back to the trait's download-and-slice default,
+//! but that fallback is contained inside the backend rather than caching a
+//! whole-file copy here.
 //!
-//! The async download on the cold path runs via
-//! [`tokio::runtime::Handle::block_on`] on the captured daemon runtime
-//! handle. `block_on` is valid here precisely because the callback thread
-//! is outside any runtime — the same precondition that lets the presenter's
-//! other callbacks call `RwLock::blocking_read`. To stay panic-proof even
-//! if a future caller invokes this from inside a runtime worker, the bridge
-//! checks [`tokio::runtime::Handle::try_current`] and falls back to
+//! The async read runs via [`tokio::runtime::Handle::block_on`] on the
+//! captured daemon runtime handle. `block_on` is valid here precisely
+//! because the callback thread is outside any runtime — the same
+//! precondition that lets the presenter's other callbacks call
+//! `RwLock::blocking_read`. To stay panic-proof even if a future caller
+//! invokes this from inside a runtime worker, the bridge checks
+//! [`tokio::runtime::Handle::try_current`] and falls back to
 //! [`tokio::task::block_in_place`] in that case, so it never hits the
 //! "Cannot start a runtime from within a runtime" panic.
 //!
 //! # Known limitations (deliberate for v8)
 //!
-//! - The cold download is not cancellable mid-stream: the presenter's
+//! - A range read is not cancellable mid-flight: the presenter's
 //!   `CancellationToken` is observed at checkpoints around `read_range`,
-//!   not inside the download. Warm range reads are cheap. The practical
-//!   consequence is that a `GetFileData` for a large cold file blocks its
-//!   callback thread — and therefore can delay daemon shutdown — for the
-//!   full duration of the download, with no way to interrupt it once the
-//!   `Backend::download` stream is in flight. A range-aware backend API
-//!   (HTTP Range) is the proper fix; materialise-then-seek is the interim.
-//! - When `mod_time` is `None`, the cache version is `"unknown"`, which
-//!   inherits the same staleness edge as the File Provider cache scheme.
-//!   A content-hash version is the proper fix but is a cross-presenter
-//!   change out of scope here.
-//! - True range-aware fetching needs a `Backend` trait extension (HTTP
-//!   Range); materialise-then-seek is the correct interim.
+//!   not inside the backend fetch. Because each read is now a bounded
+//!   slice rather than a whole-file transfer, the worst-case blocking
+//!   duration is proportional to the requested range, not the file size —
+//!   so a `GetFileData` for a large cold file no longer pins its callback
+//!   thread (and delays shutdown) for the full download.
 
-use std::io::{self, ErrorKind, Read as _, Seek as _, SeekFrom};
-use std::path::PathBuf;
+use std::io::{self, ErrorKind};
 use std::sync::Arc;
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use cascade_engine::backend::Backend;
 use cascade_engine::db::StateDb;
 use cascade_engine::types::ItemId;
 use cascade_engine::vfs::VfsTree;
 use cascade_presenter_projfs::ContentProvider;
-use tokio::io::AsyncWriteExt as _;
-
-/// Process-wide monotonic counter used to name temp download files
-/// uniquely. Shared across every provider instance and callback thread,
-/// so two concurrent cold downloads of the same item can never pick the
-/// same temp path.
-static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Source of file bytes for the `ProjFS` `GetFileData` callback, backed
 /// by the engine's state database and backend list.
 ///
-/// All fields are cheap to clone (`Arc` bumps and a `PathBuf`), so the
-/// provider can be wrapped in an `Arc<dyn ContentProvider>` and shared
-/// with the presenter's callback context.
+/// All fields are cheap to clone (`Arc` bumps), so the provider can be
+/// wrapped in an `Arc<dyn ContentProvider>` and shared with the
+/// presenter's callback context.
 ///
 /// `Debug` is implemented by hand because `dyn Backend` does not derive
 /// `Debug`; the [`ContentProvider`] trait requires the bound, so the
 /// impl summarises the backend list by count rather than printing it.
 pub struct EngineContentProvider {
     /// Shared VFS tree. Retained for parity with the other engine-backed
-    /// presenters and so future range-aware resolution has the tree to
-    /// hand; the synchronous read path resolves metadata through `db`
-    /// rather than the tree to avoid taking the VFS lock on a kernel
-    /// callback thread.
+    /// presenters and so future tree-based resolution has it to hand; the
+    /// synchronous read path resolves metadata through `db` rather than
+    /// the tree to avoid taking the VFS lock on a kernel callback thread.
     #[allow(dead_code)]
     vfs: Arc<RwLock<VfsTree>>,
     /// State database. `get_file` is synchronous `rusqlite`, so it is
     /// safe to call directly from the callback thread with no runtime.
     db: Arc<StateDb>,
     /// The backend list, used to resolve `id.backend_id()` back to the
-    /// owning backend for the cold-path download.
+    /// owning backend for the ranged read.
     backends: Vec<Arc<dyn Backend>>,
-    /// Root cache directory (a sibling of the state DB, matching the File
-    /// Provider layout). Materialised files live under `<cache_dir>/projfs`.
-    cache_dir: PathBuf,
     /// Handle to the daemon's multi-thread Tokio runtime, captured while
-    /// still on the runtime. Used to `block_on` the async download on the
-    /// cold path.
+    /// still on the runtime. Used to `block_on` the async ranged read.
     handle: tokio::runtime::Handle,
 }
 
@@ -109,7 +92,6 @@ impl std::fmt::Debug for EngineContentProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EngineContentProvider")
             .field("backend_count", &self.backends.len())
-            .field("cache_dir", &self.cache_dir)
             .finish_non_exhaustive()
     }
 }
@@ -121,14 +103,12 @@ impl EngineContentProvider {
         vfs: Arc<RwLock<VfsTree>>,
         db: Arc<StateDb>,
         backends: Vec<Arc<dyn Backend>>,
-        cache_dir: PathBuf,
         handle: tokio::runtime::Handle,
     ) -> Self {
         Self {
             vfs,
             db,
             backends,
-            cache_dir,
             handle,
         }
     }
@@ -150,48 +130,6 @@ fn to_io(err: anyhow::Error) -> io::Error {
     io::Error::other(format!("{err:#}"))
 }
 
-/// Sanitise an [`ItemId`] string into a single filesystem-safe path
-/// component. Reproduced locally rather than depending on a presenter's
-/// private helper, so the binary crate does not take a cross-presenter
-/// dependency for one pure string transform. Matches the FUSE/WebDAV
-/// scheme (`:` `/` `\` collapse to `_`).
-fn safe_filename(id: &str) -> String {
-    id.replace([':', '/', '\\'], "_")
-}
-
-/// Adapter from `tokio::fs::File` (`AsyncWrite`) to the
-/// `dyn AsyncWrite + Unpin + Send` that [`Backend::download`] expects.
-/// Mirrors the adapter the FUSE and NFS presenters use.
-struct WriterAdapter {
-    inner: tokio::fs::File,
-}
-
-impl tokio::io::AsyncWrite for WriterAdapter {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<io::Result<usize>> {
-        std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<io::Result<()>> {
-        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<io::Result<()>> {
-        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
-    }
-}
-
-impl Unpin for WriterAdapter {}
-
 impl ContentProvider for EngineContentProvider {
     fn read_range(&self, id: &ItemId, offset: u64, length: u32) -> io::Result<Vec<u8>> {
         // 1. Resolve metadata synchronously. `get_file` is plain rusqlite,
@@ -204,119 +142,251 @@ impl ContentProvider for EngineContentProvider {
             .map_err(to_io)?
             .ok_or_else(|| io::Error::from(ErrorKind::NotFound))?;
 
-        // 2. Compute the versioned cache path, mirroring the File Provider
-        //    scheme: <cache_dir>/projfs/<safe(id)>/<version>. The version
-        //    is the modification timestamp, or "unknown" when absent (a
-        //    deliberate parity edge, documented at the module level).
-        let version = entry
-            .mod_time
-            .map_or_else(|| "unknown".to_string(), |t| t.timestamp().to_string());
-        let item_dir = self.cache_dir.join("projfs").join(safe_filename(&id.0));
-        let cache_path = item_dir.join(&version);
+        // 2. Resolve the owning backend.
+        let backend = self.backend_for(id).ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::NotFound,
+                format!("no backend registered for {}", id.backend_id()),
+            )
+        })?;
+        let backend = Arc::clone(backend);
 
-        // 3. Materialise once if the cache file is absent. Racing callbacks
-        //    each download to a unique temp name and the final rename is
-        //    last-writer-wins onto identical content — correct, just mildly
-        //    wasteful on a cold race.
-        if !cache_path.exists() {
-            let backend = self.backend_for(id).ok_or_else(|| {
-                io::Error::new(
-                    ErrorKind::NotFound,
-                    format!("no backend registered for {}", id.backend_id()),
-                )
-            })?;
+        // 3. Fetch exactly the requested range. `Backend::read_range`
+        //    honours the same short-read-at-EOF contract the presenter
+        //    expects: a `Vec` shorter than `length` near EOF, and an empty
+        //    `Vec` when `offset` is at or past the end (which the presenter
+        //    maps to S_OK). The whole file is never materialised.
+        //
+        //    The ProjFS GetFileData callback runs on a kernel-owned worker
+        //    thread outside any Tokio runtime, so a bare `Handle::block_on`
+        //    is the right bridge there. To be panic-proof in any caller
+        //    (tests, or a future caller already on a runtime worker), detect
+        //    that case with `Handle::try_current` and use `block_in_place`
+        //    so we never hit the "Cannot start a runtime from within a
+        //    runtime" panic path. On the real callback thread `try_current`
+        //    returns `Err`, so we take the plain `block_on` branch.
+        let read = async move { backend.read_range(&entry, offset, length).await };
+        let bytes: anyhow::Result<Vec<u8>> = if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::block_in_place(|| self.handle.block_on(read))
+        } else {
+            self.handle.block_on(read)
+        };
 
-            std::fs::create_dir_all(&item_dir)?;
+        bytes.map_err(to_io)
+    }
+}
 
-            // Unique temp sibling: a process-wide monotonic counter
-            // guarantees a distinct name per download attempt without
-            // relying on clock resolution or thread-id reuse, so two
-            // callback threads racing the same cold file cannot collide.
-            let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let tmp_path = item_dir.join(format!("{version}.{seq}.tmp"));
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::Mutex;
+    use std::time::Duration;
 
-            let backend = Arc::clone(backend);
-            let tmp_for_download = tmp_path.clone();
-            let entry_size = entry.size;
-            // The cold-path download is the only place this provider enters
-            // the runtime. The ProjFS GetFileData callback runs on a
-            // kernel-owned worker thread that is outside any Tokio runtime,
-            // so a bare `Handle::block_on` is the right bridge there. But to
-            // be panic-proof in any caller (tests, or a future caller that
-            // happens to already be on a runtime worker), detect that case
-            // with `Handle::try_current` and use `block_in_place` so we
-            // never hit the "Cannot start a runtime from within a runtime"
-            // panic path. On the real callback thread `try_current` returns
-            // `Err`, so we take the plain `block_on` branch.
-            let download = async move {
-                let file = tokio::fs::File::create(&tmp_for_download).await?;
-                let mut writer = WriterAdapter { inner: file };
-                backend.download(&entry, &mut writer).await?;
-                writer.inner.flush().await?;
-                writer.inner.shutdown().await?;
-                anyhow::Ok(())
-            };
-            let download_result: anyhow::Result<()> =
-                if tokio::runtime::Handle::try_current().is_ok() {
-                    // Already inside a runtime worker: yield the worker with
-                    // `block_in_place` before blocking on the future, which
-                    // is the supported way to run a blocking section without
-                    // the nested-runtime panic.
-                    tokio::task::block_in_place(|| self.handle.block_on(download))
-                } else {
-                    self.handle.block_on(download)
-                };
+    use async_trait::async_trait;
+    use cascade_engine::types::{Change, Cursor, FileEntry, FileId, ItemId, Quota};
 
-            if let Err(err) = download_result {
-                // Best-effort cleanup of the partial temp file; ignore the
-                // result because the original download error is what matters.
-                let _ = std::fs::remove_file(&tmp_path);
-                return Err(to_io(err));
+    use super::*;
+
+    /// Backend that records the `(offset, length)` of every `read_range`
+    /// call and returns a fixed slice of its in-memory content, proving the
+    /// provider asks for a bounded range and never falls back to a
+    /// whole-file `download`. `download` panics so any accidental
+    /// whole-file materialisation surfaces as a test failure.
+    #[derive(Debug)]
+    struct RecordingBackend {
+        id: String,
+        content: Vec<u8>,
+        calls: Mutex<Vec<(u64, u32)>>,
+    }
+
+    impl RecordingBackend {
+        fn new(id: &str, content: &[u8]) -> Self {
+            Self {
+                id: id.to_string(),
+                content: content.to_vec(),
+                calls: Mutex::new(Vec::new()),
             }
-
-            // Validate the materialised file against the metadata size before
-            // publishing it. A truncated download (network cut mid-stream that
-            // the backend reported as success) would otherwise be renamed into
-            // the cache and served as authoritative. Fail loudly instead of
-            // serving short content. Only checked when `entry.size` is known.
-            if let Some(expected) = entry_size {
-                let written = std::fs::metadata(&tmp_path)?.len();
-                if written != expected {
-                    let _ = std::fs::remove_file(&tmp_path);
-                    return Err(io::Error::new(
-                        ErrorKind::InvalidData,
-                        format!(
-                            "downloaded length {written} does not match expected size {expected} for {}",
-                            id.0
-                        ),
-                    ));
-                }
-            }
-
-            std::fs::rename(&tmp_path, &cache_path)?;
         }
+    }
 
-        // 4. Serve the requested range synchronously from the materialised
-        //    file. A short read (or empty Vec at/after EOF) satisfies the
-        //    trait's short-read-at-EOF contract; the presenter maps an
-        //    empty Vec to S_OK.
-        let mut file = std::fs::File::open(&cache_path)?;
-        file.seek(SeekFrom::Start(offset))?;
-
-        let want = usize::try_from(length).unwrap_or(usize::MAX);
-        let mut buf = vec![0u8; want];
-        let mut filled = 0usize;
-        while filled < want {
-            let Some(slice) = buf.get_mut(filled..) else {
-                break;
-            };
-            let n = file.read(slice)?;
-            if n == 0 {
-                break; // EOF
-            }
-            filled += n;
+    #[async_trait]
+    impl Backend for RecordingBackend {
+        fn id(&self) -> &str {
+            &self.id
         }
-        buf.truncate(filled);
-        Ok(buf)
+        fn display_name(&self) -> &'static str {
+            "Recording"
+        }
+        async fn quota(&self) -> anyhow::Result<Option<Quota>> {
+            Ok(None)
+        }
+        async fn changes(&self, _cursor: Option<&Cursor>) -> anyhow::Result<(Vec<Change>, Cursor)> {
+            Ok((vec![], Cursor("recording".to_string())))
+        }
+        async fn metadata(&self, _path: &Path) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("unused")
+        }
+        async fn download(
+            &self,
+            _file: &FileEntry,
+            _writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
+        ) -> anyhow::Result<()> {
+            panic!("download must not be called: read_range should fetch a bounded slice");
+        }
+        async fn read_range(
+            &self,
+            _file: &FileEntry,
+            offset: u64,
+            length: u32,
+        ) -> anyhow::Result<Vec<u8>> {
+            self.calls.lock().map_or_else(
+                |_| panic!("recording mutex poisoned"),
+                |mut calls| calls.push((offset, length)),
+            );
+            let start = usize::try_from(offset)
+                .unwrap_or(usize::MAX)
+                .min(self.content.len());
+            let len = usize::try_from(length).unwrap_or(usize::MAX);
+            let end = start.saturating_add(len).min(self.content.len());
+            Ok(self.content.get(start..end).unwrap_or_default().to_vec())
+        }
+        async fn upload(
+            &self,
+            _path: &Path,
+            _reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+            _parent_id: &FileId,
+        ) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("unused")
+        }
+        async fn update(
+            &self,
+            _file_id: &FileId,
+            _reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+        ) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("unused")
+        }
+        async fn create_dir(&self, _path: &Path) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("unused")
+        }
+        async fn delete(&self, _file: &FileEntry) -> anyhow::Result<()> {
+            anyhow::bail!("unused")
+        }
+        async fn move_entry(&self, _src: &Path, _dst: &Path) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("unused")
+        }
+        async fn poll_interval(&self) -> Option<Duration> {
+            None
+        }
+    }
+
+    /// Build a provider whose state DB knows about one file owned by the
+    /// given backend, plus a handle to the current multi-thread runtime.
+    fn provider_with(backend: Arc<RecordingBackend>, entry: &FileEntry) -> EngineContentProvider {
+        let db = Arc::new(StateDb::open_in_memory().expect("open in-memory state db"));
+        db.register_backend(backend.id(), "recording", "Recording", None, None)
+            .expect("register backend row");
+        db.upsert_file(entry).expect("seed file row");
+
+        let root: Arc<dyn Backend> = backend.clone();
+        let vfs = Arc::new(RwLock::new(VfsTree::new(root)));
+        let backends: Vec<Arc<dyn Backend>> = vec![backend];
+
+        EngineContentProvider::new(vfs, db, backends, tokio::runtime::Handle::current())
+    }
+
+    fn file_entry(backend_id: &str) -> FileEntry {
+        FileEntry {
+            id: ItemId::new(backend_id, "f"),
+            parent_id: ItemId::new(backend_id, "root"),
+            name: "f.bin".to_string(),
+            is_dir: false,
+            size: Some(11),
+            mod_time: None,
+            mime_type: None,
+            hash: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_range_delegates_to_backend_read_range() {
+        let backend = Arc::new(RecordingBackend::new("rec", b"hello world"));
+        let entry = file_entry("rec");
+        let provider = provider_with(backend.clone(), &entry);
+
+        let bytes = provider.read_range(&entry.id, 6, 5).expect("read range");
+        assert_eq!(bytes, b"world");
+
+        let calls = backend.calls.lock().expect("calls lock");
+        assert_eq!(
+            *calls,
+            vec![(6, 5)],
+            "provider must pass the exact range through"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_range_clamps_length_past_eof() {
+        let backend = Arc::new(RecordingBackend::new("rec", b"hello world"));
+        let entry = file_entry("rec");
+        let provider = provider_with(backend, &entry);
+
+        // Length runs past EOF: the backend clamps to what's available.
+        let bytes = provider.read_range(&entry.id, 6, 999).expect("read range");
+        assert_eq!(bytes, b"world");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_range_empty_at_or_past_eof() {
+        let backend = Arc::new(RecordingBackend::new("rec", b"hello world"));
+        let entry = file_entry("rec");
+        let provider = provider_with(backend, &entry);
+
+        // Offset exactly at EOF and zero-length both yield empty buffers.
+        assert!(
+            provider
+                .read_range(&entry.id, 11, 10)
+                .expect("at eof")
+                .is_empty()
+        );
+        assert!(
+            provider
+                .read_range(&entry.id, 0, 0)
+                .expect("zero length")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_range_missing_file_is_not_found() {
+        let backend = Arc::new(RecordingBackend::new("rec", b"hello world"));
+        let entry = file_entry("rec");
+        let provider = provider_with(backend, &entry);
+
+        let unknown = ItemId::new("rec", "absent");
+        let err = provider
+            .read_range(&unknown, 0, 4)
+            .expect_err("missing file errors");
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_range_unknown_backend_is_not_found() {
+        let backend = Arc::new(RecordingBackend::new("rec", b"hello world"));
+        // Seed a file whose backend id has no registered backend.
+        let entry = file_entry("missing-backend");
+        let db = Arc::new(StateDb::open_in_memory().expect("open in-memory state db"));
+        db.register_backend("missing-backend", "recording", "Missing", None, None)
+            .expect("register backend row");
+        db.upsert_file(&entry).expect("seed file row");
+        let root: Arc<dyn Backend> = backend.clone();
+        let vfs = Arc::new(RwLock::new(VfsTree::new(root)));
+        let backends: Vec<Arc<dyn Backend>> = vec![backend];
+        let provider =
+            EngineContentProvider::new(vfs, db, backends, tokio::runtime::Handle::current());
+
+        let err = provider
+            .read_range(&entry.id, 0, 4)
+            .expect_err("unknown backend errors");
+        assert_eq!(err.kind(), ErrorKind::NotFound);
     }
 }
