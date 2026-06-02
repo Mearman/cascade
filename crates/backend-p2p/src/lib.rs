@@ -689,9 +689,15 @@ impl P2pBackend {
         command: ManageCommand,
         scope: ManageScope,
     ) -> Result<ManageResult> {
-        // Reuse an existing session if one is already live — the data plane may
-        // already hold a connection to this device.
-        if !self.sync.has_peer(device_id).await {
+        // Reuse an existing session only when it is TLS-verified — the data
+        // plane may already hold a connection to this device, but a relayed or
+        // post-hole-punch session asserts the peer's device id on the wire
+        // without an end-to-end TLS handshake, so the managed node refuses a
+        // ManageRequest on it (see `handle_manage_request`). Reusing such a
+        // session would earn a spurious unauthorised denial — the exact NAT
+        // case this feature is most needed in — so when no *verified* session
+        // exists we dial a fresh direct one over the TLS ladder.
+        if !self.sync.has_verified_peer(device_id).await {
             let address = self
                 .resolve_remote_address(device_id)
                 .await
@@ -789,13 +795,20 @@ impl P2pBackend {
         discovery
     }
 
-    /// Wait for a session to `device_id` to register in the peer map.
+    /// Wait for a *TLS-verified* session to `device_id` to register in the peer
+    /// map.
     ///
     /// [`SyncEngine::connect_to`] completes the TLS handshake then spawns the
     /// session loop, which registers the peer handle asynchronously. Poll until
-    /// the handle appears (so a following management request finds a live
-    /// session) or the bounded wait elapses, failing loudly rather than racing
-    /// the send against session setup.
+    /// the *verified* handle appears (so a following management request finds a
+    /// session the managed node will honour) or the bounded wait elapses,
+    /// failing loudly rather than racing the send against session setup.
+    ///
+    /// Waiting on the verified flavour rather than any session is deliberate: a
+    /// stale relay or post-hole-punch session for the same device id could
+    /// already be registered, and a management request on that would be refused.
+    /// The direct dial just started replaces it with a verified session, so this
+    /// waits for that replacement specifically.
     async fn await_session(&self, device_id: &str) -> Result<()> {
         // The handshake plus first registration is sub-second on a direct dial;
         // poll a short interval up to a bounded total so a wedged setup fails
@@ -803,12 +816,14 @@ impl P2pBackend {
         let poll_interval = std::time::Duration::from_millis(50);
         let max_waits = SESSION_REGISTER_TIMEOUT.as_millis() / poll_interval.as_millis();
         for _ in 0..max_waits {
-            if self.sync.has_peer(device_id).await {
+            if self.sync.has_verified_peer(device_id).await {
                 return Ok(());
             }
             tokio::time::sleep(poll_interval).await;
         }
-        anyhow::bail!("session to {device_id} did not register within the connect window")
+        anyhow::bail!(
+            "TLS-verified session to {device_id} did not register within the connect window"
+        )
     }
 
     /// Convert a `FolderIndex` row into a `FileEntry` keyed under this
@@ -1255,6 +1270,16 @@ impl Backend for P2pBackend {
         // wired). 60s is a sensible default so changes() is still called
         // periodically to flush queued peer changes.
         Some(POLL_INTERVAL)
+    }
+
+    async fn set_manage_dispatch(&self, dispatch: Arc<dyn cascade_engine::manage::ManageDispatch>) {
+        // Hand the engine's management-plane dispatcher to the sync engine. The
+        // listener and session loops were spawned in `open` from clones of the
+        // same sync engine, which share the dispatch slot behind an `Arc<RwLock>`,
+        // so a request arriving after this point is authorised, audited, and
+        // executed through the dispatcher rather than refused as "not accepting
+        // remote management".
+        self.sync.set_manage_dispatch(dispatch).await;
     }
 }
 

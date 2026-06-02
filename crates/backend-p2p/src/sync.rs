@@ -355,6 +355,15 @@ pub struct Peer {
 /// Handle to a live peer session — used to send messages and fetch blocks.
 #[derive(Debug)]
 struct PeerHandle {
+    /// How the peer's device id was established for this session. Only a
+    /// [`CallerAuthentication::TlsVerified`] session may be reused for the
+    /// management plane: a relayed or post-hole-punch session asserts the
+    /// device id on the wire without an end-to-end TLS handshake, so the
+    /// managed node would refuse a `ManageRequest` arriving on it. The
+    /// manager-side reuse check ([`SyncEngine::has_verified_peer`]) consults
+    /// this so it never sends a management request down a session the node
+    /// will reject, dialling a fresh direct session instead.
+    caller_auth: CallerAuthentication,
     outbound: mpsc::UnboundedSender<BepMessage>,
     /// Outstanding block requests, keyed by the `request_id` allocated
     /// when the Request frame was sent. The responder echoes the id in
@@ -579,23 +588,34 @@ pub struct SyncEngine {
     /// terminal in [`Self::attempt_peer_relay`]; the target registers one on
     /// [`BepMessage::RelayInbound`].
     relay_terminals: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>>,
-    /// Management-plane dispatch port. When `Some`, an arriving
-    /// [`BepMessage::ManageRequest`] is run through it — the peer's
+    /// Management-plane dispatch port. When the inner `Option` is `Some`, an
+    /// arriving [`BepMessage::ManageRequest`] is run through it — the peer's
     /// TLS-authenticated device id is the caller principal, the engine resolves
     /// that caller's grants, authorises, audits, and dispatches into the same
     /// command handlers the local CLI drives. `None` leaves the management plane
     /// disabled: a `ManageRequest` is refused with a typed
     /// [`ManageErrorKind::Unauthorised`] error rather than silently ignored, so
     /// a manager learns the node is not accepting remote administration.
-    manage_dispatch: Option<Arc<dyn ManageDispatch>>,
+    ///
+    /// Held behind a shared `RwLock` rather than a plain field because the
+    /// daemon wires this in *after* the engine has been constructed and its
+    /// clones handed to the spawned listener and session loops (see
+    /// [`Self::set_manage_dispatch`]). Interior mutability over a clone-shared
+    /// `Arc` is what lets that late injection reach the loops already running on
+    /// the cloned engines — a builder-style move setter could not.
+    manage_dispatch: Arc<RwLock<Option<Arc<dyn ManageDispatch>>>>,
 }
 
 impl std::fmt::Debug for SyncEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `try_read` keeps `Debug` non-blocking; a momentary writer (a
+        // `set_manage_dispatch` in flight) reports the port as not-yet-known
+        // rather than deadlocking the formatter.
+        let manage_enabled = self.manage_dispatch.try_read().map(|slot| slot.is_some());
         f.debug_struct("SyncEngine")
             .field("folder_id", &self.folder_id)
             .field("device_short_id", &self.device_short_id)
-            .field("manage_enabled", &self.manage_dispatch.is_some())
+            .field("manage_enabled", &manage_enabled)
             .finish_non_exhaustive()
     }
 }
@@ -635,7 +655,7 @@ impl SyncEngine {
             )),
             relay_bridges: Arc::new(Mutex::new(HashMap::new())),
             relay_terminals: Arc::new(Mutex::new(HashMap::new())),
-            manage_dispatch: None,
+            manage_dispatch: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -643,10 +663,30 @@ impl SyncEngine {
     /// arriving [`BepMessage::ManageRequest`] is authorised, audited, and
     /// dispatched through it; left unset, the management plane is disabled and
     /// requests are refused with a typed unauthorised error.
+    ///
+    /// Convenience for callers that hold the dispatch port at construction time
+    /// (the tests). The daemon, which only obtains the port after building the
+    /// engine, uses [`Self::set_manage_dispatch`] instead.
     #[must_use]
-    pub fn with_manage_dispatch(mut self, dispatch: Arc<dyn ManageDispatch>) -> Self {
-        self.manage_dispatch = Some(dispatch);
+    pub fn with_manage_dispatch(self, dispatch: Arc<dyn ManageDispatch>) -> Self {
+        // The builder runs before any clone is handed to a spawned loop, so a
+        // blocking write here cannot contend with a live reader.
+        if let Ok(mut slot) = self.manage_dispatch.try_write() {
+            *slot = Some(dispatch);
+        }
         self
+    }
+
+    /// Install (or replace) the management-plane dispatch port on a live engine.
+    ///
+    /// Unlike [`Self::with_manage_dispatch`], this takes `&self` and writes
+    /// through the shared `RwLock`, so every clone of this engine — including the
+    /// ones already handed to the spawned listener and per-peer session loops —
+    /// observes the port. The daemon calls this once, after constructing the
+    /// engine that implements [`ManageDispatch`], before remote managers connect.
+    pub async fn set_manage_dispatch(&self, dispatch: Arc<dyn ManageDispatch>) {
+        let mut slot = self.manage_dispatch.write().await;
+        *slot = Some(dispatch);
     }
 
     /// Builder-style setter for the known relay endpoint pool. Threaded
@@ -968,10 +1008,37 @@ impl SyncEngine {
         &self.identity.device_id
     }
 
+    /// The address the BEP listener is bound to, once it has bound.
+    ///
+    /// `None` until [`Self::start_listener`] has bound a socket — outbound-only
+    /// deployments never bind and so always return `None`. Useful to a caller
+    /// that opened the backend with `listen_addr` set to port 0 and needs the
+    /// OS-assigned port (the integration tests dial a node opened that way).
+    pub async fn local_listen_addr(&self) -> Option<SocketAddr> {
+        *self.local_listen_addr.read().await
+    }
+
     /// `true` if a session to `device_id` is currently active.
     pub async fn has_peer(&self, device_id: &str) -> bool {
         let peers = self.peers.lock().await;
         peers.contains_key(device_id)
+    }
+
+    /// `true` if a session to `device_id` is active *and* its peer identity was
+    /// proven by a mutual-TLS handshake (so the managed node will honour a
+    /// management request on it).
+    ///
+    /// A relayed or post-hole-punch session is unverified — the device id is
+    /// asserted on the wire, not certificate-bound — and the managed node
+    /// refuses a `ManageRequest` arriving on it. The manager-side path uses this
+    /// rather than [`Self::has_peer`] when deciding whether an existing session
+    /// can carry a management command, so it never reuses a session the node
+    /// would reject and instead dials a fresh direct session.
+    pub async fn has_verified_peer(&self, device_id: &str) -> bool {
+        let peers = self.peers.lock().await;
+        peers
+            .get(device_id)
+            .is_some_and(|handle| handle.caller_auth.permits_management())
     }
 
     /// `true` if `device_id` is in the trusted set.
@@ -1897,6 +1964,7 @@ impl SyncEngine {
             peers.insert(
                 device_id.clone(),
                 PeerHandle {
+                    caller_auth,
                     outbound: tx.clone(),
                     pending: pending.clone(),
                     manage_pending: manage_pending.clone(),
@@ -2343,7 +2411,11 @@ impl SyncEngine {
         outbound: &mpsc::UnboundedSender<BepMessage>,
     ) {
         let result = if caller_auth.permits_management() {
-            match &self.manage_dispatch {
+            // Clone the Arc out under the read guard, then drop the guard before
+            // the await so a long-running dispatch never holds the lock against a
+            // concurrent `set_manage_dispatch`.
+            let dispatch = self.manage_dispatch.read().await.clone();
+            match dispatch {
                 Some(dispatch) => {
                     let caller = DeviceId::new(peer_device_id.to_owned());
                     dispatch
@@ -2858,6 +2930,7 @@ impl SyncEngine {
                     (
                         id.clone(),
                         PeerHandle {
+                            caller_auth: h.caller_auth,
                             outbound: h.outbound.clone(),
                             pending: h.pending.clone(),
                             manage_pending: h.manage_pending.clone(),
@@ -2917,6 +2990,7 @@ impl SyncEngine {
         let handle = {
             let peers = self.peers.lock().await;
             peers.get(device_id).map(|h| PeerHandle {
+                caller_auth: h.caller_auth,
                 outbound: h.outbound.clone(),
                 pending: h.pending.clone(),
                 manage_pending: h.manage_pending.clone(),
