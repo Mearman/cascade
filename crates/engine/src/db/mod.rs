@@ -8,6 +8,25 @@ use rusqlite::Connection;
 use std::path::Path;
 use std::sync::Mutex;
 
+/// Cap a logical `u64` size into the `i64` range `SQLite` stores
+/// integers in, for binding via `Option::map`. A real file never exceeds
+/// `i64::MAX` bytes (8 EiB), so the saturation point is unreachable; this
+/// exists only because rusqlite 0.40 dropped the `u64` `ToSql` impl to
+/// prevent silent truncation.
+fn size_to_sql(size: u64) -> i64 {
+    i64::try_from(size).unwrap_or(i64::MAX)
+}
+
+/// Read an optional `size` column back as `u64`. The column is stored as
+/// `i64` (see [`size_to_sql`]); a negative value is never written, so it
+/// clamps to 0. Mirrors the inline `Option<i64>` round-trip the
+/// `mod_time` column already uses.
+fn size_from_row(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<Option<u64>> {
+    Ok(row
+        .get::<_, Option<i64>>(idx)?
+        .map(|s| u64::try_from(s).unwrap_or(0)))
+}
+
 /// `SQLite` state database. Stores file metadata, backend config,
 /// pin rules, lifecycle policies, config cache, sync cursors, and P2P state.
 pub struct StateDb {
@@ -113,7 +132,7 @@ impl StateDb {
                 &entry.parent_id.0,
                 &entry.name,
                 entry.is_dir,
-                entry.size,
+                entry.size.map(size_to_sql),
                 &entry.mime_type,
                 entry.mod_time.map(|t| t.timestamp()),
                 &entry.hash,
@@ -141,7 +160,7 @@ impl StateDb {
                 parent_id: ItemId(row.get(1)?),
                 name: row.get(2)?,
                 is_dir: row.get(3)?,
-                size: row.get(4)?,
+                size: size_from_row(row, 4)?,
                 mime_type: row.get(5)?,
                 mod_time: row
                     .get::<_, Option<i64>>(6)?
@@ -435,7 +454,7 @@ impl StateDb {
                     parent_id: ItemId(row.get(1)?),
                     name: row.get(2)?,
                     is_dir: row.get(3)?,
-                    size: row.get(4)?,
+                    size: size_from_row(row, 4)?,
                     mime_type: row.get(5)?,
                     mod_time: row
                         .get::<_, Option<i64>>(6)?
@@ -464,7 +483,7 @@ impl StateDb {
                     parent_id: ItemId(row.get(1)?),
                     name: row.get(2)?,
                     is_dir: row.get(3)?,
-                    size: row.get(4)?,
+                    size: size_from_row(row, 4)?,
                     mime_type: row.get(5)?,
                     mod_time: row
                         .get::<_, Option<i64>>(6)?
@@ -493,7 +512,7 @@ impl StateDb {
                     parent_id: ItemId(row.get(1)?),
                     name: row.get(2)?,
                     is_dir: row.get(3)?,
-                    size: row.get(4)?,
+                    size: size_from_row(row, 4)?,
                     mime_type: row.get(5)?,
                     mod_time: row
                         .get::<_, Option<i64>>(6)?
@@ -592,7 +611,7 @@ impl StateDb {
                     parent_id: ItemId(row.get(3)?),
                     name: row.get(4)?,
                     is_dir: row.get(5)?,
-                    size: row.get(6)?,
+                    size: size_from_row(row, 6)?,
                     mime_type: row.get(7)?,
                     mod_time: row
                         .get::<_, Option<i64>>(8)?
@@ -619,13 +638,13 @@ impl StateDb {
              LIMIT ?1",
         )?;
         let entries = stmt
-            .query_map([limit], |row| {
+            .query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
                 Ok(FileEntry {
                     id: ItemId(row.get(0)?),
                     parent_id: ItemId(row.get(1)?),
                     name: row.get(2)?,
                     is_dir: row.get(3)?,
-                    size: row.get(4)?,
+                    size: size_from_row(row, 4)?,
                     mime_type: row.get(5)?,
                     mod_time: row
                         .get::<_, Option<i64>>(6)?
