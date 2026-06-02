@@ -165,6 +165,21 @@ pub struct ConfiguredPeer {
     pub name: Option<String>,
 }
 
+/// Kademlia/Mainline-DHT discovery configuration.
+///
+/// Its presence is the enable switch: a [`P2pBackendConfig`] carries
+/// `Some(DhtConfig)` to register the DHT discovery source and `None` to leave
+/// it off, modelling "DHT disabled" as the absence of configuration rather than
+/// a separate boolean flag.
+#[derive(Debug, Clone, Default)]
+pub struct DhtConfig {
+    /// Bootstrap nodes used to join the Mainline DHT, as resolved socket
+    /// addresses. Empty falls back to the `mainline` crate's built-in public
+    /// bootstrap set, so an operator can enable the DHT without supplying their
+    /// own bootstrap nodes.
+    pub bootstrap_nodes: Vec<std::net::SocketAddr>,
+}
+
 /// Configuration for a P2P backend instance.
 #[derive(Debug)]
 pub struct P2pBackendConfig {
@@ -222,6 +237,13 @@ pub struct P2pBackendConfig {
     /// discovery — the device relies on LAN multicast and introducer gossip
     /// alone.
     pub announce_servers: Vec<String>,
+    /// Kademlia/Mainline-DHT discovery configuration, or `None` to leave the
+    /// DHT source off. When `Some`, a [`cascade_p2p::discovery::DhtDiscovery`]
+    /// backed by the `BitTorrent` Mainline DHT is registered, so the device
+    /// publishes its candidate set into and resolves peers out of the DHT keyed
+    /// by device id — the serverless equivalent of the announce server. `None`
+    /// by default so the existing LAN/gossip/announce story is opt-in.
+    pub dht: Option<DhtConfig>,
     /// Known relay endpoints, in preference order. Fed into
     /// [`cascade_p2p::decide_connectivity`] as the relay pool when the
     /// strategy table calls for relayed transport. Empty disables the
@@ -273,6 +295,7 @@ impl Default for P2pBackendConfig {
             enable_wan_gossip: false,
             stun_servers: Vec::new(),
             announce_servers: Vec::new(),
+            dht: None,
             relay_endpoints: Vec::new(),
             relay_shared_secret: None,
             // Hole-punching is enabled by default — operators opt OUT by
@@ -370,6 +393,8 @@ impl P2pBackend {
         let cfg_enable_wan_gossip = cfg.enable_wan_gossip;
         let cfg_stun_servers = cfg.stun_servers.clone();
         let cfg_announce_servers = cfg.announce_servers.clone();
+        let cfg_dht = cfg.dht.clone();
+        let cfg_identity_dir = cfg.identity_dir.clone();
         let bootstrap_cancel = cancel.subscribe();
         let cancel_for_children = cancel.clone();
         tokio::spawn(async move {
@@ -523,12 +548,58 @@ impl P2pBackend {
                     ),
                 }
             }
+            // Register the Kademlia/Mainline-DHT source when enabled and the
+            // listener is up. The DHT publishes and resolves keyed by device
+            // id, so it is only useful once we have a bound port to advertise;
+            // a node whose construction fails (binding the DHT UDP socket, or
+            // loading the BEP44 signing key) is logged and skipped rather than
+            // aborting backend open, exactly like the announce-server source.
+            // The constructed source is cloned: one copy joins the resolver,
+            // the other drives the periodic announce loop below.
+            let dht_source = match (cfg_dht.as_ref(), bound_port.is_some()) {
+                (Some(dht_cfg), true) => {
+                    match cascade_p2p::discovery::MainlineDht::open(
+                        &cfg_identity_dir,
+                        &dht_cfg.bootstrap_nodes,
+                    ) {
+                        Ok(node) => {
+                            let source = cascade_p2p::discovery::DhtDiscovery::new(node);
+                            discovery.register(Box::new(source.clone()));
+                            Some(source)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "cascade::backend::p2p",
+                                instance = %cfg_instance_id,
+                                error = %e,
+                                "could not construct Mainline-DHT discovery node; skipping",
+                            );
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+
             tracing::debug!(
                 target: "cascade::backend::p2p",
                 instance = %cfg_instance_id,
                 sources = discovery.len(),
                 "discovery service composed",
             );
+
+            // Publish our local candidate set into the DHT on a periodic loop
+            // so peers can resolve us by device id without a central directory.
+            // Mirrors the announce-server publish loop: it gathers the current
+            // local candidates each tick and stores them under our device-id
+            // key, observing the same cancellation watch as the other loops.
+            if let Some(dht) = dht_source {
+                let dht_sync = sync_for_listener.clone();
+                let dht_cancel = cancel_for_children.subscribe();
+                tokio::spawn(async move {
+                    dht_publish_loop(dht, dht_sync, dht_cancel).await;
+                });
+            }
 
             // Publish our local candidate set to every announce server on a
             // periodic loop so peers can resolve us by device id even when
@@ -1358,6 +1429,43 @@ async fn announce_server_publish_loop(
     }
 }
 
+/// Periodically publish our local candidate set into the Mainline DHT so
+/// peers can resolve us by device id without a central directory.
+///
+/// Each tick gathers the current local candidates from the sync engine and
+/// stores them under our device-id key via the [`Discovery::announce`] impl on
+/// [`cascade_p2p::discovery::DhtDiscovery`]. A store that does not reach enough
+/// DHT nodes is handled best-effort inside the node — publication is
+/// best-effort, exactly like LAN and announce-server publish. Reuses the
+/// announce-server publish cadence ([`ANNOUNCE_PUBLISH_INTERVAL`]) so the DHT
+/// entry refreshes on the same soft-state rhythm.
+///
+/// Exits as soon as `cancel` flips to `true`.
+async fn dht_publish_loop(
+    dht: cascade_p2p::discovery::DhtDiscovery<cascade_p2p::discovery::MainlineDht>,
+    sync: SyncEngine,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+) {
+    let device_id = sync.device_id().to_string();
+    loop {
+        if *cancel.borrow() {
+            return;
+        }
+        let candidates = sync.local_candidates().await;
+        if !candidates.is_empty() {
+            dht.announce(&device_id, &candidates).await;
+        }
+        tokio::select! {
+            () = tokio::time::sleep(ANNOUNCE_PUBLISH_INTERVAL) => {}
+            res = cancel.changed() => {
+                if res.is_err() || *cancel.borrow() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// Window each [`LanDiscovery::listen_all`] call listens for before
 /// returning the peers seen. Matches the timeout the loop used before
 /// discovery moved behind the trait.
@@ -1459,6 +1567,14 @@ async fn discovery_listen_loop(
 ///   (e.g. `https://announce.example`). When non-empty, the device publishes
 ///   its candidates to and resolves peers against those servers via the
 ///   announce-server discovery source. Empty (or omitted) disables it.
+/// - `enable_dht` (optional, default `false`) — opt in to the
+///   Kademlia/Mainline-DHT discovery source, the serverless equivalent of the
+///   announce server. Requires `listen_addr` to be set (the DHT advertises the
+///   bound port).
+/// - `dht_bootstrap_nodes` (optional) — array of `host:port` Mainline-DHT
+///   bootstrap nodes used to join the DHT. Omitted or empty falls back to the
+///   `mainline` crate's built-in public bootstrap set. Ignored when
+///   `enable_dht` is `false`.
 pub fn create_backend(config: &toml::Value) -> Result<Box<dyn Backend>> {
     let name = config
         .get("name")
@@ -1503,6 +1619,7 @@ pub fn create_backend(config: &toml::Value) -> Result<Box<dyn Backend>> {
     let stun_servers = resolve_stun_servers(configured_stun_servers);
     let announce_servers =
         parse_string_list(config.get("announce_servers"), "announce_servers")?.unwrap_or_default();
+    let dht = parse_dht_config(config)?;
     let relay_endpoints = config
         .get("relay_endpoints")
         .and_then(toml::Value::as_array)
@@ -1564,6 +1681,7 @@ pub fn create_backend(config: &toml::Value) -> Result<Box<dyn Backend>> {
         enable_wan_gossip,
         stun_servers,
         announce_servers,
+        dht,
         relay_endpoints,
         relay_shared_secret,
         enable_hole_punch,
@@ -1574,6 +1692,37 @@ pub fn create_backend(config: &toml::Value) -> Result<Box<dyn Backend>> {
 
     let backend = P2pBackend::open(cfg)?;
     Ok(Box::new(backend))
+}
+
+/// Parse the Kademlia/Mainline-DHT discovery configuration from a backend's
+/// TOML.
+///
+/// Returns `Some(DhtConfig)` when `enable_dht` is truthy and `None` otherwise,
+/// so "DHT disabled" is the absence of configuration rather than a flag paired
+/// with ignored bootstrap nodes. `dht_bootstrap_nodes` is parsed regardless of
+/// the flag — a malformed `host:port` entry fails loudly with the offending
+/// value, matching the loud-failure parsing of `relay_endpoints` — but is only
+/// retained when the DHT is enabled.
+fn parse_dht_config(config: &toml::Value) -> Result<Option<DhtConfig>> {
+    let bootstrap_nodes = config
+        .get("dht_bootstrap_nodes")
+        .and_then(toml::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(toml::Value::as_str)
+                .map(|s| {
+                    s.parse::<std::net::SocketAddr>()
+                        .with_context(|| format!("invalid DHT bootstrap node `{s}`"))
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let enabled = config
+        .get("enable_dht")
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false);
+    Ok(enabled.then_some(DhtConfig { bootstrap_nodes }))
 }
 
 /// Parse a TOML array of strings, preserving the absent-vs-present distinction.
@@ -2260,8 +2409,56 @@ mod tests {
         assert!(cfg.enable_hole_punch);
         assert!(!cfg.enable_discovery);
         assert!(!cfg.enable_wan_gossip);
+        assert!(cfg.dht.is_none());
         assert!(cfg.relay_endpoints.is_empty());
         assert!(cfg.relay_shared_secret.is_none());
+    }
+
+    #[test]
+    fn parse_dht_config_absent_is_disabled() {
+        // No `enable_dht` key → the DHT source is off, modelled as `None`.
+        let value = toml::from_str::<toml::Value>(r#"name = "x""#).unwrap();
+        assert!(parse_dht_config(&value).unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_dht_config_enabled_without_bootstrap_uses_empty_set() {
+        // Enabling without bootstrap nodes is valid — the live node falls
+        // back to the public bootstrap set — so the parsed config carries an
+        // empty bootstrap list rather than failing.
+        let value = toml::from_str::<toml::Value>("name = \"x\"\nenable_dht = true").unwrap();
+        let dht = parse_dht_config(&value).unwrap().expect("DHT enabled");
+        assert!(dht.bootstrap_nodes.is_empty());
+    }
+
+    #[test]
+    fn parse_dht_config_enabled_parses_bootstrap_nodes() {
+        let toml_src = "name = \"x\"\nenable_dht = true\n\
+             dht_bootstrap_nodes = [\"127.0.0.1:6881\", \"10.0.0.1:6882\"]";
+        let value = toml::from_str::<toml::Value>(toml_src).unwrap();
+        let dht = parse_dht_config(&value).unwrap().expect("DHT enabled");
+        assert_eq!(dht.bootstrap_nodes.len(), 2);
+        assert_eq!(dht.bootstrap_nodes[0].port(), 6881);
+        assert_eq!(dht.bootstrap_nodes[1].port(), 6882);
+    }
+
+    #[test]
+    fn parse_dht_config_disabled_ignores_bootstrap_nodes() {
+        // Bootstrap nodes present but `enable_dht` absent → still disabled.
+        let toml_src = "name = \"x\"\ndht_bootstrap_nodes = [\"127.0.0.1:6881\"]";
+        let value = toml::from_str::<toml::Value>(toml_src).unwrap();
+        assert!(parse_dht_config(&value).unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_dht_config_rejects_malformed_bootstrap_node() {
+        // A bootstrap entry that is not a valid `host:port` must fail loudly
+        // with the offending value rather than being silently dropped.
+        let toml_src = "name = \"x\"\nenable_dht = true\n\
+             dht_bootstrap_nodes = [\"not-a-socket-addr\"]";
+        let value = toml::from_str::<toml::Value>(toml_src).unwrap();
+        let err = parse_dht_config(&value).expect_err("malformed node must error");
+        assert!(err.to_string().contains("not-a-socket-addr"));
     }
 
     /// Enabling LAN discovery must not block or panic on backend open.

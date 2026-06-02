@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 cascade-engine = { path = "../engine" }
-cascade-p2p = { path = "../p2p", features = ["announce"] }
+cascade-p2p = { path = "../p2p", features = ["announce", "dht"] }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
