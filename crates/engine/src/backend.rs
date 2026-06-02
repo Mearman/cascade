@@ -37,6 +37,29 @@ pub enum BackendError {
 // Note: Box<dyn Backend> is the owned concrete return type from create_backend.
 // Trait-object dyn Backend is used via Arc<dyn Backend> in VfsTree.
 
+/// Constructs a [`Backend`] from a TOML config fragment, dispatching on the
+/// backend type.
+///
+/// This is the composition port that lets the engine register a backend at
+/// runtime — for example when an authorised manager pushes a
+/// `BackendAdd` command — without the engine depending on any concrete backend
+/// crate. The daemon implements it at the edge by routing to the per-type
+/// `create_backend` factories (`cascade_backend_gdrive::create_backend`, …);
+/// the engine holds only the contract. An engine with no factory injected
+/// cannot add backends and fails loudly rather than silently dropping the
+/// request.
+pub trait BackendFactory: Send + Sync {
+    /// Build a backend instance of `backend_type` named `name` from its TOML
+    /// config document. Returns an error for an unsupported type or an invalid
+    /// config.
+    fn create(
+        &self,
+        name: &str,
+        backend_type: &str,
+        config_toml: &str,
+    ) -> anyhow::Result<Arc<dyn Backend>>;
+}
+
 /// A backend providing file storage. Every cloud provider and the local
 /// filesystem implement this trait. The engine never sees provider-specific
 /// APIs — all operations go through here.

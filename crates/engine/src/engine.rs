@@ -17,10 +17,12 @@ use tokio::sync::watch;
 use tracing::info;
 
 use async_trait::async_trait;
-use cascade_p2p::protocol::{ManageCommand, ManageResult, ManageScope as WireScope};
+use cascade_p2p::protocol::{
+    ManageCommand, ManageConfigFormat, ManageResult, ManageScope as WireScope,
+};
 use chrono::{DateTime, Utc};
 
-use crate::backend::Backend;
+use crate::backend::{Backend, BackendFactory};
 use crate::cache::manager::{CacheManager, CacheManagerConfig};
 use crate::changefeed::ChangeFeed;
 use crate::config::ConfigResolver;
@@ -48,6 +50,11 @@ pub struct EngineConfig {
     pub enable_p2p: bool,
     /// P2P data directory override. `None` uses `db_path` parent + `/p2p`.
     pub p2p_data_dir: Option<PathBuf>,
+    /// Factory used to construct backends at runtime — for example when an
+    /// authorised manager pushes a `BackendAdd` command. `None` leaves the
+    /// engine unable to add backends; such a request fails loudly rather than
+    /// being silently dropped.
+    pub backend_factory: Option<Arc<dyn BackendFactory>>,
 }
 
 impl fmt::Debug for EngineConfig {
@@ -59,6 +66,7 @@ impl fmt::Debug for EngineConfig {
             .field("cache_dir", &self.cache_dir)
             .field("enable_p2p", &self.enable_p2p)
             .field("p2p_data_dir", &self.p2p_data_dir)
+            .field("backend_factory", &self.backend_factory.is_some())
             .finish()
     }
 }
@@ -73,6 +81,9 @@ pub struct Engine {
     /// Engine-side per-parent change index. Fed by the sync runner and
     /// read by presenters that serve `enumerateChanges`-style deltas.
     change_feed: Arc<ChangeFeed>,
+    /// Factory for constructing backends at runtime (the `BackendAdd` path).
+    /// `None` when the host did not inject one.
+    backend_factory: Option<Arc<dyn BackendFactory>>,
     cancel: watch::Sender<bool>,
     cancel_rx: watch::Receiver<bool>,
 }
@@ -92,6 +103,7 @@ impl Engine {
     /// and wires up the cache manager and optional P2P bridge.
     pub fn new(config: EngineConfig) -> Result<Self> {
         let backends = config.backends;
+        let backend_factory = config.backend_factory;
         if backends.is_empty() {
             anyhow::bail!("at least one backend is required");
         }
@@ -148,6 +160,7 @@ impl Engine {
             config: config_resolver,
             p2p,
             change_feed: Arc::new(ChangeFeed::new()),
+            backend_factory,
             cancel,
             cancel_rx,
         })
@@ -276,6 +289,168 @@ impl Engine {
         self.cache.list_pins()
     }
 
+    /// Pre-warm a path glob so matching files are fetched on the next sync.
+    ///
+    /// Warming is a recursive pin: the same operation the local `cascade cache
+    /// warm` command performs. There is deliberately no separate warm path in
+    /// the cache manager — warming *is* pinning, and the background worker
+    /// materialises the pinned files.
+    pub fn warm(&self, pattern: &str) -> Result<()> {
+        self.cache.pin(pattern, true)
+    }
+
+    /// Merge a parsed `.cascade` fragment rooted at `folder` into the node's
+    /// rule set.
+    ///
+    /// The fragment's pin and lifecycle rules are applied to the state database
+    /// exactly as the equivalent local config-merge path would: each pin path
+    /// becomes a recursive pin rule, and each lifecycle policy is inserted with
+    /// its parsed age/size bounds. Rule paths declared relative to the fragment
+    /// (not absolute) are rooted under `folder` so they land in the subtree the
+    /// push is authorised over. Returns a short summary of what was applied.
+    pub fn config_push(
+        &self,
+        folder: &str,
+        config: &cascade_config::CascadeConfig,
+    ) -> Result<String> {
+        let mut pins_applied = 0usize;
+        for pin in &config.pin {
+            let path = root_under(folder, &pin.path);
+            self.db.add_pin_rule(&path, true, None)?;
+            pins_applied += 1;
+        }
+
+        let mut policies_applied = 0usize;
+        for policy in &config.lifecycle {
+            let path = root_under(folder, &policy.path);
+            let max_age = policy
+                .max_age
+                .as_deref()
+                .map(parse_duration_secs)
+                .transpose()?;
+            let max_file_size = policy
+                .max_file_size
+                .as_deref()
+                .map(parse_size_bytes)
+                .transpose()?;
+            self.db
+                .add_lifecycle_policy(&path, max_age, max_file_size, policy.priority, None)?;
+            policies_applied += 1;
+        }
+
+        Ok(format!(
+            "config push into {folder}: {pins_applied} pin rule(s), {policies_applied} lifecycle policy/policies applied",
+        ))
+    }
+
+    /// Set a single lifecycle policy on the node.
+    ///
+    /// Delegates to the same `add_lifecycle_policy` state-database operation the
+    /// local config-merge path uses, so a pushed policy behaves identically to
+    /// one declared in a `.cascade` file.
+    pub fn policy_set(
+        &self,
+        path_glob: &str,
+        max_age_secs: Option<i64>,
+        max_file_size: Option<i64>,
+        priority: i32,
+    ) -> Result<String> {
+        self.db
+            .add_lifecycle_policy(path_glob, max_age_secs, max_file_size, priority, None)?;
+        Ok(format!("lifecycle policy set for {path_glob}"))
+    }
+
+    /// Register and mount a backend at runtime.
+    ///
+    /// Builds the backend through the injected [`BackendFactory`] (the same
+    /// per-type `create_backend` factories the local daemon uses), registers it
+    /// in the state database, and mounts it into the live VFS tree at
+    /// `mount_path`. Fails loudly when no factory was injected rather than
+    /// silently dropping the request.
+    pub fn backend_add(
+        &self,
+        name: &str,
+        backend_type: &str,
+        mount_path: &str,
+        config_toml: &str,
+    ) -> Result<String> {
+        let factory = self.backend_factory.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("this node cannot add backends: no backend factory is configured")
+        })?;
+        let backend = factory.create(name, backend_type, config_toml)?;
+        self.db.register_backend(
+            name,
+            backend_type,
+            backend.display_name(),
+            Some(mount_path),
+            Some(config_toml),
+        )?;
+        self.mount_backend(PathBuf::from(mount_path), backend);
+        Ok(format!(
+            "backend {name} ({backend_type}) added at {mount_path}",
+        ))
+    }
+
+    /// Unmount and deregister a backend by name.
+    ///
+    /// Unmounts it from the live VFS tree and removes its state-database row,
+    /// the inverse of [`Engine::backend_add`].
+    pub fn backend_remove(&self, name: &str, mount_path: &str) -> Result<String> {
+        self.unmount_backend(Path::new(mount_path));
+        let removed = self.db.remove_backend(name)?;
+        Ok(if removed {
+            format!("backend {name} removed from {mount_path}")
+        } else {
+            format!("no backend named {name} was registered")
+        })
+    }
+
+    /// Restart the engine's background workers.
+    ///
+    /// Signals the current workers to stop, re-arms the cancellation channel,
+    /// and spawns a fresh worker set — the in-process equivalent of the daemon
+    /// `cascade restart`. The returned handle owns the new background tasks.
+    pub fn restart(&self) -> Result<EngineHandle> {
+        let _ = self.cancel.send(true);
+        // Re-arm: a freshly subscribed receiver reads `false` (running) so the
+        // new worker set does not see a stale shutdown signal.
+        let _ = self.cancel.send(false);
+        self.start()
+    }
+
+    /// Stop the engine's background workers — an alias of [`Engine::shutdown`]
+    /// returning a summary for the management plane.
+    #[must_use]
+    pub fn stop(&self) -> String {
+        self.shutdown();
+        "daemon workers signalled to stop".to_owned()
+    }
+
+    /// Insert a capability grant into the store.
+    ///
+    /// Delegates to the same `insert_grant` operation the local grant store
+    /// uses. Authorisation and the subset/escalation check are the dispatcher's
+    /// responsibility — this is the raw state mutation.
+    pub fn grant_add(&self, grant: &Grant) -> Result<String> {
+        let id = self.db.insert_grant(grant)?;
+        Ok(format!(
+            "grant {id} added: {} over {:?} for {}",
+            grant.capability.as_wire(),
+            grant.scope,
+            grant.grantee,
+        ))
+    }
+
+    /// Revoke a grant by its row id.
+    pub fn grant_revoke(&self, grant_id: i64) -> Result<String> {
+        let removed = self.db.revoke_grant(grant_id)?;
+        Ok(if removed {
+            format!("grant {grant_id} revoked")
+        } else {
+            format!("no grant with id {grant_id}")
+        })
+    }
+
     /// Get engine status — running state, mounted backends, cache stats.
     #[must_use]
     pub fn status(&self) -> EngineStatus {
@@ -386,6 +561,84 @@ impl ManageCommandExecutor for Engine {
             report.bytes_freed,
         ))
     }
+
+    async fn manage_cache_warm(&self, path_glob: &str) -> Result<String> {
+        self.warm(path_glob)?;
+        Ok(format!("warmed {path_glob}"))
+    }
+
+    async fn manage_config_push(
+        &self,
+        format: ManageConfigFormat,
+        folder: &str,
+        body: &str,
+    ) -> Result<String> {
+        let config = parse_config_fragment(format, body)?;
+        self.config_push(folder, &config)
+    }
+
+    async fn manage_policy_set(
+        &self,
+        path_glob: &str,
+        max_age_secs: Option<i64>,
+        max_file_size: Option<i64>,
+        priority: i32,
+    ) -> Result<String> {
+        self.policy_set(path_glob, max_age_secs, max_file_size, priority)
+    }
+
+    async fn manage_backend_add(
+        &self,
+        name: &str,
+        backend_type: &str,
+        mount_path: &str,
+        config_toml: &str,
+    ) -> Result<String> {
+        self.backend_add(name, backend_type, mount_path, config_toml)
+    }
+
+    async fn manage_backend_remove(&self, name: &str, mount_path: &str) -> Result<String> {
+        self.backend_remove(name, mount_path)
+    }
+
+    async fn manage_restart(&self) -> Result<String> {
+        // The returned handle owns freshly spawned background tasks. The daemon
+        // keeps the engine alive past this call, so detaching the handle lets
+        // the new workers run for the daemon's lifetime exactly as the initial
+        // `start()` handle does.
+        let _handle = self.restart()?;
+        Ok("daemon workers restarted".to_owned())
+    }
+
+    async fn manage_stop(&self) -> Result<String> {
+        Ok(self.stop())
+    }
+
+    async fn manage_grant_add(&self, grant: &Grant) -> Result<String> {
+        self.grant_add(grant)
+    }
+
+    async fn manage_grant_revoke(&self, grant_id: i64) -> Result<String> {
+        self.grant_revoke(grant_id)
+    }
+}
+
+/// Parse a pushed `.cascade` config fragment in `format` into a
+/// [`CascadeConfig`](cascade_config::CascadeConfig).
+///
+/// Routes to the matching `cascade-config` parser for the wire format. The
+/// gitignore parser is infallible; the structured parsers surface a parse error
+/// loudly rather than yielding an empty config.
+fn parse_config_fragment(
+    format: ManageConfigFormat,
+    body: &str,
+) -> Result<cascade_config::CascadeConfig> {
+    match format {
+        ManageConfigFormat::Gitignore => Ok(cascade_config::parse::gitignore::parse(body)),
+        ManageConfigFormat::Toml => cascade_config::parse::toml::parse(body),
+        ManageConfigFormat::Yaml => cascade_config::parse::yaml::parse(body),
+        ManageConfigFormat::Json => cascade_config::parse::json::parse(body),
+    }
 }
 
 #[async_trait]
@@ -436,6 +689,117 @@ pub struct CacheStatsSnapshot {
     pub total_bytes: u64,
 }
 
+/// Root a config rule's path under the fragment's target folder.
+///
+/// A rule whose path is absolute (begins with `/`) is taken as already
+/// node-absolute and left untouched. A relative rule path is joined beneath
+/// `folder` so a pushed fragment's rules land in the subtree the push is
+/// authorised over, never leaking outside it.
+fn root_under(folder: &str, rule_path: &str) -> String {
+    if rule_path.starts_with('/') {
+        return rule_path.to_owned();
+    }
+    let folder = folder.trim_end_matches('/');
+    let rule = rule_path.trim_start_matches('/');
+    if folder.is_empty() {
+        format!("/{rule}")
+    } else {
+        format!("{folder}/{rule}")
+    }
+}
+
+/// Seconds in one minute.
+const SECS_PER_MINUTE: i64 = 60;
+/// Seconds in one hour.
+const SECS_PER_HOUR: i64 = SECS_PER_MINUTE * 60;
+/// Seconds in one day.
+const SECS_PER_DAY: i64 = SECS_PER_HOUR * 24;
+/// Seconds in one week.
+const SECS_PER_WEEK: i64 = SECS_PER_DAY * 7;
+
+/// Parse a human duration in the `.cascade` lifecycle form into whole seconds.
+///
+/// Accepts an integer count followed by a single unit suffix: `s` (seconds),
+/// `m` (minutes), `h` (hours), `d` (days), or `w` (weeks). A bare integer is
+/// taken as seconds. Fails loudly on an empty, non-numeric, or unknown-unit
+/// value rather than guessing.
+fn parse_duration_secs(raw: &str) -> Result<i64> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("empty duration");
+    }
+    let (digits, unit_secs) = match trimmed.strip_suffix(['s', 'm', 'h', 'd', 'w']) {
+        Some(stripped) => {
+            let unit = trimmed
+                .as_bytes()
+                .last()
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("duration unit missing: {raw}"))?;
+            let multiplier = match unit {
+                b's' => 1,
+                b'm' => SECS_PER_MINUTE,
+                b'h' => SECS_PER_HOUR,
+                b'd' => SECS_PER_DAY,
+                b'w' => SECS_PER_WEEK,
+                _ => anyhow::bail!("unknown duration unit in {raw}"),
+            };
+            (stripped, multiplier)
+        }
+        None => (trimmed, 1),
+    };
+    let count: i64 = digits
+        .trim()
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid duration count in {raw}: {e}"))?;
+    count
+        .checked_mul(unit_secs)
+        .ok_or_else(|| anyhow::anyhow!("duration overflow in {raw}"))
+}
+
+/// Bytes in one kibibyte.
+const BYTES_PER_KIB: i64 = 1024;
+/// Bytes in one mebibyte.
+const BYTES_PER_MIB: i64 = BYTES_PER_KIB * 1024;
+/// Bytes in one gibibyte.
+const BYTES_PER_GIB: i64 = BYTES_PER_MIB * 1024;
+/// Bytes in one tebibyte.
+const BYTES_PER_TIB: i64 = BYTES_PER_GIB * 1024;
+
+/// Parse a human byte size in the `.cascade` cache/lifecycle form into bytes.
+///
+/// Accepts an integer count followed by an optional binary unit suffix: `KB`,
+/// `MB`, `GB`, or `TB` (interpreted as binary multiples, matching the rest of
+/// the cache sizing in this codebase). A bare integer is taken as bytes.
+/// Case-insensitive. Fails loudly on an empty, non-numeric, or unknown-unit
+/// value.
+fn parse_size_bytes(raw: &str) -> Result<i64> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("empty size");
+    }
+    let upper = trimmed.to_ascii_uppercase();
+    // Two-letter binary units first (longest suffix wins), then the bare-byte
+    // suffix, then a plain integer.
+    let binary_units: [(&str, i64); 4] = [
+        ("TB", BYTES_PER_TIB),
+        ("GB", BYTES_PER_GIB),
+        ("MB", BYTES_PER_MIB),
+        ("KB", BYTES_PER_KIB),
+    ];
+    let (digits, multiplier) = binary_units
+        .iter()
+        .find_map(|(suffix, mult)| upper.strip_suffix(suffix).map(|d| (d, *mult)))
+        .or_else(|| upper.strip_suffix('B').map(|d| (d, 1)))
+        .unwrap_or((upper.as_str(), 1));
+    let count: i64 = digits
+        .trim()
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid size count in {raw}: {e}"))?;
+    count
+        .checked_mul(multiplier)
+        .ok_or_else(|| anyhow::anyhow!("size overflow in {raw}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,6 +815,7 @@ mod tests {
             cache_dir: None,
             enable_p2p: false,
             p2p_data_dir: None,
+            backend_factory: None,
         })
         .unwrap()
     }
@@ -540,6 +905,7 @@ mod tests {
             cache_dir: None,
             enable_p2p: false,
             p2p_data_dir: None,
+            backend_factory: None,
         });
 
         assert!(result.is_err());
@@ -558,6 +924,7 @@ mod tests {
             cache_dir: None,
             enable_p2p: false,
             p2p_data_dir: None,
+            backend_factory: None,
         })
         .unwrap();
 
@@ -763,5 +1130,209 @@ mod tests {
                 panic!("status read should be authorised, got {err:?}")
             }
         }
+    }
+
+    // ── Duration / size parsing ──
+
+    #[test]
+    fn parse_duration_secs_units() {
+        assert_eq!(parse_duration_secs("30").unwrap(), 30);
+        assert_eq!(parse_duration_secs("45s").unwrap(), 45);
+        assert_eq!(parse_duration_secs("2m").unwrap(), 120);
+        assert_eq!(parse_duration_secs("3h").unwrap(), 3 * 3600);
+        assert_eq!(parse_duration_secs("7d").unwrap(), 7 * 86_400);
+        assert_eq!(parse_duration_secs("1w").unwrap(), 7 * 86_400);
+    }
+
+    #[test]
+    fn parse_duration_secs_rejects_bad_input() {
+        assert!(parse_duration_secs("").is_err());
+        assert!(parse_duration_secs("abc").is_err());
+        assert!(parse_duration_secs("10y").is_err());
+    }
+
+    #[test]
+    fn parse_size_bytes_units() {
+        assert_eq!(parse_size_bytes("512").unwrap(), 512);
+        assert_eq!(parse_size_bytes("512B").unwrap(), 512);
+        assert_eq!(parse_size_bytes("1KB").unwrap(), 1024);
+        assert_eq!(parse_size_bytes("2MB").unwrap(), 2 * 1024 * 1024);
+        assert_eq!(parse_size_bytes("1gb").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(
+            parse_size_bytes("1TB").unwrap(),
+            1024_i64 * 1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn parse_size_bytes_rejects_bad_input() {
+        assert!(parse_size_bytes("").is_err());
+        assert!(parse_size_bytes("big").is_err());
+    }
+
+    #[test]
+    fn root_under_roots_relative_and_preserves_absolute() {
+        assert_eq!(root_under("/work", "reports"), "/work/reports");
+        assert_eq!(root_under("/work/", "reports"), "/work/reports");
+        // An absolute rule path is left untouched.
+        assert_eq!(root_under("/work", "/personal/secret"), "/personal/secret");
+        // Empty folder roots at the filesystem root.
+        assert_eq!(root_under("", "reports"), "/reports");
+    }
+
+    // ── Engine-level command entry points against the real state DB ──
+
+    #[test]
+    fn config_push_applies_pins_and_policies_into_db() {
+        let engine = make_test_engine();
+        let body = r#"
+            [[pin]]
+            path = "reports"
+
+            [[lifecycle]]
+            path = "tmp"
+            max_age = "7d"
+            max_file_size = "1MB"
+            priority = 3
+        "#;
+        let config = cascade_config::parse::toml::parse(body).unwrap();
+        engine.config_push("/work", &config).unwrap();
+
+        let pins = engine.db().list_pin_rules().unwrap();
+        assert!(
+            pins.iter().any(|p| p.path_glob == "/work/reports"),
+            "relative pin path must be rooted under the pushed folder, got {pins:?}",
+        );
+
+        let policies = engine.db().list_lifecycle_policies().unwrap();
+        let policy = policies
+            .iter()
+            .find(|p| p.path_glob == "/work/tmp")
+            .expect("lifecycle policy rooted under the folder");
+        assert_eq!(policy.max_age, Some(7 * 86_400));
+        assert_eq!(policy.max_file_size, Some(1024 * 1024));
+        assert_eq!(policy.priority, 3);
+    }
+
+    #[test]
+    fn policy_set_inserts_a_lifecycle_policy() {
+        let engine = make_test_engine();
+        engine
+            .policy_set("/work/*.tmp", Some(3600), None, 1)
+            .unwrap();
+        let policies = engine.db().list_lifecycle_policies().unwrap();
+        let policy = policies
+            .iter()
+            .find(|p| p.path_glob == "/work/*.tmp")
+            .expect("policy inserted");
+        assert_eq!(policy.max_age, Some(3600));
+        assert_eq!(policy.max_file_size, None);
+    }
+
+    #[test]
+    fn grant_add_and_revoke_round_trip_through_db() {
+        use crate::manage::{Capability, Scope};
+        let engine = make_test_engine();
+        let g = Grant {
+            grantee: DeviceId::new("SUBORDINATE"),
+            capability: Capability::PinWrite,
+            scope: Scope::folder("/work"),
+            granted_by: manager_id(),
+            expires: None,
+        };
+        engine.grant_add(&g).unwrap();
+        let grants = engine.db().list_grants().unwrap();
+        assert_eq!(grants.len(), 1);
+        let record = grants.first().expect("one grant");
+        assert_eq!(record.grant.grantee, DeviceId::new("SUBORDINATE"));
+        assert_eq!(record.grant.granted_by, manager_id());
+
+        let summary = engine.grant_revoke(record.id).unwrap();
+        assert!(summary.contains("revoked"), "summary: {summary}");
+        assert!(engine.db().list_grants().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn backend_add_without_factory_fails_loudly() {
+        // make_test_engine injects no factory, so a BackendAdd must error rather
+        // than silently no-op.
+        let engine = make_test_engine();
+        let err = engine
+            .backend_add("x", "gdrive", "/drive", "type = \"gdrive\"\n")
+            .expect_err("backend_add must fail with no factory");
+        assert!(
+            err.to_string().contains("no backend factory"),
+            "error should name the missing factory, got {err}",
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_rearms_running_state() {
+        let engine = make_test_engine();
+        engine.shutdown();
+        assert!(!engine.status().running, "shutdown should stop the engine");
+        let _handle = engine.restart().unwrap();
+        assert!(
+            engine.status().running,
+            "restart must re-arm the running state",
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_grant_add_escalation_is_refused_end_to_end() {
+        use crate::manage::{Capability, Scope};
+        let engine = make_test_engine();
+        // The manager may delegate (grant:admin over /work) but does NOT hold
+        // pin:write — delegating it is an escalation and must be refused, with
+        // no grant inserted and the denial audited.
+        engine
+            .db()
+            .insert_grant(&Grant {
+                grantee: manager_id(),
+                capability: Capability::GrantAdmin,
+                scope: Scope::folder("/work"),
+                granted_by: DeviceId::new("OWNER"),
+                expires: None,
+            })
+            .unwrap();
+
+        let result = engine
+            .dispatch(
+                &manager_id(),
+                ManageCommand::GrantAdd {
+                    grant: cascade_p2p::protocol::ManageGrant {
+                        grantee: "SUBORDINATE".to_owned(),
+                        capability: "pin:write".to_owned(),
+                        scope: WireScope::Folder {
+                            path: "/work".to_owned(),
+                        },
+                        expires: None,
+                    },
+                },
+                WireScope::Folder {
+                    path: "/work".to_owned(),
+                },
+                Utc::now(),
+            )
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                ManageResult::Err {
+                    kind: cascade_p2p::protocol::ManageErrorKind::Unauthorised,
+                    ..
+                }
+            ),
+            "escalating delegation must be refused, got {result:?}",
+        );
+        // Only the manager's own grant exists — no delegated grant was inserted.
+        assert_eq!(engine.db().list_grants().unwrap().len(), 1);
+        let audit = engine.db().list_audit().unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(
+            audit.first().map(|r| r.entry.outcome.as_str()),
+            Some("denied"),
+        );
     }
 }

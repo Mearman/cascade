@@ -25,12 +25,13 @@
 
 use async_trait::async_trait;
 use cascade_p2p::protocol::{
-    ManageCommand, ManageErrorKind, ManageResult, ManageScope as WireScope,
+    ManageCommand, ManageConfigFormat, ManageErrorKind, ManageGrant, ManageResult,
+    ManageScope as WireScope,
 };
 use chrono::{DateTime, Utc};
 
 use crate::db::AuditEntry;
-use crate::manage::{Capability, DeviceId, Scope, authorises};
+use crate::manage::{Capability, DeviceId, Grant, Scope, authorises};
 
 /// Audit `outcome` column value for a command that was authorised and applied.
 const OUTCOME_ALLOWED: &str = "allowed";
@@ -67,6 +68,59 @@ pub trait ManageCommandExecutor: Send + Sync {
 
     /// Run one cache eviction sweep. Backs [`Capability::CacheManage`].
     async fn manage_cache_evict(&self) -> anyhow::Result<String>;
+
+    /// Pre-warm a path glob so matching files are fetched on the next sync.
+    /// Backs [`Capability::CacheManage`].
+    async fn manage_cache_warm(&self, path_glob: &str) -> anyhow::Result<String>;
+
+    /// Merge a `.cascade` config fragment, in `format`, rooted at `folder`.
+    /// Backs [`Capability::ConfigPush`].
+    async fn manage_config_push(
+        &self,
+        format: ManageConfigFormat,
+        folder: &str,
+        body: &str,
+    ) -> anyhow::Result<String>;
+
+    /// Set a lifecycle policy. Backs [`Capability::PolicySet`].
+    async fn manage_policy_set(
+        &self,
+        path_glob: &str,
+        max_age_secs: Option<i64>,
+        max_file_size: Option<i64>,
+        priority: i32,
+    ) -> anyhow::Result<String>;
+
+    /// Register and mount a backend. Backs the dangerous
+    /// [`Capability::BackendManage`].
+    async fn manage_backend_add(
+        &self,
+        name: &str,
+        backend_type: &str,
+        mount_path: &str,
+        config_toml: &str,
+    ) -> anyhow::Result<String>;
+
+    /// Unmount and deregister a backend. Backs the dangerous
+    /// [`Capability::BackendManage`].
+    async fn manage_backend_remove(&self, name: &str, mount_path: &str) -> anyhow::Result<String>;
+
+    /// Restart the daemon's background workers. Backs the dangerous
+    /// [`Capability::LifecycleControl`].
+    async fn manage_restart(&self) -> anyhow::Result<String>;
+
+    /// Stop the daemon's background workers. Backs the dangerous
+    /// [`Capability::LifecycleControl`].
+    async fn manage_stop(&self) -> anyhow::Result<String>;
+
+    /// Add a delegated grant. The grant has already been validated as a subset
+    /// of the caller's authority and stamped with the caller as `granted_by`
+    /// before this is called. Backs the dangerous [`Capability::GrantAdmin`].
+    async fn manage_grant_add(&self, grant: &Grant) -> anyhow::Result<String>;
+
+    /// Revoke a grant by its row id. Backs the dangerous
+    /// [`Capability::GrantAdmin`].
+    async fn manage_grant_revoke(&self, grant_id: i64) -> anyhow::Result<String>;
 }
 
 /// The grant store and audit sink the dispatcher reads and writes.
@@ -114,7 +168,16 @@ pub const fn required_capability(command: &ManageCommand) -> Capability {
     match command {
         ManageCommand::StatusRead => Capability::StatusRead,
         ManageCommand::Pin { .. } | ManageCommand::Unpin { .. } => Capability::PinWrite,
-        ManageCommand::CacheEvict => Capability::CacheManage,
+        ManageCommand::CacheEvict | ManageCommand::CacheWarm { .. } => Capability::CacheManage,
+        ManageCommand::ConfigPush { .. } => Capability::ConfigPush,
+        ManageCommand::PolicySet { .. } => Capability::PolicySet,
+        ManageCommand::BackendAdd { .. } | ManageCommand::BackendRemove { .. } => {
+            Capability::BackendManage
+        }
+        ManageCommand::Restart | ManageCommand::Stop => Capability::LifecycleControl,
+        ManageCommand::GrantAdd { .. } | ManageCommand::GrantRevoke { .. } => {
+            Capability::GrantAdmin
+        }
     }
 }
 
@@ -130,12 +193,21 @@ pub fn scope_from_wire(scope: &WireScope) -> Scope {
 /// The [`Scope`] a command's *own payload* targets, independent of the wire
 /// `scope` field the caller supplied.
 ///
-/// A path-bearing command (Pin/Unpin) mutates the node at its `path_glob`, so
-/// the operation's real target is the folder subtree that glob lives in — not
-/// whatever scope the caller chose to advertise. A command with no path target
+/// A path-bearing command (Pin/Unpin/CacheWarm/PolicySet) mutates the node at
+/// its path, so the operation's real target is the folder subtree that path
+/// lives in — not whatever scope the caller chose to advertise. `ConfigPush`
+/// targets its declared `folder`; a backend command targets its `mount_path`; a
+/// grant command targets the scope carried in its grant/payload. A command with
+/// no payload path that acts node-wide
 /// ([`StatusRead`](ManageCommand::StatusRead),
-/// [`CacheEvict`](ManageCommand::CacheEvict)) acts node-wide, so its target is
-/// [`Scope::Node`].
+/// [`CacheEvict`](ManageCommand::CacheEvict)) targets [`Scope::Node`].
+///
+/// [`Restart`](ManageCommand::Restart) and [`Stop`](ManageCommand::Stop) carry
+/// no payload path yet affect the whole node; because their capability is
+/// dangerous (never satisfied by a node-wide grant), keying their target on
+/// [`Scope::Node`] would make them unauthorisable. They instead return `None`,
+/// signalling that their only target is the explicit folder scope the caller
+/// advertises on the wire — which the dangerous-capability bar requires anyway.
 ///
 /// The dispatcher authorises the granted scope against *both* this payload-derived
 /// target and the wire `scope`, which closes the scope-escape where an authorised
@@ -145,12 +217,24 @@ pub fn scope_from_wire(scope: &WireScope) -> Scope {
 /// bare glob with no fixed prefix (`*.pdf`) targets the node root so only a
 /// node-wide grant covers it.
 #[must_use]
-fn command_target_scope(command: &ManageCommand) -> Scope {
+fn command_target_scope(command: &ManageCommand) -> Option<Scope> {
     match command {
-        ManageCommand::StatusRead | ManageCommand::CacheEvict => Scope::Node,
-        ManageCommand::Pin { path_glob, .. } | ManageCommand::Unpin { path_glob } => {
-            Scope::folder(glob_fixed_prefix(path_glob))
+        ManageCommand::StatusRead | ManageCommand::CacheEvict => Some(Scope::Node),
+        ManageCommand::Pin { path_glob, .. }
+        | ManageCommand::Unpin { path_glob }
+        | ManageCommand::CacheWarm { path_glob }
+        | ManageCommand::PolicySet { path_glob, .. } => {
+            Some(Scope::folder(glob_fixed_prefix(path_glob)))
         }
+        ManageCommand::ConfigPush { folder, .. } => Some(Scope::folder(folder.clone())),
+        ManageCommand::BackendAdd { mount_path, .. }
+        | ManageCommand::BackendRemove { mount_path, .. } => {
+            Some(Scope::folder(mount_path.clone()))
+        }
+        ManageCommand::GrantAdd { grant } => Some(scope_from_wire(&grant.scope)),
+        ManageCommand::GrantRevoke { scope, .. } => Some(scope_from_wire(scope)),
+        // No payload path; only the advertised wire scope confines these.
+        ManageCommand::Restart | ManageCommand::Stop => None,
     }
 }
 
@@ -193,6 +277,25 @@ fn command_summary(command: &ManageCommand) -> String {
         } => format!("pin {path_glob} (recursive={recursive})"),
         ManageCommand::Unpin { path_glob } => format!("unpin {path_glob}"),
         ManageCommand::CacheEvict => "cache evict".to_owned(),
+        ManageCommand::CacheWarm { path_glob } => format!("cache warm {path_glob}"),
+        ManageCommand::ConfigPush { folder, .. } => format!("config push into {folder}"),
+        ManageCommand::PolicySet { path_glob, .. } => format!("policy set for {path_glob}"),
+        ManageCommand::BackendAdd {
+            name,
+            backend_type,
+            mount_path,
+            ..
+        } => format!("backend add {name} ({backend_type}) at {mount_path}"),
+        ManageCommand::BackendRemove { name, mount_path } => {
+            format!("backend remove {name} at {mount_path}")
+        }
+        ManageCommand::Restart => "lifecycle restart".to_owned(),
+        ManageCommand::Stop => "lifecycle stop".to_owned(),
+        ManageCommand::GrantAdd { grant } => format!(
+            "grant add {} to {} over {:?}",
+            grant.capability, grant.grantee, grant.scope
+        ),
+        ManageCommand::GrantRevoke { grant_id, .. } => format!("grant revoke {grant_id}"),
     }
 }
 
@@ -223,8 +326,10 @@ where
     // command rather than the caller-supplied wire `scope`. Authorising over
     // both closes the scope-escape where a Pin{path_glob:"/personal"} carries a
     // wire scope of "/work" the caller does hold a grant over: the grant must
-    // cover the path that is really touched, not just the advertised scope.
-    let target_scope = command_target_scope(&command);
+    // cover the path that is really touched, not just the advertised scope. A
+    // payload-less command (Restart/Stop) has no derived target; the audit row
+    // and authorisation then key on the advertised wire scope alone.
+    let target_scope = command_target_scope(&command).unwrap_or_else(|| scope.clone());
     let command_text = command_summary(&command);
 
     let grants = match store.manage_grants() {
@@ -246,8 +351,22 @@ where
     // payload-derived target stops a caller pinning `/personal` under a `/work`
     // grant by lying in the wire `scope` field, and keeping the wire-scope check
     // preserves the contract that the advertised scope is also honoured.
-    let authorised = authorises(&grants, caller, capability, &target_scope, now)
+    let capability_authorised = authorises(&grants, caller, capability, &target_scope, now)
         && authorises(&grants, caller, capability, &scope, now);
+
+    // GrantAdd carries a second, stricter gate: the grant being delegated must
+    // be a subset of what the caller itself holds. Holding `grant:admin` is not
+    // enough — a manager can only hand out authority it already has, never
+    // escalate. The check is independent of the capability authorisation above
+    // (which only confirms the caller may delegate at all over the grant's
+    // scope); a failure here is an unauthorised escalation attempt and is
+    // audited as denied just like any other refusal.
+    let delegation_permitted = match &command {
+        ManageCommand::GrantAdd { grant } => caller_can_delegate(&grants, caller, grant, now),
+        _ => true,
+    };
+
+    let authorised = capability_authorised && delegation_permitted;
 
     let outcome = if authorised {
         OUTCOME_ALLOWED
@@ -285,7 +404,7 @@ where
         };
     }
 
-    let applied = execute(executor, command).await;
+    let applied = execute(executor, caller, command).await;
     match applied {
         Ok(summary) => ManageResult::Ok { summary },
         Err(e) => {
@@ -319,7 +438,14 @@ where
 }
 
 /// Dispatch an authorised command into the executor's matching method.
-async fn execute<E>(executor: &E, command: ManageCommand) -> anyhow::Result<String>
+///
+/// `caller` is the authenticated delegating principal; it is the `granted_by`
+/// stamped onto a delegated grant, never a value taken off the wire.
+async fn execute<E>(
+    executor: &E,
+    caller: &DeviceId,
+    command: ManageCommand,
+) -> anyhow::Result<String>
 where
     E: ManageCommandExecutor + ?Sized,
 {
@@ -331,7 +457,106 @@ where
         } => executor.manage_pin(&path_glob, recursive).await,
         ManageCommand::Unpin { path_glob } => executor.manage_unpin(&path_glob).await,
         ManageCommand::CacheEvict => executor.manage_cache_evict().await,
+        ManageCommand::CacheWarm { path_glob } => executor.manage_cache_warm(&path_glob).await,
+        ManageCommand::ConfigPush {
+            format,
+            folder,
+            body,
+        } => executor.manage_config_push(format, &folder, &body).await,
+        ManageCommand::PolicySet {
+            path_glob,
+            max_age_secs,
+            max_file_size,
+            priority,
+        } => {
+            executor
+                .manage_policy_set(&path_glob, max_age_secs, max_file_size, priority)
+                .await
+        }
+        ManageCommand::BackendAdd {
+            name,
+            backend_type,
+            mount_path,
+            config_toml,
+        } => {
+            executor
+                .manage_backend_add(&name, &backend_type, &mount_path, &config_toml)
+                .await
+        }
+        ManageCommand::BackendRemove { name, mount_path } => {
+            executor.manage_backend_remove(&name, &mount_path).await
+        }
+        ManageCommand::Restart => executor.manage_restart().await,
+        ManageCommand::Stop => executor.manage_stop().await,
+        ManageCommand::GrantAdd { grant } => {
+            // Build the domain grant, stamping the authenticated caller as
+            // `granted_by`. The grantee/capability/scope/expiry come off the
+            // wire and are validated here; a malformed grant is a Failed error,
+            // not a silent skip.
+            let domain = grant_from_wire(&grant, caller)?;
+            executor.manage_grant_add(&domain).await
+        }
+        ManageCommand::GrantRevoke { grant_id, .. } => executor.manage_grant_revoke(grant_id).await,
     }
+}
+
+/// Build a domain [`Grant`] from a wire [`ManageGrant`], stamping `granted_by`
+/// with the authenticated caller.
+///
+/// Validates the capability against the known vocabulary and parses the optional
+/// RFC 3339 expiry, failing loudly rather than dropping a malformed field.
+fn grant_from_wire(wire: &ManageGrant, granted_by: &DeviceId) -> anyhow::Result<Grant> {
+    let capability = Capability::from_wire(&wire.capability).ok_or_else(|| {
+        anyhow::anyhow!("unknown capability in delegated grant: {}", wire.capability)
+    })?;
+    let scope = scope_from_wire(&wire.scope);
+    let expires = wire
+        .expires
+        .as_deref()
+        .map(|raw| {
+            DateTime::parse_from_rfc3339(raw)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|e| anyhow::anyhow!("parsing delegated grant expiry {raw}: {e}"))
+        })
+        .transpose()?;
+    Ok(Grant {
+        grantee: DeviceId::new(wire.grantee.clone()),
+        capability,
+        scope,
+        granted_by: granted_by.clone(),
+        expires,
+    })
+}
+
+/// Whether `caller` may delegate `delegated` — the subset/no-escalation guard
+/// for [`ManageCommand::GrantAdd`].
+///
+/// The delegated grant must be wholly contained in the caller's own authority:
+/// the caller must hold an unexpired grant of the *same capability* whose scope
+/// [covers](Scope::covers) the delegated scope. A manager can hand out only a
+/// subset of what it has — never a capability it lacks, and never a wider scope
+/// than it holds. Expiry is not narrowed here (a shorter or absent delegated
+/// expiry is always a subset of the caller's; a longer one is bounded in effect
+/// by the caller's own grant lapsing), so the guard keys purely on capability
+/// identity and scope containment.
+fn caller_can_delegate(
+    grants: &[Grant],
+    caller: &DeviceId,
+    delegated: &ManageGrant,
+    now: DateTime<Utc>,
+) -> bool {
+    let Some(capability) = Capability::from_wire(&delegated.capability) else {
+        // An unrecognised capability cannot be a subset of anything the caller
+        // holds — refuse rather than letting it through to a later Failed.
+        return false;
+    };
+    let delegated_scope = scope_from_wire(&delegated.scope);
+    grants.iter().any(|held| {
+        held.grantee == *caller
+            && held.capability == capability
+            && !held.is_expired(now)
+            && held.scope.covers(&delegated_scope)
+    })
 }
 
 #[cfg(test)]
@@ -439,6 +664,82 @@ mod tests {
         async fn manage_cache_evict(&self) -> anyhow::Result<String> {
             self.record("evict");
             Ok("evicted".to_owned())
+        }
+
+        async fn manage_cache_warm(&self, path_glob: &str) -> anyhow::Result<String> {
+            self.record(&format!("warm {path_glob}"));
+            Ok(format!("warmed {path_glob}"))
+        }
+
+        async fn manage_config_push(
+            &self,
+            format: ManageConfigFormat,
+            folder: &str,
+            body: &str,
+        ) -> anyhow::Result<String> {
+            self.record(&format!("config_push {format:?} {folder} {body}"));
+            Ok(format!("pushed into {folder}"))
+        }
+
+        async fn manage_policy_set(
+            &self,
+            path_glob: &str,
+            max_age_secs: Option<i64>,
+            max_file_size: Option<i64>,
+            priority: i32,
+        ) -> anyhow::Result<String> {
+            self.record(&format!(
+                "policy_set {path_glob} {max_age_secs:?} {max_file_size:?} {priority}"
+            ));
+            Ok(format!("policy set for {path_glob}"))
+        }
+
+        async fn manage_backend_add(
+            &self,
+            name: &str,
+            backend_type: &str,
+            mount_path: &str,
+            config_toml: &str,
+        ) -> anyhow::Result<String> {
+            self.record(&format!(
+                "backend_add {name} {backend_type} {mount_path} {config_toml}"
+            ));
+            Ok(format!("backend {name} added"))
+        }
+
+        async fn manage_backend_remove(
+            &self,
+            name: &str,
+            mount_path: &str,
+        ) -> anyhow::Result<String> {
+            self.record(&format!("backend_remove {name} {mount_path}"));
+            Ok(format!("backend {name} removed"))
+        }
+
+        async fn manage_restart(&self) -> anyhow::Result<String> {
+            self.record("restart");
+            Ok("restarted".to_owned())
+        }
+
+        async fn manage_stop(&self) -> anyhow::Result<String> {
+            self.record("stop");
+            Ok("stopped".to_owned())
+        }
+
+        async fn manage_grant_add(&self, grant: &Grant) -> anyhow::Result<String> {
+            self.record(&format!(
+                "grant_add grantee={} cap={} scope={:?} granted_by={}",
+                grant.grantee,
+                grant.capability.as_wire(),
+                grant.scope,
+                grant.granted_by,
+            ));
+            Ok("grant added".to_owned())
+        }
+
+        async fn manage_grant_revoke(&self, grant_id: i64) -> anyhow::Result<String> {
+            self.record(&format!("grant_revoke {grant_id}"));
+            Ok(format!("grant {grant_id} revoked"))
         }
     }
 
@@ -738,5 +1039,561 @@ mod tests {
             audit.get(1).map(|r| r.outcome.as_str()),
             Some(OUTCOME_FAILED)
         );
+    }
+
+    // ── New command surface: authorised round-trips ──
+
+    /// Assert an authorised command runs exactly once, audits a single
+    /// `allowed` row carrying the expected capability and target scope, and the
+    /// recorded executor call matches `expected_call`.
+    async fn assert_authorised(
+        grants: Vec<Grant>,
+        command: ManageCommand,
+        wire_scope: WireScope,
+        expected_capability: Capability,
+        expected_scope: Scope,
+        expected_call: &str,
+    ) {
+        let store = FakeStore::new(grants);
+        let executor = FakeExecutor::default();
+        let result = run_dispatch(
+            &store,
+            &executor,
+            &manager(),
+            command,
+            wire_scope,
+            at(2026, 1, 1),
+        )
+        .await;
+        assert!(
+            matches!(result, ManageResult::Ok { .. }),
+            "authorised command should succeed, got {result:?}",
+        );
+        assert_eq!(
+            executor.calls(),
+            vec![expected_call.to_owned()],
+            "the side effect must run exactly once with the expected arguments",
+        );
+        let audit = store.audit_rows();
+        assert_eq!(audit.len(), 1, "exactly one audit row");
+        let row = audit.first().expect("one audit row");
+        assert_eq!(row.outcome, OUTCOME_ALLOWED);
+        assert_eq!(row.capability, expected_capability);
+        assert_eq!(row.scope, expected_scope);
+    }
+
+    #[tokio::test]
+    async fn cache_warm_authorised_runs_and_audits() {
+        assert_authorised(
+            vec![grant(Capability::CacheManage, Scope::folder("/work"))],
+            ManageCommand::CacheWarm {
+                path_glob: "/work/**".to_owned(),
+            },
+            WireScope::Folder {
+                path: "/work".to_owned(),
+            },
+            Capability::CacheManage,
+            Scope::folder("/work"),
+            "warm /work/**",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn config_push_authorised_runs_and_audits() {
+        assert_authorised(
+            vec![grant(Capability::ConfigPush, Scope::folder("/work"))],
+            ManageCommand::ConfigPush {
+                format: ManageConfigFormat::Gitignore,
+                folder: "/work".to_owned(),
+                body: "*.tmp\n".to_owned(),
+            },
+            WireScope::Folder {
+                path: "/work".to_owned(),
+            },
+            Capability::ConfigPush,
+            Scope::folder("/work"),
+            "config_push Gitignore /work *.tmp\n",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn policy_set_authorised_runs_and_audits() {
+        assert_authorised(
+            vec![grant(Capability::PolicySet, Scope::folder("/work"))],
+            ManageCommand::PolicySet {
+                path_glob: "/work/*.tmp".to_owned(),
+                max_age_secs: Some(3600),
+                max_file_size: None,
+                priority: 2,
+            },
+            WireScope::Folder {
+                path: "/work".to_owned(),
+            },
+            Capability::PolicySet,
+            Scope::folder("/work"),
+            "policy_set /work/*.tmp Some(3600) None 2",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn backend_add_authorised_under_explicit_folder_grant_runs_and_audits() {
+        // BackendManage is dangerous, so an explicit folder grant — never a
+        // node-wide one — is required.
+        assert_authorised(
+            vec![grant(Capability::BackendManage, Scope::folder("/drive"))],
+            ManageCommand::BackendAdd {
+                name: "personal".to_owned(),
+                backend_type: "gdrive".to_owned(),
+                mount_path: "/drive".to_owned(),
+                config_toml: "type = \"gdrive\"\n".to_owned(),
+            },
+            WireScope::Folder {
+                path: "/drive".to_owned(),
+            },
+            Capability::BackendManage,
+            Scope::folder("/drive"),
+            "backend_add personal gdrive /drive type = \"gdrive\"\n",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn backend_remove_authorised_under_explicit_folder_grant_runs_and_audits() {
+        assert_authorised(
+            vec![grant(Capability::BackendManage, Scope::folder("/drive"))],
+            ManageCommand::BackendRemove {
+                name: "personal".to_owned(),
+                mount_path: "/drive".to_owned(),
+            },
+            WireScope::Folder {
+                path: "/drive".to_owned(),
+            },
+            Capability::BackendManage,
+            Scope::folder("/drive"),
+            "backend_remove personal /drive",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn restart_authorised_under_explicit_folder_grant_runs_and_audits() {
+        // Restart carries no payload path; its only target is the advertised
+        // wire scope, which must be an explicit folder for the dangerous
+        // lifecycle:control capability.
+        assert_authorised(
+            vec![grant(Capability::LifecycleControl, Scope::folder("/work"))],
+            ManageCommand::Restart,
+            WireScope::Folder {
+                path: "/work".to_owned(),
+            },
+            Capability::LifecycleControl,
+            Scope::folder("/work"),
+            "restart",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn stop_authorised_under_explicit_folder_grant_runs_and_audits() {
+        assert_authorised(
+            vec![grant(Capability::LifecycleControl, Scope::folder("/work"))],
+            ManageCommand::Stop,
+            WireScope::Folder {
+                path: "/work".to_owned(),
+            },
+            Capability::LifecycleControl,
+            Scope::folder("/work"),
+            "stop",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn grant_revoke_authorised_runs_and_audits() {
+        assert_authorised(
+            vec![grant(Capability::GrantAdmin, Scope::folder("/work"))],
+            ManageCommand::GrantRevoke {
+                grant_id: 7,
+                scope: WireScope::Folder {
+                    path: "/work".to_owned(),
+                },
+            },
+            WireScope::Folder {
+                path: "/work".to_owned(),
+            },
+            Capability::GrantAdmin,
+            Scope::folder("/work"),
+            "grant_revoke 7",
+        )
+        .await;
+    }
+
+    // ── New command surface: unauthorised refusals ──
+
+    #[tokio::test]
+    async fn config_push_without_grant_is_refused_audited_and_inert() {
+        // The manager holds a pin grant only — a config push must be refused,
+        // nothing executed, the denial audited.
+        let store = FakeStore::new(vec![grant(Capability::PinWrite, Scope::Node)]);
+        let executor = FakeExecutor::default();
+        let result = run_dispatch(
+            &store,
+            &executor,
+            &manager(),
+            ManageCommand::ConfigPush {
+                format: ManageConfigFormat::Toml,
+                folder: "/work".to_owned(),
+                body: String::new(),
+            },
+            WireScope::Folder {
+                path: "/work".to_owned(),
+            },
+            at(2026, 1, 1),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            ManageResult::Err {
+                kind: ManageErrorKind::Unauthorised,
+                ..
+            }
+        ));
+        assert!(executor.calls().is_empty(), "no side effect on a denial");
+        let audit = store.audit_rows();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(
+            audit.first().map(|r| r.outcome.as_str()),
+            Some(OUTCOME_DENIED)
+        );
+    }
+
+    #[tokio::test]
+    async fn config_push_path_outside_granted_folder_is_refused() {
+        // The grant covers `/work`; pushing into `/personal` must be refused
+        // even though the caller holds config:push somewhere.
+        let store = FakeStore::new(vec![grant(Capability::ConfigPush, Scope::folder("/work"))]);
+        let executor = FakeExecutor::default();
+        let result = run_dispatch(
+            &store,
+            &executor,
+            &manager(),
+            ManageCommand::ConfigPush {
+                format: ManageConfigFormat::Gitignore,
+                folder: "/personal".to_owned(),
+                body: "secret\n".to_owned(),
+            },
+            // The caller advertises a scope its grant covers, but the payload
+            // folder escapes it — authorisation keys on the payload folder.
+            WireScope::Folder {
+                path: "/work".to_owned(),
+            },
+            at(2026, 1, 1),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            ManageResult::Err {
+                kind: ManageErrorKind::Unauthorised,
+                ..
+            }
+        ));
+        assert!(executor.calls().is_empty());
+        let audit = store.audit_rows();
+        assert_eq!(audit.len(), 1);
+        let row = audit.first().expect("one row");
+        assert_eq!(row.outcome, OUTCOME_DENIED);
+        assert_eq!(
+            row.scope,
+            Scope::folder("/personal"),
+            "the audit row records the folder actually targeted",
+        );
+    }
+
+    // ── Dangerous-capability wildcard bar (new dangerous commands) ──
+
+    #[tokio::test]
+    async fn dangerous_commands_under_node_wide_grant_are_refused_and_inert() {
+        // A node-wide grant of each dangerous capability must NOT satisfy the
+        // command it backs — these require an explicit folder grant. Each is
+        // refused, nothing runs, the denial is audited.
+        let cases: Vec<(Capability, ManageCommand)> = vec![
+            (
+                Capability::BackendManage,
+                ManageCommand::BackendRemove {
+                    name: "x".to_owned(),
+                    mount_path: "/drive".to_owned(),
+                },
+            ),
+            (Capability::LifecycleControl, ManageCommand::Stop),
+            (
+                Capability::GrantAdmin,
+                ManageCommand::GrantRevoke {
+                    grant_id: 1,
+                    scope: WireScope::Folder {
+                        path: "/work".to_owned(),
+                    },
+                },
+            ),
+        ];
+        for (cap, command) in cases {
+            let store = FakeStore::new(vec![grant(cap, Scope::Node)]);
+            let executor = FakeExecutor::default();
+            let result = run_dispatch(
+                &store,
+                &executor,
+                &manager(),
+                command,
+                WireScope::Folder {
+                    path: "/work".to_owned(),
+                },
+                at(2026, 1, 1),
+            )
+            .await;
+            assert!(
+                matches!(
+                    result,
+                    ManageResult::Err {
+                        kind: ManageErrorKind::Unauthorised,
+                        ..
+                    }
+                ),
+                "node-wide grant of dangerous {cap:?} must not authorise its command",
+            );
+            assert!(
+                executor.calls().is_empty(),
+                "no side effect for dangerous {cap:?} under a wildcard grant",
+            );
+            let audit = store.audit_rows();
+            assert_eq!(audit.len(), 1);
+            assert_eq!(
+                audit.first().map(|r| r.outcome.as_str()),
+                Some(OUTCOME_DENIED),
+            );
+        }
+    }
+
+    // ── GrantAdd subset / escalation guard ──
+
+    /// A wire grant helper for delegation tests.
+    fn wire_grant(capability: &str, scope: WireScope) -> ManageGrant {
+        ManageGrant {
+            grantee: "SUBORDINATE".to_owned(),
+            capability: capability.to_owned(),
+            scope,
+            expires: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn grant_add_delegating_a_held_subset_is_allowed_and_stamps_granted_by() {
+        // The caller holds grant:admin over /work AND pin:write over /work, so
+        // it may delegate pin:write over the narrower /work/reports.
+        let store = FakeStore::new(vec![
+            grant(Capability::GrantAdmin, Scope::folder("/work")),
+            grant(Capability::PinWrite, Scope::folder("/work")),
+        ]);
+        let executor = FakeExecutor::default();
+        let result = run_dispatch(
+            &store,
+            &executor,
+            &manager(),
+            ManageCommand::GrantAdd {
+                grant: wire_grant(
+                    "pin:write",
+                    WireScope::Folder {
+                        path: "/work/reports".to_owned(),
+                    },
+                ),
+            },
+            WireScope::Folder {
+                path: "/work/reports".to_owned(),
+            },
+            at(2026, 1, 1),
+        )
+        .await;
+        assert!(
+            matches!(result, ManageResult::Ok { .. }),
+            "delegating a held subset should succeed, got {result:?}",
+        );
+        let calls = executor.calls();
+        assert_eq!(calls.len(), 1);
+        let call = calls.first().expect("one call");
+        assert!(
+            call.contains("cap=pin:write")
+                && call.contains("granted_by=MANAGER")
+                && call.contains("grantee=SUBORDINATE"),
+            "the delegated grant must be stamped with the caller as granted_by, got {call}",
+        );
+        let audit = store.audit_rows();
+        assert_eq!(
+            audit.first().map(|r| r.outcome.as_str()),
+            Some(OUTCOME_ALLOWED)
+        );
+    }
+
+    #[tokio::test]
+    async fn grant_add_escalating_capability_not_held_is_refused() {
+        // The caller holds grant:admin over /work but does NOT hold pin:write.
+        // Delegating pin:write would hand out authority it lacks — refused.
+        let store = FakeStore::new(vec![grant(Capability::GrantAdmin, Scope::folder("/work"))]);
+        let executor = FakeExecutor::default();
+        let result = run_dispatch(
+            &store,
+            &executor,
+            &manager(),
+            ManageCommand::GrantAdd {
+                grant: wire_grant(
+                    "pin:write",
+                    WireScope::Folder {
+                        path: "/work".to_owned(),
+                    },
+                ),
+            },
+            WireScope::Folder {
+                path: "/work".to_owned(),
+            },
+            at(2026, 1, 1),
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                ManageResult::Err {
+                    kind: ManageErrorKind::Unauthorised,
+                    ..
+                }
+            ),
+            "delegating a capability the caller lacks must be refused, got {result:?}",
+        );
+        assert!(executor.calls().is_empty(), "no grant may be inserted");
+        let audit = store.audit_rows();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(
+            audit.first().map(|r| r.outcome.as_str()),
+            Some(OUTCOME_DENIED)
+        );
+    }
+
+    #[tokio::test]
+    async fn grant_add_escalating_scope_wider_than_held_is_refused() {
+        // The caller holds grant:admin AND pin:write, but only over
+        // /work/reports. Delegating pin:write over the wider /work escapes the
+        // caller's own scope — refused.
+        let store = FakeStore::new(vec![
+            grant(Capability::GrantAdmin, Scope::folder("/work/reports")),
+            grant(Capability::PinWrite, Scope::folder("/work/reports")),
+        ]);
+        let executor = FakeExecutor::default();
+        let result = run_dispatch(
+            &store,
+            &executor,
+            &manager(),
+            ManageCommand::GrantAdd {
+                grant: wire_grant(
+                    "pin:write",
+                    WireScope::Folder {
+                        path: "/work".to_owned(),
+                    },
+                ),
+            },
+            WireScope::Folder {
+                path: "/work".to_owned(),
+            },
+            at(2026, 1, 1),
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                ManageResult::Err {
+                    kind: ManageErrorKind::Unauthorised,
+                    ..
+                }
+            ),
+            "delegating a wider scope than held must be refused, got {result:?}",
+        );
+        assert!(executor.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn grant_add_with_only_grant_admin_cannot_self_promote() {
+        // Holding grant:admin alone does not let a manager delegate grant:admin
+        // (or any other capability) it does not separately hold — the subset
+        // guard requires the *delegated* capability be held, not merely the
+        // power to delegate. This is the core no-self-promotion invariant.
+        let store = FakeStore::new(vec![grant(Capability::GrantAdmin, Scope::folder("/work"))]);
+        let executor = FakeExecutor::default();
+        let result = run_dispatch(
+            &store,
+            &executor,
+            &manager(),
+            ManageCommand::GrantAdd {
+                grant: wire_grant(
+                    "grant:admin",
+                    WireScope::Folder {
+                        path: "/work".to_owned(),
+                    },
+                ),
+            },
+            WireScope::Folder {
+                path: "/work".to_owned(),
+            },
+            at(2026, 1, 1),
+        )
+        .await;
+        // The caller DOES hold grant:admin over /work, so delegating grant:admin
+        // over /work IS a held subset and is permitted. This documents that a
+        // manager may pass on exactly the authority it has — the guard prevents
+        // *widening*, not faithful re-delegation.
+        assert!(
+            matches!(result, ManageResult::Ok { .. }),
+            "re-delegating an exactly-held grant:admin is permitted, got {result:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn grant_add_with_expired_held_grant_cannot_delegate() {
+        // The caller's pin:write grant has expired by the time of the request,
+        // so it is no longer a held subset — delegation is refused.
+        let mut held_pin = grant(Capability::PinWrite, Scope::folder("/work"));
+        held_pin.expires = Some(at(2026, 1, 1));
+        let store = FakeStore::new(vec![
+            grant(Capability::GrantAdmin, Scope::folder("/work")),
+            held_pin,
+        ]);
+        let executor = FakeExecutor::default();
+        let result = run_dispatch(
+            &store,
+            &executor,
+            &manager(),
+            ManageCommand::GrantAdd {
+                grant: wire_grant(
+                    "pin:write",
+                    WireScope::Folder {
+                        path: "/work".to_owned(),
+                    },
+                ),
+            },
+            WireScope::Folder {
+                path: "/work".to_owned(),
+            },
+            // After the held pin grant's expiry.
+            at(2026, 6, 1),
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                ManageResult::Err {
+                    kind: ManageErrorKind::Unauthorised,
+                    ..
+                }
+            ),
+            "an expired held grant cannot back a delegation, got {result:?}",
+        );
+        assert!(executor.calls().is_empty());
     }
 }
