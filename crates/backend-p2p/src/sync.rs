@@ -732,6 +732,26 @@ impl SyncEngine {
         self.observed_external_candidates.read().await.clone()
     }
 
+    /// The full local candidate set this device is currently reachable on.
+    ///
+    /// Combines the per-interface host candidates derived from the bound
+    /// listener port, the STUN-derived external mapping, and the
+    /// peer-as-`STUN` reflexive candidates — exactly the set the connect
+    /// path advertises in a [`BepMessage::Candidates`] frame and the relay
+    /// path filters for its offer. Exposed so the announce-server discovery
+    /// loop can publish the same set to a rendezvous directory.
+    ///
+    /// Returns an empty vector when the listener is unbound, since a device
+    /// with no listen address has no candidate to advertise.
+    pub async fn local_candidates(&self) -> Vec<Candidate> {
+        let Some(local_addr) = *self.local_listen_addr.read().await else {
+            return Vec::new();
+        };
+        let external = *self.local_external_addr.read().await;
+        let extras = self.observed_external_candidates().await;
+        gather_local_candidates(local_addr, external, extras)
+    }
+
     /// Known relay endpoints, in preference order. Returned as a slice
     /// over the shared `Arc` so callers can hand it to
     /// [`decide_connectivity`] without cloning. Empty when relay is

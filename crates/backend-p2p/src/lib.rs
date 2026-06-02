@@ -81,6 +81,50 @@ pub const DEFAULT_MAX_RELAY_SESSIONS: u32 = 8;
 /// and tunable in one place.
 pub const DEFAULT_MAX_RELAY_BANDWIDTH_BYTES_PER_SEC: u64 = 10 * 1024 * 1024;
 
+/// Public STUN servers used for NAT type detection when the operator has
+/// not configured any of their own.
+///
+/// NAT detection and the server-reflexive candidate rung need at least one
+/// STUN server to function; without a default, an out-of-the-box deployment
+/// would silently run with `NatType::Unknown` and never gather a reflexive
+/// candidate. These are Google's long-standing free public STUN endpoints,
+/// the de-facto default across WebRTC and P2P tooling. Two are listed so the
+/// RFC 5780 two-server detection path (which distinguishes the full NAT
+/// taxonomy) works without any operator configuration.
+///
+/// Source: Google public STUN servers, documented widely in the WebRTC
+/// ecosystem — e.g. <https://www.webrtc-experiment.com/docs/STUN-or-TURN.html>
+/// (Wayback: <https://web.archive.org/web/20240101000000*/webrtc-experiment.com/docs/STUN-or-TURN.html>).
+///
+/// Operator-supplied `stun_servers` override this default entirely; an
+/// explicit empty list disables STUN (see [`resolve_stun_servers`]).
+pub const DEFAULT_PUBLIC_STUN_SERVERS: &[&str] =
+    &["stun.l.google.com:19302", "stun1.l.google.com:19302"];
+
+/// Resolve the effective STUN server list from the operator-supplied value.
+///
+/// The resolution rule is explicit absence versus explicit emptiness:
+/// - `None` — the operator did not mention STUN at all, so the public
+///   defaults ([`DEFAULT_PUBLIC_STUN_SERVERS`]) apply and NAT detection works
+///   out of the box.
+/// - `Some(list)` where `list` is non-empty — the operator's servers replace
+///   the default entirely.
+/// - `Some(empty)` — the operator explicitly disabled STUN, so no servers are
+///   used and the engine stays at `NatType::Unknown`.
+///
+/// Modelling the operator's choice as `Option<Vec<String>>` rather than a
+/// bare `Vec<String>` is what lets "not configured" and "configured empty"
+/// diverge — a bare empty vector could not tell the two apart.
+#[must_use]
+pub fn resolve_stun_servers(configured: Option<Vec<String>>) -> Vec<String> {
+    configured.unwrap_or_else(|| {
+        DEFAULT_PUBLIC_STUN_SERVERS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    })
+}
+
 /// Policy controlling whether this node volunteers as a peer relay.
 ///
 /// A node only advertises itself as a relay candidate when its detected
@@ -163,10 +207,21 @@ pub struct P2pBackendConfig {
     /// (useful for future relay-candidate selection and NAT-traversal
     /// hints); this flag only controls whether gossip frames flow.
     pub enable_wan_gossip: bool,
-    /// STUN servers used for NAT type detection at startup. Empty means
-    /// no NAT detection runs. Each entry is a `host:port` string; the
-    /// first server that responds wins.
+    /// STUN servers used for NAT type detection at startup, after the
+    /// default-versus-override rule in [`resolve_stun_servers`] has been
+    /// applied. Empty means no NAT detection runs (the operator explicitly
+    /// disabled STUN). Each entry is a `host:port` string; the first server
+    /// that responds wins on the single-server path, and the first two feed
+    /// the RFC 5780 two-server path.
     pub stun_servers: Vec<String>,
+    /// Announce-server base URLs (scheme-and-authority roots, e.g.
+    /// `https://announce.example`). When non-empty, an
+    /// [`cascade_p2p::discovery::announce::AnnounceDiscovery`] source is
+    /// registered for each, so the device publishes its candidates to and
+    /// resolves peers against those servers. Empty disables announce-server
+    /// discovery — the device relies on LAN multicast and introducer gossip
+    /// alone.
+    pub announce_servers: Vec<String>,
     /// Known relay endpoints, in preference order. Fed into
     /// [`cascade_p2p::decide_connectivity`] as the relay pool when the
     /// strategy table calls for relayed transport. Empty disables the
@@ -217,6 +272,7 @@ impl Default for P2pBackendConfig {
             device_name: None,
             enable_wan_gossip: false,
             stun_servers: Vec::new(),
+            announce_servers: Vec::new(),
             relay_endpoints: Vec::new(),
             relay_shared_secret: None,
             // Hole-punching is enabled by default — operators opt OUT by
@@ -313,6 +369,7 @@ impl P2pBackend {
         let cfg_enable_discovery = cfg.enable_discovery;
         let cfg_enable_wan_gossip = cfg.enable_wan_gossip;
         let cfg_stun_servers = cfg.stun_servers.clone();
+        let cfg_announce_servers = cfg.announce_servers.clone();
         let bootstrap_cancel = cancel.subscribe();
         let cancel_for_children = cancel.clone();
         tokio::spawn(async move {
@@ -447,12 +504,52 @@ impl P2pBackend {
             if let Some(lan) = lan_source {
                 discovery.register(Box::new(lan));
             }
+
+            // Register an announce-server source for each configured base
+            // URL. Only registered when `announce_servers` is non-empty —
+            // an operator who has not opted in pays no announce-server cost.
+            // A client that fails to construct (HTTP/TLS backend init) is
+            // logged and skipped rather than aborting backend open; the
+            // other discovery sources still function.
+            for base_url in &cfg_announce_servers {
+                match cascade_p2p::discovery::announce::AnnounceDiscovery::new(base_url.clone()) {
+                    Ok(source) => discovery.register(Box::new(source)),
+                    Err(e) => tracing::warn!(
+                        target: "cascade::backend::p2p",
+                        instance = %cfg_instance_id,
+                        announce_server = %base_url,
+                        error = %e,
+                        "could not construct announce-server discovery client; skipping",
+                    ),
+                }
+            }
             tracing::debug!(
                 target: "cascade::backend::p2p",
                 instance = %cfg_instance_id,
                 sources = discovery.len(),
                 "discovery service composed",
             );
+
+            // Publish our local candidate set to every announce server on a
+            // periodic loop so peers can resolve us by device id even when
+            // we share no LAN segment and no introducer. The loop builds a
+            // fresh AnnounceDiscovery per server (the composed `discovery`
+            // service owns its boxed copies and is consumed by resolution).
+            if !cfg_announce_servers.is_empty() && bound_port.is_some() {
+                let announce_sync = sync_for_listener.clone();
+                let announce_servers = cfg_announce_servers.clone();
+                let announce_cancel = cancel_for_children.subscribe();
+                let announce_instance = cfg_instance_id.clone();
+                tokio::spawn(async move {
+                    announce_server_publish_loop(
+                        &announce_instance,
+                        announce_servers,
+                        announce_sync,
+                        announce_cancel,
+                    )
+                    .await;
+                });
+            }
 
             if let (Some(lan), Some(listen_port)) = (lan_source, bound_port) {
                 let announce_sync = sync_for_listener.clone();
@@ -1188,6 +1285,79 @@ async fn discovery_announce_loop(
     }
 }
 
+/// Interval between announce-server candidate publications.
+///
+/// The announce directory holds soft state — a stale entry simply causes a
+/// failed dial that falls back to the other discovery sources — so a minute
+/// between refreshes keeps the directory current without hammering the
+/// server. Matches the WAN-gossip cadence so the two background refresh
+/// loops tick on the same rhythm.
+const ANNOUNCE_PUBLISH_INTERVAL: std::time::Duration = std::time::Duration::from_mins(1);
+
+/// Periodically publish our local candidate set to every configured
+/// announce server so peers can resolve us by device id off-LAN.
+///
+/// Each tick gathers the current local candidates from the sync engine and
+/// registers them with every announce server. A server that constructs but
+/// then fails on the wire is handled inside
+/// [`cascade_p2p::discovery::announce::AnnounceDiscovery::announce`], which
+/// logs and moves on — publication is best-effort, exactly like LAN
+/// announce. A server whose client cannot even be constructed is skipped for
+/// the lifetime of the loop.
+///
+/// Exits as soon as `cancel` flips to `true`.
+async fn announce_server_publish_loop(
+    instance_id: &str,
+    announce_servers: Vec<String>,
+    sync: SyncEngine,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+) {
+    // Build the clients once. A client whose construction fails is logged
+    // and omitted — the others still publish.
+    let clients: Vec<cascade_p2p::discovery::announce::AnnounceDiscovery> = announce_servers
+        .iter()
+        .filter_map(|base_url| {
+            match cascade_p2p::discovery::announce::AnnounceDiscovery::new(base_url.clone()) {
+                Ok(client) => Some(client),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "cascade::backend::p2p",
+                        instance = %instance_id,
+                        announce_server = %base_url,
+                        error = %e,
+                        "could not construct announce-server client for publish loop; skipping",
+                    );
+                    None
+                }
+            }
+        })
+        .collect();
+    if clients.is_empty() {
+        return;
+    }
+
+    let device_id = sync.device_id().to_string();
+    loop {
+        if *cancel.borrow() {
+            return;
+        }
+        let candidates = sync.local_candidates().await;
+        if !candidates.is_empty() {
+            for client in &clients {
+                client.announce(&device_id, &candidates).await;
+            }
+        }
+        tokio::select! {
+            () = tokio::time::sleep(ANNOUNCE_PUBLISH_INTERVAL) => {}
+            res = cancel.changed() => {
+                if res.is_err() || *cancel.borrow() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// Window each [`LanDiscovery::listen_all`] call listens for before
 /// returning the peers seen. Matches the timeout the loop used before
 /// discovery moved behind the trait.
@@ -1281,7 +1451,14 @@ async fn discovery_listen_loop(
 ///   inbound gossip into the local peer book, so devices learn about
 ///   each other transitively
 /// - `stun_servers` (optional) — array of `host:port` STUN servers used
-///   for NAT type detection at startup
+///   for NAT type detection at startup. Omitting the key entirely applies
+///   the public defaults ([`DEFAULT_PUBLIC_STUN_SERVERS`]) so NAT detection
+///   works out of the box; supplying a non-empty list overrides them; an
+///   explicit empty list disables STUN.
+/// - `announce_servers` (optional) — array of announce-server base URLs
+///   (e.g. `https://announce.example`). When non-empty, the device publishes
+///   its candidates to and resolves peers against those servers via the
+///   announce-server discovery source. Empty (or omitted) disables it.
 pub fn create_backend(config: &toml::Value) -> Result<Box<dyn Backend>> {
     let name = config
         .get("name")
@@ -1318,8 +1495,21 @@ pub fn create_backend(config: &toml::Value) -> Result<Box<dyn Backend>> {
         .get("enable_wan_gossip")
         .and_then(toml::Value::as_bool)
         .unwrap_or(false);
-    let stun_servers = config
-        .get("stun_servers")
+    // Distinguish "not configured" (key absent → public defaults apply)
+    // from "configured empty" (key present but empty → STUN disabled). A
+    // bare `unwrap_or_default` would collapse both to an empty list and
+    // silently disable NAT detection out of the box.
+    let configured_stun_servers = config.get("stun_servers").and_then(toml::Value::as_array).map(
+        |arr| {
+            arr.iter()
+                .filter_map(toml::Value::as_str)
+                .map(String::from)
+                .collect::<Vec<_>>()
+        },
+    );
+    let stun_servers = resolve_stun_servers(configured_stun_servers);
+    let announce_servers = config
+        .get("announce_servers")
         .and_then(toml::Value::as_array)
         .map(|arr| {
             arr.iter()
@@ -1388,6 +1578,7 @@ pub fn create_backend(config: &toml::Value) -> Result<Box<dyn Backend>> {
         device_name,
         enable_wan_gossip,
         stun_servers,
+        announce_servers,
         relay_endpoints,
         relay_shared_secret,
         enable_hole_punch,
@@ -1933,6 +2124,70 @@ mod tests {
     }
 
     #[test]
+    fn resolve_stun_servers_unconfigured_uses_public_defaults() {
+        // Key absent entirely → the public defaults apply so NAT detection
+        // and the reflexive rung work out of the box.
+        let resolved = resolve_stun_servers(None);
+        let expected: Vec<String> = DEFAULT_PUBLIC_STUN_SERVERS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        assert_eq!(resolved, expected);
+        // The default must list at least two servers so the RFC 5780
+        // two-server detection path is reachable without configuration.
+        assert!(resolved.len() >= 2);
+    }
+
+    #[test]
+    fn resolve_stun_servers_non_empty_override_replaces_defaults() {
+        // A non-empty operator list replaces the defaults entirely — none
+        // of the public servers leak through.
+        let operator = vec!["stun.example.org:3478".to_string()];
+        let resolved = resolve_stun_servers(Some(operator.clone()));
+        assert_eq!(resolved, operator);
+        assert!(!resolved.iter().any(|s| s.contains("l.google.com")));
+    }
+
+    #[test]
+    fn resolve_stun_servers_explicit_empty_disables_stun() {
+        // An explicitly empty list is the operator opting out — it must NOT
+        // fall back to the defaults, which would re-enable STUN against
+        // their wishes.
+        let resolved = resolve_stun_servers(Some(Vec::new()));
+        assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn create_backend_omitting_stun_servers_applies_defaults() {
+        // End-to-end through the TOML boundary: a config that does not
+        // mention `stun_servers` resolves to the public defaults, while an
+        // explicit empty array disables STUN.
+        let without = toml::from_str::<toml::Value>(
+            r#"name = "x""#,
+        )
+        .unwrap();
+        let configured =
+            without.get("stun_servers").and_then(toml::Value::as_array).map(|arr| {
+                arr.iter()
+                    .filter_map(toml::Value::as_str)
+                    .map(String::from)
+                    .collect::<Vec<_>>()
+            });
+        assert!(resolve_stun_servers(configured).len() >= 2);
+
+        let empty =
+            toml::from_str::<toml::Value>("name = \"x\"\nstun_servers = []").unwrap();
+        let configured_empty =
+            empty.get("stun_servers").and_then(toml::Value::as_array).map(|arr| {
+                arr.iter()
+                    .filter_map(toml::Value::as_str)
+                    .map(String::from)
+                    .collect::<Vec<_>>()
+            });
+        assert!(resolve_stun_servers(configured_empty).is_empty());
+    }
+
+    #[test]
     fn parse_relay_shared_secret_round_trips_32_bytes() {
         // A 64-char lowercase hex string round-trips to its 32 source
         // bytes exactly. Anything shorter, longer, or with non-hex
@@ -2001,6 +2256,37 @@ mod tests {
         drop(backend);
         // After drop, the cancel watch must have fired; spawned tasks
         // will observe `true` on their next tick and exit.
+        cancel_rx.changed().await.unwrap();
+        assert!(*cancel_rx.borrow());
+    }
+
+    /// Configuring an announce server must not block or panic on backend
+    /// open. The publish loop and the registered announce-server discovery
+    /// source come up against an unreachable URL; both are best-effort, so
+    /// the backend opens cleanly and drops cleanly. We confirm the spawned
+    /// tasks observe cancellation, proving the announce loop honours the
+    /// shutdown watch like every other background task.
+    #[tokio::test]
+    async fn announce_server_configured_backend_opens_and_shuts_down() {
+        let dir = tempdir().unwrap();
+        let cfg = P2pBackendConfig {
+            instance_id: "p2p-announce".to_string(),
+            folder_id: "p2p-announce".to_string(),
+            display_name: "Announce".to_string(),
+            index_path: dir.path().join("index.db"),
+            block_store_root: dir.path().join("blocks"),
+            identity_dir: dir.path().join("identity"),
+            listen_addr: Some("127.0.0.1:0".parse().unwrap()),
+            // An address with no server listening — the publish loop's
+            // register calls fail and are swallowed best-effort.
+            announce_servers: vec!["http://127.0.0.1:1".to_string()],
+            ..Default::default()
+        };
+        let backend = P2pBackend::open(cfg).unwrap();
+        let mut cancel_rx = backend.cancel.subscribe();
+        assert!(!*cancel_rx.borrow());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(backend);
         cancel_rx.changed().await.unwrap();
         assert!(*cancel_rx.borrow());
     }
