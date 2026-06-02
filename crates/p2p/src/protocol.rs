@@ -24,6 +24,9 @@ const MSG_GOSSIP: u32 = 7;
 const MSG_CANDIDATES: u32 = 8;
 const MSG_SYNC_PUNCH: u32 = 9;
 const MSG_OBSERVED_ADDRESS: u32 = 10;
+const MSG_RELAY_OFFER: u32 = 11;
+const MSG_RELAY_CONNECT: u32 = 12;
+const MSG_RELAY_DATA: u32 = 13;
 
 /// Maximum number of candidates carried in a single
 /// [`BepMessage::Candidates`] frame. Bounds the receiver's allocation
@@ -49,6 +52,13 @@ const MAX_GOSSIP_PEERS: u32 = 10_000;
 /// either misconfiguration or an attempt to amplify the wire frame, so
 /// the cap stays conservative.
 const MAX_GOSSIP_ADDRESSES_PER_PEER: u32 = 32;
+
+/// Maximum number of reachable addresses a [`BepMessage::RelayOffer`] may
+/// advertise. A volunteering relay realistically exposes a single public
+/// `host:port`, occasionally a small handful (dual-stack, multiple
+/// interfaces). The cap bounds receiver allocation against a malicious or
+/// buggy offer without constraining any legitimate deployment.
+const MAX_RELAY_OFFER_ADDRESSES: u32 = 8;
 
 // ── XDR primitives ──
 
@@ -391,6 +401,44 @@ pub enum BepMessage {
     /// `cascade_p2p::nat::server_reflexive_candidate_from_addr`) exactly
     /// as it would a `STUN`-derived `XOR-MAPPED-ADDRESS`.
     ObservedAddress(SocketAddr),
+    /// Advertise this device as a willing relay to a trusted peer.
+    ///
+    /// Sent by a node whose detected `NAT` type is `Open` or `FullCone`
+    /// and whose `relay_volunteer` policy is not `Off`, to peers it shares
+    /// a folder with. The recipient records the sender (identified by the
+    /// device id of the connection the offer arrives on) as a peer-relay
+    /// candidate; when [`crate::decide_connectivity`] later calls for a
+    /// relay, a reachable peer relay is preferred over an operated one.
+    ///
+    /// The carried addresses are the volunteer's reachable BEP endpoints —
+    /// where a third peer dials to open a relay session. Bounded by
+    /// `MAX_RELAY_OFFER_ADDRESSES` to cap receiver allocation.
+    RelayOffer {
+        /// Reachable BEP endpoints at which the volunteer accepts relay
+        /// connections, in arbitrary order.
+        addresses: Vec<SocketAddr>,
+    },
+    /// Ask a volunteering relay to bridge this session to `target_device`.
+    ///
+    /// Sent by a peer that has selected this volunteer as its relay. The
+    /// volunteer pairs the requesting session with the session it holds
+    /// to `target_device` and bridges the two with the shared byte-pipe
+    /// (see [`crate::pipe::shuttle`]), exactly as the operated relay does.
+    RelayConnect {
+        /// Device id of the peer the requester wants to reach through this
+        /// relay.
+        target_device: String,
+    },
+    /// One opaque, end-to-end-encrypted frame travelling through a peer
+    /// relay.
+    ///
+    /// The volunteering relay forwards the payload verbatim between the two
+    /// bridged sessions without inspecting it — the two endpoints negotiate
+    /// their own TLS through the tunnel, so the relay sees only ciphertext.
+    RelayData {
+        /// Opaque relayed bytes.
+        payload: Vec<u8>,
+    },
 }
 
 impl BepMessage {
@@ -407,6 +455,9 @@ impl BepMessage {
             Self::Candidates { .. } => MSG_CANDIDATES,
             Self::SyncPunch { .. } => MSG_SYNC_PUNCH,
             Self::ObservedAddress(_) => MSG_OBSERVED_ADDRESS,
+            Self::RelayOffer { .. } => MSG_RELAY_OFFER,
+            Self::RelayConnect { .. } => MSG_RELAY_CONNECT,
+            Self::RelayData { .. } => MSG_RELAY_DATA,
         }
     }
 }
@@ -497,6 +548,25 @@ pub fn encode_message(msg: &BepMessage) -> Result<Vec<u8>> {
         }
         BepMessage::ObservedAddress(addr) => {
             encode_socket_addr(&mut body, *addr)?;
+        }
+        BepMessage::RelayOffer { addresses } => {
+            let count = u32::try_from(addresses.len())
+                .map_err(|_| anyhow::anyhow!("too many relay offer addresses"))?;
+            if count > MAX_RELAY_OFFER_ADDRESSES {
+                anyhow::bail!(
+                    "relay offer address count {count} exceeds maximum {MAX_RELAY_OFFER_ADDRESSES}"
+                );
+            }
+            encode_u32(&mut body, count);
+            for addr in addresses {
+                encode_socket_addr(&mut body, *addr)?;
+            }
+        }
+        BepMessage::RelayConnect { target_device } => {
+            encode_string(&mut body, target_device)?;
+        }
+        BepMessage::RelayData { payload } => {
+            encode_opaque(&mut body, payload)?;
         }
     }
 
@@ -656,6 +726,9 @@ pub fn decode_message(frame: &[u8]) -> Result<BepMessage> {
         MSG_CANDIDATES => decode_candidates(rest),
         MSG_SYNC_PUNCH => decode_sync_punch(rest),
         MSG_OBSERVED_ADDRESS => decode_observed_address(rest),
+        MSG_RELAY_OFFER => decode_relay_offer(rest),
+        MSG_RELAY_CONNECT => decode_relay_connect(rest),
+        MSG_RELAY_DATA => decode_relay_data(rest),
         _ => anyhow::bail!("unknown message type: {msg_type}"),
     }
 }
@@ -686,6 +759,34 @@ fn decode_sync_punch(data: &[u8]) -> Result<BepMessage> {
 fn decode_observed_address(data: &[u8]) -> Result<BepMessage> {
     let (addr, _) = decode_socket_addr(data)?;
     Ok(BepMessage::ObservedAddress(addr))
+}
+
+fn decode_relay_offer(data: &[u8]) -> Result<BepMessage> {
+    let (count, mut rest) = decode_u32(data)?;
+    if count > MAX_RELAY_OFFER_ADDRESSES {
+        anyhow::bail!(
+            "relay offer address count {count} exceeds maximum {MAX_RELAY_OFFER_ADDRESSES}"
+        );
+    }
+    let mut addresses = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let (addr, next) = decode_socket_addr(rest)?;
+        addresses.push(addr);
+        rest = next;
+    }
+    Ok(BepMessage::RelayOffer { addresses })
+}
+
+fn decode_relay_connect(data: &[u8]) -> Result<BepMessage> {
+    let (target_device, _) = decode_string(data)?;
+    Ok(BepMessage::RelayConnect { target_device })
+}
+
+fn decode_relay_data(data: &[u8]) -> Result<BepMessage> {
+    let (payload, _) = decode_opaque(data)?;
+    Ok(BepMessage::RelayData {
+        payload: payload.to_vec(),
+    })
 }
 
 fn decode_cluster_config(data: &[u8]) -> Result<BepMessage> {
@@ -1393,6 +1494,60 @@ mod tests {
     #[test]
     fn encode_decode_observed_address_zero_port() {
         round_trip(BepMessage::ObservedAddress(v4(0)));
+    }
+
+    #[test]
+    fn encode_decode_relay_offer_round_trip() {
+        round_trip(BepMessage::RelayOffer {
+            addresses: vec![v4(22_000), v6(22_000)],
+        });
+    }
+
+    #[test]
+    fn encode_decode_relay_offer_empty() {
+        round_trip(BepMessage::RelayOffer { addresses: vec![] });
+    }
+
+    #[test]
+    fn decode_relay_offer_rejects_excessive_address_count() {
+        // Honest body length prefix, but the inner address count exceeds
+        // the cap — the receiver must refuse to allocate the oversized
+        // vector rather than trusting the declared count.
+        let mut body = Vec::new();
+        encode_u32(&mut body, MSG_RELAY_OFFER);
+        encode_u32(&mut body, MAX_RELAY_OFFER_ADDRESSES + 1);
+        let mut frame = Vec::new();
+        let body_len = u32::try_from(body.len()).unwrap_or(0);
+        encode_u32(&mut frame, body_len);
+        frame.extend_from_slice(&body);
+        let result = decode_message(&frame);
+        assert!(result.is_err(), "excessive address count must fail");
+        assert!(
+            result
+                .err()
+                .map(|e| e.to_string())
+                .is_some_and(|msg| msg.contains("exceeds maximum")),
+            "error should mention the cap",
+        );
+    }
+
+    #[test]
+    fn encode_decode_relay_connect_round_trip() {
+        round_trip(BepMessage::RelayConnect {
+            target_device: "TARGET-DEVICE-ID".into(),
+        });
+    }
+
+    #[test]
+    fn encode_decode_relay_data_round_trip() {
+        round_trip(BepMessage::RelayData {
+            payload: vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01],
+        });
+    }
+
+    #[test]
+    fn encode_decode_relay_data_empty() {
+        round_trip(BepMessage::RelayData { payload: vec![] });
     }
 
     #[test]
