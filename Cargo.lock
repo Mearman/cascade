@@ -348,6 +348,7 @@ dependencies = [
  "cascade-p2p",
  "chrono",
  "dirs",
+ "futures-util",
  "rusqlite",
  "serde",
  "serde_json",
@@ -355,6 +356,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-tungstenite",
  "toml",
  "tracing",
 ]

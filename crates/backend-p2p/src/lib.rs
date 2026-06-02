@@ -32,6 +32,7 @@
 //! `[[peers]]` config list.
 
 pub mod index;
+pub mod peer_relay;
 pub mod sync;
 
 use std::path::{Path, PathBuf};
@@ -59,6 +60,48 @@ use crate::sync::SyncEngine;
 /// poll. We keep the interval short (1 s) so peer-pushed files appear
 /// in WebDAV/FUSE listings without user-visible lag.
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Default ceiling on the number of concurrent relay sessions this node
+/// will bridge when volunteering as a peer relay.
+///
+/// A relay session bridges two peers, holding two `WebSocket` connections
+/// and one byte-pipe task for its lifetime. Eight concurrent bridges is a
+/// generous default for a personal mesh while bounding the memory, socket,
+/// and bandwidth cost an `Open`/`FullCone` node takes on by volunteering.
+/// Past the cap, new relay requests are rejected rather than silently
+/// dropped (see [`crate::sync::SyncEngine`]).
+pub const DEFAULT_MAX_RELAY_SESSIONS: u32 = 8;
+
+/// Default ceiling on aggregate relay throughput, in bytes per second,
+/// summed across every active relay session this node bridges.
+///
+/// Ten mebibytes per second keeps a volunteer useful for block exchange
+/// without letting relayed traffic saturate a typical residential uplink.
+/// The cap is named rather than a bare literal so the budget is visible
+/// and tunable in one place.
+pub const DEFAULT_MAX_RELAY_BANDWIDTH_BYTES_PER_SEC: u64 = 10 * 1024 * 1024;
+
+/// Policy controlling whether this node volunteers as a peer relay.
+///
+/// A node only advertises itself as a relay candidate when its detected
+/// `NAT` type is `Open` or `FullCone` — a node behind a restrictive `NAT`
+/// cannot usefully relay. This policy gates that advertisement on the
+/// operator's intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RelayVolunteer {
+    /// Never volunteer as a relay, regardless of `NAT` type.
+    Off,
+    /// Volunteer only to peers explicitly configured to receive the offer.
+    /// Reserved for a future per-peer allow-list; today it behaves like
+    /// `Auto` restricted to the trusted set, which is the same population
+    /// `Auto` already targets.
+    Explicit,
+    /// Volunteer automatically to every trusted peer sharing a folder,
+    /// provided the `NAT` type permits it. The default.
+    #[default]
+    Auto,
+}
 
 /// Statically-configured peer entry.
 ///
@@ -142,6 +185,21 @@ pub struct P2pBackendConfig {
     /// Defaults to `true` so production deployments get the full path
     /// out of the box.
     pub enable_hole_punch: bool,
+    /// Whether this node volunteers as a peer relay. When not
+    /// [`RelayVolunteer::Off`] and the detected `NAT` type is `Open` or
+    /// `FullCone`, the node advertises itself as a relay candidate to
+    /// trusted peers it shares a folder with via a
+    /// [`cascade_p2p::protocol::BepMessage::RelayOffer`]. Defaults to
+    /// [`RelayVolunteer::Auto`].
+    pub relay_volunteer: RelayVolunteer,
+    /// Ceiling on concurrent relay sessions this node bridges while
+    /// volunteering. New requests past the cap are rejected rather than
+    /// silently dropped. Defaults to [`DEFAULT_MAX_RELAY_SESSIONS`].
+    pub max_relay_sessions: u32,
+    /// Ceiling on aggregate relay throughput, in bytes per second, across
+    /// every active relay session. Defaults to
+    /// [`DEFAULT_MAX_RELAY_BANDWIDTH_BYTES_PER_SEC`].
+    pub max_relay_bandwidth: u64,
 }
 
 impl Default for P2pBackendConfig {
@@ -166,6 +224,13 @@ impl Default for P2pBackendConfig {
             // `enable_discovery` and `enable_wan_gossip` are opt-IN flags
             // for behaviour with a real operational cost.
             enable_hole_punch: true,
+            // Volunteering is on by default but gated on NAT type: only
+            // `Open`/`FullCone` nodes ever actually advertise an offer, so
+            // a default of `Auto` costs nothing on the restrictive nodes
+            // that cannot relay anyway.
+            relay_volunteer: RelayVolunteer::Auto,
+            max_relay_sessions: DEFAULT_MAX_RELAY_SESSIONS,
+            max_relay_bandwidth: DEFAULT_MAX_RELAY_BANDWIDTH_BYTES_PER_SEC,
         }
     }
 }
@@ -230,7 +295,9 @@ impl P2pBackend {
         .with_local_device_name(cfg.device_name.clone())
         .with_relay_endpoints(cfg.relay_endpoints.clone())
         .with_relay_shared_secret(cfg.relay_shared_secret)
-        .with_hole_punch_enabled(cfg.enable_hole_punch);
+        .with_hole_punch_enabled(cfg.enable_hole_punch)
+        .with_relay_volunteer(cfg.relay_volunteer)
+        .with_relay_session_caps(cfg.max_relay_sessions, cfg.max_relay_bandwidth);
 
         // Cancellation channel for all background tasks. `false` =
         // run, `true` = stop. The `Sender` lives on `P2pBackend`; its
@@ -1284,6 +1351,28 @@ pub fn create_backend(config: &toml::Value) -> Result<Box<dyn Backend>> {
         .get("enable_hole_punch")
         .and_then(toml::Value::as_bool)
         .unwrap_or(true);
+    let relay_volunteer = config
+        .get("relay_volunteer")
+        .and_then(|v| v.as_str())
+        .map(parse_relay_volunteer)
+        .transpose()?
+        .unwrap_or_default();
+    let max_relay_sessions = config
+        .get("max_relay_sessions")
+        .and_then(toml::Value::as_integer)
+        .map(|raw| {
+            u32::try_from(raw).with_context(|| format!("max_relay_sessions `{raw}` out of range"))
+        })
+        .transpose()?
+        .unwrap_or(DEFAULT_MAX_RELAY_SESSIONS);
+    let max_relay_bandwidth = config
+        .get("max_relay_bandwidth")
+        .and_then(toml::Value::as_integer)
+        .map(|raw| {
+            u64::try_from(raw).with_context(|| format!("max_relay_bandwidth `{raw}` out of range"))
+        })
+        .transpose()?
+        .unwrap_or(DEFAULT_MAX_RELAY_BANDWIDTH_BYTES_PER_SEC);
 
     let instance_id = format!("p2p-{name}");
     let cfg = P2pBackendConfig {
@@ -1302,6 +1391,9 @@ pub fn create_backend(config: &toml::Value) -> Result<Box<dyn Backend>> {
         relay_endpoints,
         relay_shared_secret,
         enable_hole_punch,
+        relay_volunteer,
+        max_relay_sessions,
+        max_relay_bandwidth,
     };
 
     let backend = P2pBackend::open(cfg)?;
@@ -1367,6 +1459,23 @@ fn parse_relay_shared_secret(input: &str) -> Result<[u8; 32]> {
             .with_context(|| format!("invalid hex pair `{pair}` in relay_shared_secret"))?;
     }
     Ok(out)
+}
+
+/// Parse the `relay_volunteer` policy from its lowercase string form.
+///
+/// Accepts exactly `off`, `explicit`, or `auto`. Any other value is a
+/// configuration error rather than a silent fallback to the default —
+/// an operator who typed `aut` deserves to be told, not to discover the
+/// node quietly volunteering when they meant to turn it off.
+fn parse_relay_volunteer(input: &str) -> Result<RelayVolunteer> {
+    match input {
+        "off" => Ok(RelayVolunteer::Off),
+        "explicit" => Ok(RelayVolunteer::Explicit),
+        "auto" => Ok(RelayVolunteer::Auto),
+        other => {
+            anyhow::bail!("relay_volunteer must be one of `off`, `explicit`, `auto`, got `{other}`")
+        }
+    }
 }
 
 fn default_data_dir(name: &str) -> PathBuf {
