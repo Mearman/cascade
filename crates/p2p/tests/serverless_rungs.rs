@@ -937,7 +937,13 @@ impl Drop for NetNsHarness {
 
 /// Spawn the hub subprocess inside the internet namespace and read the
 /// `HUBPORTS …` line it prints. Returns the child and the parsed ports.
-fn spawn_hub(role: &str, identity_dir: &str) -> (std::process::Child, Vec<u16>) {
+///
+/// `test_name` is the owning scenario's `#[test]` function name. libtest
+/// treats the positional argument as a name filter, so it must be a real
+/// test name (passed with `--exact`) for the child to run a `#[test]` body
+/// and reach [`maybe_run_as_subprocess`]; an invented marker matches zero
+/// tests and the child exits without dispatching any role.
+fn spawn_hub(test_name: &str, role: &str, identity_dir: &str) -> (std::process::Child, Vec<u16>) {
     use std::io::{BufRead, BufReader};
     use std::process::Stdio;
 
@@ -945,7 +951,7 @@ fn spawn_hub(role: &str, identity_dir: &str) -> (std::process::Child, Vec<u16>) 
     let mut child = Command::new("ip")
         .args(["netns", "exec", NS_INTERNET])
         .arg(&current_exe)
-        .args(["serverless_hub_marker", "--nocapture", "--test-threads=1"])
+        .args([test_name, "--exact", "--nocapture", "--test-threads=1"])
         .env(ROLE_ENV, role)
         .env(IDENTITY_DIR_ENV, identity_dir)
         .stdin(Stdio::piped())
@@ -960,7 +966,14 @@ fn spawn_hub(role: &str, identity_dir: &str) -> (std::process::Child, Vec<u16>) 
         let mut line = String::new();
         let n = reader.read_line(&mut line).expect("reading hub stdout");
         assert!(n != 0, "hub closed stdout without printing HUBPORTS");
-        if let Some(rest) = line.trim().strip_prefix("HUBPORTS ") {
+        // Under `--nocapture` libtest writes the `test <name> ... ` progress
+        // prefix to stdout with no trailing newline, so the role's
+        // `println!("HUBPORTS …")` lands on the same physical line. Scan for
+        // the marker token anywhere in the line rather than requiring it at
+        // the start. Everything after the marker is the space-separated port
+        // list; libtest's trailing summary cannot follow it on this line
+        // because `println!` terminates it.
+        if let Some((_prefix, rest)) = line.split_once("HUBPORTS ") {
             break rest
                 .split_whitespace()
                 .map(|tok| tok.parse::<u16>().expect("hub port parses"))
@@ -980,13 +993,22 @@ fn spawn_hub(role: &str, identity_dir: &str) -> (std::process::Child, Vec<u16>) 
 
 /// Spawn a peer subprocess inside `ns` with the given environment, returning
 /// the child handle. The caller joins it to collect the exit status.
-fn spawn_peer(ns: &str, role: &str, envs: &[(&str, String)]) -> std::process::Child {
+///
+/// `test_name` is the owning scenario's `#[test]` function name, passed as
+/// the libtest filter with `--exact` so the child actually runs that test
+/// body and reaches [`maybe_run_as_subprocess`]. See [`spawn_hub`].
+fn spawn_peer(
+    test_name: &str,
+    ns: &str,
+    role: &str,
+    envs: &[(&str, String)],
+) -> std::process::Child {
     use std::process::Stdio;
     let current_exe = std::env::current_exe().expect("current_exe");
     let mut cmd = Command::new("ip");
     cmd.args(["netns", "exec", ns])
         .arg(&current_exe)
-        .args(["serverless_peer_marker", "--nocapture", "--test-threads=1"])
+        .args([test_name, "--exact", "--nocapture", "--test-threads=1"])
         .env(ROLE_ENV, role)
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
@@ -1062,6 +1084,14 @@ fn run_required(cmd: &str, args: &[&str]) {
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
+/// Name of the scenario (a) test, reused as the libtest filter when the
+/// orchestrator re-invokes this binary for each subprocess role. It must
+/// match the `#[test]` function name exactly so `--exact` selects it.
+const TEST_PEER_AS_STUN: &str = "peer_as_stun_then_hole_punch";
+
+/// Name of the scenario (b) test, used the same way as [`TEST_PEER_AS_STUN`].
+const TEST_SYMMETRIC_RELAY: &str = "symmetric_pair_via_peer_relay";
+
 /// Scenario (a): two NAT'd peers learn their reflexive mappings from a third
 /// participating peer (peer-as-STUN — zero STUN servers), hole-punch, and
 /// complete a block transfer over the punched flow. No STUN, announce, or
@@ -1081,7 +1111,7 @@ fn peer_as_stun_then_hole_punch() {
     identity.save(id_dir.path()).expect("save shared identity");
     let id_dir_str = id_dir.path().to_string_lossy().into_owned();
 
-    let (mut hub, ports) = spawn_hub("stun-hub", &id_dir_str);
+    let (mut hub, ports) = spawn_hub(TEST_PEER_AS_STUN, "stun-hub", &id_dir_str);
     assert_eq!(ports.len(), 2, "stun hub prints udp and tcp ports");
     let hub_udp = format!("{GW_A}:{}", ports[0]);
     let hub_tcp = format!("{GW_A}:{}", ports[1]);
@@ -1096,9 +1126,9 @@ fn peer_as_stun_then_hole_punch() {
         ]
     };
 
-    let peer_b = spawn_peer(NS_PEER_B, "punch-b", &common("punch-b"));
+    let peer_b = spawn_peer(TEST_PEER_AS_STUN, NS_PEER_B, "punch-b", &common("punch-b"));
     std::thread::sleep(Duration::from_millis(200));
-    let peer_a = spawn_peer(NS_PEER_A, "punch-a", &common("punch-a"));
+    let peer_a = spawn_peer(TEST_PEER_AS_STUN, NS_PEER_A, "punch-a", &common("punch-a"));
 
     let a_ok = wait_peer(peer_a, "punch-a");
     let b_ok = wait_peer(peer_b, "punch-b");
@@ -1130,7 +1160,7 @@ fn symmetric_pair_via_peer_relay() {
     identity.save(id_dir.path()).expect("save shared identity");
     let id_dir_str = id_dir.path().to_string_lossy().into_owned();
 
-    let (mut hub, ports) = spawn_hub("relay-hub", &id_dir_str);
+    let (mut hub, ports) = spawn_hub(TEST_SYMMETRIC_RELAY, "relay-hub", &id_dir_str);
     assert_eq!(ports.len(), 1, "relay hub prints one port");
     let hub_tcp = format!("{GW_A}:{}", ports[0]);
 
@@ -1143,9 +1173,19 @@ fn symmetric_pair_via_peer_relay() {
         ]
     };
 
-    let peer_b = spawn_peer(NS_PEER_B, "relay-b", &common("relay-b"));
+    let peer_b = spawn_peer(
+        TEST_SYMMETRIC_RELAY,
+        NS_PEER_B,
+        "relay-b",
+        &common("relay-b"),
+    );
     std::thread::sleep(Duration::from_millis(200));
-    let peer_a = spawn_peer(NS_PEER_A, "relay-a", &common("relay-a"));
+    let peer_a = spawn_peer(
+        TEST_SYMMETRIC_RELAY,
+        NS_PEER_A,
+        "relay-a",
+        &common("relay-a"),
+    );
 
     let a_ok = wait_peer(peer_a, "relay-a");
     let b_ok = wait_peer(peer_b, "relay-b");
