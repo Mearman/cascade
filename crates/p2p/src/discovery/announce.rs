@@ -380,10 +380,7 @@ mod client {
                             "POST" => {
                                 let request: AnnounceRequest =
                                     serde_json::from_slice(&body).unwrap();
-                                store
-                                    .lock()
-                                    .await
-                                    .insert(device_id, request.candidates);
+                                store.lock().await.insert(device_id, request.candidates);
                                 write_json_response(&mut stream, b"{}").await;
                             }
                             "GET" => {
@@ -470,7 +467,10 @@ mod tests {
         let candidate = Candidate::new(addr(33000), CandidateKind::ServerReflexive, u16::MAX);
         let wire = WireCandidate::from(candidate);
         assert_eq!(wire.priority, candidate.priority);
-        assert_eq!(wire.to_candidate().map(|c| c.priority), Some(candidate.priority));
+        assert_eq!(
+            wire.to_candidate().map(|c| c.priority),
+            Some(candidate.priority)
+        );
     }
 
     #[test]
