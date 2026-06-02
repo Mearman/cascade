@@ -144,6 +144,52 @@ jobs:
               --test serverless_rungs \
               -- --test-threads=1 --nocapture
 
+  dht-live:
+    name: DHT live tests (local mainline testnet)
+    needs: [check, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: dht-live-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: dht-live-
+      - name: Clippy the live DHT tests under their feature
+        # The standard workspace clippy job builds default features only, so the
+        # `#[cfg(feature = "dht")]` live_tests module is never linted there. The
+        # "Clippy (feature-gated discovery + integration code)" step in the check
+        # job lints it under `dht` already; re-assert it here, scoped to the same
+        # crate and feature, so this job fails on a lint regression in the live
+        # test code before it spends time bootstrapping a swarm.
+        run: cargo clippy -p cascade-p2p --all-targets --features dht -- -D warnings
+      - name: Build DHT live test binary
+        # Compile up front (without running) so the run step below only has to
+        # bootstrap the swarm, not build — keeping the timed run step lean.
+        run: cargo test -p cascade-p2p --features dht --lib discovery::dht::live_tests --no-run
+      - name: Run DHT live tests against an ephemeral local testnet
+        # The live_tests module is `#[ignore]`'d so the standard offline
+        # `cargo test --workspace` stays green; this job opts them in with
+        # `--ignored`. They spin up an in-process `mainline::Testnet` — a small
+        # swarm of DHT nodes bound to local UDP sockets — and never touch the
+        # public BitTorrent bootstrap routers, so the run is fully hermetic.
+        # Single-threaded so the swarms do not contend, and `timeout-minutes`
+        # bounds the whole step so a wedged lookup fails the job rather than
+        # hanging it (each resolve is itself bounded by DHT_RESOLVE_TIMEOUT).
+        timeout-minutes: 10
+        run: |
+          cargo test -p cascade-p2p \
+            --features dht \
+            --lib discovery::dht::live_tests \
+            -- --ignored --test-threads=1 --nocapture
+
   projfs-probe:
     name: ProjFS availability probe (Windows)
     needs: [check, test]
