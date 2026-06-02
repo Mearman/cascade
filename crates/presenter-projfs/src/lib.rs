@@ -1364,12 +1364,12 @@ mod windows_impl {
         let buffer_full_hresult = hresult_from_win32(ERROR_INSUFFICIENT_BUFFER.0);
         while let Some(entry) = state.entries.get(state.position) {
             let name_hstring = HSTRING::from(entry.name.as_str());
-            let mut basic = PRJ_FILE_BASIC_INFO::default();
-            basic.IsDirectory = entry.is_dir;
             #[allow(clippy::cast_possible_wrap)]
-            {
-                basic.FileSize = entry.size.min(i64::MAX as u64) as i64;
-            }
+            let basic = PRJ_FILE_BASIC_INFO {
+                IsDirectory: entry.is_dir,
+                FileSize: entry.size.min(i64::MAX as u64) as i64,
+                ..Default::default()
+            };
 
             // SAFETY: PrjFillDirEntryBuffer reads `filename` and
             // `filebasicinfo` for the duration of the call. Both
