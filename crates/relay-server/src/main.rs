@@ -56,6 +56,13 @@ struct Cli {
     /// memory but not exposed).
     #[arg(long)]
     metrics_bind: Option<SocketAddr>,
+
+    /// Optional address for the announce/lookup directory HTTP endpoint.
+    /// When unset the relay serves only the byte-pipe. Requires the
+    /// `announce` build feature; without it a set value logs a warning and
+    /// the endpoint stays disabled.
+    #[arg(long)]
+    announce_bind: Option<SocketAddr>,
 }
 
 #[tokio::main]
@@ -80,6 +87,7 @@ async fn main() -> Result<()> {
         session_timeout: Duration::from_secs(u64::from(cli.session_timeout_seconds)),
         max_sessions: cli.max_sessions,
         metrics_bind: cli.metrics_bind,
+        announce_bind: cli.announce_bind,
     };
 
     run_relay(config).await

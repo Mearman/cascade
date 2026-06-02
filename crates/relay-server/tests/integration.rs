@@ -55,6 +55,7 @@ fn config_for_test(
         session_timeout,
         max_sessions,
         metrics_bind: None,
+        announce_bind: None,
     }
 }
 

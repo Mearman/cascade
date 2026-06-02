@@ -38,6 +38,8 @@ pub struct RelayHandle {
     pub local_addr: SocketAddr,
     /// Optional local address the metrics endpoint is bound to.
     pub metrics_addr: Option<SocketAddr>,
+    /// Optional local address the announce endpoint is bound to.
+    pub announce_addr: Option<SocketAddr>,
     /// Shared counters — useful for tests asserting against metric values.
     pub counters: Arc<Counters>,
     /// Channel that, when signalled (sender dropped), instructs the server
@@ -45,6 +47,7 @@ pub struct RelayHandle {
     _shutdown: mpsc::Sender<()>,
     listener_task: tokio::task::JoinHandle<()>,
     metrics_task: Option<tokio::task::JoinHandle<()>>,
+    announce_task: Option<tokio::task::JoinHandle<()>>,
     /// Kept alive so the listener task's reference to it stays valid;
     /// access goes through cloned references inside the listener.
     _registry: SessionRegistry,
@@ -59,6 +62,9 @@ impl RelayHandle {
             .context("relay listener task panicked")?;
         if let Some(metrics) = self.metrics_task {
             metrics.await.context("metrics task panicked")?;
+        }
+        if let Some(announce) = self.announce_task {
+            announce.await.context("announce task panicked")?;
         }
         Ok(())
     }
@@ -77,6 +83,7 @@ pub async fn spawn(config: RelayConfig) -> Result<RelayHandle> {
     let counters = Counters::new();
 
     let (metrics_addr, metrics_task) = spawn_metrics_endpoint(&config, counters.clone()).await?;
+    let (announce_addr, announce_task) = spawn_announce_endpoint(&config).await?;
 
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
     let listener_registry = registry.clone();
@@ -94,15 +101,17 @@ pub async fn spawn(config: RelayConfig) -> Result<RelayHandle> {
         .await;
     });
 
-    info!(addr = %local_addr, metrics = ?metrics_addr, "cascade-relay listening");
+    info!(addr = %local_addr, metrics = ?metrics_addr, announce = ?announce_addr, "cascade-relay listening");
 
     Ok(RelayHandle {
         local_addr,
         metrics_addr,
+        announce_addr,
         counters,
         _shutdown: shutdown_tx,
         listener_task,
         metrics_task,
+        announce_task,
         _registry: registry,
     })
 }
@@ -137,6 +146,33 @@ async fn spawn_metrics_endpoint(
 ) -> Result<(Option<SocketAddr>, Option<tokio::task::JoinHandle<()>>)> {
     if config.metrics_bind.is_some() {
         warn!("metrics_bind set but cascade-relay-server was built without the metrics feature");
+    }
+    Ok((None, None))
+}
+
+#[cfg(feature = "announce")]
+async fn spawn_announce_endpoint(
+    config: &RelayConfig,
+) -> Result<(Option<SocketAddr>, Option<tokio::task::JoinHandle<()>>)> {
+    if let Some(bind) = config.announce_bind {
+        let directory = crate::announce::AnnounceDirectory::new();
+        let (addr, handle) = crate::announce::serve_announce(bind, directory).await?;
+        Ok((Some(addr), Some(handle)))
+    } else {
+        Ok((None, None))
+    }
+}
+
+// The `async` keyword keeps this stub's signature identical to the
+// `cfg(feature = "announce")` variant so the call site awaits the return
+// value unconditionally regardless of which variant is selected.
+#[cfg(not(feature = "announce"))]
+#[allow(clippy::unused_async)]
+async fn spawn_announce_endpoint(
+    config: &RelayConfig,
+) -> Result<(Option<SocketAddr>, Option<tokio::task::JoinHandle<()>>)> {
+    if config.announce_bind.is_some() {
+        warn!("announce_bind set but cascade-relay-server was built without the announce feature");
     }
     Ok((None, None))
 }
