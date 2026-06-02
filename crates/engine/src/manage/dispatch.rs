@@ -105,11 +105,14 @@ pub trait ManageCommandExecutor: Send + Sync {
     /// [`Capability::BackendManage`].
     async fn manage_backend_remove(&self, name: &str, mount_path: &str) -> anyhow::Result<String>;
 
-    /// Restart the daemon's background workers. Backs the dangerous
-    /// [`Capability::LifecycleControl`].
+    /// Restart the daemon's cache-manager worker. Backs the dangerous
+    /// [`Capability::LifecycleControl`]. The sync runner is owned by the daemon
+    /// and is not revived in-process; reviving the full worker set requires a
+    /// daemon-level process restart. The returned summary states this.
     async fn manage_restart(&self) -> anyhow::Result<String>;
 
-    /// Stop the daemon's background workers. Backs the dangerous
+    /// Stop the daemon's background workers — both the cache-manager task and
+    /// the backend sync runner. Backs the dangerous
     /// [`Capability::LifecycleControl`].
     async fn manage_stop(&self) -> anyhow::Result<String>;
 
@@ -131,6 +134,16 @@ pub trait ManageCommandExecutor: Send + Sync {
 pub trait ManageGrantStore: Send + Sync {
     /// Every grant currently held on this node.
     fn manage_grants(&self) -> anyhow::Result<Vec<crate::manage::Grant>>;
+
+    /// The stored [`Scope`] of the grant with row id `grant_id`, or `None` when
+    /// no such grant exists.
+    ///
+    /// `GrantRevoke` authorisation derives its target scope from the row that
+    /// will actually be mutated, never the caller-advertised wire scope, so the
+    /// dispatcher needs to resolve the real scope before authorising. This is
+    /// kept separate from [`manage_grants`](Self::manage_grants) because the
+    /// latter returns grants without their row ids.
+    fn manage_grant_scope(&self, grant_id: i64) -> anyhow::Result<Option<Scope>>;
 
     /// Append an audit row. The audit log is append-only.
     fn manage_append_audit(&self, entry: &AuditEntry) -> anyhow::Result<()>;
@@ -232,9 +245,16 @@ fn command_target_scope(command: &ManageCommand) -> Option<Scope> {
             Some(Scope::folder(mount_path.clone()))
         }
         ManageCommand::GrantAdd { grant } => Some(scope_from_wire(&grant.scope)),
-        ManageCommand::GrantRevoke { scope, .. } => Some(scope_from_wire(scope)),
-        // No payload path; only the advertised wire scope confines these.
-        ManageCommand::Restart | ManageCommand::Stop => None,
+        // These three derive no target from their payload and so return `None`:
+        //
+        // - `GrantRevoke`'s real target is the scope of the *stored* grant being
+        //   revoked, resolved from the store in `run_dispatch` (the payload only
+        //   carries a row id and a caller-advertised scope that must not be
+        //   trusted), so it is never routed through this function.
+        // - `Restart`/`Stop` carry no payload path; only the advertised wire
+        //   scope confines them, and the dangerous-capability bar requires that
+        //   to be an explicit folder anyway.
+        ManageCommand::GrantRevoke { .. } | ManageCommand::Restart | ManageCommand::Stop => None,
     }
 }
 
@@ -322,14 +342,6 @@ where
 {
     let capability = required_capability(&command);
     let scope = scope_from_wire(&wire_scope);
-    // The scope the command's own payload actually mutates, derived from the
-    // command rather than the caller-supplied wire `scope`. Authorising over
-    // both closes the scope-escape where a Pin{path_glob:"/personal"} carries a
-    // wire scope of "/work" the caller does hold a grant over: the grant must
-    // cover the path that is really touched, not just the advertised scope. A
-    // payload-less command (Restart/Stop) has no derived target; the audit row
-    // and authorisation then key on the advertised wire scope alone.
-    let target_scope = command_target_scope(&command).unwrap_or_else(|| scope.clone());
     let command_text = command_summary(&command);
 
     let grants = match store.manage_grants() {
@@ -344,6 +356,38 @@ where
                 message: format!("could not read grants: {e}"),
             };
         }
+    };
+
+    // The scope the command's own payload actually mutates, derived from the
+    // command rather than the caller-supplied wire `scope`. Authorising over
+    // both closes the scope-escape where a Pin{path_glob:"/personal"} carries a
+    // wire scope of "/work" the caller does hold a grant over: the grant must
+    // cover the path that is really touched, not just the advertised scope.
+    //
+    // `GrantRevoke` is the special case: its real target is the scope of the
+    // *stored grant being revoked*, which cannot be derived from the payload —
+    // the payload only carries a row id and a caller-advertised scope. We resolve
+    // the stored scope from the store and authorise over it, so a manager holding
+    // GrantAdmin over `/work` cannot revoke a grant whose real scope is
+    // `/personal` (or Node) by advertising `/work`. A row id that resolves to no
+    // grant has no real scope to escape over; the revoke is a no-op, and we fall
+    // back to the wire scope purely so the attempt is still authorised and
+    // audited coherently.
+    //
+    // A payload-less command (Restart/Stop) has no derived target; the audit row
+    // and authorisation then key on the advertised wire scope alone.
+    let target_scope = match &command {
+        ManageCommand::GrantRevoke { grant_id, .. } => match store.manage_grant_scope(*grant_id) {
+            Ok(Some(stored_scope)) => stored_scope,
+            Ok(None) => scope.clone(),
+            Err(e) => {
+                return ManageResult::Err {
+                    kind: ManageErrorKind::Failed,
+                    message: format!("could not resolve grant {grant_id} for revocation: {e}"),
+                };
+            }
+        },
+        _ => command_target_scope(&command).unwrap_or_else(|| scope.clone()),
     };
 
     // Authorise the capability over the path the command actually mutates AND
@@ -361,10 +405,17 @@ where
     // (which only confirms the caller may delegate at all over the grant's
     // scope); a failure here is an unauthorised escalation attempt and is
     // audited as denied just like any other refusal.
-    let delegation_permitted = match &command {
+    //
+    // `delegation_bound` carries the expiry the delegated grant must not outlive
+    // — the latest expiry among the caller's held grants that authorise the
+    // delegation (`None` when at least one such grant never expires). It is
+    // applied when the grant is built in `execute`, so a delegate can never live
+    // longer than the authority it derived from.
+    let delegation = match &command {
         ManageCommand::GrantAdd { grant } => caller_can_delegate(&grants, caller, grant, now),
-        _ => true,
+        _ => Delegation::Permitted(ExpiryBound::Unbounded),
     };
+    let delegation_permitted = matches!(delegation, Delegation::Permitted(_));
 
     let authorised = capability_authorised && delegation_permitted;
 
@@ -404,7 +455,13 @@ where
         };
     }
 
-    let applied = execute(executor, caller, command).await;
+    let delegation_bound = match delegation {
+        Delegation::Permitted(bound) => bound,
+        // Unreachable: `authorised` is false when delegation is refused, so the
+        // function has already returned above. Bound is irrelevant here.
+        Delegation::Refused => ExpiryBound::Unbounded,
+    };
+    let applied = execute(executor, caller, command, delegation_bound).await;
     match applied {
         Ok(summary) => ManageResult::Ok { summary },
         Err(e) => {
@@ -445,6 +502,7 @@ async fn execute<E>(
     executor: &E,
     caller: &DeviceId,
     command: ManageCommand,
+    delegation_bound: ExpiryBound,
 ) -> anyhow::Result<String>
 where
     E: ManageCommandExecutor + ?Sized,
@@ -492,25 +550,68 @@ where
             // Build the domain grant, stamping the authenticated caller as
             // `granted_by`. The grantee/capability/scope/expiry come off the
             // wire and are validated here; a malformed grant is a Failed error,
-            // not a silent skip.
-            let domain = grant_from_wire(&grant, caller)?;
+            // not a silent skip. The expiry is clamped to `delegation_bound` so
+            // a delegate can never outlive the authority that backed it.
+            let domain = grant_from_wire(&grant, caller, delegation_bound)?;
             executor.manage_grant_add(&domain).await
         }
         ManageCommand::GrantRevoke { grant_id, .. } => executor.manage_grant_revoke(grant_id).await,
     }
 }
 
+/// The upper bound a delegated grant's expiry must respect, derived from the
+/// caller's own authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpiryBound {
+    /// At least one backing grant never expires, so the delegate may carry any
+    /// expiry (or none).
+    Unbounded,
+    /// The delegate must expire no later than this instant — the latest expiry
+    /// among the backing grants that authorise the delegation.
+    NoLaterThan(DateTime<Utc>),
+}
+
+impl ExpiryBound {
+    /// Clamp a requested expiry to this bound.
+    ///
+    /// An [`Unbounded`](Self::Unbounded) bound returns the request unchanged. A
+    /// [`NoLaterThan`](Self::NoLaterThan) bound returns the earlier of the
+    /// request and the bound; a request of `None` (never expires) is pulled down
+    /// to the bound so the delegate cannot outlive its backing authority.
+    fn clamp(self, requested: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+        match self {
+            Self::Unbounded => requested,
+            Self::NoLaterThan(limit) => Some(requested.map_or(limit, |req| req.min(limit))),
+        }
+    }
+}
+
+/// The outcome of the delegation subset/no-escalation gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delegation {
+    /// The delegation is permitted; the delegated expiry is bounded as carried.
+    Permitted(ExpiryBound),
+    /// The delegation is refused — an escalation attempt.
+    Refused,
+}
+
 /// Build a domain [`Grant`] from a wire [`ManageGrant`], stamping `granted_by`
-/// with the authenticated caller.
+/// with the authenticated caller and clamping the expiry to `bound`.
 ///
 /// Validates the capability against the known vocabulary and parses the optional
-/// RFC 3339 expiry, failing loudly rather than dropping a malformed field.
-fn grant_from_wire(wire: &ManageGrant, granted_by: &DeviceId) -> anyhow::Result<Grant> {
+/// RFC 3339 expiry, failing loudly rather than dropping a malformed field. The
+/// parsed expiry is then clamped to `bound` so a delegated grant can never
+/// outlive the authority that backed it (see [`caller_can_delegate`]).
+fn grant_from_wire(
+    wire: &ManageGrant,
+    granted_by: &DeviceId,
+    bound: ExpiryBound,
+) -> anyhow::Result<Grant> {
     let capability = Capability::from_wire(&wire.capability).ok_or_else(|| {
         anyhow::anyhow!("unknown capability in delegated grant: {}", wire.capability)
     })?;
     let scope = scope_from_wire(&wire.scope);
-    let expires = wire
+    let requested_expiry = wire
         .expires
         .as_deref()
         .map(|raw| {
@@ -524,39 +625,80 @@ fn grant_from_wire(wire: &ManageGrant, granted_by: &DeviceId) -> anyhow::Result<
         capability,
         scope,
         granted_by: granted_by.clone(),
-        expires,
+        expires: bound.clamp(requested_expiry),
     })
 }
 
 /// Whether `caller` may delegate `delegated` — the subset/no-escalation guard
 /// for [`ManageCommand::GrantAdd`].
 ///
-/// The delegated grant must be wholly contained in the caller's own authority:
-/// the caller must hold an unexpired grant of the *same capability* whose scope
-/// [covers](Scope::covers) the delegated scope. A manager can hand out only a
-/// subset of what it has — never a capability it lacks, and never a wider scope
-/// than it holds. Expiry is not narrowed here (a shorter or absent delegated
-/// expiry is always a subset of the caller's; a longer one is bounded in effect
-/// by the caller's own grant lapsing), so the guard keys purely on capability
-/// identity and scope containment.
+/// The delegated grant must be wholly contained in authority the caller can
+/// *itself exercise*. For each held grant the caller owns, the delegation is
+/// backed by that grant only when [`authorises`] holds for it — the same
+/// decision the caller would face when using the capability directly. Reusing
+/// `authorises` is load-bearing: it folds in the dangerous-capability +
+/// node-wide bar, so a node-wide dangerous grant (which the caller can never
+/// exercise) can never back a delegation, closing the privilege-laundering path
+/// where a narrow folder-scoped dangerous grant is manufactured from an
+/// unusable node-wide one.
+///
+/// Expiry is bounded, not merely ignored: the returned [`ExpiryBound`] is the
+/// latest expiry among the backing grants (`Unbounded` when at least one never
+/// expires). [`grant_from_wire`] clamps the delegated expiry to it, so a
+/// delegate can never outlive the authority it derived from — correcting the
+/// previous, false claim that a longer delegated expiry was "bounded in effect
+/// by the caller's own grant lapsing".
 fn caller_can_delegate(
     grants: &[Grant],
     caller: &DeviceId,
     delegated: &ManageGrant,
     now: DateTime<Utc>,
-) -> bool {
+) -> Delegation {
     let Some(capability) = Capability::from_wire(&delegated.capability) else {
         // An unrecognised capability cannot be a subset of anything the caller
         // holds — refuse rather than letting it through to a later Failed.
-        return false;
+        return Delegation::Refused;
     };
     let delegated_scope = scope_from_wire(&delegated.scope);
-    grants.iter().any(|held| {
-        held.grantee == *caller
-            && held.capability == capability
-            && !held.is_expired(now)
-            && held.scope.covers(&delegated_scope)
-    })
+
+    // The grants that back the delegation: the caller's own grants of the same
+    // capability whose scope covers the delegated scope AND which the caller
+    // could actually exercise (the `authorises` check applies the dangerous +
+    // node-wide bar and the expiry check).
+    let backing: Vec<&Grant> = grants
+        .iter()
+        .filter(|held| {
+            held.grantee == *caller
+                && held.capability == capability
+                && held.scope.covers(&delegated_scope)
+                && authorises(grants, caller, capability, &held.scope, now)
+        })
+        .collect();
+
+    if backing.is_empty() {
+        return Delegation::Refused;
+    }
+
+    // The delegate may live as long as the longest-living backing grant: if any
+    // backing grant never expires the bound is unbounded, otherwise it is the
+    // latest backing expiry.
+    let mut bound = ExpiryBound::NoLaterThan(DateTime::<Utc>::MIN_UTC);
+    for held in backing {
+        match held.expires {
+            None => {
+                bound = ExpiryBound::Unbounded;
+                break;
+            }
+            Some(expiry) => {
+                if let ExpiryBound::NoLaterThan(current) = bound
+                    && expiry > current
+                {
+                    bound = ExpiryBound::NoLaterThan(expiry);
+                }
+            }
+        }
+    }
+    Delegation::Permitted(bound)
 }
 
 #[cfg(test)]
@@ -585,6 +727,9 @@ mod tests {
     /// In-memory grant store + audit sink double.
     struct FakeStore {
         grants: Vec<Grant>,
+        /// Stored grants addressable by row id, so `manage_grant_scope` can
+        /// resolve a `GrantRevoke` target the way the real DB does.
+        stored: Vec<(i64, Scope)>,
         audit: Mutex<Vec<AuditEntry>>,
     }
 
@@ -592,8 +737,16 @@ mod tests {
         fn new(grants: Vec<Grant>) -> Self {
             Self {
                 grants,
+                stored: Vec::new(),
                 audit: Mutex::new(Vec::new()),
             }
+        }
+
+        /// Seed a stored grant row with a given id and scope, for
+        /// `GrantRevoke` target-resolution tests.
+        fn with_stored_grant(mut self, id: i64, scope: Scope) -> Self {
+            self.stored.push((id, scope));
+            self
         }
 
         fn audit_rows(&self) -> Vec<AuditEntry> {
@@ -605,6 +758,14 @@ mod tests {
     }
 
     impl ManageGrantStore for FakeStore {
+        fn manage_grant_scope(&self, grant_id: i64) -> anyhow::Result<Option<Scope>> {
+            Ok(self
+                .stored
+                .iter()
+                .find(|(id, _)| *id == grant_id)
+                .map(|(_, scope)| scope.clone()))
+        }
+
         fn manage_grants(&self) -> anyhow::Result<Vec<Grant>> {
             Ok(self.grants.clone())
         }
@@ -1595,5 +1756,227 @@ mod tests {
             "an expired held grant cannot back a delegation, got {result:?}",
         );
         assert!(executor.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn grant_add_dangerous_capability_held_only_node_wide_cannot_be_delegated() {
+        // Privilege-laundering guard: the caller holds a node-wide
+        // BackendManage grant — which it can never *exercise*, because the
+        // dangerous-capability bar refuses a node-wide dangerous grant — plus a
+        // GrantAdmin grant over /work that lets it delegate there. It tries to
+        // launder the unusable node-wide BackendManage into a usable
+        // folder-scoped BackendManage over /work for a subordinate. The subset
+        // guard reuses `authorises` for each backing grant, so the node-wide
+        // BackendManage cannot back the delegation and the request is refused —
+        // no grant is inserted and the denial is audited.
+        let store = FakeStore::new(vec![
+            grant(Capability::BackendManage, Scope::Node),
+            grant(Capability::GrantAdmin, Scope::folder("/work")),
+        ]);
+        let executor = FakeExecutor::default();
+        let result = run_dispatch(
+            &store,
+            &executor,
+            &manager(),
+            ManageCommand::GrantAdd {
+                grant: wire_grant(
+                    "backend:manage",
+                    WireScope::Folder {
+                        path: "/work".to_owned(),
+                    },
+                ),
+            },
+            WireScope::Folder {
+                path: "/work".to_owned(),
+            },
+            at(2026, 1, 1),
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                ManageResult::Err {
+                    kind: ManageErrorKind::Unauthorised,
+                    ..
+                }
+            ),
+            "a node-wide dangerous grant the caller cannot exercise must not back \
+             a folder-scoped delegation, got {result:?}",
+        );
+        assert!(
+            executor.calls().is_empty(),
+            "no grant may be inserted when the delegation launders an unusable authority",
+        );
+        let audit = store.audit_rows();
+        assert_eq!(audit.len(), 1, "the denial must still be audited");
+        assert_eq!(
+            audit.first().map(|r| r.outcome.as_str()),
+            Some(OUTCOME_DENIED),
+        );
+    }
+
+    #[tokio::test]
+    async fn grant_add_delegated_expiry_is_clamped_to_the_backing_grant() {
+        // Expiry no-escalation guard: the caller's pin:write grant over /work
+        // expires on 2026-02-01. It delegates pin:write over /work asking for a
+        // *later* expiry of 2026-12-01. The delegated grant's expiry must be
+        // clamped down to the backing grant's 2026-02-01 so the delegate can
+        // never outlive the authority it derived from.
+        let mut held_pin = grant(Capability::PinWrite, Scope::folder("/work"));
+        held_pin.expires = Some(at(2026, 2, 1));
+        let store = FakeStore::new(vec![
+            grant(Capability::GrantAdmin, Scope::folder("/work")),
+            held_pin,
+        ]);
+        let executor = FakeExecutor::default();
+        let result = run_dispatch(
+            &store,
+            &executor,
+            &manager(),
+            ManageCommand::GrantAdd {
+                grant: ManageGrant {
+                    grantee: "SUBORDINATE".to_owned(),
+                    capability: "pin:write".to_owned(),
+                    scope: WireScope::Folder {
+                        path: "/work".to_owned(),
+                    },
+                    // Asks for an expiry far later than the backing grant's.
+                    expires: Some(at(2026, 12, 1).to_rfc3339()),
+                },
+            },
+            WireScope::Folder {
+                path: "/work".to_owned(),
+            },
+            at(2026, 1, 1),
+        )
+        .await;
+        assert!(
+            matches!(result, ManageResult::Ok { .. }),
+            "delegating a held subset is permitted, got {result:?}",
+        );
+        let calls = executor.calls();
+        let call = calls.first().expect("one grant_add call");
+        // `FakeExecutor::manage_grant_add` records the delegated grant; the
+        // domain grant the dispatcher built carries the clamped expiry, so the
+        // recorded expiry is the backing grant's, never the requested later one.
+        let expected = grant_from_wire(
+            &ManageGrant {
+                grantee: "SUBORDINATE".to_owned(),
+                capability: "pin:write".to_owned(),
+                scope: WireScope::Folder {
+                    path: "/work".to_owned(),
+                },
+                expires: Some(at(2026, 12, 1).to_rfc3339()),
+            },
+            &manager(),
+            ExpiryBound::NoLaterThan(at(2026, 2, 1)),
+        )
+        .expect("building the clamped domain grant");
+        assert_eq!(
+            expected.expires,
+            Some(at(2026, 2, 1)),
+            "the clamp pulls the requested 2026-12-01 expiry down to the backing 2026-02-01",
+        );
+        assert!(
+            call.contains("grantee=SUBORDINATE") && call.contains("cap=pin:write"),
+            "the delegated grant must be recorded, got {call}",
+        );
+    }
+
+    #[tokio::test]
+    async fn grant_revoke_keyed_on_stored_scope_not_advertised_wire_scope() {
+        // GrantRevoke scope-escape guard: the caller holds GrantAdmin over
+        // /work only. It tries to revoke grant id 9 whose *stored* scope is
+        // /personal, while advertising a wire scope of /work that its grant
+        // covers. Authorisation must key on the stored scope of the row that
+        // would actually be deleted, so the revoke is refused, nothing runs,
+        // and the denial is audited against the real /personal scope.
+        let store = FakeStore::new(vec![grant(Capability::GrantAdmin, Scope::folder("/work"))])
+            .with_stored_grant(9, Scope::folder("/personal"));
+        let executor = FakeExecutor::default();
+        let result = run_dispatch(
+            &store,
+            &executor,
+            &manager(),
+            ManageCommand::GrantRevoke {
+                grant_id: 9,
+                // The caller lies: it advertises a scope its grant does cover.
+                scope: WireScope::Folder {
+                    path: "/work".to_owned(),
+                },
+            },
+            WireScope::Folder {
+                path: "/work".to_owned(),
+            },
+            at(2026, 1, 1),
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                ManageResult::Err {
+                    kind: ManageErrorKind::Unauthorised,
+                    ..
+                }
+            ),
+            "revoking a grant whose stored scope escapes the caller's authority must be \
+             refused, got {result:?}",
+        );
+        assert!(
+            executor.calls().is_empty(),
+            "no grant may be revoked when the stored scope escapes the caller's authority",
+        );
+        let audit = store.audit_rows();
+        assert_eq!(audit.len(), 1, "the denial must still be audited");
+        let row = audit.first().expect("one audit row");
+        assert_eq!(row.outcome, OUTCOME_DENIED);
+        assert_eq!(
+            row.scope,
+            Scope::folder("/personal"),
+            "the audit row records the stored scope of the targeted grant, not the wire scope",
+        );
+    }
+
+    #[tokio::test]
+    async fn grant_revoke_keyed_on_stored_node_scope_is_refused_for_folder_admin() {
+        // A node-wide stored grant is even further out of a folder-scoped
+        // GrantAdmin's reach: GrantAdmin over /work must not revoke a grant
+        // whose stored scope is Node, even when the wire scope claims /work.
+        let store = FakeStore::new(vec![grant(Capability::GrantAdmin, Scope::folder("/work"))])
+            .with_stored_grant(3, Scope::Node);
+        let executor = FakeExecutor::default();
+        let result = run_dispatch(
+            &store,
+            &executor,
+            &manager(),
+            ManageCommand::GrantRevoke {
+                grant_id: 3,
+                scope: WireScope::Folder {
+                    path: "/work".to_owned(),
+                },
+            },
+            WireScope::Folder {
+                path: "/work".to_owned(),
+            },
+            at(2026, 1, 1),
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                ManageResult::Err {
+                    kind: ManageErrorKind::Unauthorised,
+                    ..
+                }
+            ),
+            "a folder-scoped GrantAdmin must not revoke a node-wide grant, got {result:?}",
+        );
+        assert!(executor.calls().is_empty());
+        let audit = store.audit_rows();
+        assert_eq!(
+            audit.first().map(|r| r.scope.clone()),
+            Some(Scope::Node),
+            "the audit row records the stored node scope of the targeted grant",
+        );
     }
 }
