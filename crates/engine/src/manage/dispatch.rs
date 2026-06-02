@@ -1,16 +1,21 @@
 //! Management-plane command dispatch — the authenticated front-end onto the
 //! same command handlers the local CLI drives.
 //!
-//! A [`BepMessage::ManageRequest`] arrives over an already-TLS-authenticated
-//! peer connection, so the caller's [`DeviceId`] is established by the
-//! transport before the command is read. The managed node resolves the caller's
-//! grants, [authorises](crate::manage::authorises) the command's required
+//! A [`ManageRequest`](cascade_p2p::protocol::BepMessage::ManageRequest)
+//! arrives over a peer connection. The dispatcher trusts the [`DeviceId`] it is
+//! handed as the caller principal; establishing that principal cryptographically
+//! is the transport's responsibility, and the backend only routes a
+//! `ManageRequest` here when the session's peer identity was proven by an
+//! end-to-end TLS handshake (relayed and post-hole-punch sessions, whose device
+//! id is merely asserted on the wire, are refused before reaching this port).
+//! The managed node resolves the caller's grants,
+//! [authorises] the command's required
 //! [`Capability`] over its target [`Scope`], **writes an audit row before
 //! applying any side effect**, then dispatches into the same internal command
 //! implementations the local CLI uses via the [`ManageCommandExecutor`]
 //! contract. On authorisation failure the command is never run, the denial is
-//! still audited, and the reply is a typed
-//! [`ManageErrorKind::Unauthorised`](ManageErrorKind::Unauthorised) error.
+//! still audited, and the reply is a typed [`ManageErrorKind::Unauthorised`]
+//! error.
 //!
 //! The constraint that keeps the plane honest: a manager can never do anything
 //! to a node the node could not already do to itself, and no command logic is
@@ -78,7 +83,7 @@ pub trait ManageGrantStore: Send + Sync {
 }
 
 /// The injected port the BEP message handler calls when a
-/// [`BepMessage::ManageRequest`] arrives.
+/// [`ManageRequest`](cascade_p2p::protocol::BepMessage::ManageRequest) arrives.
 ///
 /// The backend-p2p sync engine holds an `Arc<dyn ManageDispatch>` and invokes it
 /// with the connection's authenticated peer device id and the decoded command.
@@ -88,7 +93,8 @@ pub trait ManageGrantStore: Send + Sync {
 #[async_trait]
 pub trait ManageDispatch: Send + Sync {
     /// Run a decoded management command on behalf of `caller`, returning the
-    /// outcome to report back in a [`BepMessage::ManageResponse`].
+    /// outcome to report back in a
+    /// [`ManageResponse`](cascade_p2p::protocol::BepMessage::ManageResponse).
     ///
     /// `caller` is the authenticated peer device id from the TLS connection.
     /// `now` is the wall-clock instant used for grant-expiry checks; the BEP
@@ -118,6 +124,59 @@ pub fn scope_from_wire(scope: &WireScope) -> Scope {
     match scope {
         WireScope::Node => Scope::Node,
         WireScope::Folder { path } => Scope::folder(path.clone()),
+    }
+}
+
+/// The [`Scope`] a command's *own payload* targets, independent of the wire
+/// `scope` field the caller supplied.
+///
+/// A path-bearing command (Pin/Unpin) mutates the node at its `path_glob`, so
+/// the operation's real target is the folder subtree that glob lives in — not
+/// whatever scope the caller chose to advertise. A command with no path target
+/// ([`StatusRead`](ManageCommand::StatusRead),
+/// [`CacheEvict`](ManageCommand::CacheEvict)) acts node-wide, so its target is
+/// [`Scope::Node`].
+///
+/// The dispatcher authorises the granted scope against *both* this payload-derived
+/// target and the wire `scope`, which closes the scope-escape where an authorised
+/// `scope` field is decoupled from the path actually mutated. Folding `*`, `?`,
+/// and character-class glob metacharacters out of the path before scoping means a
+/// glob like `/work/*` is confined to the `/work` subtree it can ever match, and a
+/// bare glob with no fixed prefix (`*.pdf`) targets the node root so only a
+/// node-wide grant covers it.
+#[must_use]
+fn command_target_scope(command: &ManageCommand) -> Scope {
+    match command {
+        ManageCommand::StatusRead | ManageCommand::CacheEvict => Scope::Node,
+        ManageCommand::Pin { path_glob, .. } | ManageCommand::Unpin { path_glob } => {
+            Scope::folder(glob_fixed_prefix(path_glob))
+        }
+    }
+}
+
+/// The fixed (non-glob) leading path of a glob pattern.
+///
+/// A pin glob can match any path under its first glob metacharacter, so its
+/// authorisable extent is the directory prefix up to — but not including — the
+/// first path component that contains a `*`, `?`, or `[` metacharacter. For
+/// example `/work/reports/*.pdf` is confined to `/work/reports`, `/work/**` to
+/// `/work`, and `/*` (or a bare `*.pdf`) to the root `/` so that only a
+/// node-wide grant covers it. A pattern with no metacharacters is its own fixed
+/// prefix.
+#[must_use]
+fn glob_fixed_prefix(path_glob: &str) -> String {
+    let mut fixed: Vec<&str> = Vec::new();
+    for component in path_glob.split('/') {
+        if component.contains(['*', '?', '[']) {
+            break;
+        }
+        fixed.push(component);
+    }
+    let joined = fixed.join("/");
+    if joined.is_empty() {
+        "/".to_owned()
+    } else {
+        joined
     }
 }
 
@@ -160,6 +219,12 @@ where
 {
     let capability = required_capability(&command);
     let scope = scope_from_wire(&wire_scope);
+    // The scope the command's own payload actually mutates, derived from the
+    // command rather than the caller-supplied wire `scope`. Authorising over
+    // both closes the scope-escape where a Pin{path_glob:"/personal"} carries a
+    // wire scope of "/work" the caller does hold a grant over: the grant must
+    // cover the path that is really touched, not just the advertised scope.
+    let target_scope = command_target_scope(&command);
     let command_text = command_summary(&command);
 
     let grants = match store.manage_grants() {
@@ -176,18 +241,27 @@ where
         }
     };
 
-    let authorised = authorises(&grants, caller, capability, &scope, now);
+    // Authorise the capability over the path the command actually mutates AND
+    // over the wire scope the caller advertised. A grant must cover both: the
+    // payload-derived target stops a caller pinning `/personal` under a `/work`
+    // grant by lying in the wire `scope` field, and keeping the wire-scope check
+    // preserves the contract that the advertised scope is also honoured.
+    let authorised = authorises(&grants, caller, capability, &target_scope, now)
+        && authorises(&grants, caller, capability, &scope, now);
 
     let outcome = if authorised {
         OUTCOME_ALLOWED
     } else {
         OUTCOME_DENIED
     };
+    // The audit `scope` column records the extent the command actually touches
+    // (the payload-derived target), not the caller-supplied wire scope, so the
+    // log reflects what was really mutated rather than what was advertised.
     let audit = AuditEntry {
         timestamp: now,
         actor_device: caller.clone(),
         capability,
-        scope: scope.clone(),
+        scope: target_scope.clone(),
         command: command_text.clone(),
         outcome: outcome.to_owned(),
     };
@@ -205,7 +279,7 @@ where
         return ManageResult::Err {
             kind: ManageErrorKind::Unauthorised,
             message: format!(
-                "caller {caller} lacks {} over {scope:?}",
+                "caller {caller} lacks {} over {target_scope:?} (wire scope {scope:?})",
                 capability.as_wire()
             ),
         };
@@ -222,7 +296,7 @@ where
                 timestamp: now,
                 actor_device: caller.clone(),
                 capability,
-                scope,
+                scope: target_scope,
                 command: command_text,
                 outcome: OUTCOME_FAILED.to_owned(),
             };
@@ -412,6 +486,84 @@ mod tests {
         assert_eq!(row.outcome, OUTCOME_ALLOWED);
         assert_eq!(row.actor_device, manager());
         assert_eq!(row.capability, Capability::PinWrite);
+    }
+
+    #[tokio::test]
+    async fn pin_path_outside_granted_scope_is_refused_even_when_wire_scope_lies() {
+        // Scope-escape regression: the caller holds PinWrite over `/work` only,
+        // and advertises a wire scope of `/work` (which the grant covers), but
+        // the command's `path_glob` targets `/personal/secret`. Authorisation
+        // must key on the path the command actually mutates, not the advertised
+        // wire scope, so the request is refused and no pin runs.
+        let store = FakeStore::new(vec![grant(Capability::PinWrite, Scope::folder("/work"))]);
+        let executor = FakeExecutor::default();
+        let result = run_dispatch(
+            &store,
+            &executor,
+            &manager(),
+            ManageCommand::Pin {
+                path_glob: "/personal/secret".to_owned(),
+                recursive: false,
+            },
+            // The caller lies: it advertises a scope its grant *does* cover.
+            WireScope::Folder {
+                path: "/work".to_owned(),
+            },
+            at(2026, 1, 1),
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                ManageResult::Err {
+                    kind: ManageErrorKind::Unauthorised,
+                    ..
+                }
+            ),
+            "a pin whose path escapes the granted scope must be refused, got {result:?}",
+        );
+        assert!(
+            executor.calls().is_empty(),
+            "no pin rule may be created when the path escapes the granted scope",
+        );
+        let audit = store.audit_rows();
+        assert_eq!(audit.len(), 1, "the denial must still be audited");
+        let row = audit.first().expect("one audit row");
+        assert_eq!(row.outcome, OUTCOME_DENIED);
+        assert_eq!(
+            row.scope,
+            Scope::folder("/personal/secret"),
+            "the audit row records the path actually targeted, not the advertised wire scope",
+        );
+    }
+
+    #[tokio::test]
+    async fn pin_glob_is_confined_to_its_fixed_prefix() {
+        // A glob `path_glob` is authorisable only over the fixed directory
+        // prefix it can ever match. A grant over `/work` covers `/work/*`
+        // (fixed prefix `/work`) but a `/work` grant must NOT authorise a glob
+        // whose fixed prefix climbs out of `/work`.
+        let store = FakeStore::new(vec![grant(Capability::PinWrite, Scope::folder("/work"))]);
+        let executor = FakeExecutor::default();
+        let allowed = run_dispatch(
+            &store,
+            &executor,
+            &manager(),
+            ManageCommand::Pin {
+                path_glob: "/work/*.pdf".to_owned(),
+                recursive: false,
+            },
+            WireScope::Folder {
+                path: "/work".to_owned(),
+            },
+            at(2026, 1, 1),
+        )
+        .await;
+        assert!(
+            matches!(allowed, ManageResult::Ok { .. }),
+            "a glob confined to the granted subtree is allowed, got {allowed:?}",
+        );
     }
 
     #[tokio::test]

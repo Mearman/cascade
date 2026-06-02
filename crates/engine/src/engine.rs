@@ -595,6 +595,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_pin_outside_granted_scope_is_refused_against_real_engine() {
+        // Scope-escape regression against the live Engine + real DB: the
+        // manager holds pin:write over /work and advertises a wire scope of
+        // /work, but the command's path_glob targets /personal. The pin must be
+        // refused and no rule may land in the database.
+        let engine = make_test_engine();
+        engine
+            .db()
+            .insert_grant(&Grant {
+                grantee: manager_id(),
+                capability: Capability::PinWrite,
+                scope: Scope::folder("/work"),
+                granted_by: DeviceId::new("OWNER"),
+                expires: None,
+            })
+            .unwrap();
+
+        let result = engine
+            .dispatch(
+                &manager_id(),
+                ManageCommand::Pin {
+                    path_glob: "/personal/secret".to_owned(),
+                    recursive: false,
+                },
+                WireScope::Folder {
+                    path: "/work".to_owned(),
+                },
+                Utc::now(),
+            )
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                ManageResult::Err {
+                    kind: cascade_p2p::protocol::ManageErrorKind::Unauthorised,
+                    ..
+                }
+            ),
+            "a pin escaping the granted scope must be refused, got {result:?}",
+        );
+        assert!(
+            engine.list_pins().unwrap().is_empty(),
+            "no pin rule may be created for a path outside the granted scope",
+        );
+        let audit = engine.db().list_audit().unwrap();
+        assert_eq!(audit.len(), 1, "the denial is still audited");
+        assert_eq!(
+            audit.first().map(|r| r.entry.outcome.as_str()),
+            Some("denied"),
+        );
+    }
+
+    #[tokio::test]
     async fn dispatch_unauthorised_pin_makes_no_change_and_audits_denial() {
         let engine = make_test_engine();
         // Manager holds only status:read — a pin must be refused.
