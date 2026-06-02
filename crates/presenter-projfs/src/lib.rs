@@ -1149,7 +1149,7 @@ mod windows_impl {
         /// callback thread, so wrapped in a `std::sync::Mutex`.
         cancellation_tokens: Arc<Mutex<HashMap<i32, CancellationToken>>>,
         /// Notification mappings handed to `PrjStartVirtualizing` via
-        /// `PRJ_STARTVIRTUALIZING_OPTIONS::NotificationMappings`. ProjFS
+        /// `PRJ_STARTVIRTUALIZING_OPTIONS::NotificationMappings`. `ProjFS`
         /// retains the pointer for the lifetime of the virtualisation
         /// *instance*, not just the duration of the start call (see the
         /// Microsoft ProjFS-Managed-API `VirtualizationInstance.cs`,
@@ -1157,9 +1157,9 @@ mod windows_impl {
         /// Storing the `Vec` on the boxed context — which lives until
         /// `stop_virtualising` does `Box::from_raw` *after*
         /// `PrjStopVirtualizing` has drained outstanding callbacks —
-        /// keeps the array alive exactly as long as ProjFS may read it
+        /// keeps the array alive exactly as long as `ProjFS` may read it
         /// and frees it in lockstep with the instance.
-        _notification_mappings: Vec<PRJ_NOTIFICATION_MAPPING>,
+        notification_mappings: Vec<PRJ_NOTIFICATION_MAPPING>,
         /// Backing storage for the `NotificationRoot` strings the
         /// entries in `_notification_mappings` point at. Each
         /// `PRJ_NOTIFICATION_MAPPING::NotificationRoot` is a `PCWSTR`
@@ -1337,13 +1337,13 @@ mod windows_impl {
         // `<backend>:root`, never a bare `"root"`, so matching a literal
         // string would enumerate nothing against a real daemon mount.
         let state = if path.is_empty() {
-            match root.as_ref() {
-                Some(root_id) => build_enumeration_state(root_id, &items),
-                None => EnumerationState {
+            root.as_ref().map_or_else(
+                || EnumerationState {
                     entries: collect_root_children(&items),
                     position: 0,
                 },
-            }
+                |root_id| build_enumeration_state(root_id, &items),
+            )
         } else {
             let Some(dir) = resolve_path(&path, &items, root.as_ref()) else {
                 return hresult_from_win32(ERROR_FILE_NOT_FOUND.0);
@@ -1580,22 +1580,19 @@ mod windows_impl {
         // is behind `&dyn ContentProvider`, so wrap the call in
         // `AssertUnwindSafe` and map any caught panic to a visible Win32
         // failure (`ERROR_GEN_FAILURE`) rather than aborting the host.
-        let read_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Ok(read_result) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             provider.read_range(&item_id, byte_offset, length)
-        })) {
-            Ok(result) => result,
-            Err(_) => {
-                tracing::error!(
-                    id = %item_id,
-                    offset = byte_offset,
-                    length,
-                    "ContentProvider::read_range panicked; mapping to ERROR_GEN_FAILURE"
-                );
-                return HRESULT(
-                    super::HResultCode::from_win32(windows::Win32::Foundation::ERROR_GEN_FAILURE.0)
-                        .get(),
-                );
-            }
+        })) else {
+            tracing::error!(
+                id = %item_id,
+                offset = byte_offset,
+                length,
+                "ContentProvider::read_range panicked; mapping to ERROR_GEN_FAILURE"
+            );
+            return HRESULT(
+                super::HResultCode::from_win32(windows::Win32::Foundation::ERROR_GEN_FAILURE.0)
+                    .get(),
+            );
         };
         if let Err(ref err) = read_result {
             tracing::warn!(
@@ -1930,7 +1927,7 @@ mod windows_impl {
             enumerations: Arc::clone(&enumerations),
             content_provider,
             cancellation_tokens,
-            _notification_mappings: notification_mappings,
+            notification_mappings,
             _notification_roots: notification_roots,
         });
         let inner_ptr = Box::into_raw(inner);
@@ -1947,7 +1944,7 @@ mod windows_impl {
         // is exactly the instance lifetime ProjFS requires.
         #[allow(unsafe_code)]
         let (mappings_ptr, mappings_len) = unsafe {
-            let mappings = &(*inner_ptr)._notification_mappings;
+            let mappings = &(*inner_ptr).notification_mappings;
             (mappings.as_ptr(), mappings.len())
         };
         let options = PRJ_STARTVIRTUALIZING_OPTIONS {
