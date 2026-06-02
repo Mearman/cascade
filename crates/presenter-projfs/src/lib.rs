@@ -18,52 +18,54 @@
 //! the workspace buildable from macOS and Linux while the real callbacks
 //! are filled in.
 //!
-//! # Scaffold status
+//! # Callback table
 //!
-//! The crate is partway through the v8 roadmap. Browse callbacks are
-//! live; read and write callbacks remain stubbed.
+//! The full `ProjFS` callback table is implemented and registered with
+//! `PrjStartVirtualizing`. Browse, read, notification, and cancel all
+//! flow through the in-memory items map shared with the presenter:
 //!
 //! - [`ProjFsPresenter::upsert_item`] and [`ProjFsPresenter::delete_item`]
-//!   are real — they update an in-memory `HashMap<String, VfsItem>`
-//!   exactly like the other presenters.
+//!   update an in-memory `HashMap<String, VfsItem>` exactly like the
+//!   other presenters. The enumeration and placeholder callbacks read
+//!   from it.
+//! - `QueryFileName`, `GetPlaceholderInfo`, and the
+//!   `Start`/`Get`/`End` directory enumeration triplet serve directory
+//!   listings and placeholder metadata from the items map.
+//! - `GetFileData` serves on-demand reads. When a [`ContentProvider`]
+//!   has been installed via [`ProjFsPresenter::with_content_provider`],
+//!   the callback resolves the path back to an [`ItemId`], asks the
+//!   provider for the requested byte range, and forwards the bytes via
+//!   `PrjWriteFileData`. Without a provider the callback returns
+//!   `ERROR_CALL_NOT_IMPLEMENTED` and the projection stays browse-only.
+//! - `Notification` decodes user-driven events via
+//!   [`NotificationEvent::from_i32`], logs them, and vetoes deletes the
+//!   `allow_delete` policy rejects. The notification mapping registered
+//!   at start includes `PRJ_NOTIFY_PRE_DELETE` so the veto hook is
+//!   reachable in production.
+//! - `CancelCommand` signals the [`CancellationToken`] registered by the
+//!   in-flight `GetFileData` for the matching `CommandId`, which aborts
+//!   the read at its next checkpoint with `ERROR_OPERATION_ABORTED`.
 //! - [`ProjFsPresenter::update_state`] is a no-op log line; `ProjFS` has
 //!   no equivalent of `FSKit`'s `update_state` push hook.
 //! - [`ProjFsPresenter::evict_item`] logs and returns `Ok(())`; `ProjFS`
 //!   manages projection cache eviction at the OS layer.
-//! - [`ProjFsPresenter::fetch_contents`] returns an "not yet
-//!   implemented" error. In the full implementation, on-demand reads are
-//!   driven by the `GetFileDataCallback` rather than by direct calls
-//!   into this method.
-//! - [`ProjFsPresenter::start`] registers the virtualisation root and
-//!   begins virtualising via `PrjMarkDirectoryAsPlaceholder` and
-//!   `PrjStartVirtualizing`. The callback table now serves
-//!   `QueryFileName`, `GetPlaceholderInfo`, and the
-//!   `Start`/`Get`/`End` directory enumeration triplet from the
-//!   in-memory items map. `dir`-style listings work; reading a file's
-//!   bytes does not (see follow-up work).
+//! - [`ProjFsPresenter::fetch_contents`] intentionally bails: on-demand
+//!   reads flow through the `GetFileData` callback, not through direct
+//!   calls into this method, so there is nothing for it to do.
+//! - [`ProjFsPresenter::start`] marks the mount directory as a
+//!   placeholder via `PrjMarkDirectoryAsPlaceholder` and begins
+//!   virtualising via `PrjStartVirtualizing`.
 //! - [`ProjFsPresenter::stop`] calls `PrjStopVirtualizing` against the
 //!   stored namespace handle, then releases the heap-allocated
 //!   callback context.
 //!
 //! On non-Windows targets, [`ProjFsPresenter::start`] returns
 //! `Err("ProjFS presenter is only supported on Windows")` and
-//! [`ProjFsPresenter::stop`] is a no-op.
+//! [`ProjFsPresenter::stop`] is a no-op, so the crate stays buildable
+//! from macOS and Linux while the real callbacks only execute on Windows.
 //!
-//! # Follow-up work
-//!
-//! Three callbacks remain stubbed:
-//!
-//! 1. `GetFileDataCallback` — stream file bytes from the backend via
-//!    `PrjWriteFileData`, respecting the requested offset and length.
-//! 2. `NotificationCallback` — react to user-driven changes
-//!    (open/close/rename/delete) and forward them back into the engine.
-//! 3. `CancelCommandCallback` — abort the in-flight Tokio task for a
-//!    given `PRJ_CALLBACK_DATA.CommandId`.
-//!
-//! Each requires translating between `ProjFS`'s enumeration session model
-//! (keyed by `GUID`s) and the engine's `VfsTree`/`Backend` API. See the
-//! [Projected File System Win32 documentation][projfs] for the full
-//! callback contract.
+//! See the [Projected File System Win32 documentation][projfs] for the
+//! full callback contract.
 //!
 //! [projfs]: https://learn.microsoft.com/en-us/windows/win32/projfs/projected-file-system
 
@@ -1068,9 +1070,13 @@ mod windows_impl {
     use windows::Win32::Storage::ProjectedFileSystem::{
         PRJ_CALLBACK_DATA, PRJ_CALLBACKS, PRJ_CB_DATA_FLAG_ENUM_RESTART_SCAN,
         PRJ_DIR_ENTRY_BUFFER_HANDLE, PRJ_FILE_BASIC_INFO, PRJ_NOTIFICATION,
-        PRJ_NOTIFICATION_PARAMETERS, PRJ_PLACEHOLDER_INFO, PrjAllocateAlignedBuffer,
-        PrjFillDirEntryBuffer, PrjFreeAlignedBuffer, PrjMarkDirectoryAsPlaceholder,
-        PrjStartVirtualizing, PrjStopVirtualizing, PrjWriteFileData, PrjWritePlaceholderInfo,
+        PRJ_NOTIFICATION_MAPPING, PRJ_NOTIFICATION_PARAMETERS,
+        PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_DELETED, PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_MODIFIED,
+        PRJ_NOTIFY_FILE_OVERWRITTEN, PRJ_NOTIFY_NEW_FILE_CREATED, PRJ_NOTIFY_PRE_DELETE,
+        PRJ_NOTIFY_PRE_RENAME, PRJ_NOTIFY_TYPES, PRJ_PLACEHOLDER_INFO,
+        PRJ_STARTVIRTUALIZING_OPTIONS, PrjAllocateAlignedBuffer, PrjFillDirEntryBuffer,
+        PrjFreeAlignedBuffer, PrjMarkDirectoryAsPlaceholder, PrjStartVirtualizing,
+        PrjStopVirtualizing, PrjWriteFileData, PrjWritePlaceholderInfo,
     };
     use windows::core::{GUID, HRESULT, HSTRING, PCWSTR};
 
@@ -1794,18 +1800,55 @@ mod windows_impl {
 
         let callbacks = build_callbacks();
 
+        // Register a notification mapping so the kernel delivers the
+        // events the presenter actually acts on. Without an explicit
+        // mapping ProjFS uses a default set that excludes
+        // `PRJ_NOTIFY_PRE_DELETE`, which would leave `allow_delete`
+        // (the delete-veto policy hook) dead code — the callback would
+        // never see a pre-delete to veto. The mapping is rooted at the
+        // virtualisation root (an empty relative path) so it applies to
+        // every projected file.
+        //
+        // The mask combines the pre-delete veto event with the standard
+        // post-hoc events (create / overwrite / rename / handle-close
+        // modified / handle-close deleted) so the notification callback
+        // observes the full user-driven lifecycle, matching the variants
+        // decoded by `NotificationEvent::from_i32`.
+        let notification_mask: PRJ_NOTIFY_TYPES = PRJ_NOTIFY_PRE_DELETE
+            | PRJ_NOTIFY_PRE_RENAME
+            | PRJ_NOTIFY_NEW_FILE_CREATED
+            | PRJ_NOTIFY_FILE_OVERWRITTEN
+            | PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_MODIFIED
+            | PRJ_NOTIFY_FILE_HANDLE_CLOSED_FILE_DELETED;
+        // The root is the empty relative path: the virtualisation root
+        // itself. `PCWSTR::null()` is not valid for a notification root,
+        // so use an explicit empty wide string that outlives the call.
+        let notification_root = HSTRING::from("");
+        let mut mappings = [PRJ_NOTIFICATION_MAPPING {
+            NotificationBitMask: notification_mask,
+            NotificationRoot: PCWSTR(notification_root.as_ptr()),
+        }];
+        let options = PRJ_STARTVIRTUALIZING_OPTIONS {
+            NotificationMappings: mappings.as_mut_ptr(),
+            NotificationMappingsCount: u32::try_from(mappings.len()).unwrap_or(0),
+            ..PRJ_STARTVIRTUALIZING_OPTIONS::default()
+        };
+
         // SAFETY: PrjStartVirtualizing copies the callback function
         // pointers out of `callbacks`. The stack-local table is valid
         // for the duration of the call. The instance_context pointer
         // is the raw Box we just allocated; the kernel keeps it until
-        // PrjStopVirtualizing returns.
+        // PrjStopVirtualizing returns. `options`, `mappings`, and
+        // `notification_root` all live on this stack frame, which does
+        // not return (no await) until PrjStartVirtualizing has read
+        // them, so the pointers stay valid for the duration of the call.
         #[allow(unsafe_code)]
         let start_result = unsafe {
             PrjStartVirtualizing(
                 mount_pcwstr,
                 &raw const callbacks,
                 Some(instance_context.cast_const()),
-                None,
+                Some(&raw const options),
             )
         };
         let ctx = match start_result {
