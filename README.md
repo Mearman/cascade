@@ -146,6 +146,7 @@ crates/
   cascade-config/         .cascade parsing (4 formats), merge, directory walk
   expr/                   Conditional expression parser (PEG via pest) and evaluator
   p2p/                    BEP protocol, peer discovery (LAN, gossip, announce, Mainline DHT), block store
+  cascade-announce-wire/  Announce-server wire contract: signed-candidate types, HMAC write auth, wasm-safe handler
   backend-gdrive/         Google Drive (Drive API v3, OAuth2 device code)
   backend-s3/             S3-compatible
   backend-local/          Local filesystem (adopt-and-sync)
@@ -159,6 +160,8 @@ crates/
 swift/
   CascadeFileProvider/    macOS File Provider extension
   CascadeFSKit/           macOS FSKit extension (15.4+)
+workers/
+  announce/               Stateless announce-server Cloudflare Worker (workers-rs, KV soft state)
 ```
 
 Integration tests live inside each crate's `tests/` directory rather than at workspace root.
