@@ -1,20 +1,25 @@
-//! Engine-backed [`ContentProvider`] for the Windows `ProjFS` presenter.
+//! Engine-backed [`ContentProvider`](cascade_presenter_projfs::ContentProvider)
+//! for the Windows `ProjFS` presenter.
 //!
 //! `ProjFS`'s `GetFileData` callback runs on a kernel-owned worker thread
 //! that is **not** part of any Tokio runtime, and the callback is
 //! synchronous. This provider bridges that synchronous, runtime-free
-//! context to the engine's async [`Backend::download`] API.
+//! context to the engine's async
+//! [`Backend::download`](cascade_engine::backend::Backend::download) API.
 //!
 //! # Why this lives in the binary crate
 //!
 //! The provider needs the engine's backend list and the same
 //! backend-resolution logic that `cli/mount.rs` already owns. Keeping it
 //! here avoids leaking backend-resolution dependencies into the presenter
-//! crate, which only knows the [`ContentProvider`] trait and [`ItemId`].
+//! crate, which only knows the
+//! [`ContentProvider`](cascade_presenter_projfs::ContentProvider) trait and
+//! [`ItemId`](cascade_engine::types::ItemId).
 //!
 //! # Read strategy: materialise once, then seek
 //!
-//! [`Backend::download`] streams an entire file; it has no range API. So
+//! [`Backend::download`](cascade_engine::backend::Backend::download) streams
+//! an entire file; it has no range API. So
 //! the first time any byte of a file is requested, the provider downloads
 //! the whole file to a versioned cache path and atomically renames it into
 //! place. Every subsequent range read — including every other range of the
