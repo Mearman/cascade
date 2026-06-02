@@ -30,6 +30,8 @@
 //! - **NAT traversal** (`nat`): STUN Binding Requests for external address
 //!   discovery and relay fallback decisions.
 //! - **Relay** (`relay`): WebSocket transport for peers behind restrictive NAT.
+//! - **Pipe** (`pipe`): blind bidirectional byte-pipe shared by the operated
+//!   relay server and the in-process peer relay.
 //! - **Connection management** (`connection`): Direct TCP connection attempts
 //!   with relay fallback.
 //! - **Identity** (`identity`): Self-signed TLS certificate generation with
@@ -42,6 +44,7 @@ pub mod discovery;
 pub mod framed;
 pub mod identity;
 pub mod nat;
+pub mod pipe;
 pub mod protocol;
 pub mod relay;
 pub mod store;
@@ -50,9 +53,9 @@ pub mod traversal;
 pub mod wan;
 
 pub use traversal::{
-    CandidatePair, Clock, ConnectivityStrategy, EstablishedFlow, NatType, PunchConfig, PunchError,
-    PunchTransport, ReceivedProbe, SyncPunchAgreement, SystemClock, decide_connectivity,
-    run_hole_punch,
+    CandidatePair, Clock, ConnectivityStrategy, EstablishedFlow, NatType, PeerRelay, PunchConfig,
+    PunchError, PunchTransport, ReceivedProbe, RelayRoute, SyncPunchAgreement, SystemClock,
+    decide_connectivity, run_hole_punch,
 };
 
 use std::path::Path;
