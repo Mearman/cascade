@@ -10,6 +10,7 @@ pub fn parse(content: &str) -> anyhow::Result<CascadeConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{MaxAge, MaxSize};
 
     #[test]
     fn parse_toml_ignores() {
@@ -41,8 +42,8 @@ max_age = "7d"
 "#;
         let config = parse(input).unwrap();
         let cache = config.cache.unwrap();
-        assert_eq!(cache.max_size, Some("5GB".to_string()));
-        assert_eq!(cache.max_age, Some("7d".to_string()));
+        assert_eq!(cache.max_size.map(MaxSize::as_bytes), Some(5_000_000_000));
+        assert_eq!(cache.max_age.map(MaxAge::as_secs), Some(7 * 24 * 60 * 60));
     }
 
     #[test]

@@ -12,6 +12,7 @@
 
 use cascade_config::merge;
 use cascade_config::parse;
+use cascade_config::{MaxAge, MaxSize};
 use std::fs;
 use tempfile::TempDir;
 
@@ -57,8 +58,8 @@ max_age = "7d"
     assert_eq!(config.ignore.len(), 2);
     assert!(config.cache.is_some());
     let cache = config.cache.as_ref().unwrap();
-    assert_eq!(cache.max_size.as_deref(), Some("5GB"));
-    assert_eq!(cache.max_age.as_deref(), Some("7d"));
+    assert_eq!(cache.max_size.map(MaxSize::as_bytes), Some(5_000_000_000));
+    assert_eq!(cache.max_age.map(MaxAge::as_secs), Some(7 * 24 * 60 * 60));
 }
 
 #[test]

@@ -18,5 +18,6 @@ pub mod parse;
 pub mod types;
 
 pub use types::{
-    CascadeConfig, DeviceConfig, GrantConfig, IgnoreRule, ResolvedConfig, ScopeConfig,
+    CacheConfig, CacheStatePosture, CascadeConfig, DeviceConfig, GrantConfig, IgnoreRule, MaxAge,
+    MaxSize, ResolvedConfig, ScopeConfig,
 };

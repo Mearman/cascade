@@ -146,28 +146,23 @@ mod tests {
 
     #[test]
     fn resolve_nearest_wins_for_cache() {
+        let cache_1gb: CacheConfig = toml::from_str("max_size = \"1GB\"").unwrap();
+        let cache_5gb: CacheConfig =
+            toml::from_str("max_size = \"5GB\"\nmax_age = \"7d\"").unwrap();
         let configs = vec![
             {
                 let mut c = CascadeConfig::empty();
-                c.cache = Some(CacheConfig {
-                    max_size: Some("1GB".to_string()),
-                    max_age: None,
-                    default_state: None,
-                });
+                c.cache = Some(cache_1gb);
                 c
             },
             {
                 let mut c = CascadeConfig::empty();
-                c.cache = Some(CacheConfig {
-                    max_size: Some("5GB".to_string()),
-                    max_age: Some("7d".to_string()),
-                    default_state: None,
-                });
+                c.cache = Some(cache_5gb);
                 c
             },
         ];
         let resolved = resolve_from_configs(configs);
         // Second config wins
-        assert_eq!(resolved.cache.unwrap().max_size, Some("5GB".to_string()));
+        assert_eq!(resolved.cache.unwrap().max_size, cache_5gb.max_size);
     }
 }

@@ -42,6 +42,9 @@ pub fn show(path: &str) -> Result<()> {
         if let Some(age) = &cache.max_age {
             println!("    Max age: {age}");
         }
+        if let Some(state) = &cache.default_state {
+            println!("    Default state: {state:?}");
+        }
     }
 
     Ok(())

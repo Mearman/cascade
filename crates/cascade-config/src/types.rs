@@ -1,6 +1,10 @@
 //! Cascade config types — shared across all four format parsers.
 
-use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::time::Duration;
+
+use serde::de::{self, Visitor};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Parsed contents of a `.cascade` file.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -87,11 +91,155 @@ pub struct PinRule {
 }
 
 /// Cache configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct CacheConfig {
-    pub max_size: Option<String>,
-    pub max_age: Option<String>,
-    pub default_state: Option<String>,
+    /// Maximum on-disk cache size. Parsed from human-readable byte strings
+    /// (for example `5GB`, `512MiB`) at config load; malformed values are
+    /// rejected during deserialisation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_size: Option<MaxSize>,
+    /// Maximum age a cached file may reach before it is eligible for eviction.
+    /// Parsed from human-readable duration strings (for example `7d`, `1h30m`)
+    /// at config load; malformed values are rejected during deserialisation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_age: Option<MaxAge>,
+    /// The default cache-state posture for files in this subtree. Absent means
+    /// the engine's own default applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_state: Option<CacheStatePosture>,
+}
+
+/// The declared default cache-state posture for a subtree.
+///
+/// This is the config-level posture, distinct from the engine's per-file
+/// runtime `CacheState` (which also models transient states such as
+/// downloading). Only the postures a `.cascade` file can declare appear here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheStatePosture {
+    /// Keep matching files resident on disk; never evict them automatically.
+    Pinned,
+    /// Keep matching files metadata-only; fetch content on demand.
+    Online,
+    /// Let lifecycle policies and cache limits decide residency.
+    Auto,
+}
+
+/// A maximum on-disk size, stored as a byte count.
+///
+/// Deserialises from a human-readable string such as `5GB` or `512MiB`.
+/// Malformed strings are rejected at config load rather than at use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaxSize(bytesize::ByteSize);
+
+impl MaxSize {
+    /// The size in bytes.
+    #[must_use]
+    pub const fn as_bytes(self) -> u64 {
+        self.0.as_u64()
+    }
+}
+
+impl fmt::Display for MaxSize {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for MaxSize {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct MaxSizeVisitor;
+
+        impl Visitor<'_> for MaxSizeVisitor {
+            type Value = MaxSize;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a byte size such as \"5GB\" or \"512MiB\"")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<MaxSize, E>
+            where
+                E: de::Error,
+            {
+                value
+                    .parse::<bytesize::ByteSize>()
+                    .map(MaxSize)
+                    .map_err(de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_str(MaxSizeVisitor)
+    }
+}
+
+impl Serialize for MaxSize {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0.to_string())
+    }
+}
+
+/// A maximum cache-file age, stored as a duration.
+///
+/// Deserialises from a human-readable string such as `7d` or `1h30m`.
+/// Malformed strings are rejected at config load rather than at use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaxAge(Duration);
+
+impl MaxAge {
+    /// The age in whole seconds.
+    #[must_use]
+    pub const fn as_secs(self) -> u64 {
+        self.0.as_secs()
+    }
+}
+
+impl fmt::Display for MaxAge {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", humantime::format_duration(self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for MaxAge {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct MaxAgeVisitor;
+
+        impl Visitor<'_> for MaxAgeVisitor {
+            type Value = MaxAge;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a duration such as \"7d\" or \"1h30m\"")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<MaxAge, E>
+            where
+                E: de::Error,
+            {
+                humantime::parse_duration(value)
+                    .map(MaxAge)
+                    .map_err(de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_str(MaxAgeVisitor)
+    }
+}
+
+impl Serialize for MaxAge {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&humantime::format_duration(self.0).to_string())
+    }
 }
 
 /// P2P configuration.
@@ -243,6 +391,60 @@ fn star_match(pattern: &str, path: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Parse a byte-size string the way config load does. Test-only helper.
+    fn parse_max_size(s: &str) -> MaxSize {
+        let toml = format!("max_size = \"{s}\"");
+        let cache: CacheConfig = toml::from_str(&toml).unwrap();
+        cache.max_size.unwrap()
+    }
+
+    /// Parse a duration string the way config load does. Test-only helper.
+    fn parse_max_age(s: &str) -> MaxAge {
+        let toml = format!("max_age = \"{s}\"");
+        let cache: CacheConfig = toml::from_str(&toml).unwrap();
+        cache.max_age.unwrap()
+    }
+
+    #[test]
+    fn max_size_parses_decimal_and_binary_units() {
+        assert_eq!(parse_max_size("5GB").as_bytes(), 5_000_000_000);
+        assert_eq!(parse_max_size("512MiB").as_bytes(), 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn max_size_rejects_malformed_at_load() {
+        let result: Result<CacheConfig, _> = toml::from_str("max_size = \"not-a-size\"");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn max_age_parses_compound_durations() {
+        assert_eq!(parse_max_age("7d").as_secs(), 7 * 24 * 60 * 60);
+        assert_eq!(parse_max_age("1h30m").as_secs(), 90 * 60);
+    }
+
+    #[test]
+    fn max_age_rejects_malformed_at_load() {
+        let result: Result<CacheConfig, _> = toml::from_str("max_age = \"whenever\"");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn default_state_parses_known_postures() {
+        let cache: CacheConfig = toml::from_str("default_state = \"pinned\"").unwrap();
+        assert_eq!(cache.default_state, Some(CacheStatePosture::Pinned));
+        let cache: CacheConfig = toml::from_str("default_state = \"online\"").unwrap();
+        assert_eq!(cache.default_state, Some(CacheStatePosture::Online));
+        let cache: CacheConfig = toml::from_str("default_state = \"auto\"").unwrap();
+        assert_eq!(cache.default_state, Some(CacheStatePosture::Auto));
+    }
+
+    #[test]
+    fn default_state_rejects_unknown_posture() {
+        let result: Result<CacheConfig, _> = toml::from_str("default_state = \"sometimes\"");
+        assert!(result.is_err());
+    }
+
     #[test]
     fn cascade_config_merge_accumulates_rules() {
         let mut a = CascadeConfig::empty();
@@ -253,7 +455,7 @@ mod tests {
             conditions: vec![],
         });
         a.cache = Some(CacheConfig {
-            max_size: Some("1GB".to_string()),
+            max_size: Some(parse_max_size("1GB")),
             max_age: None,
             default_state: None,
         });
@@ -266,15 +468,18 @@ mod tests {
             conditions: vec![],
         });
         b.cache = Some(CacheConfig {
-            max_size: Some("5GB".to_string()),
-            max_age: Some("7d".to_string()),
+            max_size: Some(parse_max_size("5GB")),
+            max_age: Some(parse_max_age("7d")),
             default_state: None,
         });
 
         a.merge(b);
         assert_eq!(a.ignore.len(), 2);
         // Cache is nearest-wins (overridden)
-        assert_eq!(a.cache.as_ref().unwrap().max_size, Some("5GB".to_string()));
+        assert_eq!(
+            a.cache.as_ref().unwrap().max_size,
+            Some(parse_max_size("5GB"))
+        );
     }
 
     #[test]
