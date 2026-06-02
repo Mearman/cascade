@@ -35,7 +35,7 @@ pub struct SyncRunner {
     change_feed: Option<Arc<ChangeFeed>>,
     /// Cancellation signal the runner observes. This is the engine's shared
     /// channel, handed in at construction, so a management-plane Stop (which
-    /// signals the engine's [`Engine::shutdown`]) actually quiesces the sync
+    /// signals the engine's [`Engine::shutdown`](crate::engine::Engine::shutdown)) actually quiesces the sync
     /// loop — not just the cache worker. The runner never owns a private
     /// channel; if it did, the engine's cancel could never reach it.
     cancel_rx: watch::Receiver<bool>,
