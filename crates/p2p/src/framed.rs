@@ -251,7 +251,7 @@ mod tests {
         });
 
         let client_manager = ConnectionManager::new(identity, vec![device_id.clone()]);
-        let (_observed, client_conn) = client_manager
+        let client_conn = client_manager
             .connect(&DiscoveredPeer { device_id, address })
             .await
             .unwrap();

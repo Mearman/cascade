@@ -75,14 +75,15 @@ impl ConnectionManager {
 
     /// Connect to a known peer over direct TCP+TLS.
     ///
-    /// Returns the connection alongside the source [`SocketAddr`] the
-    /// local socket observed for the peer. For an outbound dial that is
-    /// the peer's listening address rather than a `NAT`-mapped reflexive
-    /// one, but it is surfaced symmetrically with [`Self::accept`] so the
-    /// session layer can echo it back to the peer in a
-    /// [`crate::protocol::BepMessage::ObservedAddress`] frame.
-    pub async fn connect(&self, peer: &DiscoveredPeer) -> Result<(SocketAddr, PeerConnection)> {
-        let (observed_addr, stream) = self
+    /// Returns only the connection. An outbound dial observes nothing
+    /// useful about the peer's reachability: the socket's `peer_addr()`
+    /// is simply the address we just dialled — the peer's own listening
+    /// address, which the peer already knows — not any `NAT`-mapped
+    /// reflexive source. Peer-as-`STUN` observations therefore flow only
+    /// from [`Self::accept`], where `peer_addr()` is the connecting
+    /// peer's genuine `NAT`-mapped source.
+    pub async fn connect(&self, peer: &DiscoveredPeer) -> Result<PeerConnection> {
+        let stream = self
             .connect_direct(peer.address, &peer.device_id)
             .await
             .with_context(|| {
@@ -91,7 +92,7 @@ impl ConnectionManager {
                     peer.device_id, peer.address
                 )
             })?;
-        Ok((observed_addr, PeerConnection::Direct(Box::new(stream))))
+        Ok(PeerConnection::Direct(Box::new(stream)))
     }
 
     /// Accept an incoming connection and verify the peer's device ID.
@@ -144,11 +145,14 @@ impl ConnectionManager {
     /// Initiate a direct TLS connection to an address. The `expected_device_id`
     /// is pinned at the verifier layer so the handshake fails for any peer
     /// whose certificate fingerprint does not match.
+    ///
+    /// Returns only the TLS stream. The connecting side observes no
+    /// reflexive address worth surfacing — see [`Self::connect`].
     async fn connect_direct(
         &self,
         address: SocketAddr,
         expected_device_id: &str,
-    ) -> Result<(SocketAddr, TlsStream<TcpStream>)> {
+    ) -> Result<TlsStream<TcpStream>> {
         let tcp = TcpStream::connect(address)
             .await
             .with_context(|| format!("TCP connect to {address}"))?;
@@ -165,10 +169,7 @@ impl ConnectionManager {
         // Belt-and-braces: the cert that survived the TLS handshake should
         // match the expected device, but verify once more in case a verifier
         // was misconfigured. This branch is unreachable in normal operation.
-        let (tcp, connection) = tls_stream.get_ref();
-        let observed_addr = tcp
-            .peer_addr()
-            .context("reading observed peer address from connected socket")?;
+        let (_tcp, connection) = tls_stream.get_ref();
         let peer_cert = connection
             .peer_certificates()
             .context("peer did not present a certificate")?;
@@ -183,7 +184,7 @@ impl ConnectionManager {
             );
         }
 
-        Ok((observed_addr, TlsStream::Client(tls_stream)))
+        Ok(TlsStream::Client(tls_stream))
     }
 
     /// Build a TLS client connector that presents our identity certificate
@@ -583,7 +584,7 @@ mod tests {
             address,
         };
         let client_manager = ConnectionManager::new(identity, vec![device_id]);
-        let (_observed, connection) = client_manager.connect(&peer).await.unwrap();
+        let connection = client_manager.connect(&peer).await.unwrap();
 
         match connection {
             PeerConnection::Direct(_) => {}
