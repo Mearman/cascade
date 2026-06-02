@@ -182,6 +182,38 @@ impl Engine {
         tree.unmount(prefix);
     }
 
+    /// Wire the management-plane dispatch port into every backend that serves
+    /// remote management.
+    ///
+    /// The engine is the production [`ManageDispatch`] implementation — it owns
+    /// the grant store, the audit log, and the command executor. A backend that
+    /// runs its own peer transport (the P2P backend) receives inbound
+    /// `ManageRequest` frames and needs this port to authorise, audit, and
+    /// execute them through the same core the local CLI drives. Backends with no
+    /// transport ignore the call (the trait default is a no-op).
+    ///
+    /// Called once at daemon startup, after the engine is constructed and before
+    /// its presenter begins accepting connections. Takes `self: &Arc<Self>` so
+    /// the engine can hand a clone of itself, as an `Arc<dyn ManageDispatch>`, to
+    /// each backend.
+    pub async fn wire_manage_dispatch(self: &Arc<Self>) {
+        let dispatch: Arc<dyn ManageDispatch> = self.clone();
+        let backends: Vec<Arc<dyn Backend>> = {
+            let tree = self
+                .vfs
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut backends = vec![tree.root().clone()];
+            for (_, backend) in tree.children() {
+                backends.push(backend.clone());
+            }
+            backends
+        };
+        for backend in backends {
+            backend.set_manage_dispatch(dispatch.clone()).await;
+        }
+    }
+
     /// Create a sync runner for polling all registered backends.
     ///
     /// The caller provides the presenter (typically the platform presenter —

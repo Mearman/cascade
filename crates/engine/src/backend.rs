@@ -1,10 +1,12 @@
 //! Backend trait — every cloud provider implements this.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 
+use crate::manage::ManageDispatch;
 use crate::types::{Change, Cursor, FileEntry, FileId, Quota};
 
 /// A backend-level error category that presenters can map to specific
@@ -153,6 +155,24 @@ pub trait Backend: Send + Sync {
     /// Recommended poll interval for this backend. Returns `None` if the
     /// backend doesn't support polling (use fixed interval from config).
     async fn poll_interval(&self) -> Option<Duration>;
+
+    /// Inject the management-plane dispatch port the daemon's engine implements.
+    ///
+    /// A backend that runs its own peer-to-peer transport (the P2P backend)
+    /// receives inbound `ManageRequest` frames from remote managers; it needs a
+    /// handle to the engine's [`ManageDispatch`] so an authorised remote command
+    /// runs through the same authorise → audit → execute core the local CLI
+    /// drives. The daemon calls this once, after constructing the engine, before
+    /// the backend begins accepting connections.
+    ///
+    /// The default is a no-op: backends with no transport of their own (cloud
+    /// and local-filesystem backends) never serve management requests, so they
+    /// have nothing to wire. Overriding backends take `&self` and store the port
+    /// behind their own interior mutability so the already-running listener and
+    /// session loops observe it.
+    async fn set_manage_dispatch(&self, dispatch: Arc<dyn ManageDispatch>) {
+        let _ = dispatch;
+    }
 }
 
 /// A null backend used for P2P-only folders with no cloud storage.
