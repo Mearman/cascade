@@ -20,11 +20,13 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 pub mod dispatch;
+pub mod token;
 
 pub use dispatch::{
     ManageCommandExecutor, ManageDispatch, ManageGrantStore, required_capability, run_dispatch,
     scope_from_wire,
 };
+pub use token::{CapabilityToken, MAX_DELEGATION_DEPTH, TokenClaims, TokenVerifyError};
 
 /// A device identity — the principal of the management plane.
 ///
