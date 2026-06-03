@@ -112,8 +112,18 @@ pub async fn start(
     }
 
     // Create backends from config.
+    //
+    // A daemon with nothing to mount has no work to do, so it exits cleanly
+    // rather than bailing with an error. This matters when `cascade start` is
+    // run by an OS background service (`cascade service`): a non-zero exit
+    // would make launchd / systemd treat the start as a crash and restart it
+    // in a tight loop. Exiting 0 lets the service stay idle until a backend is
+    // added and the service is restarted. The advice to run `cascade init` is
+    // surfaced for the interactive operator who started the daemon by hand.
     if main_config.backends.is_empty() {
-        anyhow::bail!("No backends configured. Run `cascade init` to set up.");
+        tracing::info!("No backends configured; nothing to mount.");
+        println!("No backends configured. Run `cascade init` to set one up, then start again.");
+        return Ok(());
     }
 
     // Resolve mount point: CLI arg > config.toml [mount].point > ~/Cloud.
