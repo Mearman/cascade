@@ -47,10 +47,16 @@ pub mod nat;
 pub mod pipe;
 pub mod protocol;
 pub mod relay;
+pub mod rendezvous;
 pub mod store;
 pub mod transport;
 pub mod traversal;
 pub mod wan;
+
+pub use rendezvous::{
+    DEFAULT_MAX_PRESENCES, DEFAULT_PRESENCE_TTL, PairedPeer, PresenceHandle, RegisterOutcome,
+    RendezvousBroker, RendezvousError, RendezvousOffer,
+};
 
 pub use traversal::{
     CandidatePair, Clock, ConnectivityStrategy, EstablishedFlow, NatType, PeerRelay, PunchConfig,
