@@ -8,27 +8,27 @@
 use super::state::StateManager;
 use super::xdr::{
     self, ACCESS4_DELETE, ACCESS4_EXECUTE, ACCESS4_LOOKUP, ACCESS4_MODIFY, ACCESS4_READ,
-    FATTR4_FILEID, FATTR4_MODE, FATTR4_SIZE, FATTR4_TYPE, Fattr4, NFS4_OK, NFS4ERR_BADHANDLE,
-    NFS4ERR_INVAL, NFS4ERR_IO, NFS4ERR_NOTSUPP, NFS4ERR_ROFS, NfsFh4, OP_ACCESS, OP_CLOSE,
-    OP_COMMIT, OP_CREATE, OP_GETATTR, OP_GETFH, OP_LINK, OP_LOCK, OP_LOCKT, OP_LOCKU, OP_LOOKUP,
-    OP_LOOKUPP, OP_OPEN, OP_PUTFH, OP_PUTROOTFH, OP_READ, OP_READDIR, OP_READLINK, OP_REMOVE,
-    OP_RENAME, OP_RESTOREFH, OP_SAVEFH, OP_SETATTR, OP_WRITE,
+    FATTR4_FILEID, FATTR4_MODE, FATTR4_SIZE, FATTR4_TYPE, FILE_SYNC4, Fattr4, NF4DIR, NFS4_OK,
+    NFS4ERR_ACCES, NFS4ERR_BADHANDLE, NFS4ERR_EXIST, NFS4ERR_INVAL, NFS4ERR_IO, NFS4ERR_NOSPC,
+    NFS4ERR_NOTEMPTY, NFS4ERR_ROFS, NFS4ERR_STALE, NfsFh4, OP_ACCESS, OP_CLOSE, OP_COMMIT,
+    OP_CREATE, OP_GETATTR, OP_GETFH, OP_LINK, OP_LOCK, OP_LOCKT, OP_LOCKU, OP_LOOKUP, OP_LOOKUPP,
+    OP_OPEN, OP_PUTFH, OP_PUTROOTFH, OP_READ, OP_READDIR, OP_READLINK, OP_REMOVE, OP_RENAME,
+    OP_RESTOREFH, OP_SAVEFH, OP_SETATTR, OP_WRITE,
 };
 use crate::nfs::context::NfsContext;
 use crate::nfs::server::NfsCacheMode;
+use crate::nfs::write::{self, WriteError};
 use std::sync::Arc;
 
-/// The status an unimplemented write operation reports for a given cache mode.
-///
-/// A read-only export ([`NfsCacheMode::Off`]) refuses writes with
-/// `NFS4ERR_ROFS`. A write-capable export reports `NFS4ERR_NOTSUPP` because the
-/// write path is not yet implemented — distinct from a deliberately read-only
-/// mount. This mirrors the `NFSv3` gating in [`crate::nfs::procedures`].
-const fn write_unsupported_status(cache_mode: NfsCacheMode) -> u32 {
-    if cache_mode.writes_permitted() {
-        NFS4ERR_NOTSUPP
-    } else {
-        NFS4ERR_ROFS
+/// Map a [`WriteError`] to the appropriate `NFS4ERR_*` status code.
+const fn write_error_status(err: WriteError) -> u32 {
+    match err {
+        WriteError::Traversal | WriteError::Forbidden => NFS4ERR_ACCES,
+        WriteError::NotFound => NFS4ERR_STALE,
+        WriteError::Conflict => NFS4ERR_EXIST,
+        WriteError::Invalid => NFS4ERR_INVAL,
+        WriteError::NoSpace => NFS4ERR_NOSPC,
+        WriteError::Io => NFS4ERR_IO,
     }
 }
 
@@ -44,7 +44,7 @@ pub fn handle_compound(
     state_mgr: &Arc<StateManager>,
     cache_mode: NfsCacheMode,
 ) -> Vec<u8> {
-    let write_unsupported = write_unsupported_status(cache_mode);
+    let writes_permitted = cache_mode.writes_permitted();
     let mut reply = Vec::new();
 
     // Decode tag.
@@ -166,7 +166,12 @@ pub fn handle_compound(
                     |fh| {
                         let path = fh.to_path().unwrap_or_default();
                         let is_dir = path.ends_with('/') || path == "/" || path.is_empty();
-                        let attr = make_attributes(&path, is_dir);
+                        let size = if is_dir {
+                            0
+                        } else {
+                            file_size_sync(ctx, &path)
+                        };
+                        let attr = xdr::make_fattr4_with_size(&path, is_dir, size);
                         let mut r = op_status_reply(NFS4_OK);
                         xdr::encode_fattr4(&mut r, &bitmap, &attr);
                         r
@@ -198,16 +203,17 @@ pub fn handle_compound(
             }
             OP_READDIR => handle_readdir(&mut cursor, ctx, current_fh.as_ref()),
             OP_READ => handle_read(&mut cursor, ctx, current_fh.as_ref()),
-            OP_WRITE => handle_write(&mut cursor, write_unsupported),
+            OP_WRITE => handle_write(&mut cursor, ctx, current_fh.as_ref(), writes_permitted),
             OP_OPEN => handle_open(&mut cursor, ctx, state_mgr, current_fh.as_ref()),
             OP_CLOSE => handle_close(&mut cursor, state_mgr),
-            OP_CREATE => handle_create(&mut cursor, current_fh.as_ref(), write_unsupported),
-            OP_REMOVE => handle_remove(&mut cursor, current_fh.as_ref(), write_unsupported),
+            OP_CREATE => handle_create(&mut cursor, ctx, current_fh.as_ref(), writes_permitted),
+            OP_REMOVE => handle_remove(&mut cursor, ctx, current_fh.as_ref(), writes_permitted),
             OP_RENAME => handle_rename(
                 &mut cursor,
+                ctx,
                 current_fh.as_ref(),
                 saved_fh.as_ref(),
-                write_unsupported,
+                writes_permitted,
             ),
             OP_SAVEFH => {
                 saved_fh.clone_from(&current_fh);
@@ -218,16 +224,13 @@ pub fn handle_compound(
                 op_status_reply(NFS4_OK)
             }
             OP_COMMIT => op_status_reply(NFS4_OK),
-            OP_SETATTR => {
-                if let Ok((_, rest)) = xdr::decode_stateid(cursor)
-                    && let Ok((_, rest)) = xdr::decode_attr_bitmap(rest)
-                {
-                    cursor = rest;
-                }
-                op_status_reply(write_unsupported)
-            }
+            OP_SETATTR => handle_setattr(&mut cursor, ctx, current_fh.as_ref(), writes_permitted),
             OP_READLINK | OP_LOCK | OP_LOCKT | OP_LOCKU => op_status_reply(NFS4ERR_INVAL),
-            OP_LINK => op_status_reply(write_unsupported),
+            OP_LINK => op_status_reply(if writes_permitted {
+                NFS4ERR_INVAL
+            } else {
+                NFS4ERR_ROFS
+            }),
             _ => {
                 overall_status = NFS4ERR_INVAL;
                 break;
@@ -359,20 +362,52 @@ fn handle_read(cursor: &mut &[u8], ctx: &NfsContext, current_fh: Option<&NfsFh4>
     )
 }
 
-/// Handle WRITE operation.
+/// Handle WRITE operation (RFC 7530 §16.36).
 ///
-/// The write path is not yet implemented. `unsupported_status` carries the
-/// mode-dependent refusal: `NFS4ERR_ROFS` on a read-only export, otherwise
-/// `NFS4ERR_NOTSUPP`.
-fn handle_write(cursor: &mut &[u8], unsupported_status: u32) -> Vec<u8> {
-    if let Ok((_, rest)) = xdr::decode_stateid(cursor)
-        && let Ok((_, rest)) = xdr::decode_u64(rest)
-        && let Ok((_, rest)) = xdr::decode_u32(rest)
-        && let Ok((_, rest)) = xdr::decode_opaque(rest)
-    {
-        *cursor = rest;
+/// Args: `stateid` + `offset (uint64)` + `stable (uint32)` + `data (opaque<>)`.
+/// On a read-only export it returns `NFS4ERR_ROFS`; otherwise it writes through
+/// the shared engine path and replies `count` + `committed` + `writeverf`.
+fn handle_write(
+    cursor: &mut &[u8],
+    ctx: &NfsContext,
+    current_fh: Option<&NfsFh4>,
+    writes_permitted: bool,
+) -> Vec<u8> {
+    let Ok((_stateid, rest)) = xdr::decode_stateid(cursor) else {
+        return op_status_reply(NFS4ERR_INVAL);
+    };
+    let Ok((offset, rest)) = xdr::decode_u64(rest) else {
+        return op_status_reply(NFS4ERR_INVAL);
+    };
+    let Ok((_stable, rest)) = xdr::decode_u32(rest) else {
+        return op_status_reply(NFS4ERR_INVAL);
+    };
+    let Ok((data, rest)) = xdr::decode_opaque(rest) else {
+        return op_status_reply(NFS4ERR_INVAL);
+    };
+    *cursor = rest;
+
+    if !writes_permitted {
+        return op_status_reply(NFS4ERR_ROFS);
     }
-    op_status_reply(unsupported_status)
+
+    current_fh.map_or_else(
+        || op_status_reply(NFS4ERR_BADHANDLE),
+        |fh| {
+            let path = fh.to_path().unwrap_or_default();
+            match write::write_file(ctx, &path, offset, data) {
+                Ok(_new_size) => {
+                    let written = u32::try_from(data.len()).unwrap_or(u32::MAX);
+                    let mut r = op_status_reply(NFS4_OK);
+                    xdr::encode_u32(&mut r, written); // count
+                    xdr::encode_u32(&mut r, FILE_SYNC4); // committed
+                    xdr::encode_u64(&mut r, 0); // writeverf
+                    r
+                }
+                Err(e) => op_status_reply(write_error_status(e)),
+            }
+        },
+    )
 }
 
 /// Handle OPEN operation (minimal — creates state but no real file I/O).
@@ -484,22 +519,27 @@ fn handle_close(cursor: &mut &[u8], state_mgr: &Arc<StateManager>) -> Vec<u8> {
     reply
 }
 
-/// Handle CREATE operation.
+/// Handle CREATE operation (RFC 7530 §16.4).
 ///
-/// The write path is not yet implemented. `unsupported_status` carries the
-/// mode-dependent refusal: `NFS4ERR_ROFS` on a read-only export, otherwise
-/// `NFS4ERR_NOTSUPP`.
+/// `NFSv4` CREATE makes non-regular objects (directories, symlinks, …); regular
+/// files are created via OPEN. Cascade supports directory creation here.
+///
+/// Args: `objtype (createtype4)` + `objname` + `createattrs (fattr4)`. For a
+/// directory the object type carries no extra union arm. On success the reply
+/// is `cinfo (change_info4)` + `attrset (bitmap4)`; the new directory becomes
+/// the current file handle.
 fn handle_create(
     cursor: &mut &[u8],
+    ctx: &NfsContext,
     current_fh: Option<&NfsFh4>,
-    unsupported_status: u32,
+    writes_permitted: bool,
 ) -> Vec<u8> {
-    let Ok((_obj_type, rest)) = xdr::decode_u32(cursor) else {
+    let Ok((obj_type, rest)) = xdr::decode_u32(cursor) else {
         return op_status_reply(NFS4ERR_INVAL);
     };
     *cursor = rest;
 
-    let Ok((_name, rest)) = xdr::decode_string(cursor) else {
+    let Ok((name, rest)) = xdr::decode_string(cursor) else {
         return op_status_reply(NFS4ERR_INVAL);
     };
     *cursor = rest;
@@ -508,52 +548,211 @@ fn handle_create(
         *cursor = rest;
     }
 
-    let _ = current_fh;
-    op_status_reply(unsupported_status)
+    if !writes_permitted {
+        return op_status_reply(NFS4ERR_ROFS);
+    }
+
+    // Only NF4DIR is supported; other object types (symlink, device, …) are not
+    // modelled by the backends.
+    if obj_type != NF4DIR {
+        return op_status_reply(NFS4ERR_INVAL);
+    }
+
+    current_fh.map_or_else(
+        || op_status_reply(NFS4ERR_BADHANDLE),
+        |dir_fh| {
+            let parent_path = dir_fh.to_path().unwrap_or_default();
+            match write::make_dir(ctx, &parent_path, &name) {
+                Ok(_child_path) => {
+                    let mut r = op_status_reply(NFS4_OK);
+                    // cinfo (change_info4): atomic, before, after.
+                    xdr::encode_bool(&mut r, true);
+                    xdr::encode_u64(&mut r, 0);
+                    xdr::encode_u64(&mut r, 1);
+                    // attrset: empty bitmap.
+                    xdr::encode_attr_bitmap(&mut r, &[]);
+                    r
+                }
+                Err(e) => op_status_reply(write_error_status(e)),
+            }
+        },
+    )
 }
 
-/// Handle REMOVE operation.
+/// Handle REMOVE operation (RFC 7530 §16.25).
 ///
-/// The write path is not yet implemented. `unsupported_status` carries the
-/// mode-dependent refusal: `NFS4ERR_ROFS` on a read-only export, otherwise
-/// `NFS4ERR_NOTSUPP`.
+/// Args: `target (component4)`. The target is removed from the directory named
+/// by the current file handle. On success the reply is `cinfo (change_info4)`.
 fn handle_remove(
     cursor: &mut &[u8],
+    ctx: &NfsContext,
     current_fh: Option<&NfsFh4>,
-    unsupported_status: u32,
+    writes_permitted: bool,
 ) -> Vec<u8> {
-    let Ok((_name, rest)) = xdr::decode_string(cursor) else {
+    let Ok((name, rest)) = xdr::decode_string(cursor) else {
         return op_status_reply(NFS4ERR_INVAL);
     };
     *cursor = rest;
 
-    let _ = current_fh;
-    op_status_reply(unsupported_status)
+    if !writes_permitted {
+        return op_status_reply(NFS4ERR_ROFS);
+    }
+
+    current_fh.map_or_else(
+        || op_status_reply(NFS4ERR_BADHANDLE),
+        |dir_fh| {
+            let parent_path = dir_fh.to_path().unwrap_or_default();
+            match write::remove_any(ctx, &parent_path, &name) {
+                Ok(child_path) => {
+                    ctx.remove_path(NfsContext::path_to_key(&child_path));
+                    let mut r = op_status_reply(NFS4_OK);
+                    // cinfo (change_info4): atomic, before, after.
+                    xdr::encode_bool(&mut r, true);
+                    xdr::encode_u64(&mut r, 0);
+                    xdr::encode_u64(&mut r, 1);
+                    r
+                }
+                Err(e) => {
+                    let status = match e {
+                        WriteError::Conflict => NFS4ERR_NOTEMPTY,
+                        other => write_error_status(other),
+                    };
+                    op_status_reply(status)
+                }
+            }
+        },
+    )
 }
 
-/// Handle RENAME operation.
+/// Handle RENAME operation (RFC 7530 §16.26).
 ///
-/// The write path is not yet implemented. `unsupported_status` carries the
-/// mode-dependent refusal: `NFS4ERR_ROFS` on a read-only export, otherwise
-/// `NFS4ERR_NOTSUPP`.
+/// Args: `oldname (component4)` + `newname (component4)`. The source directory
+/// is the saved file handle; the destination directory is the current file
+/// handle. On success the reply is `source_cinfo` + `target_cinfo`.
 fn handle_rename(
     cursor: &mut &[u8],
+    ctx: &NfsContext,
     current_fh: Option<&NfsFh4>,
     saved_fh: Option<&NfsFh4>,
-    unsupported_status: u32,
+    writes_permitted: bool,
 ) -> Vec<u8> {
-    let Ok((_oldname, rest)) = xdr::decode_string(cursor) else {
+    let Ok((oldname, rest)) = xdr::decode_string(cursor) else {
         return op_status_reply(NFS4ERR_INVAL);
     };
     *cursor = rest;
 
-    let Ok((_newname, rest)) = xdr::decode_string(cursor) else {
+    let Ok((newname, rest)) = xdr::decode_string(cursor) else {
         return op_status_reply(NFS4ERR_INVAL);
     };
     *cursor = rest;
 
-    let _ = (current_fh, saved_fh);
-    op_status_reply(unsupported_status)
+    if !writes_permitted {
+        return op_status_reply(NFS4ERR_ROFS);
+    }
+
+    let (Some(src_fh), Some(dst_fh)) = (saved_fh, current_fh) else {
+        return op_status_reply(NFS4ERR_BADHANDLE);
+    };
+    let from_parent = src_fh.to_path().unwrap_or_default();
+    let to_parent = dst_fh.to_path().unwrap_or_default();
+
+    match write::rename_entry(ctx, &from_parent, &oldname, &to_parent, &newname) {
+        Ok((src_path, _dst_path)) => {
+            ctx.remove_path(NfsContext::path_to_key(&src_path));
+            let mut r = op_status_reply(NFS4_OK);
+            // source_cinfo.
+            xdr::encode_bool(&mut r, true);
+            xdr::encode_u64(&mut r, 0);
+            xdr::encode_u64(&mut r, 1);
+            // target_cinfo.
+            xdr::encode_bool(&mut r, true);
+            xdr::encode_u64(&mut r, 0);
+            xdr::encode_u64(&mut r, 1);
+            r
+        }
+        Err(e) => op_status_reply(write_error_status(e)),
+    }
+}
+
+/// Handle SETATTR operation (RFC 7530 §16.32).
+///
+/// Args: `stateid` + `obj_attributes (fattr4)`. The only mutation Cascade
+/// honours is a `size` change (truncate / extend); other attribute changes are
+/// accepted as no-ops. On success the reply is `attrsset (bitmap4)`.
+fn handle_setattr(
+    cursor: &mut &[u8],
+    ctx: &NfsContext,
+    current_fh: Option<&NfsFh4>,
+    writes_permitted: bool,
+) -> Vec<u8> {
+    let Ok((_stateid, rest)) = xdr::decode_stateid(cursor) else {
+        return op_status_reply(NFS4ERR_INVAL);
+    };
+    *cursor = rest;
+
+    let Ok((bitmap, rest)) = xdr::decode_attr_bitmap(cursor) else {
+        return op_status_reply(NFS4ERR_INVAL);
+    };
+
+    // The attribute values follow the bitmap directly, in ascending
+    // attribute-number order — matching this codebase's `encode_fattr4`, which
+    // does not wrap the values in an `opaque<>`.
+    let new_size = decode_size_attr(&bitmap, rest);
+    // Consume the size value from the cursor when it was present so the next
+    // operation in the compound stays framed.
+    if new_size.is_some()
+        && let Ok((_, after)) = xdr::decode_u64(rest)
+    {
+        *cursor = after;
+    } else {
+        *cursor = rest;
+    }
+
+    if !writes_permitted {
+        return op_status_reply(NFS4ERR_ROFS);
+    }
+
+    current_fh.map_or_else(
+        || op_status_reply(NFS4ERR_BADHANDLE),
+        |fh| {
+            let path = fh.to_path().unwrap_or_default();
+            new_size.map_or_else(
+                || {
+                    let mut r = op_status_reply(NFS4_OK);
+                    xdr::encode_attr_bitmap(&mut r, &[]);
+                    r
+                },
+                |size| match write::truncate_file(ctx, &path, size) {
+                    Ok(()) => {
+                        let mut r = op_status_reply(NFS4_OK);
+                        xdr::encode_attr_bitmap(&mut r, &[FATTR4_SIZE]);
+                        r
+                    }
+                    Err(e) => op_status_reply(write_error_status(e)),
+                },
+            )
+        },
+    )
+}
+
+/// Extract a requested `FATTR4_SIZE` value from the encoded `fattr4` values
+/// blob. Returns `None` when the bitmap does not request a size change.
+///
+/// Per RFC 7530 the values are encoded in ascending attribute-number order, so
+/// `size` (attribute 4) is the first value when present and the bitmap requests
+/// nothing lower-numbered that carries data. Cascade only acts on `size`, so it
+/// reads the leading `uint64` when `FATTR4_SIZE` is the lowest set bit.
+fn decode_size_attr(bitmap: &[u32], values: &[u8]) -> Option<u64> {
+    if !bitmap.contains(&FATTR4_SIZE) {
+        return None;
+    }
+    // Cascade only honours size; if any lower-numbered attribute is also set the
+    // leading bytes belong to it and the size offset is unknown, so the change
+    // is treated as a no-op rather than misparsed.
+    if bitmap.iter().any(|&b| b < FATTR4_SIZE) {
+        return None;
+    }
+    xdr::decode_u64(values).ok().map(|(size, _)| size)
 }
 
 /// Build attributes for a path.
@@ -579,6 +778,15 @@ fn parent_path(path: &str) -> String {
         Some(0) | None => "/".to_string(),
         Some(idx) => trimmed[..idx].to_string(),
     }
+}
+
+/// Fetch the current size of a file via the backend, returning 0 when the file
+/// is absent or its size is unknown.
+fn file_size_sync(ctx: &NfsContext, path: &str) -> u64 {
+    ctx.metadata_sync(path)
+        .ok()
+        .and_then(|entry| entry.size)
+        .unwrap_or(0)
 }
 
 /// Synchronously fetch file data from the VFS backend.
@@ -745,17 +953,6 @@ mod tests {
     }
 
     #[test]
-    fn write_on_write_capable_export_returns_notsupp() {
-        let (ctx, state_mgr) = test_ctx();
-        for mode in [NfsCacheMode::Minimal, NfsCacheMode::Full] {
-            let args = write_compound_args();
-            let reply = handle_compound(&args, &ctx, &state_mgr, mode);
-            let (status, _) = xdr::decode_u32(&reply).unwrap();
-            assert_eq!(status, NFS4ERR_NOTSUPP);
-        }
-    }
-
-    #[test]
     fn compound_close() {
         let (ctx, state_mgr) = test_ctx();
         let sid = state_mgr.create_open("/test.txt", 1);
@@ -795,5 +992,280 @@ mod tests {
         assert_eq!(parent_path("/Documents"), "/");
         assert_eq!(parent_path("/Documents/Reports"), "/Documents");
         assert_eq!(parent_path("/a/b/c"), "/a/b");
+    }
+}
+
+/// `NFSv4` write-path integration tests backed by a real `LocalBackend`.
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+    use crate::nfs::context::NfsContext;
+    use crate::nfs::v4::state::StateManager;
+    use cascade_engine::vfs::VfsTree;
+    use std::sync::RwLock;
+    use tempfile::TempDir;
+
+    fn writable_ctx() -> (Arc<NfsContext>, Arc<StateManager>, TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = toml::Value::Table({
+            let mut t = toml::map::Map::new();
+            t.insert(
+                "root_path".to_string(),
+                toml::Value::String(dir.path().to_string_lossy().into_owned()),
+            );
+            t.insert("id".to_string(), toml::Value::String("local".to_string()));
+            t
+        });
+        let backend: Arc<dyn cascade_engine::backend::Backend> =
+            cascade_backend_local::create_backend(&config)
+                .expect("create local backend")
+                .into();
+        let vfs = Arc::new(RwLock::new(VfsTree::new(backend)));
+        let ctx = Arc::new(NfsContext::new(vfs));
+        ctx.register_path("/");
+        (ctx, Arc::new(StateManager::new()), dir)
+    }
+
+    fn build_compound(ops: &[(u32, &[u8])]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        xdr::encode_string(&mut buf, "");
+        xdr::encode_u32(&mut buf, 0);
+        xdr::encode_u32(&mut buf, u32::try_from(ops.len()).unwrap_or(0));
+        for &(opnum, args) in ops {
+            xdr::encode_u32(&mut buf, opnum);
+            buf.extend_from_slice(args);
+        }
+        buf
+    }
+
+    fn run(
+        ctx: &Arc<NfsContext>,
+        state_mgr: &Arc<StateManager>,
+        ops: &[(u32, &[u8])],
+        mode: NfsCacheMode,
+    ) -> Vec<u8> {
+        let args = build_compound(ops);
+        tokio::task::block_in_place(|| handle_compound(&args, ctx, state_mgr, mode))
+    }
+
+    fn lookup_op(name: &str) -> Vec<u8> {
+        let mut a = Vec::new();
+        xdr::encode_string(&mut a, name);
+        a
+    }
+
+    fn write_op(offset: u64, data: &[u8]) -> Vec<u8> {
+        let mut a = Vec::new();
+        xdr::encode_stateid(&mut a, &super::super::xdr::StateId::zero());
+        xdr::encode_u64(&mut a, offset);
+        xdr::encode_u32(&mut a, 0); // UNSTABLE4
+        xdr::encode_opaque(&mut a, data);
+        a
+    }
+
+    /// Resolve the file size via a PUTROOTFH/LOOKUP/GETATTR compound.
+    fn getattr_size(ctx: &Arc<NfsContext>, state_mgr: &Arc<StateManager>, name: &str) -> u64 {
+        let mut bitmap = Vec::new();
+        xdr::encode_attr_bitmap(&mut bitmap, &[super::super::xdr::FATTR4_SIZE]);
+        let lookup = lookup_op(name);
+        let reply = run(
+            ctx,
+            state_mgr,
+            &[
+                (OP_PUTROOTFH, &[]),
+                (OP_LOOKUP, &lookup),
+                (OP_GETATTR, &bitmap),
+            ],
+            NfsCacheMode::Minimal,
+        );
+        // Walk the compound reply to the GETATTR op result. Layout: overall
+        // status + tag(string) + numops, then per-op: opnum-less status blocks
+        // appended by `op_status_reply`. Each op reply here begins with its
+        // status; the GETATTR op reply is status + fattr4 (bitmap + size).
+        let (overall, rest) = xdr::decode_u32(&reply).unwrap();
+        assert_eq!(overall, NFS4_OK);
+        let (_tag, rest) = xdr::decode_string(rest).unwrap();
+        let (_numops, rest) = xdr::decode_u32(rest).unwrap();
+        // PUTROOTFH op: status only.
+        let (s0, rest) = xdr::decode_u32(rest).unwrap();
+        assert_eq!(s0, NFS4_OK);
+        // LOOKUP op: status only.
+        let (s1, rest) = xdr::decode_u32(rest).unwrap();
+        assert_eq!(s1, NFS4_OK);
+        // GETATTR op: status + bitmap + size value.
+        let (s2, rest) = xdr::decode_u32(rest).unwrap();
+        assert_eq!(s2, NFS4_OK);
+        let (_returned_bitmap, rest) = xdr::decode_attr_bitmap(rest).unwrap();
+        let (size, _) = xdr::decode_u64(rest).unwrap();
+        size
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_then_getattr_reflects_size() {
+        let (ctx, state_mgr, _dir) = writable_ctx();
+        let lookup = lookup_op("v4.txt");
+        let write = write_op(0, b"abcdef");
+        let reply = run(
+            &ctx,
+            &state_mgr,
+            &[
+                (OP_PUTROOTFH, &[]),
+                (OP_LOOKUP, &lookup),
+                (OP_WRITE, &write),
+            ],
+            NfsCacheMode::Minimal,
+        );
+        assert_eq!(xdr::decode_u32(&reply).unwrap().0, NFS4_OK);
+
+        assert_eq!(getattr_size(&ctx, &state_mgr, "v4.txt"), 6);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_makes_directory() {
+        let (ctx, state_mgr, _dir) = writable_ctx();
+        // CREATE objtype=NF4DIR, name, empty createattrs.
+        let mut create = Vec::new();
+        xdr::encode_u32(&mut create, NF4DIR);
+        xdr::encode_string(&mut create, "v4dir");
+        xdr::encode_attr_bitmap(&mut create, &[]);
+
+        let reply = run(
+            &ctx,
+            &state_mgr,
+            &[(OP_PUTROOTFH, &[]), (OP_CREATE, &create)],
+            NfsCacheMode::Minimal,
+        );
+        assert_eq!(xdr::decode_u32(&reply).unwrap().0, NFS4_OK);
+
+        // The directory must now resolve via LOOKUP.
+        let lookup = lookup_op("v4dir");
+        let reply = run(
+            &ctx,
+            &state_mgr,
+            &[(OP_PUTROOTFH, &[]), (OP_LOOKUP, &lookup)],
+            NfsCacheMode::Minimal,
+        );
+        assert_eq!(xdr::decode_u32(&reply).unwrap().0, NFS4_OK);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn setattr_truncate_changes_size() {
+        let (ctx, state_mgr, _dir) = writable_ctx();
+        let lookup = lookup_op("trunc.txt");
+        let write = write_op(0, b"0123456789");
+        run(
+            &ctx,
+            &state_mgr,
+            &[
+                (OP_PUTROOTFH, &[]),
+                (OP_LOOKUP, &lookup),
+                (OP_WRITE, &write),
+            ],
+            NfsCacheMode::Minimal,
+        );
+        assert_eq!(getattr_size(&ctx, &state_mgr, "trunc.txt"), 10);
+
+        // SETATTR size=3: stateid + bitmap([SIZE]) + size value.
+        let mut setattr = Vec::new();
+        xdr::encode_stateid(&mut setattr, &super::super::xdr::StateId::zero());
+        xdr::encode_attr_bitmap(&mut setattr, &[super::super::xdr::FATTR4_SIZE]);
+        xdr::encode_u64(&mut setattr, 3);
+
+        let lookup = lookup_op("trunc.txt");
+        let reply = run(
+            &ctx,
+            &state_mgr,
+            &[
+                (OP_PUTROOTFH, &[]),
+                (OP_LOOKUP, &lookup),
+                (OP_SETATTR, &setattr),
+            ],
+            NfsCacheMode::Minimal,
+        );
+        assert_eq!(xdr::decode_u32(&reply).unwrap().0, NFS4_OK);
+
+        assert_eq!(getattr_size(&ctx, &state_mgr, "trunc.txt"), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remove_deletes_file() {
+        let (ctx, state_mgr, _dir) = writable_ctx();
+        let lookup = lookup_op("gone.txt");
+        let write = write_op(0, b"x");
+        run(
+            &ctx,
+            &state_mgr,
+            &[
+                (OP_PUTROOTFH, &[]),
+                (OP_LOOKUP, &lookup),
+                (OP_WRITE, &write),
+            ],
+            NfsCacheMode::Minimal,
+        );
+
+        // REMOVE operates on the directory in the current fh (root).
+        let remove = lookup_op("gone.txt");
+        let reply = run(
+            &ctx,
+            &state_mgr,
+            &[(OP_PUTROOTFH, &[]), (OP_REMOVE, &remove)],
+            NfsCacheMode::Minimal,
+        );
+        assert_eq!(xdr::decode_u32(&reply).unwrap().0, NFS4_OK);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rename_moves_via_savefh() {
+        let (ctx, state_mgr, _dir) = writable_ctx();
+        let lookup = lookup_op("src.txt");
+        let write = write_op(0, b"data");
+        run(
+            &ctx,
+            &state_mgr,
+            &[
+                (OP_PUTROOTFH, &[]),
+                (OP_LOOKUP, &lookup),
+                (OP_WRITE, &write),
+            ],
+            NfsCacheMode::Minimal,
+        );
+
+        // RENAME: SAVEFH (root as source dir), PUTROOTFH (root as dest dir),
+        // RENAME oldname/newname.
+        let mut rename = Vec::new();
+        xdr::encode_string(&mut rename, "src.txt");
+        xdr::encode_string(&mut rename, "dst.txt");
+        let reply = run(
+            &ctx,
+            &state_mgr,
+            &[
+                (OP_PUTROOTFH, &[]),
+                (OP_SAVEFH, &[]),
+                (OP_PUTROOTFH, &[]),
+                (OP_RENAME, &rename),
+            ],
+            NfsCacheMode::Minimal,
+        );
+        assert_eq!(xdr::decode_u32(&reply).unwrap().0, NFS4_OK);
+
+        assert_eq!(getattr_size(&ctx, &state_mgr, "dst.txt"), 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_on_read_only_export_returns_rofs() {
+        let (ctx, state_mgr, _dir) = writable_ctx();
+        let lookup = lookup_op("ro.txt");
+        let write = write_op(0, b"nope");
+        let reply = run(
+            &ctx,
+            &state_mgr,
+            &[
+                (OP_PUTROOTFH, &[]),
+                (OP_LOOKUP, &lookup),
+                (OP_WRITE, &write),
+            ],
+            NfsCacheMode::Off,
+        );
+        assert_eq!(xdr::decode_u32(&reply).unwrap().0, NFS4ERR_ROFS);
     }
 }

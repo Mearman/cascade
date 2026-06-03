@@ -18,6 +18,8 @@ dirs.workspace = true
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tempfile = "3"
 proptest = "1"
+cascade-backend-local = { path = "../backend-local" }
+toml.workspace = true
 
 [lints]
 workspace = true

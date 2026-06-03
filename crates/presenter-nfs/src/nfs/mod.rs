@@ -3,6 +3,7 @@ pub mod mount;
 pub mod procedures;
 pub mod server;
 pub mod v4;
+pub mod write;
 pub mod xdr;
 
 // NFSv3 + NFSv4 server implementation.

@@ -115,6 +115,27 @@ impl NfsContext {
         vfs.read_dir(std::path::Path::new(path)).await
     }
 
+    /// Rename a VFS path, routing through [`VfsTree::rename`] (which handles
+    /// same-backend moves and cross-backend download/upload/delete).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend rejects the move.
+    ///
+    /// Note: the `RwLockReadGuard` is intentionally held across the `.await`
+    /// here because `VfsTree::rename` needs `&self` for the duration of the
+    /// call, exactly as [`Self::list_dir`] does. The future is therefore not
+    /// `Send`; all callers invoke it via `block_on` from a sync context.
+    #[allow(clippy::await_holding_lock, clippy::future_not_send)]
+    pub async fn rename(&self, src: &str, dst: &str) -> anyhow::Result<()> {
+        let vfs = self
+            .vfs
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        vfs.rename(std::path::Path::new(src), std::path::Path::new(dst))
+            .await
+    }
+
     /// Get file metadata at a VFS path.
     ///
     /// # Errors

@@ -541,6 +541,7 @@ version = "0.1.53"
 dependencies = [
  "anyhow",
  "async-trait",
+ "cascade-backend-local",
  "cascade-engine",
  "dirs",
  "proptest",
@@ -549,6 +550,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "toml",
  "tracing",
 ]
 

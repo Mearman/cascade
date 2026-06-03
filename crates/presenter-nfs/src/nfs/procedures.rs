@@ -1,17 +1,24 @@
 //! NFS procedure handlers.
 //!
-//! Phase 1 read-only procedures: NULL, GETATTR, LOOKUP, READDIR, READ, FSSTAT.
-//! Write procedures return `NFS3ERR_ROFS`.
+//! Read procedures: NULL, GETATTR, LOOKUP, READDIR, READ, FSSTAT.
+//! Write procedures: WRITE, CREATE, SETATTR, MKDIR, REMOVE, RMDIR, RENAME,
+//! COMMIT — gated on the export's [`NfsCacheMode`]. A read-only export
+//! ([`NfsCacheMode::Off`]) refuses every write with `NFS3ERR_ROFS`; a
+//! write-capable export funnels the write into the same engine operations the
+//! `WebDAV` and FUSE presenters use (see [`crate::nfs::write`]).
 
 use super::context::NfsContext;
 use super::server::NfsCacheMode;
+use super::write::{self, WriteError};
 use super::xdr::{
-    Fattr3, NF3DIR, NF3REG, NFS3_OK, NFS3ERR_INVAL, NFS3ERR_IO, NFS3ERR_NOTSUPP, NFS3ERR_ROFS,
-    NFS3ERR_STALE, NFS3PROC_COMMIT, NFS3PROC_CREATE, NFS3PROC_FSSTAT, NFS3PROC_GETATTR,
-    NFS3PROC_LOOKUP, NFS3PROC_MKDIR, NFS3PROC_NULL, NFS3PROC_READ, NFS3PROC_READDIR,
-    NFS3PROC_REMOVE, NFS3PROC_RENAME, NFS3PROC_RMDIR, NFS3PROC_SETATTR, NFS3PROC_WRITE, NfsFh3,
-    NfsTime, PostOpAttr, Specdata3, decode_fh, decode_string, decode_u32, decode_u64, encode_bool,
-    encode_fh, encode_post_op_attr, encode_string, encode_u32, encode_u64,
+    Fattr3, NF3DIR, NF3REG, NFS3_FILE_SYNC, NFS3_OK, NFS3ERR_ACCES, NFS3ERR_EXIST, NFS3ERR_INVAL,
+    NFS3ERR_IO, NFS3ERR_NOSPC, NFS3ERR_NOTEMPTY, NFS3ERR_ROFS, NFS3ERR_STALE, NFS3PROC_COMMIT,
+    NFS3PROC_CREATE, NFS3PROC_FSSTAT, NFS3PROC_GETATTR, NFS3PROC_LOOKUP, NFS3PROC_MKDIR,
+    NFS3PROC_NULL, NFS3PROC_READ, NFS3PROC_READDIR, NFS3PROC_REMOVE, NFS3PROC_RENAME,
+    NFS3PROC_RMDIR, NFS3PROC_SETATTR, NFS3PROC_WRITE, NfsFh3, NfsTime, PostOpAttr, Sattr3,
+    Specdata3, decode_fh, decode_opaque, decode_sattr3, decode_string, decode_u32, decode_u64,
+    encode_bool, encode_fh, encode_post_op_attr, encode_post_op_fh3, encode_string, encode_u32,
+    encode_u64, encode_wcc_data,
 };
 use std::sync::Arc;
 
@@ -20,7 +27,7 @@ use std::sync::Arc;
 ///
 /// Write procedures are gated on `cache_mode`: a read-only export
 /// ([`NfsCacheMode::Off`]) refuses them with `NFS3ERR_ROFS`, while a
-/// write-capable export reports `NFS3ERR_NOTSUPP` until the write path lands.
+/// write-capable export performs the write.
 pub fn handle_nfs_call(
     proc: u32,
     args: &[u8],
@@ -34,10 +41,53 @@ pub fn handle_nfs_call(
         NFS3PROC_READDIR => handle_readdir(args, ctx),
         NFS3PROC_READ => handle_read(args, ctx),
         NFS3PROC_FSSTAT => handle_fsstat(args, ctx),
-        NFS3PROC_SETATTR | NFS3PROC_WRITE | NFS3PROC_CREATE | NFS3PROC_MKDIR | NFS3PROC_REMOVE
-        | NFS3PROC_RMDIR | NFS3PROC_RENAME | NFS3PROC_COMMIT => handle_write(cache_mode),
+        NFS3PROC_WRITE => guard_write(cache_mode, || handle_write(args, ctx)),
+        NFS3PROC_CREATE => guard_write(cache_mode, || handle_create(args, ctx)),
+        NFS3PROC_SETATTR => guard_write(cache_mode, || handle_setattr(args, ctx)),
+        NFS3PROC_MKDIR => guard_write(cache_mode, || handle_mkdir(args, ctx)),
+        NFS3PROC_REMOVE => guard_write(cache_mode, || handle_remove(args, ctx)),
+        NFS3PROC_RMDIR => guard_write(cache_mode, || handle_rmdir(args, ctx)),
+        NFS3PROC_RENAME => guard_write(cache_mode, || handle_rename(args, ctx)),
+        NFS3PROC_COMMIT => guard_write(cache_mode, handle_commit),
         _ => handle_unimplemented(),
     }
+}
+
+/// Refuse a write on a read-only export, otherwise run the handler.
+///
+/// A read-only export ([`NfsCacheMode::Off`]) returns a bare `NFS3ERR_ROFS`
+/// status. Write-capable modes ([`NfsCacheMode::Minimal`], [`NfsCacheMode::Full`])
+/// run `handler`.
+fn guard_write(cache_mode: NfsCacheMode, handler: impl FnOnce() -> Vec<u8>) -> Vec<u8> {
+    if cache_mode.writes_permitted() {
+        handler()
+    } else {
+        let mut reply = Vec::new();
+        encode_u32(&mut reply, NFS3ERR_ROFS);
+        reply
+    }
+}
+
+/// Map a [`WriteError`] to the appropriate `NFS3ERR_*` status code.
+const fn write_error_status(err: WriteError) -> u32 {
+    match err {
+        WriteError::Traversal | WriteError::Forbidden => NFS3ERR_ACCES,
+        WriteError::NotFound => NFS3ERR_STALE,
+        WriteError::Conflict => NFS3ERR_EXIST,
+        WriteError::Invalid => NFS3ERR_INVAL,
+        WriteError::NoSpace => NFS3ERR_NOSPC,
+        WriteError::Io => NFS3ERR_IO,
+    }
+}
+
+/// Resolve the VFS path for a directory file handle, defaulting to the export
+/// root when the handle is unknown (mirrors the read procedures).
+fn dir_path_for_fh(ctx: &NfsContext, fh: &NfsFh3) -> String {
+    let key = fh
+        .to_item_id()
+        .and_then(|id| id.parse::<u64>().ok())
+        .unwrap_or(0);
+    ctx.lookup_path(key).unwrap_or_else(|| "/".to_string())
 }
 
 /// NULL procedure — do nothing.
@@ -55,7 +105,13 @@ fn handle_getattr(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
             .and_then(|id| id.parse::<u64>().ok())
             .unwrap_or(0);
         if let Some(path) = ctx.lookup_path(key) {
-            let attr = make_attributes(&path, path == "/");
+            let is_dir = path == "/";
+            let size = if is_dir {
+                0
+            } else {
+                file_size_sync(ctx, &path)
+            };
+            let attr = make_attributes_with_size(&path, is_dir, size);
             encode_u32(&mut reply, NFS3_OK);
             encode_post_op_attr(&mut reply, &PostOpAttr::some(attr));
         } else {
@@ -296,20 +352,301 @@ fn handle_fsstat(args: &[u8], _ctx: &Arc<NfsContext>) -> Vec<u8> {
     reply
 }
 
-/// Write operations, gated on the export's cache mode.
+/// WRITE — write `data` at `offset` into a file (RFC 1813 §3.3.7).
 ///
-/// A read-only export refuses writes with `NFS3ERR_ROFS`. A write-capable
-/// export reports `NFS3ERR_NOTSUPP` because the write path is not yet
-/// implemented — distinct from a deliberately read-only mount.
-fn handle_write(cache_mode: NfsCacheMode) -> Vec<u8> {
-    let status = if cache_mode.writes_permitted() {
-        NFS3ERR_NOTSUPP
-    } else {
-        NFS3ERR_ROFS
-    };
+/// Args: `file (nfs_fh3)` + `offset (uint64)` + `count (uint32)` +
+/// `stable (uint32)` + `data (opaque<>)`. The reply on success is
+/// `file_wcc (wcc_data)` + `count` + `committed (uint32)` + `verf (8 bytes)`.
+fn handle_write(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
     let mut reply = Vec::new();
-    encode_u32(&mut reply, status);
-    // For an error reply, wcc_data with no pre/post attrs is sufficient.
+
+    let Ok((fh, rest)) = decode_fh(args) else {
+        encode_u32(&mut reply, NFS3ERR_STALE);
+        encode_wcc_data(&mut reply, &PostOpAttr::none());
+        return reply;
+    };
+    let Some(path) = lookup_existing_path(ctx, &fh) else {
+        encode_u32(&mut reply, NFS3ERR_STALE);
+        encode_wcc_data(&mut reply, &PostOpAttr::none());
+        return reply;
+    };
+    let Ok((offset, rest)) = decode_u64(rest) else {
+        encode_u32(&mut reply, NFS3ERR_INVAL);
+        encode_wcc_data(&mut reply, &PostOpAttr::none());
+        return reply;
+    };
+    // count + stable precede the data; the opaque length is authoritative.
+    let Ok((_count, rest)) = decode_u32(rest) else {
+        encode_u32(&mut reply, NFS3ERR_INVAL);
+        encode_wcc_data(&mut reply, &PostOpAttr::none());
+        return reply;
+    };
+    let Ok((_stable, rest)) = decode_u32(rest) else {
+        encode_u32(&mut reply, NFS3ERR_INVAL);
+        encode_wcc_data(&mut reply, &PostOpAttr::none());
+        return reply;
+    };
+    let Ok((data, _)) = decode_opaque(rest) else {
+        encode_u32(&mut reply, NFS3ERR_INVAL);
+        encode_wcc_data(&mut reply, &PostOpAttr::none());
+        return reply;
+    };
+
+    match write::write_file(ctx, &path, offset, data) {
+        Ok(new_size) => {
+            let attr = make_attributes_with_size(&path, false, new_size);
+            let written = u32::try_from(data.len()).unwrap_or(u32::MAX);
+            encode_u32(&mut reply, NFS3_OK);
+            encode_wcc_data(&mut reply, &PostOpAttr::some(attr));
+            encode_u32(&mut reply, written); // count
+            encode_u32(&mut reply, NFS3_FILE_SYNC); // committed
+            encode_u64(&mut reply, 0); // write verifier
+        }
+        Err(e) => {
+            encode_u32(&mut reply, write_error_status(e));
+            encode_wcc_data(&mut reply, &PostOpAttr::none());
+        }
+    }
+
+    reply
+}
+
+/// CREATE — create a regular file in a directory (RFC 1813 §3.3.8).
+///
+/// Args: `where (dir_fh + name)` + `how (createhow3)`. The reply on success is
+/// `obj (post_op_fh3)` + `obj_attributes (post_op_attr)` + `dir_wcc (wcc_data)`.
+fn handle_create(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
+    let mut reply = Vec::new();
+
+    let Ok((dir_fh, rest)) = decode_fh(args) else {
+        encode_u32(&mut reply, NFS3ERR_STALE);
+        encode_wcc_data(&mut reply, &PostOpAttr::none());
+        return reply;
+    };
+    let Ok((name, _rest)) = decode_string(rest) else {
+        encode_u32(&mut reply, NFS3ERR_INVAL);
+        encode_wcc_data(&mut reply, &PostOpAttr::none());
+        return reply;
+    };
+    // The createhow3 mode and attributes follow but do not affect content for a
+    // zero-length create; the resulting size is always 0.
+    let parent_path = dir_path_for_fh(ctx, &dir_fh);
+
+    match write::create_file(ctx, &parent_path, &name) {
+        Ok(child_path) => {
+            let key = ctx.register_path(&child_path);
+            let child_fh = NfsFh3::from_item_id(&key.to_string());
+            let attr = make_attributes_with_size(&child_path, false, 0);
+            encode_u32(&mut reply, NFS3_OK);
+            encode_post_op_fh3(&mut reply, Some(&child_fh));
+            encode_post_op_attr(&mut reply, &PostOpAttr::some(attr));
+            encode_wcc_data(&mut reply, &PostOpAttr::none());
+        }
+        Err(e) => {
+            encode_u32(&mut reply, write_error_status(e));
+            encode_wcc_data(&mut reply, &PostOpAttr::none());
+        }
+    }
+
+    reply
+}
+
+/// SETATTR — change file attributes; the only mutation honoured is a size
+/// change (truncate / extend) (RFC 1813 §3.3.2).
+///
+/// Args: `object (nfs_fh3)` + `new_attributes (sattr3)` + `guard`. The reply on
+/// success is `obj_wcc (wcc_data)`.
+fn handle_setattr(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
+    let mut reply = Vec::new();
+
+    let Ok((fh, rest)) = decode_fh(args) else {
+        encode_u32(&mut reply, NFS3ERR_STALE);
+        encode_wcc_data(&mut reply, &PostOpAttr::none());
+        return reply;
+    };
+    let Some(path) = lookup_existing_path(ctx, &fh) else {
+        encode_u32(&mut reply, NFS3ERR_STALE);
+        encode_wcc_data(&mut reply, &PostOpAttr::none());
+        return reply;
+    };
+    let Ok((attrs, _rest)) = decode_sattr3(rest) else {
+        encode_u32(&mut reply, NFS3ERR_INVAL);
+        encode_wcc_data(&mut reply, &PostOpAttr::none());
+        return reply;
+    };
+
+    // Only a size change has a content effect. Mode/uid/gid/time changes are
+    // accepted as no-ops — the backends model neither — so a client `chmod`
+    // does not fail the whole SETATTR.
+    let Sattr3 { size, .. } = attrs;
+    if let Some(new_size) = size {
+        match write::truncate_file(ctx, &path, new_size) {
+            Ok(()) => {
+                let attr = make_attributes_with_size(&path, false, new_size);
+                encode_u32(&mut reply, NFS3_OK);
+                encode_wcc_data(&mut reply, &PostOpAttr::some(attr));
+            }
+            Err(e) => {
+                encode_u32(&mut reply, write_error_status(e));
+                encode_wcc_data(&mut reply, &PostOpAttr::none());
+            }
+        }
+    } else {
+        let current = file_size_sync(ctx, &path);
+        let attr = make_attributes_with_size(&path, false, current);
+        encode_u32(&mut reply, NFS3_OK);
+        encode_wcc_data(&mut reply, &PostOpAttr::some(attr));
+    }
+
+    reply
+}
+
+/// MKDIR — create a directory (RFC 1813 §3.3.9).
+fn handle_mkdir(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
+    let mut reply = Vec::new();
+
+    let Ok((dir_fh, rest)) = decode_fh(args) else {
+        encode_u32(&mut reply, NFS3ERR_STALE);
+        encode_wcc_data(&mut reply, &PostOpAttr::none());
+        return reply;
+    };
+    let Ok((name, _rest)) = decode_string(rest) else {
+        encode_u32(&mut reply, NFS3ERR_INVAL);
+        encode_wcc_data(&mut reply, &PostOpAttr::none());
+        return reply;
+    };
+    let parent_path = dir_path_for_fh(ctx, &dir_fh);
+
+    match write::make_dir(ctx, &parent_path, &name) {
+        Ok(child_path) => {
+            let key = ctx.register_path(&child_path);
+            let child_fh = NfsFh3::from_item_id(&key.to_string());
+            let attr = make_attributes_with_size(&child_path, true, 0);
+            encode_u32(&mut reply, NFS3_OK);
+            encode_post_op_fh3(&mut reply, Some(&child_fh));
+            encode_post_op_attr(&mut reply, &PostOpAttr::some(attr));
+            encode_wcc_data(&mut reply, &PostOpAttr::none());
+        }
+        Err(e) => {
+            encode_u32(&mut reply, write_error_status(e));
+            encode_wcc_data(&mut reply, &PostOpAttr::none());
+        }
+    }
+
+    reply
+}
+
+/// REMOVE — delete a file (RFC 1813 §3.3.12).
+fn handle_remove(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
+    handle_unlink(args, ctx, false)
+}
+
+/// RMDIR — delete a directory (RFC 1813 §3.3.13).
+fn handle_rmdir(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
+    handle_unlink(args, ctx, true)
+}
+
+/// Shared body for REMOVE and RMDIR. Args: `object (dir_fh + name)`. The reply
+/// on success is `dir_wcc (wcc_data)`.
+fn handle_unlink(args: &[u8], ctx: &Arc<NfsContext>, expect_dir: bool) -> Vec<u8> {
+    let mut reply = Vec::new();
+
+    let Ok((dir_fh, rest)) = decode_fh(args) else {
+        encode_u32(&mut reply, NFS3ERR_STALE);
+        encode_wcc_data(&mut reply, &PostOpAttr::none());
+        return reply;
+    };
+    let Ok((name, _rest)) = decode_string(rest) else {
+        encode_u32(&mut reply, NFS3ERR_INVAL);
+        encode_wcc_data(&mut reply, &PostOpAttr::none());
+        return reply;
+    };
+    let parent_path = dir_path_for_fh(ctx, &dir_fh);
+
+    match write::remove_entry(ctx, &parent_path, &name, expect_dir) {
+        Ok(child_path) => {
+            ctx.remove_path(NfsContext::path_to_key(&child_path));
+            encode_u32(&mut reply, NFS3_OK);
+            encode_wcc_data(&mut reply, &PostOpAttr::none());
+        }
+        Err(e) => {
+            // A kind mismatch is reported by the engine as `Invalid`; for RMDIR
+            // on a non-empty directory the backend surfaces a generic failure
+            // mapped to IO, but a not-empty backend error maps to NOTEMPTY.
+            let status = match (&e, expect_dir) {
+                (WriteError::Conflict, true) => NFS3ERR_NOTEMPTY,
+                _ => write_error_status(e),
+            };
+            encode_u32(&mut reply, status);
+            encode_wcc_data(&mut reply, &PostOpAttr::none());
+        }
+    }
+
+    reply
+}
+
+/// RENAME — move/rename an entry (RFC 1813 §3.3.14).
+///
+/// Args: `from (dir_fh + name)` + `to (dir_fh + name)`. The reply on success is
+/// `fromdir_wcc (wcc_data)` + `todir_wcc (wcc_data)`.
+fn handle_rename(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
+    let mut reply = Vec::new();
+
+    let Ok((from_fh, rest)) = decode_fh(args) else {
+        encode_u32(&mut reply, NFS3ERR_STALE);
+        encode_wcc_data(&mut reply, &PostOpAttr::none());
+        encode_wcc_data(&mut reply, &PostOpAttr::none());
+        return reply;
+    };
+    let Ok((from_name, rest)) = decode_string(rest) else {
+        encode_u32(&mut reply, NFS3ERR_INVAL);
+        encode_wcc_data(&mut reply, &PostOpAttr::none());
+        encode_wcc_data(&mut reply, &PostOpAttr::none());
+        return reply;
+    };
+    let Ok((to_fh, rest)) = decode_fh(rest) else {
+        encode_u32(&mut reply, NFS3ERR_STALE);
+        encode_wcc_data(&mut reply, &PostOpAttr::none());
+        encode_wcc_data(&mut reply, &PostOpAttr::none());
+        return reply;
+    };
+    let Ok((to_name, _rest)) = decode_string(rest) else {
+        encode_u32(&mut reply, NFS3ERR_INVAL);
+        encode_wcc_data(&mut reply, &PostOpAttr::none());
+        encode_wcc_data(&mut reply, &PostOpAttr::none());
+        return reply;
+    };
+
+    let from_parent = dir_path_for_fh(ctx, &from_fh);
+    let to_parent = dir_path_for_fh(ctx, &to_fh);
+
+    match write::rename_entry(ctx, &from_parent, &from_name, &to_parent, &to_name) {
+        Ok((src_path, _dst_path)) => {
+            ctx.remove_path(NfsContext::path_to_key(&src_path));
+            encode_u32(&mut reply, NFS3_OK);
+            encode_wcc_data(&mut reply, &PostOpAttr::none());
+            encode_wcc_data(&mut reply, &PostOpAttr::none());
+        }
+        Err(e) => {
+            encode_u32(&mut reply, write_error_status(e));
+            encode_wcc_data(&mut reply, &PostOpAttr::none());
+            encode_wcc_data(&mut reply, &PostOpAttr::none());
+        }
+    }
+
+    reply
+}
+
+/// COMMIT — flush buffered writes (RFC 1813 §3.3.21).
+///
+/// Cascade replies `NFS3_FILE_SYNC` for every WRITE, so there is no buffered
+/// data to flush. COMMIT therefore succeeds immediately with empty `wcc_data`
+/// and a zero verifier.
+fn handle_commit() -> Vec<u8> {
+    let mut reply = Vec::new();
+    encode_u32(&mut reply, NFS3_OK);
+    encode_wcc_data(&mut reply, &PostOpAttr::none());
+    encode_u64(&mut reply, 0); // write verifier
     reply
 }
 
@@ -320,16 +657,39 @@ fn handle_unimplemented() -> Vec<u8> {
     reply
 }
 
-/// Build synthetic attributes for a file/directory.
+/// Look up the VFS path for a file handle, returning `None` for the root or any
+/// unregistered handle — used by procedures that operate on an existing file.
+fn lookup_existing_path(ctx: &NfsContext, fh: &NfsFh3) -> Option<String> {
+    let key = fh.to_item_id().and_then(|id| id.parse::<u64>().ok())?;
+    ctx.lookup_path(key)
+}
+
+/// Fetch the current size of a file via the backend, returning 0 when the file
+/// is absent or its size is unknown.
+fn file_size_sync(ctx: &NfsContext, path: &str) -> u64 {
+    ctx.metadata_sync(path)
+        .ok()
+        .and_then(|entry| entry.size)
+        .unwrap_or(0)
+}
+
+/// Build synthetic attributes for a file/directory with an unknown (zero)
+/// size. Used by procedures that do not report content length (LOOKUP,
+/// READDIR, FSSTAT, READ — which carries its own byte count).
 fn make_attributes(id: &str, is_dir: bool) -> Fattr3 {
+    make_attributes_with_size(id, is_dir, 0)
+}
+
+/// Build synthetic attributes for a file/directory with a known size.
+fn make_attributes_with_size(id: &str, is_dir: bool, size: u64) -> Fattr3 {
     Fattr3 {
         ftype: if is_dir { NF3DIR } else { NF3REG },
         mode: if is_dir { 0o755 } else { 0o644 },
         nlink: if is_dir { 2 } else { 1 },
         uid: 501,
         gid: 20,
-        size: 0,
-        used: 0,
+        size,
+        used: size,
         rdev: Specdata3::default(),
         fsid: 0,
         fileid: id_hash(id),
@@ -411,24 +771,6 @@ mod tests {
     }
 
     #[test]
-    fn write_on_read_only_export_returns_rofs() {
-        let ctx = test_ctx();
-        let reply = handle_nfs_call(NFS3PROC_CREATE, &[], &ctx, NfsCacheMode::Off);
-        let (status, _) = decode_u32(&reply).unwrap();
-        assert_eq!(status, NFS3ERR_ROFS);
-    }
-
-    #[test]
-    fn write_on_write_capable_export_returns_notsupp() {
-        let ctx = test_ctx();
-        for mode in [NfsCacheMode::Minimal, NfsCacheMode::Full] {
-            let reply = handle_nfs_call(NFS3PROC_CREATE, &[], &ctx, mode);
-            let (status, _) = decode_u32(&reply).unwrap();
-            assert_eq!(status, NFS3ERR_NOTSUPP);
-        }
-    }
-
-    #[test]
     fn fsstat_returns_ok() {
         let ctx = test_ctx();
         let root_key = ctx.root_key();
@@ -439,5 +781,304 @@ mod tests {
         let reply = handle_nfs_call(NFS3PROC_FSSTAT, &args, &ctx, NfsCacheMode::Minimal);
         let (status, _) = decode_u32(&reply).unwrap();
         assert_eq!(status, NFS3_OK);
+    }
+}
+
+/// Write-path integration tests backed by a real `LocalBackend` over a tempdir,
+/// so each procedure exercises the actual engine write operations rather than a
+/// stub.
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+    use cascade_engine::vfs::VfsTree;
+    use std::sync::RwLock;
+    use tempfile::TempDir;
+
+    /// Build a write-capable context rooted at a fresh tempdir, returning the
+    /// context and the `TempDir` guard (which must outlive the context).
+    fn writable_ctx() -> (Arc<NfsContext>, TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = toml::Value::Table({
+            let mut t = toml::map::Map::new();
+            t.insert(
+                "root_path".to_string(),
+                toml::Value::String(dir.path().to_string_lossy().into_owned()),
+            );
+            t.insert("id".to_string(), toml::Value::String("local".to_string()));
+            t
+        });
+        let backend: Arc<dyn cascade_engine::backend::Backend> =
+            cascade_backend_local::create_backend(&config)
+                .expect("create local backend")
+                .into();
+        let vfs = Arc::new(RwLock::new(VfsTree::new(backend)));
+        let ctx = Arc::new(NfsContext::new(vfs));
+        ctx.register_path("/");
+        (ctx, dir)
+    }
+
+    /// Run a synchronous NFS handler that internally uses `block_on`, from
+    /// within a multi-thread Tokio test, by entering a blocking section.
+    fn call(ctx: &Arc<NfsContext>, proc: u32, args: &[u8], mode: NfsCacheMode) -> Vec<u8> {
+        tokio::task::block_in_place(|| handle_nfs_call(proc, args, ctx, mode))
+    }
+
+    /// Encode a `WRITE3args` body: `file_fh` + offset + count + stable + data.
+    fn write_args(fh: &NfsFh3, offset: u64, data: &[u8]) -> Vec<u8> {
+        let mut args = Vec::new();
+        encode_fh(&mut args, fh);
+        encode_u64(&mut args, offset);
+        encode_u32(&mut args, u32::try_from(data.len()).unwrap_or(u32::MAX));
+        encode_u32(&mut args, super::super::xdr::NFS3_UNSTABLE);
+        super::super::xdr::encode_opaque(&mut args, data);
+        args
+    }
+
+    /// Encode a `CREATE3args` body: `dir_fh` + name + `createhow3` (UNCHECKED,
+    /// empty `sattr3`).
+    fn create_args(dir_fh: &NfsFh3, name: &str) -> Vec<u8> {
+        let mut args = Vec::new();
+        encode_fh(&mut args, dir_fh);
+        encode_string(&mut args, name);
+        encode_u32(&mut args, super::super::xdr::NFS3_CREATE_UNCHECKED);
+        // Empty sattr3: every set_* discriminant false; two set_time DONT_CHANGE.
+        for _ in 0..4 {
+            encode_bool(&mut args, false);
+        }
+        encode_u32(&mut args, 0); // atime: DONT_CHANGE
+        encode_u32(&mut args, 0); // mtime: DONT_CHANGE
+        args
+    }
+
+    /// Encode a `diropargs3` body: `dir_fh` + name. Shared by MKDIR/REMOVE/RMDIR.
+    fn dirop_args(dir_fh: &NfsFh3, name: &str) -> Vec<u8> {
+        let mut args = Vec::new();
+        encode_fh(&mut args, dir_fh);
+        encode_string(&mut args, name);
+        args
+    }
+
+    /// Encode an `MKDIR3args` body: `dir_fh` + name + empty `sattr3`.
+    fn mkdir_args(dir_fh: &NfsFh3, name: &str) -> Vec<u8> {
+        let mut args = dirop_args(dir_fh, name);
+        for _ in 0..4 {
+            encode_bool(&mut args, false);
+        }
+        encode_u32(&mut args, 0); // atime DONT_CHANGE
+        encode_u32(&mut args, 0); // mtime DONT_CHANGE
+        args
+    }
+
+    /// Encode a `SETATTR3args` body: `object_fh` + `sattr3` (size set) + guard.
+    fn setattr_size_args(fh: &NfsFh3, size: u64) -> Vec<u8> {
+        let mut args = Vec::new();
+        encode_fh(&mut args, fh);
+        encode_bool(&mut args, false); // mode unset
+        encode_bool(&mut args, false); // uid unset
+        encode_bool(&mut args, false); // gid unset
+        encode_bool(&mut args, true); // size set
+        encode_u64(&mut args, size);
+        encode_u32(&mut args, 0); // atime DONT_CHANGE
+        encode_u32(&mut args, 0); // mtime DONT_CHANGE
+        encode_bool(&mut args, false); // guard: no check
+        args
+    }
+
+    /// Register a file path and return its file handle.
+    fn fh_for(ctx: &NfsContext, path: &str) -> NfsFh3 {
+        let key = ctx.register_path(path);
+        NfsFh3::from_item_id(&key.to_string())
+    }
+
+    /// GETATTR size for a registered path.
+    fn getattr_size(ctx: &Arc<NfsContext>, path: &str) -> u64 {
+        let fh = fh_for(ctx, path);
+        let mut args = Vec::new();
+        encode_fh(&mut args, &fh);
+        let reply = call(ctx, NFS3PROC_GETATTR, &args, NfsCacheMode::Minimal);
+        let (status, rest) = decode_u32(&reply).unwrap();
+        assert_eq!(status, NFS3_OK);
+        // post_op_attr: attributes_follow (bool) then fattr3. size is the 6th
+        // field (ftype, mode, nlink, uid, gid are u32 — 5 words — then size u64).
+        let (follows, rest) = super::super::xdr::decode_bool(rest).unwrap();
+        assert!(follows);
+        let mut cursor = rest;
+        for _ in 0..5 {
+            let (_, r) = decode_u32(cursor).unwrap();
+            cursor = r;
+        }
+        let (size, _) = decode_u64(cursor).unwrap();
+        size
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_then_getattr_reflects_new_size() {
+        let (ctx, _dir) = writable_ctx();
+        let file_fh = fh_for(&ctx, "/note.txt");
+
+        let payload = b"hello world";
+        let args = write_args(&file_fh, 0, payload);
+        let reply = call(&ctx, NFS3PROC_WRITE, &args, NfsCacheMode::Minimal);
+        let (status, _) = decode_u32(&reply).unwrap();
+        assert_eq!(status, NFS3_OK);
+
+        let size = getattr_size(&ctx, "/note.txt");
+        assert_eq!(size, payload.len() as u64);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_at_offset_extends_file() {
+        let (ctx, _dir) = writable_ctx();
+        let file_fh = fh_for(&ctx, "/sparse.bin");
+
+        // Write 4 bytes starting at offset 8: total length must be 12.
+        let args = write_args(&file_fh, 8, b"DATA");
+        let reply = call(&ctx, NFS3PROC_WRITE, &args, NfsCacheMode::Minimal);
+        let (status, _) = decode_u32(&reply).unwrap();
+        assert_eq!(status, NFS3_OK);
+
+        assert_eq!(getattr_size(&ctx, "/sparse.bin"), 12);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_then_lookup_finds_file() {
+        let (ctx, _dir) = writable_ctx();
+        let root_fh = NfsFh3::from_item_id(&ctx.root_key().to_string());
+
+        let args = create_args(&root_fh, "fresh.txt");
+        let reply = call(&ctx, NFS3PROC_CREATE, &args, NfsCacheMode::Minimal);
+        let (status, _) = decode_u32(&reply).unwrap();
+        assert_eq!(status, NFS3_OK);
+
+        // LOOKUP must now resolve the created name.
+        let mut lookup = Vec::new();
+        encode_fh(&mut lookup, &root_fh);
+        encode_string(&mut lookup, "fresh.txt");
+        let reply = call(&ctx, NFS3PROC_LOOKUP, &lookup, NfsCacheMode::Minimal);
+        let (status, _) = decode_u32(&reply).unwrap();
+        assert_eq!(status, NFS3_OK);
+
+        assert_eq!(getattr_size(&ctx, "/fresh.txt"), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn setattr_truncate_shrinks_file() {
+        let (ctx, _dir) = writable_ctx();
+        let file_fh = fh_for(&ctx, "/big.txt");
+
+        let args = write_args(&file_fh, 0, b"0123456789");
+        call(&ctx, NFS3PROC_WRITE, &args, NfsCacheMode::Minimal);
+        assert_eq!(getattr_size(&ctx, "/big.txt"), 10);
+
+        let args = setattr_size_args(&file_fh, 4);
+        let reply = call(&ctx, NFS3PROC_SETATTR, &args, NfsCacheMode::Minimal);
+        let (status, _) = decode_u32(&reply).unwrap();
+        assert_eq!(status, NFS3_OK);
+
+        assert_eq!(getattr_size(&ctx, "/big.txt"), 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mkdir_then_remove_and_rmdir() {
+        let (ctx, _dir) = writable_ctx();
+        let root_fh = NfsFh3::from_item_id(&ctx.root_key().to_string());
+
+        // MKDIR.
+        let reply = call(
+            &ctx,
+            NFS3PROC_MKDIR,
+            &mkdir_args(&root_fh, "sub"),
+            NfsCacheMode::Minimal,
+        );
+        assert_eq!(decode_u32(&reply).unwrap().0, NFS3_OK);
+
+        // Create a file inside it, then REMOVE that file.
+        let sub_fh = fh_for(&ctx, "/sub");
+        let inner_fh = fh_for(&ctx, "/sub/inner.txt");
+        call(
+            &ctx,
+            NFS3PROC_WRITE,
+            &write_args(&inner_fh, 0, b"x"),
+            NfsCacheMode::Minimal,
+        );
+        let reply = call(
+            &ctx,
+            NFS3PROC_REMOVE,
+            &dirop_args(&sub_fh, "inner.txt"),
+            NfsCacheMode::Minimal,
+        );
+        assert_eq!(decode_u32(&reply).unwrap().0, NFS3_OK);
+
+        // RMDIR the now-empty directory.
+        let reply = call(
+            &ctx,
+            NFS3PROC_RMDIR,
+            &dirop_args(&root_fh, "sub"),
+            NfsCacheMode::Minimal,
+        );
+        assert_eq!(decode_u32(&reply).unwrap().0, NFS3_OK);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rename_moves_file() {
+        let (ctx, _dir) = writable_ctx();
+        let root_fh = NfsFh3::from_item_id(&ctx.root_key().to_string());
+        let file_fh = fh_for(&ctx, "/old.txt");
+        call(
+            &ctx,
+            NFS3PROC_WRITE,
+            &write_args(&file_fh, 0, b"payload"),
+            NfsCacheMode::Minimal,
+        );
+
+        // RENAME3args: from(dir_fh+name) + to(dir_fh+name).
+        let mut args = Vec::new();
+        encode_fh(&mut args, &root_fh);
+        encode_string(&mut args, "old.txt");
+        encode_fh(&mut args, &root_fh);
+        encode_string(&mut args, "new.txt");
+        let reply = call(&ctx, NFS3PROC_RENAME, &args, NfsCacheMode::Minimal);
+        assert_eq!(decode_u32(&reply).unwrap().0, NFS3_OK);
+
+        assert_eq!(getattr_size(&ctx, "/new.txt"), b"payload".len() as u64);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_on_read_only_export_returns_rofs() {
+        let (ctx, _dir) = writable_ctx();
+        let file_fh = fh_for(&ctx, "/blocked.txt");
+        let reply = call(
+            &ctx,
+            NFS3PROC_WRITE,
+            &write_args(&file_fh, 0, b"nope"),
+            NfsCacheMode::Off,
+        );
+        assert_eq!(decode_u32(&reply).unwrap().0, NFS3ERR_ROFS);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_on_read_only_export_returns_rofs() {
+        let (ctx, _dir) = writable_ctx();
+        let root_fh = NfsFh3::from_item_id(&ctx.root_key().to_string());
+        let reply = call(
+            &ctx,
+            NFS3PROC_CREATE,
+            &create_args(&root_fh, "nope.txt"),
+            NfsCacheMode::Off,
+        );
+        assert_eq!(decode_u32(&reply).unwrap().0, NFS3ERR_ROFS);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rmdir_on_missing_directory_returns_stale() {
+        let (ctx, _dir) = writable_ctx();
+        let root_fh = NfsFh3::from_item_id(&ctx.root_key().to_string());
+        let reply = call(
+            &ctx,
+            NFS3PROC_RMDIR,
+            &dirop_args(&root_fh, "ghost"),
+            NfsCacheMode::Minimal,
+        );
+        assert_eq!(decode_u32(&reply).unwrap().0, NFS3ERR_STALE);
     }
 }
