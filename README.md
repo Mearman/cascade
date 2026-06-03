@@ -150,6 +150,7 @@ crates/
   backend-gdrive/         Google Drive (Drive API v3, OAuth2 device code)
   backend-s3/             S3-compatible
   backend-local/          Local filesystem (adopt-and-sync)
+  backend-p2p/            P2P-only content-addressed store (no cloud authority; blocks local, metadata in SQLite)
   presenter-nfs/          NFSv3 server
   presenter-fuse/         Linux FUSE presenter
   presenter-webdav/       WebDAV server presenter (cross-platform)
@@ -157,6 +158,7 @@ crates/
   presenter-fskit/        macOS FSKit bridge (Rust side, macOS 15.4+)
   presenter-projfs/       Windows ProjFS presenter
   cascade/                Binary crate (CLI entry point and daemon)
+  relay-server/           Opaque byte-pipe relay (binary): pairs two WebSocket clients by session ID for WAN NAT traversal, HMAC-gated, never inspects payload
 swift/
   CascadeFileProvider/    macOS File Provider extension
   CascadeFSKit/           macOS FSKit extension (15.4+)
