@@ -79,3 +79,16 @@ version_group = "workspace"
 name = "cascade-relay-server"
 release = false
 version_group = "workspace"
+
+# Internal library crates added after this file was first written. Without an
+# explicit release = false they default to release = true and cut their own
+# stray release tags (cascade-announce-wire-vX, cascade-presenter-projfs-vX).
+[[package]]
+name = "cascade-announce-wire"
+release = false
+version_group = "workspace"
+
+[[package]]
+name = "cascade-presenter-projfs"
+release = false
+version_group = "workspace"
