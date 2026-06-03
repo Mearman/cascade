@@ -25,6 +25,7 @@ use async_trait::async_trait;
 use cascade_backend_p2p::index::FolderIndex;
 use cascade_backend_p2p::sync::{Peer, SyncEngine};
 use cascade_engine::db::AuditEntry;
+use cascade_engine::manage::token::CapabilityToken;
 use cascade_engine::manage::{
     Capability, DeviceId, Grant, ManageCommandExecutor, ManageDispatch, ManageGrantStore, Scope,
     run_dispatch,
@@ -45,15 +46,29 @@ struct TestNode {
     grants: Vec<Grant>,
     audit: Mutex<Vec<AuditEntry>>,
     calls: Mutex<Vec<String>>,
+    /// This node's own device id — the identity a presented capability token's
+    /// chain must root in to verify against it.
+    node_device_id: DeviceId,
+    /// Revoked token ids the verify path consults.
+    revoked: std::collections::HashSet<String>,
 }
 
 impl TestNode {
-    const fn new(grants: Vec<Grant>) -> Self {
+    fn new(grants: Vec<Grant>) -> Self {
         Self {
             grants,
             audit: Mutex::new(Vec::new()),
             calls: Mutex::new(Vec::new()),
+            node_device_id: DeviceId::new("UNSET-NODE-ID"),
+            revoked: std::collections::HashSet::new(),
         }
+    }
+
+    /// Set the node's own device id — used by the token round-trip test so the
+    /// node verifies a token issued under its real device id.
+    fn with_node_device_id(mut self, id: &str) -> Self {
+        self.node_device_id = DeviceId::new(id);
+        self
     }
 
     fn calls(&self) -> Vec<String> {
@@ -92,6 +107,14 @@ impl ManageGrantStore for TestNode {
             .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?
             .push(entry.clone());
         Ok(())
+    }
+
+    fn manage_node_device_id(&self) -> anyhow::Result<DeviceId> {
+        Ok(self.node_device_id.clone())
+    }
+
+    fn manage_revoked_token_ids(&self) -> anyhow::Result<std::collections::HashSet<String>> {
+        Ok(self.revoked.clone())
     }
 }
 
@@ -199,9 +222,10 @@ impl ManageDispatch for TestNode {
         caller: &DeviceId,
         command: ManageCommand,
         scope: ManageScope,
+        token: Option<String>,
         now: DateTime<Utc>,
     ) -> ManageResult {
-        run_dispatch(self, self, caller, command, scope, now).await
+        run_dispatch(self, self, caller, command, scope, token, now).await
     }
 }
 
@@ -281,7 +305,12 @@ async fn manager_drives_status_and_pin_over_loopback() {
 
     // ── StatusRead — the wire command `cascade remote <id> status` sends ──
     let status = manager
-        .send_manage_request(&target_id, ManageCommand::StatusRead, ManageScope::Node)
+        .send_manage_request(
+            &target_id,
+            ManageCommand::StatusRead,
+            ManageScope::Node,
+            None,
+        )
         .await
         .expect("status round-trip should not fail at the transport");
     assert!(
@@ -300,6 +329,7 @@ async fn manager_drives_status_and_pin_over_loopback() {
             ManageScope::Folder {
                 path: "/work/reports".to_owned(),
             },
+            None,
         )
         .await
         .expect("pin round-trip should not fail at the transport");
@@ -331,6 +361,7 @@ async fn manager_drives_status_and_pin_over_loopback() {
             ManageScope::Folder {
                 path: "/personal/secret".to_owned(),
             },
+            None,
         )
         .await
         .expect("an unauthorised pin still returns a typed reply, not a transport error");
@@ -358,4 +389,84 @@ async fn manager_drives_status_and_pin_over_loopback() {
             "denied".to_owned(),
         ],
     );
+}
+
+/// A signed capability token authorises a `ManageRequest` end to end over
+/// loopback, with NO on-node grant for the caller.
+///
+/// The target node holds no grant row for the manager. The node issues a token
+/// for the manager device id (signed under the node's own device identity), the
+/// manager presents it on the wire alongside a pin command, and the node
+/// verifies it (root issuer == this node, unexpired, not revoked, bearer == the
+/// TLS-authenticated manager) and authorises the command against the
+/// token-carried grant — the offline-issued authority alone carries it.
+#[tokio::test]
+async fn token_authorises_a_command_over_loopback_with_no_grant() {
+    let (_manager_dir, manager) = make_engine("shared");
+    let manager_id = manager.device_id().to_owned();
+
+    let (_target_dir, target) = make_engine("shared");
+    let target_id = target.device_id().to_owned();
+
+    // The node holds NO grants, and reports its real device id so a token issued
+    // under it roots correctly.
+    let node = Arc::new(TestNode::new(Vec::new()).with_node_device_id(&target_id));
+    let dispatch: Arc<dyn ManageDispatch> = node.clone();
+    let target = target.with_manage_dispatch(dispatch);
+
+    target.trust(manager_id.clone()).await;
+    manager.trust(target_id.clone()).await;
+
+    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let (addr, _task) = target
+        .start_listener("127.0.0.1:0".parse().unwrap(), cancel_rx)
+        .await
+        .unwrap();
+    manager
+        .connect_to(Peer {
+            device_id: target_id.clone(),
+            address: addr,
+        })
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        if manager.has_peer(&target_id).await {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(manager.has_peer(&target_id).await);
+
+    // The node issues a token for the manager, covering pin:write over /work,
+    // far in the future so it is unexpired during the test.
+    let token = CapabilityToken::issue(
+        "loopback-tok-1",
+        &DeviceId::new(target_id.clone()),
+        &DeviceId::new(manager_id.clone()),
+        Capability::PinWrite,
+        Scope::folder("/work"),
+        Utc::now() + chrono::Duration::days(365),
+    );
+    let token_json = serde_json::to_string(&token).unwrap();
+
+    let result = manager
+        .send_manage_request(
+            &target_id,
+            ManageCommand::Pin {
+                path_glob: "/work/reports".to_owned(),
+                recursive: false,
+            },
+            ManageScope::Folder {
+                path: "/work".to_owned(),
+            },
+            Some(token_json),
+        )
+        .await
+        .expect("token round-trip should not fail at the transport");
+    assert!(
+        matches!(result, ManageResult::Ok { .. }),
+        "a valid presented token must authorise the command, got {result:?}",
+    );
+    assert_eq!(node.calls(), vec!["pin /work/reports false".to_owned()]);
+    assert_eq!(node.audit_outcomes(), vec!["allowed".to_owned()]);
 }

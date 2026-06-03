@@ -174,7 +174,7 @@ async fn daemon_wired_node_accepts_authorised_management_over_the_wire() {
 
     // ── Authorised StatusRead — must succeed, proving the dispatcher ran ──
     let status = manager
-        .send_manage_request(&node_id, ManageCommand::StatusRead, ManageScope::Node)
+        .send_manage_request(&node_id, ManageCommand::StatusRead, ManageScope::Node, None)
         .await
         .expect("status round-trip should not fail at the transport");
     assert!(
@@ -187,7 +187,7 @@ async fn daemon_wired_node_accepts_authorised_management_over_the_wire() {
     // genuine authorisation denial (not the "not accepting management" refusal)
     // confirms the request reached the engine's grant logic.
     let denied = manager
-        .send_manage_request(&node_id, ManageCommand::CacheEvict, ManageScope::Node)
+        .send_manage_request(&node_id, ManageCommand::CacheEvict, ManageScope::Node, None)
         .await
         .expect("an unauthorised command still returns a typed reply");
     match denied {
