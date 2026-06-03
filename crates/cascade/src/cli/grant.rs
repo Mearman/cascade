@@ -89,7 +89,7 @@ pub(super) fn resolve_owner_device(ctx: &CliContext) -> Result<DeviceId> {
 /// key — for signing a capability token.
 ///
 /// Reads the same first-configured P2P backend identity `resolve_owner_device`
-/// resolves, but returns the whole [`DeviceIdentity`] so the caller can sign with
+/// resolves, but returns the whole [`cascade_p2p::identity::DeviceIdentity`] so the caller can sign with
 /// the node's real private key. Without a configured P2P backend a node has no
 /// device identity, so the command fails loudly rather than inventing one.
 pub(super) fn resolve_owner_identity(
