@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use cascade_engine::backend::Backend;
+use cascade_engine::backend::{Backend, BackendError};
 use cascade_engine::types::{Change, Cursor, FileEntry, FileId, ItemId, Quota};
 use manifest::{FileState, Manifest, walk_tree};
 use sha2::Digest;
@@ -288,7 +288,7 @@ impl Backend for LocalBackend {
     async fn metadata(&self, path: &Path) -> anyhow::Result<FileEntry> {
         let abs = self.absolute_path(path);
         if !abs.exists() {
-            anyhow::bail!("path not found: {}", path.display());
+            return Err(BackendError::NotFound(path.display().to_string()).into());
         }
 
         let relative = abs
