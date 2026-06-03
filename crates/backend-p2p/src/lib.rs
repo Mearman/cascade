@@ -144,105 +144,11 @@ pub fn resolve_stun_servers(configured: Option<Vec<String>>) -> Vec<String> {
     })
 }
 
-/// Policy controlling whether this node volunteers as a peer relay.
-///
-/// A node only advertises itself as a relay candidate when its detected
-/// `NAT` type is `Open` or `FullCone` — a node behind a restrictive `NAT`
-/// cannot usefully relay. This policy gates that advertisement on the
-/// operator's intent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum RelayVolunteer {
-    /// Never volunteer as a relay, regardless of `NAT` type.
-    Off,
-    /// Volunteer only to peers explicitly configured to receive the offer.
-    /// Reserved for a future per-peer allow-list; today it behaves like
-    /// `Auto` restricted to the trusted set, which is the same population
-    /// `Auto` already targets.
-    Explicit,
-    /// Volunteer automatically to every trusted peer sharing a folder,
-    /// provided the `NAT` type permits it. The default.
-    #[default]
-    Auto,
-}
-
-/// How far this device reaches out to discover and connect to peers.
-///
-/// The posture is an intent, not a bundle of switches: it names the
-/// furthest exposure level the operator is comfortable with, and every
-/// discovery and traversal source self-activates when the posture
-/// permits its level *and* the source has what it needs to run (a bound
-/// listener for LAN, configured-or-default bootstrap for the DHT, a
-/// configured server for announce). The server lists and DHT config say
-/// *where to point* a source; the posture decides *whether* it runs.
-///
-/// The levels are ordered by how far traffic about this device travels:
-/// `LanOnly` ⊂ `Private` ⊂ `Public`. Each level permits everything the
-/// level below it does, plus its own additions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum DiscoveryReach {
-    /// LAN segment only. UDP-multicast LAN discovery and direct dialling
-    /// of statically-configured peers are the only ways this device finds
-    /// or reaches others; nothing about it leaves the local segment. No
-    /// introducer gossip, no hole punch, no peer relay, and no
-    /// publication to any global directory.
-    LanOnly,
-    /// Trusted private mesh — the default. Everything `LanOnly` permits,
-    /// plus introducer gossip among trusted peers, NAT hole punching, and
-    /// acting as (or using) a peer relay. Still publishes nothing to a
-    /// global directory: no DHT publish or query, no announce-server
-    /// registration. A device at this posture is discoverable only by
-    /// peers it already shares a segment, an introducer, or a relay with.
-    #[default]
-    Private,
-    /// Open to the wider internet. Everything `Private` permits, plus
-    /// publishing to and querying the Mainline DHT and any configured
-    /// announce servers, so never-met peers can resolve this device by
-    /// its device id for zero-config WAN discovery.
-    Public,
-}
-
-impl DiscoveryReach {
-    /// Whether introducer (WAN) gossip may run at this posture.
-    ///
-    /// Gossip shares the local peer book with trusted peers so devices
-    /// learn about one another transitively. Permitted from `Private`
-    /// upward; `LanOnly` keeps the peer book to itself.
-    #[must_use]
-    pub const fn permits_gossip(self) -> bool {
-        matches!(self, Self::Private | Self::Public)
-    }
-
-    /// Whether NAT hole punching may run at this posture.
-    ///
-    /// Hole punching coordinates a simultaneous UDP burst to traverse
-    /// NATs. Permitted from `Private` upward; `LanOnly` never punches.
-    #[must_use]
-    pub const fn permits_hole_punch(self) -> bool {
-        matches!(self, Self::Private | Self::Public)
-    }
-
-    /// Whether peer relaying may run at this posture.
-    ///
-    /// Covers both volunteering as a relay and dialling through one.
-    /// Permitted from `Private` upward; `LanOnly` neither offers nor
-    /// uses a relay.
-    #[must_use]
-    pub const fn permits_peer_relay(self) -> bool {
-        matches!(self, Self::Private | Self::Public)
-    }
-
-    /// Whether this device may publish to and query a global directory —
-    /// the Mainline DHT and announce servers.
-    ///
-    /// Permitted only at `Public`. This is the line between a private
-    /// mesh and zero-config WAN discovery of never-met peers.
-    #[must_use]
-    pub const fn permits_global_directory(self) -> bool {
-        matches!(self, Self::Public)
-    }
-}
+// `DiscoveryReach` and `RelayVolunteer` are defined in `cascade-p2p` so the
+// engine can reference them without a circular dependency. Re-export them here
+// so existing callers of `cascade_backend_p2p::DiscoveryReach` and
+// `cascade_backend_p2p::RelayVolunteer` continue to compile unchanged.
+pub use cascade_p2p::{DiscoveryReach, RelayVolunteer};
 
 /// Statically-configured peer entry.
 ///
@@ -2005,8 +1911,17 @@ pub fn open_from_config(config: &toml::Value) -> Result<P2pBackend> {
             arr.iter()
                 .filter_map(toml::Value::as_str)
                 .map(|s| {
-                    s.parse::<std::net::SocketAddr>()
-                        .with_context(|| format!("invalid relay endpoint `{s}`"))
+                    // Accept a DNS hostname or Docker service name, not only a
+                    // literal IP:port — resolved here at config load. A bind
+                    // address (listen_addr) stays a SocketAddr; a relay we dial
+                    // may legitimately be addressed by name.
+                    use std::net::ToSocketAddrs as _;
+                    s.to_socket_addrs()
+                        .with_context(|| {
+                            format!("relay endpoint `{s}` is not a resolvable host:port")
+                        })?
+                        .next()
+                        .with_context(|| format!("relay endpoint `{s}` resolved to no addresses"))
                 })
                 .collect::<Result<Vec<_>>>()
         })

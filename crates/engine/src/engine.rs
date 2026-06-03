@@ -50,6 +50,27 @@ pub struct EngineConfig {
     pub enable_p2p: bool,
     /// P2P data directory override. `None` uses `db_path` parent + `/p2p`.
     pub p2p_data_dir: Option<PathBuf>,
+    /// Discovery reach for the engine's optimisation-layer P2P bridge.
+    ///
+    /// Controls how far the bridge reaches for peers when sharing blocks across
+    /// cloud-backed backends. `None` uses the engine default (`private`). Only
+    /// meaningful when `enable_p2p` is `true`. A pure-P2P backend (type `p2p`)
+    /// carries its own posture in its per-backend TOML; this field is for the
+    /// case where a cloud-backed node also wants block sharing with a specific
+    /// reach.
+    pub p2p_posture: Option<cascade_p2p::DiscoveryReach>,
+    /// Relay endpoint addresses for WAN NAT traversal of the optimisation-layer P2P.
+    ///
+    /// Each entry is a resolved `host:port` of a `cascade-relay` server. Empty
+    /// means no relay strategy is provisioned for the optimisation layer. Only
+    /// meaningful when `enable_p2p` is `true` and `p2p_posture` permits relay.
+    pub p2p_relay_endpoints: Vec<std::net::SocketAddr>,
+    /// 32-byte HMAC shared secret for authenticating this node to the relay server.
+    ///
+    /// `None` means no authentication secret is configured; the relay strategy
+    /// will be provisioned but the dial will be skipped. Only meaningful when
+    /// `p2p_relay_endpoints` is non-empty.
+    pub p2p_relay_shared_secret: Option<[u8; 32]>,
     /// Factory used to construct backends at runtime — for example when an
     /// authorised manager pushes a `BackendAdd` command. `None` leaves the
     /// engine unable to add backends; such a request fails loudly rather than
@@ -66,6 +87,15 @@ impl fmt::Debug for EngineConfig {
             .field("cache_dir", &self.cache_dir)
             .field("enable_p2p", &self.enable_p2p)
             .field("p2p_data_dir", &self.p2p_data_dir)
+            .field("p2p_posture", &self.p2p_posture)
+            .field(
+                "p2p_relay_endpoints",
+                &format!("[{} endpoint(s)]", self.p2p_relay_endpoints.len()),
+            )
+            .field(
+                "p2p_relay_shared_secret",
+                &self.p2p_relay_shared_secret.is_some(),
+            )
             .field("backend_factory", &self.backend_factory.is_some())
             .finish()
     }
@@ -146,7 +176,19 @@ impl Engine {
             });
             let p2p_engine = cascade_p2p::P2pEngine::new(&p2p_dir)?;
             info!(device_id = %p2p_engine.device_id(), "P2P engine initialised");
-            Some(P2pBridge::new(p2p_engine, db.clone()))
+            let bridge_config = crate::p2p_bridge::P2pBridgeConfig {
+                posture: config.p2p_posture,
+                relay_endpoints: config.p2p_relay_endpoints,
+                relay_shared_secret: config.p2p_relay_shared_secret,
+            };
+            if let Some(posture) = bridge_config.posture {
+                info!(?posture, "P2P bridge posture set");
+            }
+            Some(P2pBridge::with_config(
+                p2p_engine,
+                db.clone(),
+                bridge_config,
+            ))
         } else {
             None
         };
@@ -919,6 +961,9 @@ mod tests {
             cache_dir: None,
             enable_p2p: false,
             p2p_data_dir: None,
+            p2p_posture: None,
+            p2p_relay_endpoints: Vec::new(),
+            p2p_relay_shared_secret: None,
             backend_factory: None,
         })
         .unwrap()
@@ -1009,6 +1054,9 @@ mod tests {
             cache_dir: None,
             enable_p2p: false,
             p2p_data_dir: None,
+            p2p_posture: None,
+            p2p_relay_endpoints: Vec::new(),
+            p2p_relay_shared_secret: None,
             backend_factory: None,
         });
 
@@ -1028,6 +1076,9 @@ mod tests {
             cache_dir: None,
             enable_p2p: false,
             p2p_data_dir: None,
+            p2p_posture: None,
+            p2p_relay_endpoints: Vec::new(),
+            p2p_relay_shared_secret: None,
             backend_factory: None,
         })
         .unwrap();

@@ -24,13 +24,23 @@ pub struct InitFlags {
     pub backend_type: Option<String>,
     pub name: Option<String>,
     pub mount_point: Option<String>,
+    // S3 flags.
     pub endpoint: Option<String>,
     pub bucket: Option<String>,
     pub region: Option<String>,
     pub access_key_id: Option<String>,
     pub secret_access_key: Option<String>,
+    // Google Drive flags.
     pub client_id: Option<String>,
     pub client_secret: Option<String>,
+    // Local backend flags.
+    pub local_root: Option<String>,
+    // P2P backend flags.
+    pub p2p_data_dir: Option<String>,
+    pub p2p_exposure: Option<String>,
+    pub p2p_listen_addr: Option<String>,
+    pub p2p_relay_endpoint: Option<String>,
+    pub p2p_relay_secret: Option<String>,
 }
 
 use super::CliContext;
@@ -59,10 +69,36 @@ pub struct MountConfig {
 /// checks LAN peers for the blocks first before falling back to the
 /// cloud. Default off — opt-in via `[p2p] enabled = true` in
 /// `config.toml`, or `--p2p` on the CLI.
+///
+/// The `posture`, `relay_endpoint`, and `relay_shared_secret` fields extend the
+/// optimisation-layer P2P (i.e. a cloud-backed node that also shares blocks) so
+/// it can express a `DiscoveryReach` posture and a WAN relay endpoint rather than
+/// always running with built-in defaults. A pure-P2P backend (type = "p2p") has
+/// its own per-backend TOML for these; these fields serve the case where a node
+/// is backed by gdrive/s3 but also wants `posture = public` with a relay for NAT
+/// traversal of the optimisation-layer P2P.
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct P2pConfig {
     #[serde(default)]
     pub enabled: bool,
+    /// Discovery reach for the optimisation-layer P2P engine.
+    ///
+    /// Accepted values: `lan-only`, `private`, `public`. Absent means the
+    /// engine default (`private`) applies. Stored as a free-form string so the
+    /// config file can be round-tripped without importing the backend crate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub posture: Option<String>,
+    /// `host:port` of the cascade-relay server used for WAN NAT traversal.
+    ///
+    /// Required when `posture = "public"` and the node is behind NAT. Absent
+    /// means no relay strategy is provisioned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_endpoint: Option<String>,
+    /// 64-character hex HMAC shared secret for authenticating this node to the
+    /// relay server. Required when `relay_endpoint` is set. Never placed on
+    /// argv — stays in the config file with mode 0600.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_shared_secret: Option<String>,
 }
 
 /// A single backend configuration entry.
@@ -75,7 +111,12 @@ pub struct BackendConfig {
 }
 
 /// Supported backend types for the init wizard.
-const BACKEND_TYPES: &[(&str, &str)] = &[("gdrive", "Google Drive"), ("s3", "S3-compatible")];
+const BACKEND_TYPES: &[(&str, &str)] = &[
+    ("gdrive", "Google Drive"),
+    ("s3", "S3-compatible"),
+    ("local", "Local filesystem"),
+    ("p2p", "P2P content-addressed store"),
+];
 
 /// Run the init command.
 ///
@@ -149,10 +190,12 @@ fn write_provider_config(
         "type".to_string(),
         toml::Value::String(backend_type.to_string()),
     );
-    backend_table.insert("account".to_string(), toml::Value::String(name.to_string()));
 
     match backend_type {
         "gdrive" => {
+            // `account` is the gdrive-specific identifier for token persistence.
+            backend_table.insert("account".to_string(), toml::Value::String(name.to_string()));
+
             let client_id = flags.client_id.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("--client-id is required for backend type 'gdrive'")
             })?;
@@ -230,12 +273,112 @@ fn write_provider_config(
                 toml::Value::String(secret_access_key.to_string()),
             );
         }
+        "local" => {
+            let root = flags.local_root.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("--local-root is required for backend type 'local'")
+            })?;
+            if root.is_empty() {
+                anyhow::bail!("--local-root must not be empty");
+            }
+            backend_table.insert("root".to_string(), toml::Value::String(root.to_string()));
+        }
+        "p2p" => {
+            // The `name` key is required by backend-p2p's open_from_config.
+            backend_table.insert("name".to_string(), toml::Value::String(name.to_string()));
+
+            if let Some(data_dir) = flags.p2p_data_dir.as_deref()
+                && !data_dir.is_empty()
+            {
+                backend_table.insert(
+                    "data_dir".to_string(),
+                    toml::Value::String(data_dir.to_string()),
+                );
+            }
+
+            if let Some(exposure) = flags.p2p_exposure.as_deref()
+                && !exposure.is_empty()
+            {
+                validate_posture(exposure)?;
+                backend_table.insert(
+                    "exposure".to_string(),
+                    toml::Value::String(exposure.to_string()),
+                );
+            }
+
+            if let Some(listen_addr) = flags.p2p_listen_addr.as_deref()
+                && !listen_addr.is_empty()
+            {
+                listen_addr.parse::<std::net::SocketAddr>().map_err(|e| {
+                    anyhow::anyhow!("invalid --p2p-listen-addr `{listen_addr}`: {e}")
+                })?;
+                backend_table.insert(
+                    "listen_addr".to_string(),
+                    toml::Value::String(listen_addr.to_string()),
+                );
+            }
+
+            if let Some(relay_endpoint) = flags.p2p_relay_endpoint.as_deref()
+                && !relay_endpoint.is_empty()
+            {
+                relay_endpoint
+                    .parse::<std::net::SocketAddr>()
+                    .map_err(|e| {
+                        anyhow::anyhow!("invalid --p2p-relay-endpoint `{relay_endpoint}`: {e}")
+                    })?;
+                // relay_endpoints is an array in the TOML.
+                backend_table.insert(
+                    "relay_endpoints".to_string(),
+                    toml::Value::Array(vec![toml::Value::String(relay_endpoint.to_string())]),
+                );
+            }
+
+            if let Some(relay_secret) = flags.p2p_relay_secret.as_deref()
+                && !relay_secret.is_empty()
+            {
+                validate_relay_shared_secret_hex(relay_secret)?;
+                backend_table.insert(
+                    "relay_shared_secret".to_string(),
+                    toml::Value::String(relay_secret.to_string()),
+                );
+            }
+        }
         other => anyhow::bail!("unsupported backend type '{other}'"),
     }
 
     let backend_toml = toml::to_string_pretty(&backend_table)?;
     let backend_config_path = ctx.config_dir.join(format!("{name}.toml"));
     std::fs::write(&backend_config_path, &backend_toml)?;
+    Ok(())
+}
+
+/// Validate that a posture string is one of the accepted values.
+///
+/// Fails loudly with a clear message rather than silently defaulting — an
+/// operator who typed `publik` deserves to be told.
+fn validate_posture(posture: &str) -> Result<()> {
+    match posture {
+        "lan-only" | "private" | "public" => Ok(()),
+        other => {
+            anyhow::bail!("posture must be one of `lan-only`, `private`, `public`, got `{other}`")
+        }
+    }
+}
+
+/// Validate that a relay shared secret is exactly 64 hex characters.
+///
+/// The relay authenticates writes with a 32-byte HMAC key expressed as 64 hex
+/// characters. Catching a malformed value at config-write time avoids a
+/// confusing runtime authentication failure.
+fn validate_relay_shared_secret_hex(secret: &str) -> Result<()> {
+    if secret.len() != 64 {
+        anyhow::bail!(
+            "relay shared secret must be exactly 64 hex characters (32 bytes), got {}",
+            secret.len()
+        );
+    }
+    if !secret.chars().all(|c| c.is_ascii_hexdigit()) {
+        anyhow::bail!("relay shared secret must contain only hex characters (0-9, a-f, A-F)");
+    }
     Ok(())
 }
 
@@ -320,104 +463,155 @@ fn run_interactive(ctx: &CliContext) -> Result<()> {
 
     // Step 3: Provider-specific setup.
     // Writes ~/.config/cascade/{name}.toml with credentials for the chosen provider.
-    if backend_type == "gdrive" {
-        // Collect OAuth2 client credentials.
-        println!("Google Drive setup:");
-        println!("  You'll need an OAuth2 client ID and secret from the Google Cloud Console.");
-        println!(
-            "  Create a project at https://console.cloud.google.com/ and enable the Drive API."
-        );
-        println!();
+    match backend_type {
+        "gdrive" => {
+            // Collect OAuth2 client credentials.
+            println!("Google Drive setup:");
+            println!("  You'll need an OAuth2 client ID and secret from the Google Cloud Console.");
+            println!(
+                "  Create a project at https://console.cloud.google.com/ and enable the Drive API."
+            );
+            println!();
 
-        let client_id = read_input("Client ID")?;
-        if client_id.is_empty() {
-            anyhow::bail!("client ID must not be empty");
+            let client_id = read_input("Client ID")?;
+            if client_id.is_empty() {
+                anyhow::bail!("client ID must not be empty");
+            }
+
+            let client_secret = read_input("Client secret")?;
+            if client_secret.is_empty() {
+                anyhow::bail!("client secret must not be empty");
+            }
+
+            println!();
+
+            // Write per-backend credentials file: ~/.config/cascade/{name}.toml
+            let mut backend_table = toml::Table::new();
+            backend_table.insert(
+                "type".to_string(),
+                toml::Value::String("gdrive".to_string()),
+            );
+            backend_table.insert("client_id".to_string(), toml::Value::String(client_id));
+            backend_table.insert(
+                "client_secret".to_string(),
+                toml::Value::String(client_secret),
+            );
+            backend_table.insert("account".to_string(), toml::Value::String(name.clone()));
+
+            let backend_toml = toml::to_string_pretty(&backend_table)?;
+            let backend_config_path = ctx.config_dir.join(format!("{name}.toml"));
+            std::fs::write(&backend_config_path, &backend_toml)?;
+
+            println!(
+                "\u{2713} Credentials written to {}",
+                backend_config_path.display()
+            );
+            println!("Run `cascade backend auth {name}` to complete OAuth setup.");
+            println!();
         }
+        "s3" => {
+            // S3-compatible backend: collect credentials interactively.
+            println!("S3 configuration:");
+            println!();
 
-        let client_secret = read_input("Client secret")?;
-        if client_secret.is_empty() {
-            anyhow::bail!("client secret must not be empty");
+            let endpoint = read_input("Endpoint URL (e.g. https://s3.amazonaws.com)")?;
+            if endpoint.is_empty() {
+                anyhow::bail!("endpoint URL must not be empty");
+            }
+
+            let bucket = read_input("Bucket name")?;
+            if bucket.is_empty() {
+                anyhow::bail!("bucket name must not be empty");
+            }
+
+            let region_input = read_input("Region (e.g. us-east-1)")?;
+            let region = if region_input.is_empty() {
+                "us-east-1".to_string()
+            } else {
+                region_input
+            };
+
+            let access_key_id = read_input("Access key ID")?;
+            if access_key_id.is_empty() {
+                anyhow::bail!("access key ID must not be empty");
+            }
+
+            let secret_access_key = read_input("Secret access key")?;
+            if secret_access_key.is_empty() {
+                anyhow::bail!("secret access key must not be empty");
+            }
+
+            println!();
+
+            // Write per-backend credentials file: ~/.config/cascade/{name}.toml
+            let mut backend_table = toml::Table::new();
+            backend_table.insert("type".to_string(), toml::Value::String("s3".to_string()));
+            backend_table.insert("endpoint".to_string(), toml::Value::String(endpoint));
+            backend_table.insert("bucket".to_string(), toml::Value::String(bucket));
+            backend_table.insert("region".to_string(), toml::Value::String(region));
+            backend_table.insert(
+                "access_key_id".to_string(),
+                toml::Value::String(access_key_id),
+            );
+            backend_table.insert(
+                "secret_access_key".to_string(),
+                toml::Value::String(secret_access_key),
+            );
+
+            let backend_toml = toml::to_string_pretty(&backend_table)?;
+            let backend_config_path = ctx.config_dir.join(format!("{name}.toml"));
+            std::fs::write(&backend_config_path, &backend_toml)?;
         }
+        "local" => {
+            println!("Local filesystem backend:");
+            println!("  Adopts an existing directory and syncs its contents into Cascade.");
+            println!();
 
-        println!();
+            let root = read_input("Root directory path")?;
+            if root.is_empty() {
+                anyhow::bail!("root directory must not be empty");
+            }
+            let root = shellexpand::tilde(&root).to_string();
 
-        // Write per-backend credentials file: ~/.config/cascade/{name}.toml
-        let mut backend_table = toml::Table::new();
-        backend_table.insert(
-            "type".to_string(),
-            toml::Value::String("gdrive".to_string()),
-        );
-        backend_table.insert("client_id".to_string(), toml::Value::String(client_id));
-        backend_table.insert(
-            "client_secret".to_string(),
-            toml::Value::String(client_secret),
-        );
-        backend_table.insert("account".to_string(), toml::Value::String(name.clone()));
+            let mut backend_table = toml::Table::new();
+            backend_table.insert("type".to_string(), toml::Value::String("local".to_string()));
+            backend_table.insert("root".to_string(), toml::Value::String(root));
 
-        let backend_toml = toml::to_string_pretty(&backend_table)?;
-        let backend_config_path = ctx.config_dir.join(format!("{name}.toml"));
-        std::fs::write(&backend_config_path, &backend_toml)?;
-
-        println!(
-            "\u{2713} Credentials written to {}",
-            backend_config_path.display()
-        );
-        println!("Run `cascade backend auth {name}` to complete OAuth setup.");
-        println!();
-    } else {
-        // S3-compatible backend: collect credentials interactively.
-        println!("S3 configuration:");
-        println!();
-
-        let endpoint = read_input("Endpoint URL (e.g. https://s3.amazonaws.com)")?;
-        if endpoint.is_empty() {
-            anyhow::bail!("endpoint URL must not be empty");
+            let backend_toml = toml::to_string_pretty(&backend_table)?;
+            let backend_config_path = ctx.config_dir.join(format!("{name}.toml"));
+            std::fs::write(&backend_config_path, &backend_toml)?;
         }
+        "p2p" => {
+            println!("P2P content-addressed store:");
+            println!("  Stores files as content-addressed blocks shared with trusted peers.");
+            println!();
 
-        let bucket = read_input("Bucket name")?;
-        if bucket.is_empty() {
-            anyhow::bail!("bucket name must not be empty");
+            let listen_addr_input =
+                read_input("BEP listener address (e.g. 0.0.0.0:22000, or empty for any port)")?;
+
+            let mut backend_table = toml::Table::new();
+            backend_table.insert("type".to_string(), toml::Value::String("p2p".to_string()));
+            // The `name` key is required by backend-p2p's open_from_config.
+            backend_table.insert("name".to_string(), toml::Value::String(name.clone()));
+
+            if !listen_addr_input.is_empty() {
+                listen_addr_input
+                    .parse::<std::net::SocketAddr>()
+                    .map_err(|e| {
+                        anyhow::anyhow!("invalid BEP listen address `{listen_addr_input}`: {e}")
+                    })?;
+                backend_table.insert(
+                    "listen_addr".to_string(),
+                    toml::Value::String(listen_addr_input),
+                );
+            }
+
+            let backend_toml = toml::to_string_pretty(&backend_table)?;
+            let backend_config_path = ctx.config_dir.join(format!("{name}.toml"));
+            std::fs::write(&backend_config_path, &backend_toml)?;
         }
-
-        let region_input = read_input("Region (e.g. us-east-1)")?;
-        let region = if region_input.is_empty() {
-            "us-east-1".to_string()
-        } else {
-            region_input
-        };
-
-        let access_key_id = read_input("Access key ID")?;
-        if access_key_id.is_empty() {
-            anyhow::bail!("access key ID must not be empty");
-        }
-
-        let secret_access_key = read_input("Secret access key")?;
-        if secret_access_key.is_empty() {
-            anyhow::bail!("secret access key must not be empty");
-        }
-
-        println!();
-
-        // Write per-backend credentials file: ~/.config/cascade/{name}.toml
-        let mut backend_table = toml::Table::new();
-        backend_table.insert("type".to_string(), toml::Value::String("s3".to_string()));
-        backend_table.insert("endpoint".to_string(), toml::Value::String(endpoint));
-        backend_table.insert("bucket".to_string(), toml::Value::String(bucket));
-        backend_table.insert("region".to_string(), toml::Value::String(region));
-        backend_table.insert(
-            "access_key_id".to_string(),
-            toml::Value::String(access_key_id),
-        );
-        backend_table.insert(
-            "secret_access_key".to_string(),
-            toml::Value::String(secret_access_key),
-        );
-
-        let backend_toml = toml::to_string_pretty(&backend_table)?;
-        let backend_config_path = ctx.config_dir.join(format!("{name}.toml"));
-        std::fs::write(&backend_config_path, &backend_toml)?;
+        other => anyhow::bail!("unsupported backend type '{other}'"),
     }
-    let account: Option<String> = None;
 
     // Step 4: Mount point.
     let default_mount = dirs::home_dir()
@@ -436,9 +630,12 @@ fn run_interactive(ctx: &CliContext) -> Result<()> {
     let config_path = ctx.config_dir.join("config.toml");
 
     // Build TOML config.
+    // The `account` field in the main config.toml is not used for routing —
+    // it was a legacy field kept for backwards compatibility. The per-backend
+    // TOML carries the actual credential configuration.
     let backend_config = BackendConfig {
         backend_type: backend_type.to_string(),
-        account,
+        account: None,
     };
 
     let mut config = CascadeConfig::default();
@@ -715,5 +912,199 @@ mod tests {
         // Main config references "s3" as the backend name.
         let config_toml = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
         assert!(config_toml.contains("[backends.s3]"));
+    }
+
+    // -- P2pConfig serialisation tests ---------------------------------------
+
+    #[test]
+    fn p2p_config_defaults_are_absent_in_toml() {
+        let config = CascadeConfig::default();
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        // None fields should be omitted entirely.
+        assert!(!toml_str.contains("posture"));
+        assert!(!toml_str.contains("relay_endpoint"));
+        assert!(!toml_str.contains("relay_shared_secret"));
+    }
+
+    #[test]
+    fn p2p_config_posture_round_trips() {
+        let toml_str = r#"
+[p2p]
+enabled = true
+posture = "public"
+relay_endpoint = "10.0.0.1:22067"
+relay_shared_secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+"#;
+        let config: CascadeConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.p2p.enabled);
+        assert_eq!(config.p2p.posture.as_deref(), Some("public"));
+        assert_eq!(config.p2p.relay_endpoint.as_deref(), Some("10.0.0.1:22067"));
+        assert!(config.p2p.relay_shared_secret.is_some());
+    }
+
+    #[test]
+    fn p2p_config_absent_posture_is_none() {
+        let toml_str = "[p2p]\nenabled = true\n";
+        let config: CascadeConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.p2p.enabled);
+        assert!(config.p2p.posture.is_none());
+        assert!(config.p2p.relay_endpoint.is_none());
+        assert!(config.p2p.relay_shared_secret.is_none());
+    }
+
+    // -- Non-interactive local backend tests ---------------------------------
+
+    #[test]
+    fn noninteractive_local_writes_config_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = make_context(dir.path());
+        let mount = dir.path().join("mnt");
+        let root = dir.path().join("data");
+
+        let flags = InitFlags {
+            backend_type: Some("local".to_string()),
+            name: Some("mylocal".to_string()),
+            mount_point: Some(mount.to_string_lossy().to_string()),
+            local_root: Some(root.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+
+        run(&ctx, flags).unwrap();
+
+        let backend_toml = std::fs::read_to_string(dir.path().join("mylocal.toml")).unwrap();
+        assert!(backend_toml.contains("type = \"local\""));
+        assert!(backend_toml.contains("root = "));
+
+        let config_toml = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(config_toml.contains("[backends.mylocal]"));
+        assert!(config_toml.contains("type = \"local\""));
+
+        // The local TOML should NOT contain an `account` key.
+        assert!(!backend_toml.contains("account"));
+    }
+
+    #[test]
+    fn noninteractive_local_missing_root_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = make_context(dir.path());
+
+        let flags = InitFlags {
+            backend_type: Some("local".to_string()),
+            ..Default::default()
+        };
+
+        let err = run(&ctx, flags).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("--local-root is required"), "error was: {msg}");
+    }
+
+    // -- Non-interactive P2P backend tests -----------------------------------
+
+    #[test]
+    fn noninteractive_p2p_writes_config_with_required_name_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = make_context(dir.path());
+        let mount = dir.path().join("mnt");
+
+        let flags = InitFlags {
+            backend_type: Some("p2p".to_string()),
+            name: Some("myp2p".to_string()),
+            mount_point: Some(mount.to_string_lossy().to_string()),
+            ..Default::default()
+        };
+
+        run(&ctx, flags).unwrap();
+
+        let backend_toml = std::fs::read_to_string(dir.path().join("myp2p.toml")).unwrap();
+        assert!(backend_toml.contains("type = \"p2p\""));
+        // The `name` key is required by backend-p2p's open_from_config.
+        assert!(backend_toml.contains("name = \"myp2p\""));
+        // No account key for p2p backends.
+        assert!(!backend_toml.contains("account"));
+
+        let config_toml = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        assert!(config_toml.contains("[backends.myp2p]"));
+        assert!(config_toml.contains("type = \"p2p\""));
+    }
+
+    #[test]
+    fn noninteractive_p2p_writes_exposure_and_relay() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = make_context(dir.path());
+        let mount = dir.path().join("mnt");
+        let secret = "a".repeat(64);
+
+        let flags = InitFlags {
+            backend_type: Some("p2p".to_string()),
+            name: Some("seeder".to_string()),
+            mount_point: Some(mount.to_string_lossy().to_string()),
+            p2p_exposure: Some("public".to_string()),
+            p2p_listen_addr: Some("0.0.0.0:22000".to_string()),
+            p2p_relay_endpoint: Some("1.2.3.4:22067".to_string()),
+            p2p_relay_secret: Some(secret.clone()),
+            ..Default::default()
+        };
+
+        run(&ctx, flags).unwrap();
+
+        let backend_toml = std::fs::read_to_string(dir.path().join("seeder.toml")).unwrap();
+        assert!(backend_toml.contains("exposure = \"public\""));
+        assert!(backend_toml.contains("listen_addr = \"0.0.0.0:22000\""));
+        assert!(backend_toml.contains("relay_endpoints = [\"1.2.3.4:22067\"]"));
+        assert!(backend_toml.contains(&format!("relay_shared_secret = \"{secret}\"")));
+    }
+
+    #[test]
+    fn noninteractive_p2p_rejects_invalid_posture() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = make_context(dir.path());
+
+        let flags = InitFlags {
+            backend_type: Some("p2p".to_string()),
+            p2p_exposure: Some("publik".to_string()),
+            ..Default::default()
+        };
+
+        let err = run(&ctx, flags).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("posture must be one of"), "error was: {msg}");
+    }
+
+    #[test]
+    fn noninteractive_p2p_rejects_invalid_listen_addr() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = make_context(dir.path());
+
+        let flags = InitFlags {
+            backend_type: Some("p2p".to_string()),
+            p2p_listen_addr: Some("not-a-socket-addr".to_string()),
+            ..Default::default()
+        };
+
+        let err = run(&ctx, flags).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("invalid --p2p-listen-addr"),
+            "error was: {msg}"
+        );
+    }
+
+    #[test]
+    fn noninteractive_p2p_rejects_short_relay_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = make_context(dir.path());
+
+        let flags = InitFlags {
+            backend_type: Some("p2p".to_string()),
+            p2p_relay_secret: Some("tooshort".to_string()),
+            ..Default::default()
+        };
+
+        let err = run(&ctx, flags).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("relay shared secret must be exactly 64"),
+            "error was: {msg}"
+        );
     }
 }

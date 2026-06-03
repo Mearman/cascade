@@ -132,6 +132,9 @@ async fn daemon_wired_node_accepts_authorised_management_over_the_wire() {
             cache_dir: None,
             enable_p2p: false,
             p2p_data_dir: None,
+            p2p_posture: None,
+            p2p_relay_endpoints: Vec::new(),
+            p2p_relay_shared_secret: None,
             backend_factory: None,
         })
         .unwrap(),

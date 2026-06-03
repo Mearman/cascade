@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use cascade_p2p::DiscoveryReach;
 use cascade_p2p::P2pEngine;
 use cascade_p2p::block::{BlockHash, FileBlocks};
 use cascade_p2p::store::BlockStore;
@@ -17,24 +18,74 @@ use tracing::{debug, warn};
 use crate::db::StateDb;
 use crate::types::{FileEntry, ItemId};
 
+/// Configuration for the optimisation-layer P2P bridge.
+///
+/// These fields extend the bridge's reach beyond LAN defaults: they let a
+/// cloud-backed node also participate in WAN peer discovery (with a specific
+/// `DiscoveryReach` posture) and use a `cascade-relay` server for NAT
+/// traversal. They mirror the fields a pure-P2P backend carries in its own
+/// per-backend TOML, but live here for the engine's optimisation layer so
+/// the two paths share a single source of intent.
+#[derive(Debug, Clone, Default)]
+pub struct P2pBridgeConfig {
+    /// Discovery reach for the optimisation-layer P2P engine.
+    ///
+    /// `None` means the engine default (`private`) applies: trusted mesh,
+    /// no global directory publication.
+    pub posture: Option<DiscoveryReach>,
+    /// Relay endpoint addresses for WAN NAT traversal.
+    ///
+    /// Each entry is a `cascade-relay` server socket address. Empty means no
+    /// relay strategy is provisioned.
+    pub relay_endpoints: Vec<std::net::SocketAddr>,
+    /// 32-byte HMAC shared secret authenticating this node to the relay server.
+    ///
+    /// `None` means no relay secret is configured; a relay endpoint will be
+    /// provisioned but dials will fail authentication at the relay side.
+    pub relay_shared_secret: Option<[u8; 32]>,
+}
+
 /// Bridge between P2P engine and the sync/cache layer.
 pub struct P2pBridge {
     p2p: P2pEngine,
     db: Arc<StateDb>,
+    /// Configuration governing the optimisation-layer reach and relay.
+    ///
+    /// Stored for use when the bridge spawns its peer-session loop. Held
+    /// here rather than in `P2pEngine` because the `cascade_p2p::P2pEngine`
+    /// type predates posture/relay configuration and is used by the
+    /// per-backend path too; keeping the configuration on the bridge keeps
+    /// the two paths independent.
+    pub config: P2pBridgeConfig,
 }
 
 impl std::fmt::Debug for P2pBridge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("P2pBridge")
             .field("device_id", &self.p2p.device_id())
+            .field("posture", &self.config.posture)
+            .field(
+                "relay_endpoints",
+                &format!("[{} endpoint(s)]", self.config.relay_endpoints.len()),
+            )
             .finish_non_exhaustive()
     }
 }
 
 impl P2pBridge {
-    /// Create a new P2P bridge.
-    pub const fn new(p2p: P2pEngine, db: Arc<StateDb>) -> Self {
-        Self { p2p, db }
+    /// Create a new P2P bridge with default configuration (private posture,
+    /// no relay).
+    pub fn new(p2p: P2pEngine, db: Arc<StateDb>) -> Self {
+        Self {
+            p2p,
+            db,
+            config: P2pBridgeConfig::default(),
+        }
+    }
+
+    /// Create a new P2P bridge with explicit posture and relay configuration.
+    pub const fn with_config(p2p: P2pEngine, db: Arc<StateDb>, config: P2pBridgeConfig) -> Self {
+        Self { p2p, db, config }
     }
 
     /// Access the underlying P2P engine.

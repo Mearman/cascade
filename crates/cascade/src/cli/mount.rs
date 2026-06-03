@@ -9,8 +9,109 @@ use cascade_engine::presenter::VfsPresenter;
 use cascade_presenter_nfs::nfs::server::{NfsCacheMode, NfsServer, NfsServerConfig};
 use cascade_presenter_webdav::WebDavPresenter;
 
-use super::init::{BackendConfig, CascadeConfig};
+use super::init::{BackendConfig, CascadeConfig, P2pConfig};
 use super::{CliContext, is_process_alive};
+
+/// Resolved optimisation-layer P2P configuration threaded into every
+/// `EngineConfig` at daemon startup.
+///
+/// Bundles the three new `EngineConfig` fields so they can be passed
+/// to each `try_*` presenter constructor without repeating the same three
+/// arguments on every call.
+#[derive(Debug, Clone)]
+struct ResolvedP2pConfig {
+    enable_p2p: bool,
+    posture: Option<cascade_p2p::DiscoveryReach>,
+    relay_endpoints: Vec<std::net::SocketAddr>,
+    relay_shared_secret: Option<[u8; 32]>,
+}
+
+/// Parse the `[p2p]` table from `config.toml` into the fields that the engine's
+/// P2P bridge needs.
+///
+/// Fails loudly on a malformed `posture` value (typos should surface at startup,
+/// not silently default to a less-exposed posture the operator did not intend)
+/// and on a malformed relay secret (wrong length or non-hex characters).
+fn resolve_p2p_bridge_config(cfg: &P2pConfig) -> Result<ResolvedP2pConfig> {
+    let posture = cfg.posture.as_deref().map(parse_posture_str).transpose()?;
+
+    let relay_endpoints = cfg
+        .relay_endpoint
+        .as_deref()
+        .map(|ep| {
+            // Accept a DNS hostname or a Docker service name, not only a literal
+            // IP:port — resolved here at config load so compose service names
+            // like `relay:9999` work. The relay is dialled by the resolved
+            // address; restart the daemon if the relay's address later changes.
+            use std::net::ToSocketAddrs as _;
+            ep.to_socket_addrs()
+                .with_context(|| {
+                    format!("[p2p] relay_endpoint `{ep}` is not a resolvable host:port")
+                })?
+                .next()
+                .with_context(|| format!("[p2p] relay_endpoint `{ep}` resolved to no addresses"))
+        })
+        .transpose()?
+        .map(|addr| vec![addr])
+        .unwrap_or_default();
+
+    let relay_shared_secret = cfg
+        .relay_shared_secret
+        .as_deref()
+        .map(parse_relay_secret_hex)
+        .transpose()?;
+
+    Ok(ResolvedP2pConfig {
+        enable_p2p: cfg.enabled,
+        posture,
+        relay_endpoints,
+        relay_shared_secret,
+    })
+}
+
+/// Parse a posture string from the config file into a `DiscoveryReach`.
+///
+/// Fails loudly rather than silently defaulting: an operator who typed `publik`
+/// deserves a clear error rather than discovering the node quietly confined to
+/// the LAN when they meant WAN, or the reverse.
+fn parse_posture_str(s: &str) -> Result<cascade_p2p::DiscoveryReach> {
+    match s {
+        "lan-only" => Ok(cascade_p2p::DiscoveryReach::LanOnly),
+        "private" => Ok(cascade_p2p::DiscoveryReach::Private),
+        "public" => Ok(cascade_p2p::DiscoveryReach::Public),
+        other => anyhow::bail!(
+            "[p2p] posture `{other}` is not valid; expected one of: lan-only, private, public"
+        ),
+    }
+}
+
+/// Parse a 64-character hex relay shared secret into a 32-byte array.
+///
+/// The relay HMAC key is exactly 32 bytes (64 hex chars). Catching a
+/// malformed value at startup is better than a confusing runtime 401.
+fn parse_relay_secret_hex(hex: &str) -> Result<[u8; 32]> {
+    if hex.len() != 64 {
+        anyhow::bail!(
+            "[p2p] relay_shared_secret must be exactly 64 hex characters (32 bytes), got {}",
+            hex.len()
+        );
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        let pair_start = i
+            .checked_mul(2)
+            .ok_or_else(|| anyhow::anyhow!("relay_shared_secret index overflow"))?;
+        let pair_end = pair_start
+            .checked_add(2)
+            .ok_or_else(|| anyhow::anyhow!("relay_shared_secret index overflow"))?;
+        let pair = hex.get(pair_start..pair_end).ok_or_else(|| {
+            anyhow::anyhow!("relay_shared_secret hex slice out of range at position {pair_start}")
+        })?;
+        *byte = u8::from_str_radix(pair, 16)
+            .with_context(|| format!("invalid hex pair `{pair}` in relay_shared_secret"))?;
+    }
+    Ok(out)
+}
 
 /// Park until the process is asked to shut down.
 ///
@@ -156,9 +257,18 @@ pub async fn start(
     // Read main config.toml written by `cascade init`.
     let main_config = load_main_config(&ctx.config_dir)?;
 
-    // Resolve P2P enablement: CLI override > config file > default off.
-    let enable_p2p = p2p_override.unwrap_or(main_config.p2p.enabled);
-    if enable_p2p {
+    // Resolve the optimisation-layer P2P config from the [p2p] table.
+    // Misconfigured posture or relay values are caught here at startup so they
+    // surface before any mount attempt.
+    let mut p2p_config = resolve_p2p_bridge_config(&main_config.p2p)?;
+
+    // Apply the CLI override for P2P enablement: --p2p / --no-p2p overrides
+    // the [p2p].enabled value from config.toml.
+    if let Some(override_val) = p2p_override {
+        p2p_config.enable_p2p = override_val;
+    }
+
+    if p2p_config.enable_p2p {
         tracing::info!("P2P optimisation layer enabled");
     }
 
@@ -207,7 +317,7 @@ pub async fn start(
             strategy = "webdav-forced",
             "honouring CASCADE_PRESENTER=webdav"
         );
-        return try_webdav(ctx, &mount_path, backends, no_mount, enable_p2p).await;
+        return try_webdav(ctx, &mount_path, backends, no_mount, &p2p_config).await;
     }
 
     // `--file-provider` is an explicit opt-in to the macOS File Provider
@@ -223,7 +333,7 @@ pub async fn start(
     if file_provider {
         let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
         tracing::info!(strategy = "fileprovider", "attempting File Provider mount");
-        return try_fileprovider(ctx, &mount_path, backends, no_mount, enable_p2p).await;
+        return try_fileprovider(ctx, &mount_path, backends, no_mount, &p2p_config).await;
     }
 
     // On macOS: FSKit first (native, kext-free, POSIX), then WebDAV (no
@@ -238,7 +348,7 @@ pub async fn start(
         if !no_mount {
             let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
             tracing::info!(strategy = "fskit", "attempting FSKit mount");
-            match try_fskit(ctx, &mount_path, backends, enable_p2p).await {
+            match try_fskit(ctx, &mount_path, backends, &p2p_config).await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     tracing::warn!(error = %e, "FSKit mount failed, falling back to WebDAV");
@@ -250,7 +360,7 @@ pub async fn start(
         // Attempt 2: WebDAV.
         let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
         tracing::info!(strategy = "webdav", "attempting WebDAV mount");
-        match try_webdav(ctx, &mount_path, backends, no_mount, enable_p2p).await {
+        match try_webdav(ctx, &mount_path, backends, no_mount, &p2p_config).await {
             Ok(()) => return Ok(()),
             Err(e) => {
                 tracing::warn!(error = %e, "WebDAV mount failed, falling back to NFS");
@@ -260,24 +370,40 @@ pub async fn start(
 
         // Attempt 3: NFS (v4 → v3 escalation inside mount_nfs).
         let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
-        try_nfs(ctx, &mount_path, backends, no_mount, enable_p2p).await
+        try_nfs(ctx, &mount_path, backends, no_mount, &p2p_config).await
     }
 
     #[cfg(target_os = "linux")]
     {
-        // FUSE first (native, runs as the calling user), NFS fallback.
-        let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
-        tracing::info!(strategy = "fuse", "attempting FUSE mount");
-        match try_fuse(ctx, &mount_path, backends, enable_p2p).await {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                tracing::warn!(error = %e, "FUSE mount failed, falling back to NFS");
-                drop(e);
+        // When --no-mount is set, skip FUSE entirely (it always mounts and
+        // the entrypoint's seed mode relies on this gate to stay unprivileged).
+        // Fall straight through to WebDAV, which honours no_mount and runs
+        // without /dev/fuse or SYS_ADMIN. The CASCADE_PRESENTER=webdav env
+        // override is handled above, so we reach here only when the presenter
+        // is unset (i.e. the operator explicitly wants FUSE if available).
+        if !no_mount {
+            let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
+            tracing::info!(strategy = "fuse", "attempting FUSE mount");
+            match try_fuse(ctx, &mount_path, backends, &p2p_config).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    tracing::warn!(error = %e, "FUSE mount failed, falling back to NFS");
+                    drop(e);
+                }
             }
-        }
 
-        let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
-        try_nfs(ctx, &mount_path, backends, no_mount, enable_p2p).await
+            let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
+            try_nfs(ctx, &mount_path, backends, no_mount, &p2p_config).await
+        } else {
+            // --no-mount on Linux: run the WebDAV server without mounting.
+            // This is the headless seed mode used by the Docker entrypoint.
+            let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
+            tracing::info!(
+                strategy = "webdav-seed",
+                "--no-mount set on Linux; starting WebDAV server in seed mode"
+            );
+            try_webdav(ctx, &mount_path, backends, no_mount, &p2p_config).await
+        }
     }
 
     #[cfg(target_os = "windows")]
@@ -292,7 +418,7 @@ pub async fn start(
         if !no_mount {
             let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
             tracing::info!(strategy = "projfs", "attempting ProjFS mount");
-            match try_projfs(ctx, &mount_path, backends, enable_p2p).await {
+            match try_projfs(ctx, &mount_path, backends, &p2p_config).await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     tracing::warn!(error = %e, "ProjFS mount failed, falling back to WebDAV");
@@ -304,13 +430,13 @@ pub async fn start(
         // Attempt 2: WebDAV via the built-in WebClient service.
         let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
         tracing::info!(strategy = "webdav", "attempting WebDAV mount");
-        try_webdav(ctx, &mount_path, backends, no_mount, enable_p2p).await
+        try_webdav(ctx, &mount_path, backends, no_mount, &p2p_config).await
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
-        try_nfs(ctx, &mount_path, backends, no_mount, enable_p2p).await
+        try_nfs(ctx, &mount_path, backends, no_mount, &p2p_config).await
     }
 }
 
@@ -329,15 +455,18 @@ async fn try_fskit(
     ctx: &CliContext,
     mount_path: &Path,
     backends: Vec<Arc<dyn cascade_engine::backend::Backend>>,
-    enable_p2p: bool,
+    p2p: &ResolvedP2pConfig,
 ) -> Result<()> {
     let engine_config = EngineConfig {
         db_path: ctx.db_path.clone(),
         mount_point: mount_path.to_path_buf(),
         backends,
         cache_dir: None,
-        enable_p2p,
+        enable_p2p: p2p.enable_p2p,
         p2p_data_dir: None,
+        p2p_posture: p2p.posture,
+        p2p_relay_endpoints: p2p.relay_endpoints.clone(),
+        p2p_relay_shared_secret: p2p.relay_shared_secret,
         backend_factory: Some(cli_backend_factory()),
     };
     let engine = Arc::new(Engine::new(engine_config)?);
@@ -478,7 +607,7 @@ async fn try_fileprovider(
     mount_path: &Path,
     backends: Vec<Arc<dyn cascade_engine::backend::Backend>>,
     _no_mount: bool,
-    enable_p2p: bool,
+    p2p: &ResolvedP2pConfig,
 ) -> Result<()> {
     use cascade_presenter_fileprovider::engine_handlers::EngineHandlers;
     use cascade_presenter_fileprovider::server::FileProviderServer;
@@ -488,8 +617,11 @@ async fn try_fileprovider(
         mount_point: mount_path.to_path_buf(),
         backends,
         cache_dir: None,
-        enable_p2p,
+        enable_p2p: p2p.enable_p2p,
         p2p_data_dir: None,
+        p2p_posture: p2p.posture,
+        p2p_relay_endpoints: p2p.relay_endpoints.clone(),
+        p2p_relay_shared_secret: p2p.relay_shared_secret,
         backend_factory: Some(cli_backend_factory()),
     };
     let engine = Arc::new(Engine::new(engine_config)?);
@@ -599,7 +731,7 @@ async fn try_projfs(
     ctx: &CliContext,
     mount_path: &Path,
     backends: Vec<Arc<dyn cascade_engine::backend::Backend>>,
-    enable_p2p: bool,
+    p2p: &ResolvedP2pConfig,
 ) -> Result<()> {
     // The backend list is consumed by EngineConfig, so clone it for the
     // content provider first. Cloning a `Vec<Arc<dyn Backend>>` is cheap —
@@ -611,8 +743,11 @@ async fn try_projfs(
         mount_point: mount_path.to_path_buf(),
         backends,
         cache_dir: None,
-        enable_p2p,
+        enable_p2p: p2p.enable_p2p,
         p2p_data_dir: None,
+        p2p_posture: p2p.posture,
+        p2p_relay_endpoints: p2p.relay_endpoints.clone(),
+        p2p_relay_shared_secret: p2p.relay_shared_secret,
         backend_factory: Some(cli_backend_factory()),
     };
     let engine = Arc::new(Engine::new(engine_config)?);
@@ -732,15 +867,18 @@ async fn try_webdav(
     mount_path: &Path,
     backends: Vec<Arc<dyn cascade_engine::backend::Backend>>,
     no_mount: bool,
-    enable_p2p: bool,
+    p2p: &ResolvedP2pConfig,
 ) -> Result<()> {
     let engine_config = EngineConfig {
         db_path: ctx.db_path.clone(),
         mount_point: mount_path.to_path_buf(),
         backends,
         cache_dir: None,
-        enable_p2p,
+        enable_p2p: p2p.enable_p2p,
         p2p_data_dir: None,
+        p2p_posture: p2p.posture,
+        p2p_relay_endpoints: p2p.relay_endpoints.clone(),
+        p2p_relay_shared_secret: p2p.relay_shared_secret,
         backend_factory: Some(cli_backend_factory()),
     };
     let engine = Arc::new(Engine::new(engine_config)?);
@@ -847,20 +985,29 @@ async fn try_webdav(
 /// Same shutdown guarantees as the macOS presenter functions: on any
 /// failure during engine, presenter, or mount setup, every started
 /// resource is stopped before the error is returned.
+///
+/// This function is only called when `--no-mount` is not set. The `start()`
+/// caller gates the FUSE attempt behind `!no_mount` so that seed mode (the
+/// Docker container default) is a genuine unprivileged path: FUSE always mounts
+/// and cannot honour `--no-mount` internally, so the gate lives at the call
+/// site rather than inside this function.
 #[cfg(target_os = "linux")]
 async fn try_fuse(
     ctx: &CliContext,
     mount_path: &Path,
     backends: Vec<Arc<dyn cascade_engine::backend::Backend>>,
-    enable_p2p: bool,
+    p2p: &ResolvedP2pConfig,
 ) -> Result<()> {
     let engine_config = EngineConfig {
         db_path: ctx.db_path.clone(),
         mount_point: mount_path.to_path_buf(),
         backends,
         cache_dir: None,
-        enable_p2p,
+        enable_p2p: p2p.enable_p2p,
         p2p_data_dir: None,
+        p2p_posture: p2p.posture,
+        p2p_relay_endpoints: p2p.relay_endpoints.clone(),
+        p2p_relay_shared_secret: p2p.relay_shared_secret,
         backend_factory: Some(cli_backend_factory()),
     };
     let engine = Arc::new(Engine::new(engine_config)?);
@@ -932,15 +1079,18 @@ async fn try_nfs(
     mount_path: &Path,
     backends: Vec<Arc<dyn cascade_engine::backend::Backend>>,
     no_mount: bool,
-    enable_p2p: bool,
+    p2p: &ResolvedP2pConfig,
 ) -> Result<()> {
     let engine_config = EngineConfig {
         db_path: ctx.db_path.clone(),
         mount_point: mount_path.to_path_buf(),
         backends,
         cache_dir: None,
-        enable_p2p,
+        enable_p2p: p2p.enable_p2p,
         p2p_data_dir: None,
+        p2p_posture: p2p.posture,
+        p2p_relay_endpoints: p2p.relay_endpoints.clone(),
+        p2p_relay_shared_secret: p2p.relay_shared_secret,
         backend_factory: Some(cli_backend_factory()),
     };
     let engine = Arc::new(Engine::new(engine_config)?);
@@ -2271,5 +2421,106 @@ mod tests {
         tokio::task::yield_now().await;
         // Abort must not panic even though the task already finished.
         sync_handle.abort();
+    }
+
+    // --- resolve_p2p_bridge_config tests ------------------------------------
+
+    #[test]
+    fn resolve_p2p_bridge_config_defaults_produce_none() {
+        use crate::cli::init::P2pConfig;
+        let cfg = resolve_p2p_bridge_config(&P2pConfig::default()).unwrap();
+        assert!(!cfg.enable_p2p);
+        assert!(cfg.posture.is_none());
+        assert!(cfg.relay_endpoints.is_empty());
+        assert!(cfg.relay_shared_secret.is_none());
+    }
+
+    #[test]
+    fn resolve_p2p_bridge_config_parses_public_posture_and_relay() {
+        use crate::cli::init::P2pConfig;
+        let secret = "b".repeat(64);
+        let cfg = resolve_p2p_bridge_config(&P2pConfig {
+            enabled: true,
+            posture: Some("public".to_string()),
+            relay_endpoint: Some("10.0.0.1:22067".to_string()),
+            relay_shared_secret: Some(secret),
+        })
+        .unwrap();
+        assert!(cfg.enable_p2p);
+        assert_eq!(cfg.posture, Some(cascade_p2p::DiscoveryReach::Public));
+        assert_eq!(cfg.relay_endpoints.len(), 1);
+        assert!(cfg.relay_shared_secret.is_some());
+    }
+
+    #[test]
+    fn resolve_p2p_bridge_config_parses_lan_only_posture() {
+        use crate::cli::init::P2pConfig;
+        let cfg = resolve_p2p_bridge_config(&P2pConfig {
+            enabled: true,
+            posture: Some("lan-only".to_string()),
+            relay_endpoint: None,
+            relay_shared_secret: None,
+        })
+        .unwrap();
+        assert_eq!(cfg.posture, Some(cascade_p2p::DiscoveryReach::LanOnly));
+        assert!(cfg.relay_endpoints.is_empty());
+    }
+
+    #[test]
+    fn resolve_p2p_bridge_config_parses_private_posture() {
+        use crate::cli::init::P2pConfig;
+        let cfg = resolve_p2p_bridge_config(&P2pConfig {
+            enabled: false,
+            posture: Some("private".to_string()),
+            relay_endpoint: None,
+            relay_shared_secret: None,
+        })
+        .unwrap();
+        assert_eq!(cfg.posture, Some(cascade_p2p::DiscoveryReach::Private));
+    }
+
+    #[test]
+    fn resolve_p2p_bridge_config_rejects_unknown_posture() {
+        use crate::cli::init::P2pConfig;
+        let result = resolve_p2p_bridge_config(&P2pConfig {
+            enabled: true,
+            posture: Some("publik".to_string()),
+            relay_endpoint: None,
+            relay_shared_secret: None,
+        });
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(msg.contains("[p2p] posture"), "error was: {msg}");
+    }
+
+    #[test]
+    fn resolve_p2p_bridge_config_rejects_malformed_relay_endpoint() {
+        use crate::cli::init::P2pConfig;
+        let result = resolve_p2p_bridge_config(&P2pConfig {
+            enabled: true,
+            posture: None,
+            relay_endpoint: Some("not-a-socket".to_string()),
+            relay_shared_secret: None,
+        });
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(msg.contains("[p2p] relay_endpoint"), "error was: {msg}");
+    }
+
+    #[test]
+    fn resolve_p2p_bridge_config_rejects_malformed_relay_secret() {
+        use crate::cli::init::P2pConfig;
+        let result = resolve_p2p_bridge_config(&P2pConfig {
+            enabled: true,
+            posture: None,
+            relay_endpoint: Some("10.0.0.1:22067".to_string()),
+            relay_shared_secret: Some("tooshort".to_string()),
+        });
+        assert!(result.is_err());
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("relay_shared_secret must be exactly 64"),
+            "error was: {msg}"
+        );
     }
 }

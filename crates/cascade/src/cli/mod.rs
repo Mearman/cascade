@@ -121,49 +121,85 @@ pub struct Cli {
     pub quiet: bool,
 }
 
+/// Arguments for the `cascade init` sub-command.
+///
+/// Extracted into a separate Args struct so the `Commands::Init` variant
+/// does not become a large-size outlier in the `Commands` enum, which triggers
+/// `clippy::large_enum_variant`. Clap's `#[command(flatten)]` inlines these
+/// fields into the `Init` variant for argument parsing.
+#[derive(Debug, clap::Args)]
+pub struct InitArgs {
+    /// Backend type (gdrive, s3, local, p2p)
+    #[arg(long)]
+    pub backend_type: Option<String>,
+
+    /// Name for this backend instance
+    #[arg(long)]
+    pub name: Option<String>,
+
+    /// Mount point path
+    #[arg(long)]
+    pub mount_point: Option<String>,
+
+    /// S3 endpoint URL (for --backend-type s3)
+    #[arg(long)]
+    pub endpoint: Option<String>,
+
+    /// S3 bucket name (for --backend-type s3)
+    #[arg(long)]
+    pub bucket: Option<String>,
+
+    /// S3 region (for --backend-type s3)
+    #[arg(long)]
+    pub region: Option<String>,
+
+    /// S3 access key ID (for --backend-type s3)
+    #[arg(long)]
+    pub access_key_id: Option<String>,
+
+    /// S3 secret access key (for --backend-type s3)
+    #[arg(long)]
+    pub secret_access_key: Option<String>,
+
+    /// Google Drive `OAuth2` client ID (for --backend-type gdrive)
+    #[arg(long)]
+    pub client_id: Option<String>,
+
+    /// Google Drive `OAuth2` client secret (for --backend-type gdrive)
+    #[arg(long)]
+    pub client_secret: Option<String>,
+
+    /// Root directory for the local backend (for --backend-type local)
+    #[arg(long)]
+    pub local_root: Option<String>,
+
+    /// P2P block-store data directory (for --backend-type p2p)
+    #[arg(long)]
+    pub p2p_data_dir: Option<String>,
+
+    /// P2P discovery posture: lan-only, private, or public (for --backend-type p2p)
+    #[arg(long)]
+    pub p2p_exposure: Option<String>,
+
+    /// P2P BEP listener address, e.g. 0.0.0.0:22000 (for --backend-type p2p)
+    #[arg(long)]
+    pub p2p_listen_addr: Option<String>,
+
+    /// P2P relay endpoint host:port for WAN NAT traversal (for --backend-type p2p)
+    #[arg(long)]
+    pub p2p_relay_endpoint: Option<String>,
+
+    /// 64-char hex HMAC secret for the relay server (for --backend-type p2p)
+    #[arg(long)]
+    pub p2p_relay_secret: Option<String>,
+}
+
 #[derive(Subcommand)]
 pub enum Commands {
     /// Guided initial setup
     Init {
-        /// Backend type (gdrive, s3)
-        #[arg(long)]
-        backend_type: Option<String>,
-
-        /// Name for this backend instance
-        #[arg(long)]
-        name: Option<String>,
-
-        /// Mount point path
-        #[arg(long)]
-        mount_point: Option<String>,
-
-        /// S3 endpoint URL (for --backend-type s3)
-        #[arg(long)]
-        endpoint: Option<String>,
-
-        /// S3 bucket name (for --backend-type s3)
-        #[arg(long)]
-        bucket: Option<String>,
-
-        /// S3 region (for --backend-type s3)
-        #[arg(long)]
-        region: Option<String>,
-
-        /// S3 access key ID (for --backend-type s3)
-        #[arg(long)]
-        access_key_id: Option<String>,
-
-        /// S3 secret access key (for --backend-type s3)
-        #[arg(long)]
-        secret_access_key: Option<String>,
-
-        /// Google Drive `OAuth2` client ID (for --backend-type gdrive)
-        #[arg(long)]
-        client_id: Option<String>,
-
-        /// Google Drive `OAuth2` client secret (for --backend-type gdrive)
-        #[arg(long)]
-        client_secret: Option<String>,
+        #[command(flatten)]
+        args: Box<InitArgs>,
     },
 
     /// Start the daemon and mount all configured backends
@@ -740,30 +776,25 @@ pub enum CacheCommands {
 impl Cli {
     pub async fn run(self, ctx: &CliContext) -> Result<()> {
         match self.command {
-            Commands::Init {
-                backend_type,
-                name,
-                mount_point,
-                endpoint,
-                bucket,
-                region,
-                access_key_id,
-                secret_access_key,
-                client_id,
-                client_secret,
-            } => init::run(
+            Commands::Init { args } => init::run(
                 ctx,
                 init::InitFlags {
-                    backend_type,
-                    name,
-                    mount_point,
-                    endpoint,
-                    bucket,
-                    region,
-                    access_key_id,
-                    secret_access_key,
-                    client_id,
-                    client_secret,
+                    backend_type: args.backend_type,
+                    name: args.name,
+                    mount_point: args.mount_point,
+                    endpoint: args.endpoint,
+                    bucket: args.bucket,
+                    region: args.region,
+                    access_key_id: args.access_key_id,
+                    secret_access_key: args.secret_access_key,
+                    client_id: args.client_id,
+                    client_secret: args.client_secret,
+                    local_root: args.local_root,
+                    p2p_data_dir: args.p2p_data_dir,
+                    p2p_exposure: args.p2p_exposure,
+                    p2p_listen_addr: args.p2p_listen_addr,
+                    p2p_relay_endpoint: args.p2p_relay_endpoint,
+                    p2p_relay_secret: args.p2p_relay_secret,
                 },
             ),
             Commands::Start {
