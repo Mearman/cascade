@@ -15,7 +15,7 @@ tracing.workspace = true
 # `Win32_Storage_ProjectedFileSystem` feature. Only pull it in on
 # Windows targets so the crate compiles cross-platform.
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.59", features = [
+windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
     "Win32_Storage_ProjectedFileSystem",

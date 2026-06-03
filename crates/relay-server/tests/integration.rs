@@ -20,7 +20,7 @@ use cascade_relay_server::auth::encode_handshake;
 use cascade_relay_server::config::{RelayConfig, SHARED_SECRET_LEN};
 use cascade_relay_server::server::{RelayHandle, spawn};
 use futures_util::{SinkExt, StreamExt};
-use rand::RngCore;
+use rand::Rng;
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
