@@ -113,6 +113,7 @@ mod axum_endpoint {
     use anyhow::{Context, Result};
     use axum::Router;
     use axum::extract::State;
+    use axum::http::StatusCode;
     use axum::http::header::CONTENT_TYPE;
     use axum::response::{IntoResponse, Response};
     use axum::routing::get;
@@ -120,7 +121,14 @@ mod axum_endpoint {
 
     use super::Counters;
 
-    /// Bind a small `HTTP` server on `bind` that exposes `/metrics`.
+    /// Bind a small `HTTP` server on `bind` that exposes `/metrics` and `/health`.
+    ///
+    /// `/metrics` serves the Prometheus text exposition for the relay counters.
+    /// `/health` is an unauthenticated liveness endpoint that returns `200 OK`
+    /// with the body `ok` once the relay is accepting connections. Its only
+    /// job is to let a load balancer or container orchestrator determine that
+    /// the process is up; it carries no sensitive information.
+    ///
     /// Returns the actual bound address (useful when binding to port 0) and
     /// a handle that keeps the server alive until dropped.
     pub async fn serve_metrics(
@@ -136,6 +144,7 @@ mod axum_endpoint {
 
         let app = Router::new()
             .route("/metrics", get(metrics_handler))
+            .route("/health", get(health_handler))
             .with_state(counters);
 
         let join = tokio::spawn(async move {
@@ -149,6 +158,17 @@ mod axum_endpoint {
     async fn metrics_handler(State(counters): State<Arc<Counters>>) -> Response {
         let body = counters.render_prometheus();
         ([(CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
+    }
+
+    /// Unauthenticated liveness probe. Returns `200 OK` with the body `ok`.
+    ///
+    /// The handler takes no state and performs no computation — it exists solely
+    /// to let container healthchecks and load-balancer probes confirm the process
+    /// is alive and the HTTP listener is reachable. Always succeeds; a failure to
+    /// reach this endpoint means the process is down, not that anything went wrong
+    /// inside the handler.
+    pub(super) async fn health_handler() -> Response {
+        (StatusCode::OK, "ok").into_response()
     }
 }
 
@@ -177,5 +197,21 @@ mod tests {
         ] {
             assert!(body.contains(needle), "missing {needle} in {body}");
         }
+    }
+
+    /// The `/health` handler returns `200 OK` with the body `ok`. The handler
+    /// is callable directly (no state, no axum extractors beyond the implicit
+    /// route match) so the test drives it without a network round-trip.
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn health_handler_returns_200_ok() {
+        use axum::body::to_bytes;
+        use axum::http::StatusCode;
+
+        let response = axum_endpoint::health_handler().await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), 16).await.unwrap();
+        assert_eq!(body.as_ref(), b"ok");
     }
 }

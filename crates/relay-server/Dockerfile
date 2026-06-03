@@ -29,16 +29,23 @@ COPY --from=builder /usr/local/bin/cascade-relay /usr/local/bin/cascade-relay
 
 # Byte-pipe listener (protocol traffic from peers).
 EXPOSE 9999
-# Optional Prometheus /metrics endpoint.
+# Optional /metrics and /health HTTP endpoint.
+# /health is an unauthenticated liveness probe; /metrics serves Prometheus text.
 EXPOSE 9998
+# Optional announce/lookup directory endpoint (requires --features announce at build time).
+EXPOSE 9997
 
 # Operators configure the relay via these environment variables.
 #
-# CASCADE_RELAY_LISTEN  — bind address for the peer listener (default 0.0.0.0:9999)
-# CASCADE_RELAY_METRICS — bind address for the /metrics HTTP endpoint (optional)
 # CASCADE_RELAY_SHARED_SECRET  — 64-char hex shared HMAC secret (required)
-#
-# Generate a secret with: openssl rand -hex 32
+#                                Generate with: openssl rand -hex 32
+# CASCADE_RELAY_LISTEN         — bind address for the peer listener
+#                                Default: 0.0.0.0:9999
+# CASCADE_RELAY_METRICS        — bind address for /metrics and /health (optional)
+#                                Set to 0.0.0.0:9998 to enable.
+# CASCADE_RELAY_ANNOUNCE       — bind address for the announce directory (optional)
+#                                Requires the announce build feature.
+#                                Set to 0.0.0.0:9997 to enable.
 ENV CASCADE_RELAY_LISTEN="0.0.0.0:9999"
 
 # The entrypoint shell script maps env vars to CLI flags so that
@@ -46,5 +53,23 @@ ENV CASCADE_RELAY_LISTEN="0.0.0.0:9999"
 # helm values — no need to override the command line.
 COPY --from=builder /src/crates/relay-server/docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh
+
+# Liveness healthcheck against the /health endpoint on the metrics port.
+#
+# The /health route is served by the same HTTP listener as /metrics, so the
+# check works only when CASCADE_RELAY_METRICS is set. When it is unset the
+# check exits 0 immediately (healthy by assumption) so the container does not
+# cycle through unhealthy states just because the operator chose not to expose
+# metrics. In a production deployment set CASCADE_RELAY_METRICS so the
+# orchestrator can actually distinguish a crashed process from a healthy one.
+#
+# wget is present in debian:bookworm-slim; curl is not installed to keep the
+# image minimal.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD if [ -n "${CASCADE_RELAY_METRICS:-}" ]; then \
+          wget -qO- "http://${CASCADE_RELAY_METRICS}/health" | grep -q ok; \
+        else \
+          exit 0; \
+        fi
 
 ENTRYPOINT ["/docker-entrypoint.sh"]

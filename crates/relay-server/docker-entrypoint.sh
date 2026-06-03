@@ -13,10 +13,14 @@
 #                                  appearing in /proc/<pid>/cmdline.
 #
 # Optional:
-#   CASCADE_RELAY_LISTEN  — bind address for the peer listener.
-#                           Default: 0.0.0.0:9999
-#   CASCADE_RELAY_METRICS — bind address for the /metrics HTTP endpoint.
-#                           When unset the metrics endpoint is disabled.
+#   CASCADE_RELAY_LISTEN    — bind address for the peer listener.
+#                             Default: 0.0.0.0:9999
+#   CASCADE_RELAY_METRICS   — bind address for the /metrics and /health HTTP
+#                             endpoint. When unset both endpoints are disabled.
+#   CASCADE_RELAY_ANNOUNCE  — bind address for the /announce/<device_id>
+#                             directory endpoint (requires the `announce` build
+#                             feature). When unset the announce endpoint is
+#                             disabled.
 #
 # Any additional arguments passed to the container (CMD overrides) are
 # forwarded as-is after the flags derived from env vars, allowing
@@ -40,6 +44,10 @@ ARGS="--bind ${CASCADE_RELAY_LISTEN:-0.0.0.0:9999}"
 
 if [ -n "${CASCADE_RELAY_METRICS:-}" ]; then
     ARGS="$ARGS --metrics-bind $CASCADE_RELAY_METRICS"
+fi
+
+if [ -n "${CASCADE_RELAY_ANNOUNCE:-}" ]; then
+    ARGS="$ARGS --announce-bind $CASCADE_RELAY_ANNOUNCE"
 fi
 
 # shellcheck disable=SC2086
