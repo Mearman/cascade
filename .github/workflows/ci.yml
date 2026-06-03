@@ -976,6 +976,13 @@ jobs:
               bin.install "cascade"
             end
 
+            service do
+              run [opt_bin/"cascade", "start"]
+              keep_alive true
+              log_path var/"log/cascade.log"
+              error_log_path var/"log/cascade.err.log"
+            end
+
             test do
               assert_match version.to_s, shell_output("\#{bin}/cascade --version")
             end
