@@ -9,6 +9,13 @@ name = "cascade"
 release = true
 # All workspace crates share the same version.
 version_group = "workspace"
+# Pin the tag name. release-plz defaults to a bare `v{version}` tag when only a
+# single crate is released and a crate-prefixed `cascade-v{version}` tag when
+# several are. The CI release/build jobs and the formula URLs all assume the
+# crate-prefixed form, so force it explicitly — otherwise reducing the released
+# set to just `cascade` silently switches to bare tags and every build job
+# fails checking out a `cascade-v{version}` tag that was never created.
+git_tag_name = "cascade-v{{ version }}"
 
 [[package]]
 name = "cascade-engine"
