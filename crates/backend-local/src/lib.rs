@@ -141,12 +141,16 @@ impl LocalBackend {
 
     /// Convert a relative path to an absolute path under the root.
     fn absolute_path(&self, relative: &Path) -> PathBuf {
-        if relative.is_absolute() {
-            self.root
-                .join(relative.strip_prefix("/").unwrap_or(relative))
-        } else {
-            self.root.join(relative)
-        }
+        // VFS paths are forward-slash rooted ("/foo/bar") on every OS. Strip the
+        // leading separator unconditionally so the result nests under `root`.
+        // Gating on `is_absolute()` was wrong on Windows: there "/foo" is not
+        // absolute (it has no drive prefix), so the strip was skipped and
+        // `join` resolved the path to the current drive's root — escaping the
+        // export and making writes land where reads could not find them.
+        // `strip_prefix("/")` matches the RootDir component on every platform; a
+        // path without a leading separator is kept as-is.
+        let nested = relative.strip_prefix("/").unwrap_or(relative);
+        self.root.join(nested)
     }
 
     /// Convert a `FileState` into a `FileEntry`.
@@ -391,8 +395,12 @@ impl Backend for LocalBackend {
             anyhow::bail!("local backend is in upload-only mode");
         }
 
-        let relative = path.to_string_lossy();
-        let abs = self.root.join(relative.as_ref());
+        let abs = self.absolute_path(path);
+        let relative = abs
+            .strip_prefix(&self.root)
+            .unwrap_or(&abs)
+            .to_string_lossy()
+            .into_owned();
 
         // Ensure parent directory exists.
         if let Some(parent) = abs.parent() {
@@ -419,7 +427,7 @@ impl Backend for LocalBackend {
         };
 
         let state = FileState {
-            path: relative.to_string(),
+            path: relative,
             mtime_secs: i64::try_from(modified.as_secs()).unwrap_or(i64::MAX),
             mtime_nanos: modified.subsec_nanos(),
             size: metadata.len(),
@@ -490,8 +498,12 @@ impl Backend for LocalBackend {
             anyhow::bail!("local backend is in upload-only mode");
         }
 
-        let relative = path.to_string_lossy();
-        let abs = self.root.join(relative.as_ref());
+        let abs = self.absolute_path(path);
+        let relative = abs
+            .strip_prefix(&self.root)
+            .unwrap_or(&abs)
+            .to_string_lossy()
+            .into_owned();
 
         tokio::fs::create_dir_all(&abs).await?;
 
