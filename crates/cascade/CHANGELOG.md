@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.61](https://github.com/Mearman/cascade/compare/cascade-v0.1.60...cascade-v0.1.61) - 2026-06-03
+
+### Added
+
+- *(cli-service)* implement the Linux system scope for cascade service
+
+### Fixed
+
+- *(cli-service)* correct the desktop scope prompt for Linux system support
+
+### Other
+
+- *(cli-service)* record Linux system scope as implemented
+
 ## [0.1.60](https://github.com/Mearman/cascade/compare/cascade-v0.1.59...cascade-v0.1.60) - 2026-06-03
 
 ### Added
