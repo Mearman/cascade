@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.66](https://github.com/Mearman/cascade/compare/cascade-v0.1.65...cascade-v0.1.66) - 2026-06-03
+
+### Added
+
+- *(cascade)* add a headless daemon Docker image for NAS deployment
+- *(cascade)* express P2P posture and relay in config and honour --no-mount on Linux
+
+### Fixed
+
+- *(cascade)* satisfy Linux-gated clippy in the start fallback chain
+
 ## [0.1.65](https://github.com/Mearman/cascade/compare/cascade-v0.1.64...cascade-v0.1.65) - 2026-06-03
 
 ### Other
