@@ -61,8 +61,9 @@ docker pull ghcr.io/mearman/cascade-relay:latest
 # Create a dedicated unprivileged user.
 useradd --system --no-create-home --shell /usr/sbin/nologin cascade-relay
 
-# Install the unit file and the environment file template.
+# Install the unit file, launcher script, and the environment file template.
 cp crates/relay-server/cascade-relay.service /etc/systemd/system/
+install -m 0755 crates/relay-server/cascade-relay-start.sh /usr/local/bin/
 cp crates/relay-server/relay.env.example /etc/cascade/relay.env
 chmod 600 /etc/cascade/relay.env
 chown cascade-relay: /etc/cascade/relay.env
@@ -112,21 +113,23 @@ Set the exposure posture to `public` and configure the announce server and relay
 ```toml
 # ~/.config/cascade/backends/my-p2p-folder.toml
 
-[p2p]
 # public: LAN discovery, gossip, hole-punching, announce servers, relay, and DHT.
 # private: LAN discovery, gossip, hole-punching, and relay — no global publication.
 # lan-only: only UDP multicast LAN discovery.
 exposure = "public"
 
 # Announce server.  Do NOT bake in a default hostname — operator-supplied only.
-[[p2p.announce_servers]]
-base_url = "https://cascade-announce.<your-account>.workers.dev"
+# The key is `url`, not `base_url`.
+[[announce_servers]]
+url = "https://cascade-announce.<your-account>.workers.dev"
 shared_secret = "your-64-char-hex-secret"   # same secret as ANNOUNCE_SHARED_SECRET
 
-# Relay.  The relay_shared_secret must match CASCADE_RELAY_SHARED_SECRET.
-[p2p.relay]
-endpoints = ["relay.example.com:9999"]
-shared_secret = "your-64-char-hex-secret"   # same secret as CASCADE_RELAY_SHARED_SECRET
+# Relay.  relay_shared_secret must match CASCADE_RELAY_SHARED_SECRET.
+# These are flat top-level keys — there is no [relay] sub-section.
+# relay_endpoints takes IP:port strings (SocketAddr); resolve the hostname
+# to its IP first if needed.
+relay_endpoints = ["203.0.113.10:9999"]
+relay_shared_secret = "your-64-char-hex-secret"   # same secret as CASCADE_RELAY_SHARED_SECRET
 ```
 
 Both the announce server and the relay use the same HMAC key length (32 bytes / 64 hex chars). You may use the same secret for both if they are operated together by the same person; use separate secrets if the announce Worker and the relay are operated by different parties.

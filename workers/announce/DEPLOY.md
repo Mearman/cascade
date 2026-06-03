@@ -80,10 +80,11 @@ In each device's P2P backend configuration, add the deployed Worker URL as an an
 # The exposure posture must be Public for announce-server discovery to run.
 exposure = "public"
 
-[[p2p.announce_servers]]
-# Base URL of the announce Worker — no trailing slash.
+[[announce_servers]]
+# URL of the announce Worker — no trailing slash.
 # Do NOT bake in a specific public hostname as a default.  Operator-supplied only.
-base_url = "https://cascade-announce.<your-account>.workers.dev"
+# The key is `url`, not `base_url`.
+url = "https://cascade-announce.<your-account>.workers.dev"
 # The same hex secret configured via `wrangler secret put ANNOUNCE_SHARED_SECRET`.
 # Generate with: openssl rand -hex 32
 shared_secret = "your-64-char-hex-secret"

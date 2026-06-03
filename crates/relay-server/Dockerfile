@@ -25,6 +25,13 @@ RUN cargo build --release -p cascade-relay-server && \
 # ---- runtime ----
 FROM debian:bookworm-slim
 
+# Install wget for the HEALTHCHECK.  debian:bookworm-slim does not include wget
+# in its base package set (only Priority:required and Priority:important packages
+# are present); it must be installed explicitly.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends wget \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY --from=builder /usr/local/bin/cascade-relay /usr/local/bin/cascade-relay
 
 # Byte-pipe listener (protocol traffic from peers).
@@ -63,8 +70,8 @@ RUN chmod +x /docker-entrypoint.sh
 # metrics. In a production deployment set CASCADE_RELAY_METRICS so the
 # orchestrator can actually distinguish a crashed process from a healthy one.
 #
-# wget is present in debian:bookworm-slim; curl is not installed to keep the
-# image minimal.
+# wget is installed explicitly above (it is not present in debian:bookworm-slim
+# by default); curl is not installed to keep the image minimal.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD if [ -n "${CASCADE_RELAY_METRICS:-}" ]; then \
           wget -qO- "http://${CASCADE_RELAY_METRICS}/health" | grep -q ok; \

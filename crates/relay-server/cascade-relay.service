@@ -1,7 +1,9 @@
 # systemd unit for cascade-relay.
 #
-# Install to /etc/systemd/system/cascade-relay.service, then:
+# Install the unit file and the launcher script, then reload and enable:
 #
+#   install -m 0755 crates/relay-server/cascade-relay-start.sh /usr/local/bin/
+#   cp crates/relay-server/cascade-relay.service /etc/systemd/system/
 #   systemctl daemon-reload
 #   systemctl enable --now cascade-relay
 #
@@ -9,6 +11,12 @@
 # At minimum it must set CASCADE_RELAY_SHARED_SECRET.  See that file's template
 # at crates/relay-server/relay.env.example in the source tree, or read the
 # inline comments on EnvironmentFile below.
+#
+# The ExecStart launcher script (cascade-relay-start.sh) conditionally appends
+# --metrics-bind and --announce-bind only when the corresponding variables are
+# non-empty.  systemd does not support ${VAR:-default} expansion in ExecStart,
+# so default values and optional flags are handled in the script rather than
+# inline.
 
 [Unit]
 Description=Cascade relay server
@@ -22,9 +30,7 @@ Type=simple
 # appearing in /proc/<pid>/cmdline or process listings.
 EnvironmentFile=/etc/cascade/relay.env
 
-ExecStart=/usr/local/bin/cascade-relay \
-    --bind "${CASCADE_RELAY_LISTEN:-0.0.0.0:9999}" \
-    --metrics-bind "${CASCADE_RELAY_METRICS:-127.0.0.1:9998}"
+ExecStart=/usr/local/bin/cascade-relay-start.sh
 
 # Restart on unexpected exit. 5-second back-off avoids tight loops if the
 # port is held by a lingering previous instance.
