@@ -741,6 +741,18 @@ pub enum BepMessage {
         /// The scope the command targets. Authorisation checks the caller's
         /// grants cover this scope.
         scope: ManageScope,
+        /// An optional signed capability token presented to authorise the
+        /// command, as the token's JSON form.
+        ///
+        /// When present, the managed node verifies the token (signed by this
+        /// node or a delegation chain rooting in it, unexpired, not revoked,
+        /// bearer matching the authenticated connection) and authorises the
+        /// command against the token-carried grant in addition to any on-node
+        /// grant. This lets a device act on authority issued offline, without a
+        /// live grant row on the node. Kept as the opaque JSON string so this
+        /// protocol crate stays free of the engine's token domain type; the
+        /// engine deserialises and verifies it at the dispatch boundary.
+        token: Option<String>,
     },
     /// Reply to a [`BepMessage::ManageRequest`].
     ///
@@ -894,10 +906,12 @@ pub fn encode_message(msg: &BepMessage) -> Result<Vec<u8>> {
             request_id,
             command,
             scope,
+            token,
         } => {
             encode_u64(&mut body, *request_id);
             encode_manage_command(&mut body, command)?;
             encode_manage_scope(&mut body, scope)?;
+            encode_opt_string(&mut body, token.as_deref())?;
         }
         BepMessage::ManageResponse { request_id, result } => {
             encode_u64(&mut body, *request_id);
@@ -1467,11 +1481,13 @@ fn decode_manage_result(data: &[u8]) -> Result<(ManageResult, &[u8])> {
 fn decode_manage_request(data: &[u8]) -> Result<BepMessage> {
     let (request_id, rest) = decode_u64(data)?;
     let (command, rest) = decode_manage_command(rest)?;
-    let (scope, _) = decode_manage_scope(rest)?;
+    let (scope, rest) = decode_manage_scope(rest)?;
+    let (token, _) = decode_opt_string(rest)?;
     Ok(BepMessage::ManageRequest {
         request_id,
         command,
         scope,
+        token,
     })
 }
 
@@ -2257,6 +2273,7 @@ mod tests {
             request_id: 7,
             command: ManageCommand::StatusRead,
             scope: ManageScope::Node,
+            token: None,
         });
     }
 
@@ -2271,6 +2288,7 @@ mod tests {
             scope: ManageScope::Folder {
                 path: "/work".into(),
             },
+            token: None,
         });
     }
 
@@ -2284,6 +2302,7 @@ mod tests {
             scope: ManageScope::Folder {
                 path: "/work".into(),
             },
+            token: None,
         });
     }
 
@@ -2293,6 +2312,7 @@ mod tests {
             request_id: u64::MAX,
             command: ManageCommand::CacheEvict,
             scope: ManageScope::Node,
+            token: None,
         });
     }
 
@@ -2338,6 +2358,7 @@ mod tests {
             scope: ManageScope::Folder {
                 path: "/work".into(),
             },
+            token: None,
         });
     }
 
@@ -2359,6 +2380,7 @@ mod tests {
                 scope: ManageScope::Folder {
                     path: "/work".into(),
                 },
+                token: None,
             });
         }
     }
@@ -2376,6 +2398,7 @@ mod tests {
             scope: ManageScope::Folder {
                 path: "/work".into(),
             },
+            token: None,
         });
         // Both dimensions unbounded — the None sentinels must round-trip
         // distinctly from a zero value.
@@ -2390,6 +2413,7 @@ mod tests {
             scope: ManageScope::Folder {
                 path: "/work".into(),
             },
+            token: None,
         });
     }
 
@@ -2406,6 +2430,7 @@ mod tests {
             scope: ManageScope::Folder {
                 path: "/drive".into(),
             },
+            token: None,
         });
     }
 
@@ -2420,6 +2445,7 @@ mod tests {
             scope: ManageScope::Folder {
                 path: "/drive".into(),
             },
+            token: None,
         });
     }
 
@@ -2431,6 +2457,7 @@ mod tests {
             scope: ManageScope::Folder {
                 path: "/work".into(),
             },
+            token: None,
         });
         round_trip(BepMessage::ManageRequest {
             request_id: 17,
@@ -2438,6 +2465,7 @@ mod tests {
             scope: ManageScope::Folder {
                 path: "/work".into(),
             },
+            token: None,
         });
     }
 
@@ -2458,6 +2486,7 @@ mod tests {
             scope: ManageScope::Folder {
                 path: "/work/reports".into(),
             },
+            token: None,
         });
         round_trip(BepMessage::ManageRequest {
             request_id: 19,
@@ -2470,6 +2499,7 @@ mod tests {
                 },
             },
             scope: ManageScope::Node,
+            token: None,
         });
     }
 
@@ -2486,6 +2516,24 @@ mod tests {
             scope: ManageScope::Folder {
                 path: "/work".into(),
             },
+            token: None,
+        });
+    }
+
+    #[test]
+    fn encode_decode_manage_request_with_presented_token() {
+        // A ManageRequest carrying a presented capability token (its opaque JSON
+        // form) must round-trip the token field intact.
+        round_trip(BepMessage::ManageRequest {
+            request_id: 99,
+            command: ManageCommand::Pin {
+                path_glob: "/work/reports".into(),
+                recursive: true,
+            },
+            scope: ManageScope::Folder {
+                path: "/work".into(),
+            },
+            token: Some("{\"claims\":{\"token_id\":\"t1\"}}".into()),
         });
     }
 
