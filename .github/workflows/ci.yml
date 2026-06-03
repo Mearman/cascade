@@ -442,7 +442,12 @@ jobs:
     name: Release
     needs: [check, test]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    timeout-minutes: 30
+    # release-plz bumps Cargo.lock on every release, which invalidates
+    # rust-cache's target/ wholesale, and the sccache Save steps only run on a
+    # main push — so the first release after a cold/evicted cache rebuilds the
+    # full workspace from scratch. 60 minutes gives that cold path headroom;
+    # warm releases finish well inside it.
+    timeout-minutes: 60
     runs-on: ubuntu-latest
     outputs:
       released: ${{ steps.release.outputs.released }}
@@ -539,7 +544,11 @@ jobs:
     name: Build macOS ARM
     needs: release
     if: needs.release.outputs.released == 'true'
-    timeout-minutes: 30
+    # Full-workspace release build gated on a release: see the release job —
+    # the same Cargo.lock churn + cold sccache means a near-clean compile of
+    # the whole dependency graph. 60 minutes covers the cold path on
+    # oversubscribed macOS runners; warm builds finish well inside it.
+    timeout-minutes: 60
     runs-on: macos-latest
     permissions:
       contents: write
@@ -604,7 +613,11 @@ jobs:
     name: Build macOS x86_64
     needs: release
     if: needs.release.outputs.released == 'true'
-    timeout-minutes: 30
+    # Full-workspace cross-compile gated on a release — cold sccache plus the
+    # release-plz Cargo.lock bump means a near-clean build of the whole
+    # dependency graph. 60 minutes covers the cold path; warm builds finish
+    # well inside it.
+    timeout-minutes: 60
     runs-on: macos-latest
     permissions:
       contents: write
@@ -670,7 +683,11 @@ jobs:
     name: Build Linux x86_64
     needs: release
     if: needs.release.outputs.released == 'true'
-    timeout-minutes: 30
+    # Full-workspace release build gated on a release — cold sccache plus the
+    # release-plz Cargo.lock bump means a near-clean build of the whole
+    # dependency graph. 60 minutes covers the cold path; warm builds finish
+    # well inside it.
+    timeout-minutes: 60
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -735,7 +752,11 @@ jobs:
     name: Build Linux ARM64
     needs: release
     if: needs.release.outputs.released == 'true'
-    timeout-minutes: 30
+    # Full-workspace cross-compile gated on a release — cold sccache plus the
+    # release-plz Cargo.lock bump means a near-clean build of the whole
+    # dependency graph. 60 minutes covers the cold path; warm builds finish
+    # well inside it.
+    timeout-minutes: 60
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -806,7 +827,11 @@ jobs:
     name: Build Windows x86_64
     needs: release
     if: needs.release.outputs.released == 'true'
-    timeout-minutes: 30
+    # Full-workspace release build gated on a release — cold sccache plus the
+    # release-plz Cargo.lock bump means a near-clean build of the whole
+    # dependency graph, and Windows linking is the slowest of the matrix.
+    # 60 minutes covers the cold path; warm builds finish well inside it.
+    timeout-minutes: 60
     runs-on: windows-latest
     permissions:
       contents: write
