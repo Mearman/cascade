@@ -378,10 +378,19 @@ pub async fn start(
         // When --no-mount is set, skip FUSE entirely (it always mounts and
         // the entrypoint's seed mode relies on this gate to stay unprivileged).
         // Fall straight through to WebDAV, which honours no_mount and runs
-        // without /dev/fuse or SYS_ADMIN. The CASCADE_PRESENTER=webdav env
-        // override is handled above, so we reach here only when the presenter
-        // is unset (i.e. the operator explicitly wants FUSE if available).
-        if !no_mount {
+        // without /dev/fuse or SYS_ADMIN. Otherwise (the operator wants a real
+        // mount, and CASCADE_PRESENTER=webdav was not forced above) try FUSE
+        // first, then NFS.
+        if no_mount {
+            // Headless seed mode used by the Docker entrypoint: run the WebDAV
+            // server without mounting.
+            let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
+            tracing::info!(
+                strategy = "webdav-seed",
+                "--no-mount set on Linux; starting WebDAV server in seed mode"
+            );
+            try_webdav(ctx, &mount_path, backends, no_mount, &p2p_config).await
+        } else {
             let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
             tracing::info!(strategy = "fuse", "attempting FUSE mount");
             match try_fuse(ctx, &mount_path, backends, &p2p_config).await {
@@ -394,15 +403,6 @@ pub async fn start(
 
             let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
             try_nfs(ctx, &mount_path, backends, no_mount, &p2p_config).await
-        } else {
-            // --no-mount on Linux: run the WebDAV server without mounting.
-            // This is the headless seed mode used by the Docker entrypoint.
-            let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
-            tracing::info!(
-                strategy = "webdav-seed",
-                "--no-mount set on Linux; starting WebDAV server in seed mode"
-            );
-            try_webdav(ctx, &mount_path, backends, no_mount, &p2p_config).await
         }
     }
 
