@@ -35,11 +35,33 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
+    # sccache wraps rustc so individual compilation units survive release-plz's
+    # per-release Cargo.lock churn (which invalidates rust-cache's target/
+    # wholesale). rust-cache below still carries the registry/git/deps.
+    env:
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: rustfmt, clippy
+      - name: Install sccache
+        uses: taiki-e/install-action@e49978b799e49ff429d162b7a30601a569ab6538 # v2.81.1
+        with:
+          tool: sccache
+      - name: Configure sccache dir
+        # runner.temp is not available in job-level env, so export SCCACHE_DIR
+        # here (bash is present on every runner OS, so this is uniform across
+        # Linux/macOS/Windows). It matches the actions/cache path below.
+        shell: bash
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/sccache" >> "$GITHUB_ENV"
+      - name: Restore sccache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        id: sccache
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: sccache-check-${{ matrix.target }}-${{ github.sha }}
+          restore-keys: sccache-check-${{ matrix.target }}-
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           # Share the compiled-dependency cache with the `test` job on the same
@@ -74,6 +96,16 @@ jobs:
         run: cargo doc --workspace --no-deps --document-private-items
         env:
           RUSTDOCFLAGS: "-D warnings"
+      - name: sccache stats
+        run: sccache --show-stats
+      - name: Save sccache
+        # Mirror rust-cache's save-if policy: only main writes the cache so
+        # feature-branch churn can't evict the warm main-line entry.
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: sccache-check-${{ matrix.target }}-${{ github.sha }}
 
   test:
     name: Test (${{ matrix.target }})
@@ -90,9 +122,27 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
+    env:
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Install sccache
+        uses: taiki-e/install-action@e49978b799e49ff429d162b7a30601a569ab6538 # v2.81.1
+        with:
+          tool: sccache
+      - name: Configure sccache dir
+        # runner.temp is not available in job-level env, so export SCCACHE_DIR
+        # here (bash is present on every runner OS, so this is uniform across
+        # Linux/macOS/Windows). It matches the actions/cache path below.
+        shell: bash
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/sccache" >> "$GITHUB_ENV"
+      - name: Restore sccache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: sccache-test-${{ matrix.target }}-${{ github.sha }}
+          restore-keys: sccache-test-${{ matrix.target }}-
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           shared-key: ${{ matrix.target }}
@@ -102,17 +152,43 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
       - name: Run tests
         run: cargo test --workspace
+      - name: sccache stats
+        run: sccache --show-stats
+      - name: Save sccache
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: sccache-test-${{ matrix.target }}-${{ github.sha }}
 
   nat-integration:
     name: NAT integration (Linux netns)
     needs: [check, test]
     runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Install Rust toolchain
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Install sccache
+        uses: taiki-e/install-action@e49978b799e49ff429d162b7a30601a569ab6538 # v2.81.1
+        with:
+          tool: sccache
+      - name: Configure sccache dir
+        # runner.temp is not available in job-level env, so export SCCACHE_DIR
+        # here (bash is present on every runner OS, so this is uniform across
+        # Linux/macOS/Windows). It matches the actions/cache path below.
+        shell: bash
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/sccache" >> "$GITHUB_ENV"
+      - name: Restore sccache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: sccache-nat-integration-${{ github.sha }}
+          restore-keys: sccache-nat-integration-
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           # rust-cache rather than a lockfile-hash blob: it keys on rustc
@@ -125,15 +201,20 @@ jobs:
       - name: Build nat-integration test binaries
         # Build the operated-relay test and the serverless-rung tests up front
         # (without sudo) so the sudo invocations below only have to run, not
-        # compile — keeping the privileged surface as small as possible.
+        # compile — keeping the privileged surface as small as possible. This
+        # non-privileged build is where sccache earns its keep; the sudo steps
+        # below run as root and deliberately bypass sccache (RUSTC_WRAPPER=)
+        # so they never write root-owned files into the runner-owned cache dir.
         run: |
           cargo test -p cascade-p2p --features nat-integration --test nat_integration --no-run
           cargo test -p cascade-p2p --features nat-integration --test serverless_rungs --no-run
       - name: Run NAT integration tests (requires root for CAP_NET_ADMIN)
         # sudo -E forwards the full environment (including PATH so cargo is
         # found) and HOME so the Cargo registry cache is accessible.
+        # RUSTC_WRAPPER= disables sccache under root so the cache dir stays
+        # owned by the runner user and the save step can read it.
         run: |
-          sudo -E env "PATH=$PATH" "HOME=$HOME" \
+          sudo -E env "PATH=$PATH" "HOME=$HOME" "RUSTC_WRAPPER=" \
             cargo test -p cascade-p2p \
               --features nat-integration \
               --test nat_integration \
@@ -145,22 +226,48 @@ jobs:
         # symmetric-NAT pair bridges through a third open peer acting as a peer
         # relay. Both assert a block transfer completes over the expected rung.
         run: |
-          sudo -E env "PATH=$PATH" "HOME=$HOME" \
+          sudo -E env "PATH=$PATH" "HOME=$HOME" "RUSTC_WRAPPER=" \
             cargo test -p cascade-p2p \
               --features nat-integration \
               --test serverless_rungs \
               -- --test-threads=1 --nocapture
+      - name: sccache stats
+        run: sccache --show-stats
+      - name: Save sccache
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: sccache-nat-integration-${{ github.sha }}
 
   dht-live:
     name: DHT live tests (local mainline testnet)
     needs: [check, test]
     runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Install Rust toolchain
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Install sccache
+        uses: taiki-e/install-action@e49978b799e49ff429d162b7a30601a569ab6538 # v2.81.1
+        with:
+          tool: sccache
+      - name: Configure sccache dir
+        # runner.temp is not available in job-level env, so export SCCACHE_DIR
+        # here (bash is present on every runner OS, so this is uniform across
+        # Linux/macOS/Windows). It matches the actions/cache path below.
+        shell: bash
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/sccache" >> "$GITHUB_ENV"
+      - name: Restore sccache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: sccache-dht-live-${{ github.sha }}
+          restore-keys: sccache-dht-live-
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: dht-live
@@ -192,6 +299,14 @@ jobs:
             --features dht \
             --lib discovery::dht::live_tests \
             -- --ignored --test-threads=1 --nocapture
+      - name: sccache stats
+        run: sccache --show-stats
+      - name: Save sccache
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: sccache-dht-live-${{ github.sha }}
 
   projfs-probe:
     name: ProjFS availability probe (Windows)
@@ -327,12 +442,30 @@ jobs:
       version: ${{ steps.release.outputs.version }}
     permissions:
       contents: write
+    env:
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Install sccache
+        uses: taiki-e/install-action@e49978b799e49ff429d162b7a30601a569ab6538 # v2.81.1
+        with:
+          tool: sccache
+      - name: Configure sccache dir
+        # runner.temp is not available in job-level env, so export SCCACHE_DIR
+        # here (bash is present on every runner OS, so this is uniform across
+        # Linux/macOS/Windows). It matches the actions/cache path below.
+        shell: bash
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/sccache" >> "$GITHUB_ENV"
+      - name: Restore sccache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: sccache-release-${{ github.sha }}
+          restore-keys: sccache-release-
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -386,6 +519,14 @@ jobs:
           fi
 
           exit $RC
+      - name: sccache stats
+        run: sccache --show-stats
+      - name: Save sccache
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: sccache-release-${{ github.sha }}
 
   build-macos-arm:
     name: Build macOS ARM
@@ -394,6 +535,8 @@ jobs:
     runs-on: macos-latest
     permissions:
       contents: write
+    env:
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -401,6 +544,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           targets: aarch64-apple-darwin
+      - name: Install sccache
+        uses: taiki-e/install-action@e49978b799e49ff429d162b7a30601a569ab6538 # v2.81.1
+        with:
+          tool: sccache
+      - name: Configure sccache dir
+        # runner.temp is not available in job-level env, so export SCCACHE_DIR
+        # here (bash is present on every runner OS, so this is uniform across
+        # Linux/macOS/Windows). It matches the actions/cache path below.
+        shell: bash
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/sccache" >> "$GITHUB_ENV"
+      - name: Restore sccache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: sccache-build-aarch64-apple-darwin-${{ github.sha }}
+          restore-keys: sccache-build-aarch64-apple-darwin-
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: build-aarch64-apple-darwin
@@ -410,6 +569,14 @@ jobs:
         env:
           CASCADE_GDRIVE_CLIENT_ID: ${{ secrets.CASCADE_GDRIVE_CLIENT_ID }}
           CASCADE_GDRIVE_CLIENT_SECRET: ${{ secrets.CASCADE_GDRIVE_CLIENT_SECRET }}
+      - name: sccache stats
+        run: sccache --show-stats
+      - name: Save sccache
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: sccache-build-aarch64-apple-darwin-${{ github.sha }}
       - name: Package archive
         run: |
           mkdir -p dist
@@ -432,6 +599,8 @@ jobs:
     runs-on: macos-latest
     permissions:
       contents: write
+    env:
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -440,6 +609,22 @@ jobs:
         with:
           targets: x86_64-apple-darwin
       - run: rustup target add x86_64-apple-darwin
+      - name: Install sccache
+        uses: taiki-e/install-action@e49978b799e49ff429d162b7a30601a569ab6538 # v2.81.1
+        with:
+          tool: sccache
+      - name: Configure sccache dir
+        # runner.temp is not available in job-level env, so export SCCACHE_DIR
+        # here (bash is present on every runner OS, so this is uniform across
+        # Linux/macOS/Windows). It matches the actions/cache path below.
+        shell: bash
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/sccache" >> "$GITHUB_ENV"
+      - name: Restore sccache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: sccache-build-x86_64-apple-darwin-${{ github.sha }}
+          restore-keys: sccache-build-x86_64-apple-darwin-
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: build-x86_64-apple-darwin
@@ -449,6 +634,14 @@ jobs:
         env:
           CASCADE_GDRIVE_CLIENT_ID: ${{ secrets.CASCADE_GDRIVE_CLIENT_ID }}
           CASCADE_GDRIVE_CLIENT_SECRET: ${{ secrets.CASCADE_GDRIVE_CLIENT_SECRET }}
+      - name: sccache stats
+        run: sccache --show-stats
+      - name: Save sccache
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: sccache-build-x86_64-apple-darwin-${{ github.sha }}
       - name: Package archive
         run: |
           mkdir -p dist
@@ -471,11 +664,29 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ needs.release.outputs.version }}
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Install sccache
+        uses: taiki-e/install-action@e49978b799e49ff429d162b7a30601a569ab6538 # v2.81.1
+        with:
+          tool: sccache
+      - name: Configure sccache dir
+        # runner.temp is not available in job-level env, so export SCCACHE_DIR
+        # here (bash is present on every runner OS, so this is uniform across
+        # Linux/macOS/Windows). It matches the actions/cache path below.
+        shell: bash
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/sccache" >> "$GITHUB_ENV"
+      - name: Restore sccache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: sccache-build-x86_64-unknown-linux-gnu-${{ github.sha }}
+          restore-keys: sccache-build-x86_64-unknown-linux-gnu-
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: build-x86_64-unknown-linux-gnu
@@ -487,6 +698,14 @@ jobs:
         env:
           CASCADE_GDRIVE_CLIENT_ID: ${{ secrets.CASCADE_GDRIVE_CLIENT_ID }}
           CASCADE_GDRIVE_CLIENT_SECRET: ${{ secrets.CASCADE_GDRIVE_CLIENT_SECRET }}
+      - name: sccache stats
+        run: sccache --show-stats
+      - name: Save sccache
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: sccache-build-x86_64-unknown-linux-gnu-${{ github.sha }}
       - name: Package archive
         run: |
           mkdir -p dist
@@ -509,6 +728,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -517,6 +738,22 @@ jobs:
         with:
           targets: aarch64-unknown-linux-gnu
       - run: rustup target add aarch64-unknown-linux-gnu
+      - name: Install sccache
+        uses: taiki-e/install-action@e49978b799e49ff429d162b7a30601a569ab6538 # v2.81.1
+        with:
+          tool: sccache
+      - name: Configure sccache dir
+        # runner.temp is not available in job-level env, so export SCCACHE_DIR
+        # here (bash is present on every runner OS, so this is uniform across
+        # Linux/macOS/Windows). It matches the actions/cache path below.
+        shell: bash
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/sccache" >> "$GITHUB_ENV"
+      - name: Restore sccache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: sccache-build-aarch64-unknown-linux-gnu-${{ github.sha }}
+          restore-keys: sccache-build-aarch64-unknown-linux-gnu-
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: build-aarch64-unknown-linux-gnu
@@ -531,6 +768,14 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
           CASCADE_GDRIVE_CLIENT_ID: ${{ secrets.CASCADE_GDRIVE_CLIENT_ID }}
           CASCADE_GDRIVE_CLIENT_SECRET: ${{ secrets.CASCADE_GDRIVE_CLIENT_SECRET }}
+      - name: sccache stats
+        run: sccache --show-stats
+      - name: Save sccache
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: sccache-build-aarch64-unknown-linux-gnu-${{ github.sha }}
       - name: Package archive
         run: |
           mkdir -p dist
@@ -553,6 +798,8 @@ jobs:
     runs-on: windows-latest
     permissions:
       contents: write
+    env:
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -560,6 +807,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           targets: x86_64-pc-windows-msvc
+      - name: Install sccache
+        uses: taiki-e/install-action@e49978b799e49ff429d162b7a30601a569ab6538 # v2.81.1
+        with:
+          tool: sccache
+      - name: Configure sccache dir
+        # runner.temp is not available in job-level env, so export SCCACHE_DIR
+        # here (bash is present on every runner OS, so this is uniform across
+        # Linux/macOS/Windows). It matches the actions/cache path below.
+        shell: bash
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/sccache" >> "$GITHUB_ENV"
+      - name: Restore sccache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: sccache-build-x86_64-pc-windows-msvc-${{ github.sha }}
+          restore-keys: sccache-build-x86_64-pc-windows-msvc-
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: build-x86_64-pc-windows-msvc
@@ -569,6 +832,14 @@ jobs:
         env:
           CASCADE_GDRIVE_CLIENT_ID: ${{ secrets.CASCADE_GDRIVE_CLIENT_ID }}
           CASCADE_GDRIVE_CLIENT_SECRET: ${{ secrets.CASCADE_GDRIVE_CLIENT_SECRET }}
+      - name: sccache stats
+        run: sccache --show-stats
+      - name: Save sccache
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: sccache-build-x86_64-pc-windows-msvc-${{ github.sha }}
       - name: Package archive
         shell: pwsh
         run: |
@@ -1289,6 +1560,8 @@ jobs:
     runs-on: macos-latest
     permissions:
       contents: write
+    env:
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -1298,12 +1571,36 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
             sh -s -- -y --default-toolchain stable --target aarch64-apple-darwin
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Install sccache
+        uses: taiki-e/install-action@e49978b799e49ff429d162b7a30601a569ab6538 # v2.81.1
+        with:
+          tool: sccache
+      - name: Configure sccache dir
+        # runner.temp is not available in job-level env, so export SCCACHE_DIR
+        # here (bash is present on every runner OS, so this is uniform across
+        # Linux/macOS/Windows). It matches the actions/cache path below.
+        shell: bash
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/sccache" >> "$GITHUB_ENV"
+      - name: Restore sccache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: sccache-relay-aarch64-apple-darwin-${{ github.sha }}
+          restore-keys: sccache-relay-aarch64-apple-darwin-
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: relay-aarch64-apple-darwin
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build
         run: cargo build --release --target aarch64-apple-darwin -p cascade-relay-server
+      - name: sccache stats
+        run: sccache --show-stats
+      - name: Save sccache
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: sccache-relay-aarch64-apple-darwin-${{ github.sha }}
       - name: Package archive
         run: |
           mkdir -p dist
@@ -1330,6 +1627,8 @@ jobs:
     runs-on: macos-latest
     permissions:
       contents: write
+    env:
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -1340,12 +1639,36 @@ jobs:
             sh -s -- -y --default-toolchain stable --target x86_64-apple-darwin
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           rustup target add x86_64-apple-darwin
+      - name: Install sccache
+        uses: taiki-e/install-action@e49978b799e49ff429d162b7a30601a569ab6538 # v2.81.1
+        with:
+          tool: sccache
+      - name: Configure sccache dir
+        # runner.temp is not available in job-level env, so export SCCACHE_DIR
+        # here (bash is present on every runner OS, so this is uniform across
+        # Linux/macOS/Windows). It matches the actions/cache path below.
+        shell: bash
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/sccache" >> "$GITHUB_ENV"
+      - name: Restore sccache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: sccache-relay-x86_64-apple-darwin-${{ github.sha }}
+          restore-keys: sccache-relay-x86_64-apple-darwin-
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: relay-x86_64-apple-darwin
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build
         run: cargo build --release --target x86_64-apple-darwin -p cascade-relay-server
+      - name: sccache stats
+        run: sccache --show-stats
+      - name: Save sccache
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: sccache-relay-x86_64-apple-darwin-${{ github.sha }}
       - name: Package archive
         run: |
           mkdir -p dist
@@ -1372,6 +1695,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -1381,6 +1706,22 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
             sh -s -- -y --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Install sccache
+        uses: taiki-e/install-action@e49978b799e49ff429d162b7a30601a569ab6538 # v2.81.1
+        with:
+          tool: sccache
+      - name: Configure sccache dir
+        # runner.temp is not available in job-level env, so export SCCACHE_DIR
+        # here (bash is present on every runner OS, so this is uniform across
+        # Linux/macOS/Windows). It matches the actions/cache path below.
+        shell: bash
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/sccache" >> "$GITHUB_ENV"
+      - name: Restore sccache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: sccache-relay-x86_64-unknown-linux-gnu-${{ github.sha }}
+          restore-keys: sccache-relay-x86_64-unknown-linux-gnu-
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: relay-x86_64-unknown-linux-gnu
@@ -1389,6 +1730,14 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
       - name: Build
         run: cargo build --release --target x86_64-unknown-linux-gnu -p cascade-relay-server
+      - name: sccache stats
+        run: sccache --show-stats
+      - name: Save sccache
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: sccache-relay-x86_64-unknown-linux-gnu-${{ github.sha }}
       - name: Package archive
         run: |
           mkdir -p dist
@@ -1415,6 +1764,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      RUSTC_WRAPPER: sccache
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -1425,6 +1776,22 @@ jobs:
             sh -s -- -y --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           rustup target add aarch64-unknown-linux-gnu
+      - name: Install sccache
+        uses: taiki-e/install-action@e49978b799e49ff429d162b7a30601a569ab6538 # v2.81.1
+        with:
+          tool: sccache
+      - name: Configure sccache dir
+        # runner.temp is not available in job-level env, so export SCCACHE_DIR
+        # here (bash is present on every runner OS, so this is uniform across
+        # Linux/macOS/Windows). It matches the actions/cache path below.
+        shell: bash
+        run: echo "SCCACHE_DIR=$RUNNER_TEMP/sccache" >> "$GITHUB_ENV"
+      - name: Restore sccache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: sccache-relay-aarch64-unknown-linux-gnu-${{ github.sha }}
+          restore-keys: sccache-relay-aarch64-unknown-linux-gnu-
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: relay-aarch64-unknown-linux-gnu
@@ -1437,6 +1804,14 @@ jobs:
         run: cargo build --release --target aarch64-unknown-linux-gnu -p cascade-relay-server
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      - name: sccache stats
+        run: sccache --show-stats
+      - name: Save sccache
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/sccache
+          key: sccache-relay-aarch64-unknown-linux-gnu-${{ github.sha }}
       - name: Package archive
         run: |
           mkdir -p dist
