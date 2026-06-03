@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.54](https://github.com/Mearman/cascade/compare/cascade-v0.1.53...cascade-v0.1.54) - 2026-06-03
+
+### Added
+
+- *(cli)* cascade token issue/revoke/list and a --token flag on remote
+
+### Fixed
+
+- *(cascade)* fully-qualify the DeviceIdentity intra-doc link in grant.rs
+- *(engine-manage)* sign capability tokens with the node's real device key
+
 ## [0.1.53](https://github.com/Mearman/cascade/compare/cascade-v0.1.52...cascade-v0.1.53) - 2026-06-02
 
 ### Other
