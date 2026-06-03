@@ -9,7 +9,18 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use data_encoding::{BASE32_NOPAD, BASE64};
 use rcgen::KeyPair;
+use ring::rand::SystemRandom;
+use ring::signature::{
+    ECDSA_P256_SHA256_FIXED, ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, UnparsedPublicKey,
+};
 use sha2::{Digest, Sha256};
+use thiserror::Error;
+use x509_parser::prelude::FromDer;
+
+/// The byte length of a fixed-form ECDSA P-256 signature (`r ‖ s`, each a
+/// 32-byte scalar). The device identity key is ECDSA P-256, so every capability
+/// signature it produces is exactly this wide.
+pub const DEVICE_SIGNATURE_LENGTH: usize = 64;
 
 /// File name for the stored certificate.
 pub const CERT_FILE: &str = "device.crt";
@@ -85,6 +96,143 @@ impl DeviceIdentity {
             Ok(identity)
         }
     }
+
+    /// The DER bytes of this identity's certificate — the exact bytes the device
+    /// id is the hash of, and the bytes a remote verifier hashes to bind the
+    /// carried public key back to the issuer's device id.
+    pub fn cert_der(&self) -> Result<Vec<u8>, DeviceKeyError> {
+        pem_certificate_to_der(&self.cert_pem)
+    }
+
+    /// Sign `message` with this device's real identity private key — the secret
+    /// behind the TLS certificate, not anything derivable from the public device
+    /// id.
+    ///
+    /// This is the key step that makes a capability signature a genuine proof of
+    /// node-key possession: only the holder of the private key persisted in
+    /// `device.key` can produce a signature that verifies against the public key
+    /// inside the certificate the device id commits to. A trusted-but-ungranted
+    /// peer, which knows only the public device id, cannot.
+    pub fn sign_capability(
+        &self,
+        message: &[u8],
+    ) -> Result<[u8; DEVICE_SIGNATURE_LENGTH], DeviceKeyError> {
+        let key_der = pem_pkcs8_to_der(&self.key_pem)?;
+        let rng = SystemRandom::new();
+        let key_pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &key_der, &rng)
+            .map_err(|_| DeviceKeyError::MalformedPrivateKey)?;
+        let signature = key_pair
+            .sign(&rng, message)
+            .map_err(|_| DeviceKeyError::Signing)?;
+        <[u8; DEVICE_SIGNATURE_LENGTH]>::try_from(signature.as_ref())
+            .map_err(|_| DeviceKeyError::Signing)
+    }
+}
+
+/// Why signing with, or verifying against, a device identity key failed.
+///
+/// Every variant is a hard failure surfaced to the caller — never a silent
+/// fallback. A verify failure means the signature does not prove possession of
+/// the issuer's private key, or the carried certificate does not belong to the
+/// claimed issuer; either way the credential is rejected.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum DeviceKeyError {
+    /// The stored private key PEM did not contain a usable PKCS#8 key.
+    #[error("device private key is missing or malformed")]
+    MalformedPrivateKey,
+
+    /// Producing the signature failed inside the signing primitive.
+    #[error("signing the capability payload failed")]
+    Signing,
+
+    /// The carried certificate could not be parsed as DER X.509.
+    #[error("issuer certificate is not valid DER X.509")]
+    MalformedCertificate,
+
+    /// The certificate's device id (the hash of its DER bytes) is not the issuer
+    /// the credential claims. A verifier rejects the signature before checking it
+    /// so a forger cannot present its own certificate under a victim's id.
+    #[error("issuer certificate does not match claimed device id {claimed}")]
+    IssuerMismatch {
+        /// The device id the credential claimed.
+        claimed: String,
+        /// The device id the carried certificate actually hashes to.
+        actual: String,
+    },
+
+    /// The signature did not verify against the public key in the certificate.
+    #[error("capability signature did not verify against the issuer certificate")]
+    BadSignature,
+}
+
+/// Verify `signature` over `message` using the public key bound to
+/// `issuer_cert_der`, after confirming that certificate belongs to
+/// `claimed_issuer`.
+///
+/// The binding check is load-bearing: the device id is the hash of the
+/// certificate DER, so re-deriving it from the carried certificate and demanding
+/// it equal the claimed issuer is what stops a forger from presenting its own
+/// certificate (and its own signature) under another node's device id. Only once
+/// the certificate is bound to the issuer is its public key trusted to check the
+/// signature.
+pub fn verify_capability_signature(
+    issuer_cert_der: &[u8],
+    claimed_issuer: &str,
+    message: &[u8],
+    signature: &[u8],
+) -> Result<(), DeviceKeyError> {
+    let actual = derive_device_id(issuer_cert_der);
+    if actual != claimed_issuer {
+        return Err(DeviceKeyError::IssuerMismatch {
+            claimed: claimed_issuer.to_owned(),
+            actual,
+        });
+    }
+    let public_key_point = certificate_public_key_point(issuer_cert_der)?;
+    UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, public_key_point.as_slice())
+        .verify(message, signature)
+        .map_err(|_| DeviceKeyError::BadSignature)
+}
+
+/// Extract the raw ECDSA public-key point (`0x04 ‖ X ‖ Y`) from a DER X.509
+/// certificate's `SubjectPublicKeyInfo`.
+fn certificate_public_key_point(cert_der: &[u8]) -> Result<Vec<u8>, DeviceKeyError> {
+    let (_, certificate) = x509_parser::certificate::X509Certificate::from_der(cert_der)
+        .map_err(|_| DeviceKeyError::MalformedCertificate)?;
+    Ok(certificate
+        .public_key()
+        .subject_public_key
+        .data
+        .as_ref()
+        .to_vec())
+}
+
+/// Decode a PEM `CERTIFICATE` block to its DER bytes.
+fn pem_certificate_to_der(cert_pem: &str) -> Result<Vec<u8>, DeviceKeyError> {
+    let normalised = cert_pem
+        .lines()
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    rustls_pemfile::certs(&mut normalised.as_bytes())
+        .next()
+        .and_then(Result::ok)
+        .map(|der| der.as_ref().to_vec())
+        .ok_or(DeviceKeyError::MalformedCertificate)
+}
+
+/// Decode a PEM PKCS#8 `PRIVATE KEY` block to its DER bytes.
+fn pem_pkcs8_to_der(key_pem: &str) -> Result<Vec<u8>, DeviceKeyError> {
+    let normalised = key_pem
+        .lines()
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    rustls_pemfile::pkcs8_private_keys(&mut normalised.as_bytes())
+        .next()
+        .and_then(Result::ok)
+        .map(|key| key.secret_pkcs8_der().to_vec())
+        .ok_or(DeviceKeyError::MalformedPrivateKey)
 }
 
 /// Derive a device ID from certificate DER bytes.
@@ -197,5 +345,55 @@ mod tests {
         // DER should start with SEQUENCE tag (0x30).
         assert_eq!(der[0], 0x30);
         assert!(!der.is_empty());
+    }
+
+    #[test]
+    fn sign_then_verify_round_trips_against_the_certificate() {
+        let id = DeviceIdentity::generate().unwrap();
+        let message = b"cascade capability payload";
+        let signature = id.sign_capability(message).unwrap();
+        let cert_der = id.cert_der().unwrap();
+        verify_capability_signature(&cert_der, &id.device_id, message, &signature).unwrap();
+    }
+
+    #[test]
+    fn a_different_devices_signature_does_not_verify() {
+        // The key step: knowing the public device id is not enough. Another
+        // device's signature, presented under the victim's certificate, must
+        // fail — only the victim's private key produces a verifying signature.
+        let victim = DeviceIdentity::generate().unwrap();
+        let attacker = DeviceIdentity::generate().unwrap();
+        let message = b"forge me";
+        let forged = attacker.sign_capability(message).unwrap();
+        let victim_cert = victim.cert_der().unwrap();
+        assert_eq!(
+            verify_capability_signature(&victim_cert, &victim.device_id, message, &forged),
+            Err(DeviceKeyError::BadSignature)
+        );
+    }
+
+    #[test]
+    fn a_certificate_under_a_foreign_id_is_rejected_before_verification() {
+        // An attacker presents its own (validly self-signed) certificate but
+        // claims it belongs to the victim's id. The id binding rejects it.
+        let victim = DeviceIdentity::generate().unwrap();
+        let attacker = DeviceIdentity::generate().unwrap();
+        let message = b"mismatched issuer";
+        let signature = attacker.sign_capability(message).unwrap();
+        let attacker_cert = attacker.cert_der().unwrap();
+        let result =
+            verify_capability_signature(&attacker_cert, &victim.device_id, message, &signature);
+        assert!(matches!(result, Err(DeviceKeyError::IssuerMismatch { .. })));
+    }
+
+    #[test]
+    fn a_tampered_message_does_not_verify() {
+        let id = DeviceIdentity::generate().unwrap();
+        let signature = id.sign_capability(b"original").unwrap();
+        let cert_der = id.cert_der().unwrap();
+        assert_eq!(
+            verify_capability_signature(&cert_der, &id.device_id, b"tampered", &signature),
+            Err(DeviceKeyError::BadSignature)
+        );
     }
 }

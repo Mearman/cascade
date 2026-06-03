@@ -433,7 +433,6 @@ dependencies = [
  "cascade-p2p",
  "chrono",
  "data-encoding",
- "ed25519-dalek",
  "rusqlite",
  "serde",
  "serde_json",
@@ -474,6 +473,7 @@ dependencies = [
  "mainline",
  "rcgen",
  "reqwest",
+ "ring",
  "rusqlite",
  "rustls-pemfile",
  "serde",
@@ -485,6 +485,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-tungstenite",
  "tracing",
+ "x509-parser",
 ]
 
 [[package]]
