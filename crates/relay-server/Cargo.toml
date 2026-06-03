@@ -23,7 +23,7 @@ hex.workspace = true
 http = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"], optional = true }
 cascade-p2p = { path = "../p2p" }
-cascade-announce-wire = { version = "0.1.55", path = "../cascade-announce-wire" }
+cascade-announce-wire = { version = "0.1.56", path = "../cascade-announce-wire" }
 serde_json = { workspace = true, optional = true }
 
 [features]
