@@ -9,16 +9,17 @@
 
 use super::context::NfsContext;
 use super::server::NfsCacheMode;
-use super::write::{self, WriteError};
+use super::write::{self, CreateMode, WriteError};
 use super::xdr::{
-    Fattr3, NF3DIR, NF3REG, NFS3_FILE_SYNC, NFS3_OK, NFS3ERR_ACCES, NFS3ERR_EXIST, NFS3ERR_INVAL,
-    NFS3ERR_IO, NFS3ERR_NOSPC, NFS3ERR_NOTEMPTY, NFS3ERR_ROFS, NFS3ERR_STALE, NFS3PROC_COMMIT,
-    NFS3PROC_CREATE, NFS3PROC_FSSTAT, NFS3PROC_GETATTR, NFS3PROC_LOOKUP, NFS3PROC_MKDIR,
-    NFS3PROC_NULL, NFS3PROC_READ, NFS3PROC_READDIR, NFS3PROC_REMOVE, NFS3PROC_RENAME,
-    NFS3PROC_RMDIR, NFS3PROC_SETATTR, NFS3PROC_WRITE, NfsFh3, NfsTime, PostOpAttr, Sattr3,
-    Specdata3, decode_fh, decode_opaque, decode_sattr3, decode_string, decode_u32, decode_u64,
-    encode_bool, encode_fh, encode_post_op_attr, encode_post_op_fh3, encode_string, encode_u32,
-    encode_u64, encode_wcc_data,
+    Fattr3, NF3DIR, NF3REG, NFS3_CREATE_EXCLUSIVE, NFS3_CREATE_GUARDED, NFS3_FILE_SYNC, NFS3_OK,
+    NFS3ERR_ACCES, NFS3ERR_EXIST, NFS3ERR_INVAL, NFS3ERR_IO, NFS3ERR_NOSPC, NFS3ERR_NOTEMPTY,
+    NFS3ERR_ROFS, NFS3ERR_STALE, NFS3PROC_COMMIT, NFS3PROC_CREATE, NFS3PROC_FSSTAT,
+    NFS3PROC_GETATTR, NFS3PROC_LOOKUP, NFS3PROC_MKDIR, NFS3PROC_NULL, NFS3PROC_READ,
+    NFS3PROC_READDIR, NFS3PROC_REMOVE, NFS3PROC_RENAME, NFS3PROC_RMDIR, NFS3PROC_SETATTR,
+    NFS3PROC_WRITE, NfsFh3, NfsTime, PostOpAttr, Sattr3, Specdata3, decode_fh, decode_opaque,
+    decode_sattr3, decode_string, decode_u32, decode_u64, encode_bool, encode_fh,
+    encode_post_op_attr, encode_post_op_fh3, encode_string, encode_u32, encode_u64,
+    encode_wcc_data,
 };
 use std::sync::Arc;
 
@@ -423,16 +424,28 @@ fn handle_create(args: &[u8], ctx: &Arc<NfsContext>) -> Vec<u8> {
         encode_wcc_data(&mut reply, &PostOpAttr::none());
         return reply;
     };
-    let Ok((name, _rest)) = decode_string(rest) else {
+    let Ok((name, rest)) = decode_string(rest) else {
         encode_u32(&mut reply, NFS3ERR_INVAL);
         encode_wcc_data(&mut reply, &PostOpAttr::none());
         return reply;
     };
-    // The createhow3 mode and attributes follow but do not affect content for a
-    // zero-length create; the resulting size is always 0.
+    // Decode the createhow3 mode discriminant. GUARDED/EXCLUSIVE must refuse an
+    // existing target with NFS3ERR_EXIST; UNCHECKED must not truncate one. The
+    // trailing sattr3 / verifier carries no content effect for Cascade and is
+    // not consumed further — CREATE is the last meaningful decode of its args.
+    let Ok((mode, _rest)) = decode_u32(rest) else {
+        encode_u32(&mut reply, NFS3ERR_INVAL);
+        encode_wcc_data(&mut reply, &PostOpAttr::none());
+        return reply;
+    };
+    let create_mode = match mode {
+        NFS3_CREATE_GUARDED => CreateMode::Guarded,
+        NFS3_CREATE_EXCLUSIVE => CreateMode::Exclusive,
+        _ => CreateMode::Unchecked,
+    };
     let parent_path = dir_path_for_fh(ctx, &dir_fh);
 
-    match write::create_file(ctx, &parent_path, &name) {
+    match write::create_file(ctx, &parent_path, &name, create_mode) {
         Ok(child_path) => {
             let key = ctx.register_path(&child_path);
             let child_fh = NfsFh3::from_item_id(&key.to_string());
@@ -570,9 +583,9 @@ fn handle_unlink(args: &[u8], ctx: &Arc<NfsContext>, expect_dir: bool) -> Vec<u8
             encode_wcc_data(&mut reply, &PostOpAttr::none());
         }
         Err(e) => {
-            // A kind mismatch is reported by the engine as `Invalid`; for RMDIR
-            // on a non-empty directory the backend surfaces a generic failure
-            // mapped to IO, but a not-empty backend error maps to NOTEMPTY.
+            // A kind mismatch (file vs directory) is reported as `Invalid`. A
+            // non-empty directory is refused by the backend's non-recursive
+            // delete as `Conflict`, which for RMDIR maps to NFS3ERR_NOTEMPTY.
             let status = match (&e, expect_dir) {
                 (WriteError::Conflict, true) => NFS3ERR_NOTEMPTY,
                 _ => write_error_status(e),
@@ -837,10 +850,16 @@ mod write_tests {
     /// Encode a `CREATE3args` body: `dir_fh` + name + `createhow3` (UNCHECKED,
     /// empty `sattr3`).
     fn create_args(dir_fh: &NfsFh3, name: &str) -> Vec<u8> {
+        create_args_mode(dir_fh, name, super::super::xdr::NFS3_CREATE_UNCHECKED)
+    }
+
+    /// Encode a `CREATE3args` body with an explicit `createmode3` discriminant
+    /// and an empty `sattr3`.
+    fn create_args_mode(dir_fh: &NfsFh3, name: &str, mode: u32) -> Vec<u8> {
         let mut args = Vec::new();
         encode_fh(&mut args, dir_fh);
         encode_string(&mut args, name);
-        encode_u32(&mut args, super::super::xdr::NFS3_CREATE_UNCHECKED);
+        encode_u32(&mut args, mode);
         // Empty sattr3: every set_* discriminant false; two set_time DONT_CHANGE.
         for _ in 0..4 {
             encode_bool(&mut args, false);
@@ -1017,6 +1036,88 @@ mod write_tests {
             NfsCacheMode::Minimal,
         );
         assert_eq!(decode_u32(&reply).unwrap().0, NFS3_OK);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn guarded_create_over_existing_returns_exist() {
+        let (ctx, _dir) = writable_ctx();
+        let root_fh = NfsFh3::from_item_id(&ctx.root_key().to_string());
+
+        // Populate the file first.
+        let file_fh = fh_for(&ctx, "/lock.txt");
+        call(
+            &ctx,
+            NFS3PROC_WRITE,
+            &write_args(&file_fh, 0, b"held"),
+            NfsCacheMode::Minimal,
+        );
+        assert_eq!(getattr_size(&ctx, "/lock.txt"), 4);
+
+        // GUARDED create over the existing name must be refused with EXIST and
+        // must not truncate the existing content.
+        let args = create_args_mode(&root_fh, "lock.txt", super::super::xdr::NFS3_CREATE_GUARDED);
+        let reply = call(&ctx, NFS3PROC_CREATE, &args, NfsCacheMode::Minimal);
+        assert_eq!(decode_u32(&reply).unwrap().0, NFS3ERR_EXIST);
+        assert_eq!(getattr_size(&ctx, "/lock.txt"), 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unchecked_create_over_existing_preserves_content() {
+        let (ctx, _dir) = writable_ctx();
+        let root_fh = NfsFh3::from_item_id(&ctx.root_key().to_string());
+
+        let file_fh = fh_for(&ctx, "/keep.txt");
+        call(
+            &ctx,
+            NFS3PROC_WRITE,
+            &write_args(&file_fh, 0, b"0123456789"),
+            NfsCacheMode::Minimal,
+        );
+        assert_eq!(getattr_size(&ctx, "/keep.txt"), 10);
+
+        // UNCHECKED create over the existing name must succeed without
+        // truncating: the content (and size) survive.
+        let args = create_args(&root_fh, "keep.txt");
+        let reply = call(&ctx, NFS3PROC_CREATE, &args, NfsCacheMode::Minimal);
+        assert_eq!(decode_u32(&reply).unwrap().0, NFS3_OK);
+        assert_eq!(getattr_size(&ctx, "/keep.txt"), 10);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rmdir_on_non_empty_directory_returns_notempty_and_preserves_contents() {
+        let (ctx, dir) = writable_ctx();
+        let root_fh = NfsFh3::from_item_id(&ctx.root_key().to_string());
+
+        // MKDIR then place a file inside it.
+        call(
+            &ctx,
+            NFS3PROC_MKDIR,
+            &mkdir_args(&root_fh, "populated"),
+            NfsCacheMode::Minimal,
+        );
+        let inner_fh = fh_for(&ctx, "/populated/child.txt");
+        call(
+            &ctx,
+            NFS3PROC_WRITE,
+            &write_args(&inner_fh, 0, b"alive"),
+            NfsCacheMode::Minimal,
+        );
+
+        // RMDIR on the populated directory must fail NOTEMPTY, not wipe it.
+        let reply = call(
+            &ctx,
+            NFS3PROC_RMDIR,
+            &dirop_args(&root_fh, "populated"),
+            NfsCacheMode::Minimal,
+        );
+        assert_eq!(decode_u32(&reply).unwrap().0, NFS3ERR_NOTEMPTY);
+
+        // Both the directory and its child are still on disk.
+        assert!(dir.path().join("populated").is_dir());
+        assert_eq!(
+            std::fs::read(dir.path().join("populated/child.txt")).unwrap(),
+            b"alive"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -696,17 +696,13 @@ fn handle_setattr(
 
     // The attribute values follow the bitmap directly, in ascending
     // attribute-number order — matching this codebase's `encode_fattr4`, which
-    // does not wrap the values in an `opaque<>`.
-    let new_size = decode_size_attr(&bitmap, rest);
-    // Consume the size value from the cursor when it was present so the next
-    // operation in the compound stays framed.
-    if new_size.is_some()
-        && let Ok((_, after)) = xdr::decode_u64(rest)
-    {
-        *cursor = after;
-    } else {
-        *cursor = rest;
-    }
+    // does not wrap the values in an `opaque<>`. Consume the whole values blob
+    // (not just the size) so the next operation in the COMPOUND stays framed
+    // even when the client sets multiple attributes (e.g. size + mtime).
+    let Ok((new_size, after_values)) = xdr::decode_setattr_values(&bitmap, rest) else {
+        return op_status_reply(NFS4ERR_INVAL);
+    };
+    *cursor = after_values;
 
     if !writes_permitted {
         return op_status_reply(NFS4ERR_ROFS);
@@ -733,26 +729,6 @@ fn handle_setattr(
             )
         },
     )
-}
-
-/// Extract a requested `FATTR4_SIZE` value from the encoded `fattr4` values
-/// blob. Returns `None` when the bitmap does not request a size change.
-///
-/// Per RFC 7530 the values are encoded in ascending attribute-number order, so
-/// `size` (attribute 4) is the first value when present and the bitmap requests
-/// nothing lower-numbered that carries data. Cascade only acts on `size`, so it
-/// reads the leading `uint64` when `FATTR4_SIZE` is the lowest set bit.
-fn decode_size_attr(bitmap: &[u32], values: &[u8]) -> Option<u64> {
-    if !bitmap.contains(&FATTR4_SIZE) {
-        return None;
-    }
-    // Cascade only honours size; if any lower-numbered attribute is also set the
-    // leading bytes belong to it and the size offset is unknown, so the change
-    // is treated as a no-op rather than misparsed.
-    if bitmap.iter().any(|&b| b < FATTR4_SIZE) {
-        return None;
-    }
-    xdr::decode_u64(values).ok().map(|(size, _)| size)
 }
 
 /// Build attributes for a path.
@@ -1185,6 +1161,123 @@ mod write_tests {
         assert_eq!(xdr::decode_u32(&reply).unwrap().0, NFS4_OK);
 
         assert_eq!(getattr_size(&ctx, &state_mgr, "trunc.txt"), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn multi_attr_setattr_keeps_following_op_framed() {
+        let (ctx, state_mgr, _dir) = writable_ctx();
+        let lookup = lookup_op("multi.txt");
+        let write = write_op(0, b"0123456789");
+        run(
+            &ctx,
+            &state_mgr,
+            &[
+                (OP_PUTROOTFH, &[]),
+                (OP_LOOKUP, &lookup),
+                (OP_WRITE, &write),
+            ],
+            NfsCacheMode::Minimal,
+        );
+        assert_eq!(getattr_size(&ctx, &state_mgr, "multi.txt"), 10);
+
+        // SETATTR setting size (4) AND time_modify (53): stateid + bitmap + size
+        // value (u64) + nfstime4 (u64 secs + u32 nsecs), in ascending id order.
+        let mut setattr = Vec::new();
+        xdr::encode_stateid(&mut setattr, &super::super::xdr::StateId::zero());
+        xdr::encode_attr_bitmap(
+            &mut setattr,
+            &[
+                super::super::xdr::FATTR4_SIZE,
+                super::super::xdr::FATTR4_TIME_MODIFY,
+            ],
+        );
+        xdr::encode_u64(&mut setattr, 4); // size
+        xdr::encode_u64(&mut setattr, 1_700_000_000); // mtime seconds
+        xdr::encode_u32(&mut setattr, 0); // mtime nseconds
+
+        // A GETATTR follows in the same compound; if SETATTR mis-frames the
+        // trailing time bytes the GETATTR would parse garbage and the op (or the
+        // whole compound) would fail.
+        let lookup = lookup_op("multi.txt");
+        let mut bitmap = Vec::new();
+        xdr::encode_attr_bitmap(&mut bitmap, &[super::super::xdr::FATTR4_SIZE]);
+        let reply = run(
+            &ctx,
+            &state_mgr,
+            &[
+                (OP_PUTROOTFH, &[]),
+                (OP_LOOKUP, &lookup),
+                (OP_SETATTR, &setattr),
+                (OP_GETATTR, &bitmap),
+            ],
+            NfsCacheMode::Minimal,
+        );
+
+        // Whole compound succeeded and the truncate took effect.
+        let (overall, rest) = xdr::decode_u32(&reply).unwrap();
+        assert_eq!(overall, NFS4_OK);
+        let (_tag, rest) = xdr::decode_string(rest).unwrap();
+        let (_numops, rest) = xdr::decode_u32(rest).unwrap();
+        let (s0, rest) = xdr::decode_u32(rest).unwrap(); // PUTROOTFH
+        assert_eq!(s0, NFS4_OK);
+        let (s1, rest) = xdr::decode_u32(rest).unwrap(); // LOOKUP
+        assert_eq!(s1, NFS4_OK);
+        let (s2, rest) = xdr::decode_u32(rest).unwrap(); // SETATTR
+        assert_eq!(s2, NFS4_OK);
+        let (_attrset, rest) = xdr::decode_attr_bitmap(rest).unwrap();
+        // GETATTR op: status + bitmap + size value.
+        let (s3, rest) = xdr::decode_u32(rest).unwrap();
+        assert_eq!(s3, NFS4_OK);
+        let (_returned_bitmap, rest) = xdr::decode_attr_bitmap(rest).unwrap();
+        let (size, _) = xdr::decode_u64(rest).unwrap();
+        assert_eq!(size, 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remove_on_non_empty_directory_returns_notempty() {
+        let (ctx, state_mgr, dir) = writable_ctx();
+
+        // CREATE a directory, then write a file inside it.
+        let mut create = Vec::new();
+        xdr::encode_u32(&mut create, NF4DIR);
+        xdr::encode_string(&mut create, "box");
+        xdr::encode_attr_bitmap(&mut create, &[]);
+        run(
+            &ctx,
+            &state_mgr,
+            &[(OP_PUTROOTFH, &[]), (OP_CREATE, &create)],
+            NfsCacheMode::Minimal,
+        );
+
+        // PUTROOTFH, LOOKUP box, LOOKUP child.txt, WRITE — writing a file inside
+        // the directory so it is genuinely non-empty.
+        let lookup_box = lookup_op("box");
+        let lookup_child = lookup_op("child.txt");
+        let write = write_op(0, b"keep");
+        run(
+            &ctx,
+            &state_mgr,
+            &[
+                (OP_PUTROOTFH, &[]),
+                (OP_LOOKUP, &lookup_box),
+                (OP_LOOKUP, &lookup_child),
+                (OP_WRITE, &write),
+            ],
+            NfsCacheMode::Minimal,
+        );
+
+        // REMOVE box (current fh = root) must fail NOTEMPTY, not wipe it.
+        let remove = lookup_op("box");
+        let reply = run(
+            &ctx,
+            &state_mgr,
+            &[(OP_PUTROOTFH, &[]), (OP_REMOVE, &remove)],
+            NfsCacheMode::Minimal,
+        );
+        assert_eq!(xdr::decode_u32(&reply).unwrap().0, NFS4ERR_NOTEMPTY);
+
+        // The directory and its child survive.
+        assert!(dir.path().join("box").is_dir());
     }
 
     #[tokio::test(flavor = "multi_thread")]

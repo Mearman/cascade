@@ -180,7 +180,7 @@ pub fn write_file(
     let off = usize::try_from(offset).map_err(|_| WriteError::Invalid)?;
 
     block_on(async move {
-        let existing = backend.metadata(&relative).await.ok();
+        let existing = lookup_existing(backend.as_ref(), &relative).await?;
 
         let mut buf = if let Some(entry) = &existing {
             let mut current = Vec::new();
@@ -228,20 +228,60 @@ pub fn write_file(
     })
 }
 
-/// Create an empty regular file named `name` in the directory at `parent_path`,
-/// returning the new file's server-absolute VFS path.
+/// The RFC 1813 §3.3.8 `createmode3` discriminant governing how `CREATE`
+/// treats a name that already exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateMode {
+    /// `UNCHECKED` — create if absent, otherwise leave the existing file's
+    /// content untouched (a no-op create). Never truncates.
+    Unchecked,
+    /// `GUARDED` — fail with [`WriteError::Conflict`] if the name already
+    /// exists.
+    Guarded,
+    /// `EXCLUSIVE` — create only if absent, keyed by a client verifier. Cascade
+    /// has no per-file verifier store, so it applies the same existence guard as
+    /// `GUARDED`: an existing name is refused.
+    Exclusive,
+}
+
+/// Create a regular file named `name` in the directory at `parent_path`,
+/// honouring the `createmode3` semantics, and return the new file's
+/// server-absolute VFS path.
+///
+/// `GUARDED`/`EXCLUSIVE` refuse an existing name with [`WriteError::Conflict`]
+/// (which the v3 handler maps to `NFS3ERR_EXIST`). `UNCHECKED` on an existing
+/// name is a no-op that preserves the existing content — it must never call
+/// `Backend::upload`, which writes a zero-length buffer and truncates. A fresh
+/// create uploads empty content.
 ///
 /// # Errors
 ///
 /// Returns a [`WriteError`] if the parent path escapes the export, the name is
-/// invalid, or the backend rejects the upload.
-pub fn create_file(ctx: &NfsContext, parent_path: &str, name: &str) -> Result<String, WriteError> {
+/// invalid, the mode forbids an existing target, or the backend rejects the
+/// upload.
+pub fn create_file(
+    ctx: &NfsContext,
+    parent_path: &str,
+    name: &str,
+    mode: CreateMode,
+) -> Result<String, WriteError> {
     validate_vfs_path(parent_path)?;
     validate_name(name)?;
     let child_path = join_child(parent_path, name);
     let (backend, relative) = resolve(ctx, &child_path);
 
     block_on(async move {
+        let existing = lookup_existing(backend.as_ref(), &relative).await?;
+        match (mode, existing) {
+            // GUARDED/EXCLUSIVE over an existing name: refuse, do not touch it.
+            (CreateMode::Guarded | CreateMode::Exclusive, Some(_)) => {
+                return Err(WriteError::Conflict);
+            }
+            // UNCHECKED over an existing name: no-op, preserve content.
+            (CreateMode::Unchecked, Some(_)) => return Ok(child_path),
+            // Absent for any mode: create empty.
+            (_, None) => {}
+        }
         let parent_id = parent_file_id(backend.as_ref(), &relative).await;
         let mut cursor = std::io::Cursor::new(Vec::new());
         backend
@@ -403,6 +443,33 @@ pub fn rename_entry(
     Ok((src_path, dst_path))
 }
 
+/// Fetch the metadata of an existing target, distinguishing genuine absence
+/// from a transient or permission failure.
+///
+/// A `WRITE` is a partial pwrite at an offset: the existing content must be
+/// fetched and the new fragment spliced in, then the whole object written back.
+/// If `metadata` fails for any reason other than genuine absence (a timeout, a
+/// 5xx, a 403), treating it as "absent" would skip the download and overwrite
+/// the entire object with just the new fragment — silent truncation. So only
+/// [`BackendError::NotFound`] yields `Ok(None)` (the create case); every other
+/// error aborts the write loudly.
+///
+/// # Errors
+///
+/// Returns a categorised [`WriteError`] for any non-`NotFound` backend failure.
+async fn lookup_existing(
+    backend: &dyn Backend,
+    relative: &Path,
+) -> Result<Option<cascade_engine::types::FileEntry>, WriteError> {
+    match backend.metadata(relative).await {
+        Ok(entry) => Ok(Some(entry)),
+        Err(err) => match WriteError::from_backend(&err) {
+            WriteError::NotFound => Ok(None),
+            other => Err(other),
+        },
+    }
+}
+
 /// Resolve the `FileId` of the parent directory of a backend-relative path.
 ///
 /// Mirrors the `WebDAV` presenter: the parent is resolved by `Backend::metadata`
@@ -463,5 +530,103 @@ mod tests {
     fn join_child_handles_root_and_nested() {
         assert_eq!(join_child("/", "a"), "/a");
         assert_eq!(join_child("/a", "b"), "/a/b");
+    }
+}
+
+/// Tests for the metadata-error discrimination in [`write_file`], using a stub
+/// backend whose `metadata` fails with a category other than `NotFound`.
+#[cfg(test)]
+mod discrimination_tests {
+    use super::*;
+    use std::sync::RwLock;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use cascade_engine::backend::{Backend, BackendError};
+    use cascade_engine::types::{Change, Cursor, FileEntry, FileId, Quota};
+    use cascade_engine::vfs::VfsTree;
+
+    /// Backend whose `metadata` returns the configured non-`NotFound` error.
+    /// Records whether any content-writing call (`upload`/`update`) was made so
+    /// a test can assert that a transient metadata failure never reaches the
+    /// truncating write.
+    #[derive(Debug)]
+    struct FlakyBackend {
+        wrote: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Backend for FlakyBackend {
+        fn id(&self) -> &'static str {
+            "flaky"
+        }
+        fn display_name(&self) -> &'static str {
+            "Flaky"
+        }
+        async fn quota(&self) -> anyhow::Result<Option<Quota>> {
+            Ok(None)
+        }
+        async fn changes(&self, _cursor: Option<&Cursor>) -> anyhow::Result<(Vec<Change>, Cursor)> {
+            Ok((vec![], Cursor("flaky".to_string())))
+        }
+        async fn metadata(&self, _path: &Path) -> anyhow::Result<FileEntry> {
+            // A transient/permission failure on an existing file — NOT absence.
+            Err(BackendError::Forbidden("transient HEAD failure".to_string()).into())
+        }
+        async fn download(
+            &self,
+            _file: &FileEntry,
+            _writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("unused")
+        }
+        async fn upload(
+            &self,
+            _path: &Path,
+            _reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+            _parent_id: &FileId,
+        ) -> anyhow::Result<FileEntry> {
+            self.wrote.store(true, Ordering::SeqCst);
+            anyhow::bail!("upload must not be reached on a transient metadata error")
+        }
+        async fn update(
+            &self,
+            _file_id: &FileId,
+            _reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+        ) -> anyhow::Result<FileEntry> {
+            self.wrote.store(true, Ordering::SeqCst);
+            anyhow::bail!("update must not be reached on a transient metadata error")
+        }
+        async fn create_dir(&self, _path: &Path) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("unused")
+        }
+        async fn delete(&self, _file: &FileEntry) -> anyhow::Result<()> {
+            anyhow::bail!("unused")
+        }
+        async fn move_entry(&self, _src: &Path, _dst: &Path) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("unused")
+        }
+        async fn poll_interval(&self) -> Option<std::time::Duration> {
+            None
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_aborts_on_non_notfound_metadata_error() {
+        let wrote = Arc::new(AtomicBool::new(false));
+        let backend: Arc<dyn Backend> = Arc::new(FlakyBackend {
+            wrote: Arc::clone(&wrote),
+        });
+        let vfs = Arc::new(RwLock::new(VfsTree::new(backend)));
+        let ctx = NfsContext::new(vfs);
+
+        let result = tokio::task::block_in_place(|| write_file(&ctx, "/data.bin", 0, b"fragment"));
+
+        // The transient error must surface (here as Forbidden), and crucially the
+        // truncating upload/update must never have been attempted.
+        assert!(matches!(result, Err(WriteError::Forbidden)));
+        assert!(
+            !wrote.load(Ordering::SeqCst),
+            "write_file truncated through a non-NotFound metadata error"
+        );
     }
 }
