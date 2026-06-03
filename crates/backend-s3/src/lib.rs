@@ -27,12 +27,32 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-/// Maximum bytes buffered for a single `PutObject` upload.
+/// Objects at or below this size are uploaded via a single `PutObject` request.
 ///
-/// S3 `PutObject` requires `Content-Length` upfront, so we must buffer the
-/// entire payload in memory. Objects larger than 5 GB require multipart upload,
-/// which is not yet implemented.
-const MAX_UPLOAD_BYTES: usize = 5 * 1024 * 1024 * 1024;
+/// S3 `PutObject` accepts bodies up to 5 GiB. We use exactly that limit so that
+/// any object smaller than 5 GiB takes the fast single-request path.
+pub const MULTIPART_THRESHOLD: usize = 5 * 1024 * 1024 * 1024;
+
+/// S3 imposes a maximum of 10,000 parts per multipart upload.
+pub const MAX_PARTS: usize = 10_000;
+
+/// Minimum size of any part except the last, as mandated by S3.
+///
+/// S3 rejects `UploadPart` requests smaller than 5 MiB (except for the final
+/// part). Using this as the floor ensures compliance for any object larger than
+/// `MULTIPART_THRESHOLD`.
+pub const MIN_PART_SIZE: usize = 5 * 1024 * 1024;
+
+/// Compute the part size to use for a multipart upload of `total_bytes`.
+///
+/// Returns the smallest multiple-of-`MIN_PART_SIZE` that keeps the part count
+/// within `MAX_PARTS`. For objects that fit into `MAX_PARTS` parts of
+/// `MIN_PART_SIZE` each, this returns `MIN_PART_SIZE` directly.
+fn compute_part_size(total_bytes: usize) -> usize {
+    // Ceiling division: the minimum part size needed so we do not exceed MAX_PARTS.
+    let min_for_limit = total_bytes.div_ceil(MAX_PARTS);
+    min_for_limit.max(MIN_PART_SIZE)
+}
 
 // ── Config ───────────────────────────────────────────────────────────────────
 
@@ -263,6 +283,145 @@ impl S3Backend {
         anyhow::bail!("S3 error {status}: {body}");
     }
 
+    /// Upload `data` to S3 key `key` using the multipart upload API.
+    ///
+    /// Splits `data` into parts sized by [`compute_part_size`], issues
+    /// `CreateMultipartUpload`, then one `UploadPart` per chunk, then
+    /// `CompleteMultipartUpload`. Calls `AbortMultipartUpload` if any step
+    /// fails so the partial upload does not leak storage.
+    async fn multipart_upload(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
+        let url = self.object_url(key);
+
+        // ── 1. CreateMultipartUpload ──────────────────────────────────────────
+        let create_resp = self
+            .signed_request("POST", &url, &[("uploads", "")], &[], &[])
+            .await?;
+        let create_resp = Self::check_response(create_resp).await?;
+        let create_xml = create_resp.text().await?;
+        let upload_id = parse_upload_id(&create_xml)?;
+
+        tracing::debug!(key, upload_id = %upload_id, "created multipart upload");
+
+        // Abort helper — called on any failure after the upload is created.
+        let abort = |upload_id: String| {
+            let this = self;
+            let key = key.to_owned();
+            async move {
+                let abort_url = this.object_url(&key);
+                match this
+                    .signed_request(
+                        "DELETE",
+                        &abort_url,
+                        &[("uploadId", upload_id.as_str())],
+                        &[],
+                        &[],
+                    )
+                    .await
+                {
+                    Ok(r) => {
+                        if !r.status().is_success() {
+                            tracing::warn!(
+                                key,
+                                upload_id = %upload_id,
+                                "AbortMultipartUpload returned non-2xx"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(key, upload_id = %upload_id, error = %e, "AbortMultipartUpload failed");
+                    }
+                }
+            }
+        };
+
+        // ── 2. UploadPart ─────────────────────────────────────────────────────
+        let part_size = compute_part_size(data.len());
+        let mut completed_parts: Vec<(usize, String)> = Vec::new();
+
+        for (index, chunk) in data.chunks(part_size).enumerate() {
+            let part_number = index + 1;
+            let part_number_str = part_number.to_string();
+
+            let part_resp = self
+                .signed_request(
+                    "PUT",
+                    &url,
+                    &[
+                        ("partNumber", part_number_str.as_str()),
+                        ("uploadId", upload_id.as_str()),
+                    ],
+                    chunk,
+                    &[("content-length", &chunk.len().to_string())],
+                )
+                .await;
+
+            let part_resp = match part_resp {
+                Ok(r) => r,
+                Err(e) => {
+                    abort(upload_id).await;
+                    return Err(e);
+                }
+            };
+
+            let part_resp = match Self::check_response(part_resp).await {
+                Ok(r) => r,
+                Err(e) => {
+                    abort(upload_id).await;
+                    return Err(e);
+                }
+            };
+
+            let etag = part_resp
+                .headers()
+                .get("etag")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from)
+                .ok_or_else(|| anyhow::anyhow!("UploadPart response missing ETag header"))?;
+
+            tracing::debug!(key, part_number, etag = %etag, "uploaded part");
+
+            completed_parts.push((part_number, etag));
+        }
+
+        // ── 3. CompleteMultipartUpload ────────────────────────────────────────
+        let complete_body = build_complete_xml(&completed_parts);
+        let complete_bytes = complete_body.as_bytes();
+        let content_length = complete_bytes.len().to_string();
+
+        let complete_resp = self
+            .signed_request(
+                "POST",
+                &url,
+                &[("uploadId", upload_id.as_str())],
+                complete_bytes,
+                &[("content-length", &content_length)],
+            )
+            .await;
+
+        let complete_resp = match complete_resp {
+            Ok(r) => r,
+            Err(e) => {
+                abort(upload_id).await;
+                return Err(e);
+            }
+        };
+
+        match Self::check_response(complete_resp).await {
+            Ok(_) => {
+                tracing::debug!(
+                    key,
+                    parts = completed_parts.len(),
+                    "completed multipart upload"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                abort(upload_id).await;
+                Err(e)
+            }
+        }
+    }
+
     /// Build a `FileEntry` for an S3 object.
     fn object_entry(
         &self,
@@ -439,6 +598,30 @@ fn parse_flat_list_response(
     let next_token = xml_text(xml, "NextContinuationToken").map(String::from);
 
     Ok((entries, next_token))
+}
+
+/// Parse the `<UploadId>` from a `CreateMultipartUpload` XML response body.
+fn parse_upload_id(xml: &str) -> anyhow::Result<String> {
+    xml_text(xml, "UploadId")
+        .map(String::from)
+        .ok_or_else(|| anyhow::anyhow!("CreateMultipartUpload response missing <UploadId>"))
+}
+
+/// Build the XML body for a `CompleteMultipartUpload` request.
+///
+/// `parts` is a slice of `(part_number, etag)` pairs in ascending order.
+fn build_complete_xml(parts: &[(usize, String)]) -> String {
+    let mut xml = String::from("<CompleteMultipartUpload>");
+    for (number, etag) in parts {
+        xml.push_str("<Part><PartNumber>");
+        xml.push_str(&number.to_string());
+        xml.push_str("</PartNumber><ETag>");
+        // ETags from the response may already be quoted; keep them as-is.
+        xml.push_str(etag);
+        xml.push_str("</ETag></Part>");
+    }
+    xml.push_str("</CompleteMultipartUpload>");
+    xml
 }
 
 /// Parse a `HeadObject` response into a `FileEntry`.
@@ -646,24 +829,21 @@ impl Backend for S3Backend {
         let mut data = Vec::new();
         reader.read_to_end(&mut data).await?;
 
-        // S3 PutObject requires Content-Length upfront. We buffer the full file.
-        // For objects > 5 GB, multipart upload (not yet implemented) is required.
-        if data.len() > MAX_UPLOAD_BYTES {
-            anyhow::bail!("upload exceeds 5 GB limit; multipart upload is not yet implemented");
+        if data.len() > MULTIPART_THRESHOLD {
+            self.multipart_upload(&key, &data).await?;
+        } else {
+            let content_length = data.len().to_string();
+            let resp = self
+                .signed_request(
+                    "PUT",
+                    &url,
+                    &[],
+                    &data,
+                    &[("content-length", &content_length)],
+                )
+                .await?;
+            Self::check_response(resp).await?;
         }
-
-        let content_length = data.len().to_string();
-
-        let resp = self
-            .signed_request(
-                "PUT",
-                &url,
-                &[],
-                &data,
-                &[("content-length", &content_length)],
-            )
-            .await?;
-        Self::check_response(resp).await?;
 
         let name = path
             .file_name()
@@ -693,22 +873,21 @@ impl Backend for S3Backend {
         let mut data = Vec::new();
         reader.read_to_end(&mut data).await?;
 
-        if data.len() > MAX_UPLOAD_BYTES {
-            anyhow::bail!("upload exceeds 5 GB limit; multipart upload is not yet implemented");
+        if data.len() > MULTIPART_THRESHOLD {
+            self.multipart_upload(key, &data).await?;
+        } else {
+            let content_length = data.len().to_string();
+            let resp = self
+                .signed_request(
+                    "PUT",
+                    &url,
+                    &[],
+                    &data,
+                    &[("content-length", &content_length)],
+                )
+                .await?;
+            Self::check_response(resp).await?;
         }
-
-        let content_length = data.len().to_string();
-
-        let resp = self
-            .signed_request(
-                "PUT",
-                &url,
-                &[],
-                &data,
-                &[("content-length", &content_length)],
-            )
-            .await?;
-        Self::check_response(resp).await?;
 
         let size = u64::try_from(data.len()).unwrap_or(u64::MAX);
         let parent_key = key
@@ -916,6 +1095,41 @@ impl S3Backend {
     #[cfg(test)]
     fn strip_key_prefix<'a>(key: &'a str, list_prefix: &str) -> Option<&'a str> {
         key.strip_prefix(list_prefix)
+    }
+}
+
+// ── Test helpers ──────────────────────────────────────────────────────────────
+
+impl S3Backend {
+    /// Construct an `S3Backend` directly from parts.
+    ///
+    /// Intended for use in integration tests where calling the full TOML
+    /// [`create_backend`] factory would add unnecessary ceremony.
+    #[must_use]
+    #[doc(hidden)]
+    pub fn new_for_test(endpoint: String, bucket: &str, region: &str) -> Self {
+        Self {
+            config: S3Config {
+                endpoint,
+                bucket: bucket.to_string(),
+                region: region.to_string(),
+                access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+                secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+                prefix: None,
+            },
+            http: reqwest::Client::new(),
+            backend_id: "s3".to_string(),
+        }
+    }
+
+    /// Drive the multipart upload path directly.
+    ///
+    /// This is `pub` so that integration tests can exercise the multipart
+    /// code path with small bodies (avoiding a 5 GiB allocation) without
+    /// exposing a separate test-only binary feature.
+    #[doc(hidden)]
+    pub async fn multipart_upload_pub(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
+        self.multipart_upload(key, data).await
     }
 }
 
