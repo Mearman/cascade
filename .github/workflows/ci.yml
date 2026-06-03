@@ -499,7 +499,12 @@ jobs:
             echo "bumped=false" >> "$GITHUB_OUTPUT"
           else
             VERSION=$(grep '^version =' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-            git commit -m "chore: release v${VERSION}"
+            # [skip ci] keeps this bot bump from spawning a second, redundant CI
+            # run: the release and its asset builds already ran as downstream
+            # jobs of the push that triggered this one, so re-running the full
+            # matrix here only burns minutes and cancels the original run's
+            # trailing jobs via the cancel-in-progress concurrency group.
+            git commit -m "chore: release v${VERSION} [skip ci]"
             git push
             echo "bumped=true" >> "$GITHUB_OUTPUT"
             echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
