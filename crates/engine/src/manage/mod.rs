@@ -26,7 +26,9 @@ pub use dispatch::{
     ManageCommandExecutor, ManageDispatch, ManageGrantStore, required_capability, run_dispatch,
     scope_from_wire,
 };
-pub use token::{CapabilityToken, MAX_DELEGATION_DEPTH, TokenClaims, TokenVerifyError};
+pub use token::{
+    CapabilityToken, MAX_DELEGATION_DEPTH, TokenClaims, TokenVerifyError, derive_token_id,
+};
 
 /// A device identity — the principal of the management plane.
 ///

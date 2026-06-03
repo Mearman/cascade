@@ -1,6 +1,6 @@
 //! Signed capability tokens — portable, offline-issuable grants.
 //!
-//! The on-node [`Grant`](crate::manage::Grant) list is the management plane's
+//! The on-node [`Grant`] list is the management plane's
 //! authority of record: a grant lives on the managed node, and a manager's
 //! command is [authorised](crate::manage::authorises) against it. A
 //! [`CapabilityToken`] is the *portable* form of the same authority. Instead of
@@ -27,7 +27,7 @@
 //! hash of the device's TLS certificate, exchanged on every handshake). So the
 //! signature proves "the author knew the issuer's device id", not "the author
 //! holds the issuer's TLS private key" — the same limitation
-//! [`cascade_announce_wire::signing`] documents for signed candidate sets. A
+//! `cascade_announce_wire::signing` documents for signed candidate sets. A
 //! token is therefore **not** a bearer credential good on its own: presenting a
 //! validly-signed token is necessary but not sufficient. The load-bearing
 //! second factor is the connection. [`CapabilityToken::verify`] requires the
@@ -40,7 +40,7 @@
 //!
 //! ## Bounded delegation
 //!
-//! A holder of [`Capability::GrantAdmin`](crate::manage::Capability::GrantAdmin)
+//! A holder of [`Capability::GrantAdmin`]
 //! may mint a token that delegates a strict *subset* of what it itself holds —
 //! the same no-escalation rule the on-node delegation path enforces with
 //! [`caller_can_delegate`](crate::manage::dispatch). A delegated token carries
@@ -49,8 +49,10 @@
 //! every hop, so a chain can never widen authority.
 
 use chrono::{DateTime, Utc};
+use data_encoding::BASE32_NOPAD;
 use ed25519_dalek::{SIGNATURE_LENGTH, Signature, Signer, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use cascade_p2p::discovery::signing::{keypair_for_device, verifying_key_for_device};
@@ -76,6 +78,47 @@ const TOKEN_SIGNING_DOMAIN: &[u8] = b"cascade-manage-capability-token-v1";
 /// every delegation adds one. Eight hops is far beyond any administrative
 /// delegation a human builds, while staying a hard, cheap ceiling.
 pub const MAX_DELEGATION_DEPTH: usize = 8;
+
+/// Domain-separation prefix mixed into a derived token id, keeping it distinct
+/// from any other hash of the same fields.
+const TOKEN_ID_DOMAIN: &[u8] = b"cascade-manage-token-id-v1";
+
+/// Derive a collision-resistant token id from the claim fields and an issuance
+/// instant.
+///
+/// The id is `BASE32(SHA-256(domain || issuer || bearer || capability || scope
+/// || expiry || issued_at_nanos))`, truncated to a short, copy-pasteable
+/// handle. Folding the nanosecond issuance instant in makes two otherwise
+/// identical tokens distinct; the store's `token_id` primary key is the
+/// backstop that turns any residual clash into a hard error rather than a silent
+/// overwrite. The id is opaque — it carries no authority of its own; it is only
+/// the handle a revocation names.
+#[must_use]
+pub fn derive_token_id(
+    issuer: &DeviceId,
+    bearer: &DeviceId,
+    capability: Capability,
+    scope: &Scope,
+    expires: DateTime<Utc>,
+    issued_at: DateTime<Utc>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(TOKEN_ID_DOMAIN);
+    hasher.update(issuer.as_str().as_bytes());
+    hasher.update(bearer.as_str().as_bytes());
+    hasher.update(capability.as_wire().as_bytes());
+    let (scope_kind, scope_path) = scope.to_columns();
+    hasher.update(scope_kind.as_bytes());
+    hasher.update(scope_path.unwrap_or("").as_bytes());
+    hasher.update(expires.timestamp_millis().to_be_bytes());
+    hasher.update(issued_at.timestamp_nanos_opt().unwrap_or(0).to_be_bytes());
+    let digest = hasher.finalize();
+    // A 16-byte (128-bit) prefix is ample for a handle: base32 of it is 26
+    // characters, collision-resistant in practice, and the store's primary key
+    // catches the vanishing remainder.
+    let prefix = digest.get(..16).unwrap_or(&digest);
+    BASE32_NOPAD.encode(prefix)
+}
 
 /// Why verifying a [`CapabilityToken`] failed.
 ///
@@ -198,7 +241,7 @@ pub struct TokenClaims {
 
 impl TokenClaims {
     /// The grant this token confers, as the management plane's
-    /// [`Grant`](crate::manage::Grant) type, with `granted_by` set to the
+    /// [`Grant`] type, with `granted_by` set to the
     /// issuer. Once a token verifies, the dispatcher feeds this grant through
     /// the same [`authorises`](crate::manage::authorises) path an on-node grant
     /// takes — the token is just a portable grant.
@@ -259,7 +302,8 @@ impl TokenClaims {
 pub struct CapabilityToken {
     /// The claims this token asserts.
     pub claims: TokenClaims,
-    /// ed25519 signature (raw 64 bytes) over [`TokenClaims::signing_bytes`],
+    /// ed25519 signature (raw 64 bytes) over the claims' canonical signing
+    /// bytes,
     /// produced by the issuer's device key. Carried as base64 on the wire
     /// because serde does not derive (de)serialisation for byte arrays this
     /// wide.
@@ -360,7 +404,7 @@ impl CapabilityToken {
     ///   the transport authenticated.
     ///
     /// On success the verified leaf claims are returned; the caller converts
-    /// them to a [`Grant`](crate::manage::Grant) and authorises the command
+    /// them to a [`Grant`] and authorises the command
     /// against it exactly as for an on-node grant.
     pub fn verify(
         &self,
