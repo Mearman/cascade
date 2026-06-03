@@ -195,8 +195,16 @@ async fn handle_connection(
         let mut msg_buf = vec![0u8; len];
         stream.read_exact(&mut msg_buf).await?;
 
-        // Parse and dispatch.
-        let reply = dispatch_rpc(&msg_buf, ctx, state_mgr, cache_mode);
+        // Parse and dispatch. The procedure handlers are synchronous and bridge
+        // into the async engine via `Handle::block_on` (both the read and write
+        // paths). `dispatch_rpc` runs here inside a `tokio::spawn`ed task on the
+        // multi-thread runtime, so calling `block_on` directly would panic
+        // ("Cannot block the current thread from within a runtime"). Wrapping the
+        // dispatch in `block_in_place` moves this worker thread out of the async
+        // pool for the duration of the call, making the nested `block_on` legal —
+        // the same guard the handler tests apply.
+        let reply =
+            tokio::task::block_in_place(|| dispatch_rpc(&msg_buf, ctx, state_mgr, cache_mode));
 
         // Send length-prefixed reply.
         let reply_len = u32::try_from(reply.len()).unwrap_or(u32::MAX);
@@ -451,6 +459,100 @@ mod tests {
         let ctx = test_ctx();
         let server = NfsServer::start(config, ctx).await.unwrap();
         assert!(server.local_addr.port() > 0);
+        server.stop().unwrap();
+    }
+
+    /// Drive a real WRITE through the spawned server connection task, over TCP,
+    /// rather than via `tokio::task::block_in_place` as the handler unit tests
+    /// do. This locks in that the production dispatch path (`handle_connection` →
+    /// `dispatch_rpc` → `block_on`) does not panic ("Cannot block the current
+    /// thread from within a runtime") the first time a client issues a write.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn write_over_real_server_path_succeeds() {
+        use super::super::xdr::{
+            NFS3_OK, NFS3_UNSTABLE, NFS3PROC_WRITE, NfsFh3, encode_fh, encode_opaque, encode_u64,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Writable context backed by a real LocalBackend over a tempdir.
+        let dir = tempfile::tempdir().unwrap();
+        let config_toml = toml::Value::Table({
+            let mut t = toml::map::Map::new();
+            t.insert(
+                "root_path".to_string(),
+                toml::Value::String(dir.path().to_string_lossy().into_owned()),
+            );
+            t.insert("id".to_string(), toml::Value::String("local".to_string()));
+            t
+        });
+        let backend: Arc<dyn cascade_engine::backend::Backend> =
+            cascade_backend_local::create_backend(&config_toml)
+                .unwrap()
+                .into();
+        let vfs = Arc::new(RwLock::new(VfsTree::new(backend)));
+        let ctx = Arc::new(NfsContext::new(vfs));
+        ctx.register_path("/");
+        // Register the target path so its file handle resolves in WRITE.
+        let file_key = ctx.register_path("/server-write.txt");
+        let file_fh = NfsFh3::from_item_id(&file_key.to_string());
+
+        let server = NfsServer::start(NfsServerConfig::default(), ctx)
+            .await
+            .unwrap();
+        let addr = server.local_addr;
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        // Build the RPC call: header + WRITE3args.
+        let payload = b"real-path payload";
+        let mut call = Vec::new();
+        encode_u32(&mut call, 7); // xid
+        encode_u32(&mut call, RPC_MSG_CALL);
+        encode_u32(&mut call, 2); // rpc version
+        encode_u32(&mut call, NFS_PROGRAM);
+        encode_u32(&mut call, NFS_V3);
+        encode_u32(&mut call, NFS3PROC_WRITE);
+        encode_u32(&mut call, RPC_AUTH_NONE);
+        encode_u32(&mut call, 0); // empty auth body
+        // WRITE3args: file_fh + offset + count + stable + data.
+        encode_fh(&mut call, &file_fh);
+        encode_u64(&mut call, 0); // offset
+        encode_u32(&mut call, u32::try_from(payload.len()).unwrap()); // count
+        encode_u32(&mut call, NFS3_UNSTABLE); // stable
+        encode_opaque(&mut call, payload);
+
+        // Length-prefixed frame.
+        let frame_len = u32::try_from(call.len()).unwrap();
+        stream.write_all(&frame_len.to_be_bytes()).await.unwrap();
+        stream.write_all(&call).await.unwrap();
+        stream.flush().await.unwrap();
+
+        // Read the length-prefixed reply — a panic in the task would instead
+        // close the connection and yield an EOF here.
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).await.unwrap();
+        let reply_len = usize::try_from(u32::from_be_bytes(len_buf)).unwrap();
+        let mut reply = vec![0u8; reply_len];
+        stream.read_exact(&mut reply).await.unwrap();
+
+        // RPC reply header: xid + msg_type + reply_stat + verifier(flavor+len) +
+        // accept_stat, then the NFS WRITE3res status.
+        let (xid, rest) = decode_u32(&reply).unwrap();
+        assert_eq!(xid, 7);
+        let (msg_type, rest) = decode_u32(rest).unwrap();
+        assert_eq!(msg_type, RPC_MSG_REPLY);
+        let (_reply_stat, rest) = decode_u32(rest).unwrap();
+        let (_vflavor, rest) = decode_u32(rest).unwrap();
+        let (_vlen, rest) = decode_u32(rest).unwrap();
+        let (accept, rest) = decode_u32(rest).unwrap();
+        assert_eq!(accept, RPC_ACCEPT_SUCCESS);
+        let (write_status, _) = decode_u32(rest).unwrap();
+        assert_eq!(write_status, NFS3_OK);
+
+        // The bytes landed on disk through the real engine path.
+        let written = std::fs::read(dir.path().join("server-write.txt")).unwrap();
+        assert_eq!(written, payload);
+
         server.stop().unwrap();
     }
 
