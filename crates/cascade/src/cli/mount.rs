@@ -12,6 +12,33 @@ use cascade_presenter_webdav::WebDavPresenter;
 use super::init::{BackendConfig, CascadeConfig};
 use super::{CliContext, is_process_alive};
 
+/// Park until the process is asked to shut down.
+///
+/// On Unix this resolves on `SIGINT` (Ctrl+C) **or** `SIGTERM`. `SIGTERM` is
+/// what `cascade stop`, launchd, and systemd send to stop the daemon; catching
+/// it lets the caller run its graceful unmount-and-cleanup path rather than
+/// being terminated abruptly with the mount left stale. On non-Unix platforms
+/// `SIGTERM` has no equivalent, so only Ctrl+C is awaited.
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> std::io::Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    tokio::select! {
+        _ = interrupt.recv() => {}
+        _ = terminate.recv() => {}
+    }
+    Ok(())
+}
+
+/// Park until the process is asked to shut down (Ctrl+C on non-Unix platforms,
+/// which have no `SIGTERM` equivalent).
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> std::io::Result<()> {
+    tokio::signal::ctrl_c().await
+}
+
 /// Resources held by a running presenter attempt.
 ///
 /// When a mount strategy fails, [`PresenterResources::shutdown`] must be
@@ -302,7 +329,7 @@ async fn try_fskit(
     println!();
     println!("Press Ctrl+C to stop.");
 
-    tokio::signal::ctrl_c().await?;
+    wait_for_shutdown_signal().await?;
 
     tracing::info!("Shutting down...");
 
@@ -476,7 +503,7 @@ async fn try_fileprovider(
     println!();
     println!("Press Ctrl+C to stop.");
 
-    tokio::signal::ctrl_c().await?;
+    wait_for_shutdown_signal().await?;
 
     tracing::info!("Shutting down...");
 
@@ -620,7 +647,7 @@ async fn try_projfs(
     println!();
     println!("Press Ctrl+C to stop.");
 
-    tokio::signal::ctrl_c().await?;
+    wait_for_shutdown_signal().await?;
 
     tracing::info!("Shutting down...");
 
@@ -744,7 +771,7 @@ async fn try_webdav(
     println!();
     println!("Press Ctrl+C to stop.");
 
-    tokio::signal::ctrl_c().await?;
+    wait_for_shutdown_signal().await?;
 
     tracing::info!("Shutting down...");
 
@@ -828,7 +855,7 @@ async fn try_fuse(
     println!();
     println!("Press Ctrl+C to stop.");
 
-    tokio::signal::ctrl_c().await?;
+    wait_for_shutdown_signal().await?;
 
     tracing::info!("Shutting down...");
 
@@ -931,7 +958,7 @@ async fn try_nfs(
     println!();
     println!("Press Ctrl+C to stop.");
 
-    tokio::signal::ctrl_c().await?;
+    wait_for_shutdown_signal().await?;
 
     tracing::info!("Shutting down...");
 
