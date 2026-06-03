@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+## Expose `new_for_test` and `multipart_upload_pub` for integration-test use.
+## Never enable in release builds.
+testing = []
+
 [dependencies]
 cascade-engine = { path = "../engine" }
 anyhow = { workspace = true }
@@ -19,6 +24,7 @@ hex = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+cascade-backend-s3 = { path = ".", features = ["testing"] }
 mockito = "1.7.2"
 tokio = { workspace = true, features = ["test-util", "macros"] }
 

@@ -393,6 +393,7 @@ version = "0.1.53"
 dependencies = [
  "anyhow",
  "async-trait",
+ "cascade-backend-s3",
  "cascade-engine",
  "chrono",
  "hex",

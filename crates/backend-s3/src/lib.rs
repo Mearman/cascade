@@ -371,12 +371,15 @@ impl S3Backend {
                 }
             };
 
-            let etag = part_resp
+            let Some(etag) = part_resp
                 .headers()
                 .get("etag")
                 .and_then(|v| v.to_str().ok())
                 .map(String::from)
-                .ok_or_else(|| anyhow::anyhow!("UploadPart response missing ETag header"))?;
+            else {
+                abort(upload_id).await;
+                return Err(anyhow::anyhow!("UploadPart response missing ETag header"));
+            };
 
             tracing::debug!(key, part_number, etag = %etag, "uploaded part");
 
@@ -394,7 +397,10 @@ impl S3Backend {
                 &url,
                 &[("uploadId", upload_id.as_str())],
                 complete_bytes,
-                &[("content-length", &content_length)],
+                &[
+                    ("content-length", &content_length),
+                    ("content-type", "application/xml"),
+                ],
             )
             .await;
 
@@ -406,20 +412,32 @@ impl S3Backend {
             }
         };
 
-        match Self::check_response(complete_resp).await {
-            Ok(_) => {
-                tracing::debug!(
-                    key,
-                    parts = completed_parts.len(),
-                    "completed multipart upload"
-                );
-                Ok(())
-            }
+        let complete_resp = match Self::check_response(complete_resp).await {
+            Ok(r) => r,
             Err(e) => {
                 abort(upload_id).await;
-                Err(e)
+                return Err(e);
             }
+        };
+
+        // AWS S3 may return HTTP 200 with an `<Error>` element in the body when
+        // it encounters a server-side error after it has begun streaming the
+        // response. `check_response` only inspects the status code, so we must
+        // inspect the body too.
+        let complete_text = complete_resp.text().await?;
+        if let Some(code) = xml_text(&complete_text, "Code") {
+            abort(upload_id).await;
+            return Err(anyhow::anyhow!(
+                "CompleteMultipartUpload returned 200 with error: {code}"
+            ));
         }
+
+        tracing::debug!(
+            key,
+            parts = completed_parts.len(),
+            "completed multipart upload"
+        );
+        Ok(())
     }
 
     /// Build a `FileEntry` for an S3 object.
@@ -1100,21 +1118,35 @@ impl S3Backend {
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
+/// Test helpers gated behind the `testing` Cargo feature.
+///
+/// Enable with `cascade-backend-s3 = { …, features = ["testing"] }` in
+/// `[dev-dependencies]`. Never enabled in release builds.
+#[cfg(feature = "testing")]
 impl S3Backend {
     /// Construct an `S3Backend` directly from parts.
     ///
     /// Intended for use in integration tests where calling the full TOML
     /// [`create_backend`] factory would add unnecessary ceremony.
+    ///
+    /// Credentials default to the AWS documentation example values, which are
+    /// safe for use against mock servers but must never appear in production
+    /// config.
     #[must_use]
-    #[doc(hidden)]
-    pub fn new_for_test(endpoint: String, bucket: &str, region: &str) -> Self {
+    pub fn new_for_test(
+        endpoint: String,
+        bucket: &str,
+        region: &str,
+        access_key_id: &str,
+        secret_access_key: &str,
+    ) -> Self {
         Self {
             config: S3Config {
                 endpoint,
                 bucket: bucket.to_string(),
                 region: region.to_string(),
-                access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
-                secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+                access_key_id: access_key_id.to_string(),
+                secret_access_key: secret_access_key.to_string(),
                 prefix: None,
             },
             http: reqwest::Client::new(),
@@ -1124,10 +1156,8 @@ impl S3Backend {
 
     /// Drive the multipart upload path directly.
     ///
-    /// This is `pub` so that integration tests can exercise the multipart
-    /// code path with small bodies (avoiding a 5 GiB allocation) without
-    /// exposing a separate test-only binary feature.
-    #[doc(hidden)]
+    /// Allows integration tests to exercise multipart logic with small bodies,
+    /// avoiding a multi-gigabyte allocation.
     pub async fn multipart_upload_pub(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
         self.multipart_upload(key, data).await
     }

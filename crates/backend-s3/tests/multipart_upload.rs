@@ -20,6 +20,8 @@ use std::path::Path;
 
 const BUCKET: &str = "test-bucket";
 const REGION: &str = "us-east-1";
+const ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
+const SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
 
 fn backend(endpoint: &str) -> Box<dyn Backend> {
     let mut table = toml::map::Map::new();
@@ -37,13 +39,17 @@ fn backend(endpoint: &str) -> Box<dyn Backend> {
     );
     table.insert(
         "access_key_id".to_string(),
-        toml::Value::String("AKIAIOSFODNN7EXAMPLE".to_string()),
+        toml::Value::String(ACCESS_KEY.to_string()),
     );
     table.insert(
         "secret_access_key".to_string(),
-        toml::Value::String("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
+        toml::Value::String(SECRET_KEY.to_string()),
     );
     create_backend(&toml::Value::Table(table)).unwrap()
+}
+
+fn s3(endpoint: &str) -> S3Backend {
+    S3Backend::new_for_test(endpoint.to_string(), BUCKET, REGION, ACCESS_KEY, SECRET_KEY)
 }
 
 fn object_path(key: &str) -> String {
@@ -132,13 +138,14 @@ async fn multipart_upload_issues_create_parts_complete_in_order() {
         .create_async()
         .await;
 
-    // `CompleteMultipartUpload`
+    // `CompleteMultipartUpload` — must include Content-Type: application/xml.
     let complete_mock = server
         .mock("POST", object_path(key).as_str())
         .match_query(mockito::Matcher::UrlEncoded(
             "uploadId".to_string(),
             upload_id.to_string(),
         ))
+        .match_header("content-type", "application/xml")
         .with_status(200)
         .with_body(format!(
             "<?xml version=\"1.0\"?><CompleteMultipartUploadResult>\
@@ -149,8 +156,10 @@ async fn multipart_upload_issues_create_parts_complete_in_order() {
         .create_async()
         .await;
 
-    let s3 = S3Backend::new_for_test(server.url(), BUCKET, REGION);
-    s3.multipart_upload_pub(key, &body).await.unwrap();
+    s3(&server.url())
+        .multipart_upload_pub(key, &body)
+        .await
+        .unwrap();
 
     // All mocks must have fired exactly once.
     create_mock.assert_async().await;
@@ -210,13 +219,154 @@ async fn multipart_upload_aborts_on_part_failure() {
         .create_async()
         .await;
 
-    let s3 = S3Backend::new_for_test(server.url(), BUCKET, REGION);
-    let result = s3.multipart_upload_pub(key, &body).await;
+    let result = s3(&server.url()).multipart_upload_pub(key, &body).await;
 
     // The upload must have failed.
     assert!(result.is_err());
 
     // Abort must have been called.
+    abort_mock.assert_async().await;
+}
+
+// ── Multipart upload: `AbortMultipartUpload` on missing ETag ──────────────────
+
+/// If `UploadPart` returns HTTP 200 but with no `ETag` header, the upload is
+/// aborted so the partial upload does not leak storage.
+#[tokio::test]
+async fn multipart_upload_aborts_on_missing_etag() {
+    let mut server = mockito::Server::new_async().await;
+    let key = "missing-etag.bin";
+    let upload_id = "missing-etag-upload-id";
+
+    let body = vec![0xEFu8; MIN_PART_SIZE];
+
+    // `CreateMultipartUpload` succeeds.
+    let _create_mock = server
+        .mock("POST", object_path(key).as_str())
+        .match_query(mockito::Matcher::UrlEncoded(
+            "uploads".to_string(),
+            String::new(),
+        ))
+        .with_status(200)
+        .with_body(format!(
+            "<?xml version=\"1.0\"?><InitiateMultipartUploadResult>\
+             <UploadId>{upload_id}</UploadId></InitiateMultipartUploadResult>"
+        ))
+        .create_async()
+        .await;
+
+    // `UploadPart` returns 200 but no ETag header.
+    let _part_mock = server
+        .mock("PUT", object_path(key).as_str())
+        .match_query(mockito::Matcher::AllOf(vec![
+            mockito::Matcher::UrlEncoded("partNumber".to_string(), "1".to_string()),
+            mockito::Matcher::UrlEncoded("uploadId".to_string(), upload_id.to_string()),
+        ]))
+        .with_status(200)
+        // No etag header — simulates a broken or non-standard S3-compatible server.
+        .create_async()
+        .await;
+
+    // `AbortMultipartUpload` must fire exactly once.
+    let abort_mock = server
+        .mock("DELETE", object_path(key).as_str())
+        .match_query(mockito::Matcher::UrlEncoded(
+            "uploadId".to_string(),
+            upload_id.to_string(),
+        ))
+        .with_status(204)
+        .create_async()
+        .await;
+
+    let result = s3(&server.url()).multipart_upload_pub(key, &body).await;
+
+    assert!(result.is_err(), "expected Err for missing ETag, got Ok");
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("ETag"),
+        "expected ETag in error message, got: {msg}"
+    );
+
+    abort_mock.assert_async().await;
+}
+
+// ── Multipart upload: 200+<Error> body from CompleteMultipartUpload ───────────
+
+/// AWS S3 can return HTTP 200 with an `<Error>` element in the body when it
+/// encounters a server-side error after beginning the `CompleteMultipartUpload`
+/// response. The upload must be aborted and the call must return `Err`.
+#[tokio::test]
+async fn multipart_upload_aborts_on_complete_200_with_error_body() {
+    let mut server = mockito::Server::new_async().await;
+    let key = "complete-error.bin";
+    let upload_id = "complete-error-upload-id";
+
+    let body = vec![0x12u8; MIN_PART_SIZE];
+
+    // `CreateMultipartUpload` succeeds.
+    let _create_mock = server
+        .mock("POST", object_path(key).as_str())
+        .match_query(mockito::Matcher::UrlEncoded(
+            "uploads".to_string(),
+            String::new(),
+        ))
+        .with_status(200)
+        .with_body(format!(
+            "<?xml version=\"1.0\"?><InitiateMultipartUploadResult>\
+             <UploadId>{upload_id}</UploadId></InitiateMultipartUploadResult>"
+        ))
+        .create_async()
+        .await;
+
+    // `UploadPart` 1 succeeds.
+    let _part_mock = server
+        .mock("PUT", object_path(key).as_str())
+        .match_query(mockito::Matcher::AllOf(vec![
+            mockito::Matcher::UrlEncoded("partNumber".to_string(), "1".to_string()),
+            mockito::Matcher::UrlEncoded("uploadId".to_string(), upload_id.to_string()),
+        ]))
+        .with_status(200)
+        .with_header("etag", "\"etag-part-1\"")
+        .create_async()
+        .await;
+
+    // `CompleteMultipartUpload` returns 200 with an `<Error>` body — the AWS
+    // documented late-error case.
+    let _complete_mock = server
+        .mock("POST", object_path(key).as_str())
+        .match_query(mockito::Matcher::UrlEncoded(
+            "uploadId".to_string(),
+            upload_id.to_string(),
+        ))
+        .with_status(200)
+        .with_body(
+            "<?xml version=\"1.0\"?>\
+             <Error><Code>InternalError</Code>\
+             <Message>We encountered an internal error.</Message></Error>",
+        )
+        .create_async()
+        .await;
+
+    // `AbortMultipartUpload` must fire exactly once.
+    let abort_mock = server
+        .mock("DELETE", object_path(key).as_str())
+        .match_query(mockito::Matcher::UrlEncoded(
+            "uploadId".to_string(),
+            upload_id.to_string(),
+        ))
+        .with_status(204)
+        .create_async()
+        .await;
+
+    let result = s3(&server.url()).multipart_upload_pub(key, &body).await;
+
+    assert!(result.is_err(), "expected Err for 200+<Error> body, got Ok");
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("InternalError"),
+        "expected error code in message, got: {msg}"
+    );
+
     abort_mock.assert_async().await;
 }
 
