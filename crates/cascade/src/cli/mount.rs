@@ -108,7 +108,10 @@ async fn finish_shutdown(
         teardown.await;
     };
 
-    if tokio::time::timeout(SHUTDOWN_GRACE, sequence).await.is_err() {
+    if tokio::time::timeout(SHUTDOWN_GRACE, sequence)
+        .await
+        .is_err()
+    {
         tracing::warn!(
             grace_secs = SHUTDOWN_GRACE.as_secs(),
             "graceful shutdown timed out; forcing exit"
