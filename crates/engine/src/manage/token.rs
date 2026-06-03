@@ -45,15 +45,17 @@
 //!
 //! ## Bounded delegation
 //!
-//! A holder of [`Capability::GrantAdmin`]
-//! may mint a token that delegates a strict *subset* of what it itself holds —
-//! the same no-escalation rule the on-node delegation path enforces with
-//! [`caller_can_delegate`](crate::manage::dispatch). A delegated token carries
-//! its parent token inline, forming a chain; [`CapabilityToken::verify`] walks
-//! the chain to a root signed by the verifying node and checks containment at
-//! every hop, so a chain can never widen authority. Each hop carries the
-//! delegating party's certificate too, so every hop's signature is proven
-//! against a private key, not a public id.
+//! The bearer of a token may mint a delegated sub-token that confers a strict
+//! *subset* of what it itself holds. [`CapabilityToken::delegate`] requires
+//! only that the delegating device is the token's bearer and that the child's
+//! capability, scope, and expiry are all contained within the parent's — there
+//! is no `grant:admin` requirement on the token delegation path. (The
+//! `grant:admin` requirement belongs to the on-node `GrantAdd` command path,
+//! not here.) A delegated token carries its parent token inline, forming a
+//! chain; [`CapabilityToken::verify`] walks the chain to a root signed by the
+//! verifying node and checks containment at every hop, so a chain can never
+//! widen authority. Each hop carries the delegating party's certificate too, so
+//! every hop's signature is proven against a private key, not a public id.
 
 use chrono::{DateTime, Utc};
 use data_encoding::BASE32_NOPAD;
@@ -85,6 +87,17 @@ const TOKEN_SIGNING_DOMAIN: &[u8] = b"cascade-manage-capability-token-v1";
 /// every delegation adds one. Eight hops is far beyond any administrative
 /// delegation a human builds, while staying a hard, cheap ceiling.
 pub const MAX_DELEGATION_DEPTH: usize = 8;
+
+/// Maximum byte length of a capability-token JSON string accepted by the
+/// dispatcher before it even attempts to deserialise it.
+///
+/// A root token is a compact JSON object. Even a full chain at
+/// [`MAX_DELEGATION_DEPTH`] hops, each carrying a DER certificate (~1–2 KiB)
+/// and the parent token inline, tops out well under 32 KiB. The 64 KiB ceiling
+/// is generous enough to accommodate realistic chains while blocking a
+/// TLS-authenticated-but-malicious peer from forcing a 15 MiB allocation on
+/// every `ManageRequest`.
+pub const MAX_TOKEN_JSON_BYTES: usize = 64 * 1024;
 
 /// Domain-separation prefix mixed into a derived token id, keeping it distinct
 /// from any other hash of the same fields.

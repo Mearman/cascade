@@ -31,7 +31,7 @@ use cascade_p2p::protocol::{
 use chrono::{DateTime, Utc};
 
 use crate::db::AuditEntry;
-use crate::manage::token::CapabilityToken;
+use crate::manage::token::{CapabilityToken, MAX_TOKEN_JSON_BYTES};
 use crate::manage::{Capability, DeviceId, Grant, Scope, authorises};
 
 /// Audit `outcome` column value for a command that was authorised and applied.
@@ -354,6 +354,16 @@ fn verify_presented_token<S>(
 where
     S: ManageGrantStore + ?Sized,
 {
+    if token_json.len() > MAX_TOKEN_JSON_BYTES {
+        return Err(ManageResult::Err {
+            kind: ManageErrorKind::Failed,
+            message: format!(
+                "presented capability token exceeds maximum length ({} > {MAX_TOKEN_JSON_BYTES} bytes)",
+                token_json.len(),
+            ),
+        });
+    }
+
     let token: CapabilityToken =
         serde_json::from_str(token_json).map_err(|e| ManageResult::Err {
             kind: ManageErrorKind::Failed,
