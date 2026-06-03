@@ -1,0 +1,171 @@
+# Cascade full stack — daemon + relay for WAN NAT traversal.
+#
+# This template pairs the cascade daemon (posture=public) with a
+# cascade-relay instance so the daemon node can reach peers across the
+# internet even when behind NAT.
+#
+# How it works:
+#   The cascade-relay is a blind byte-pipe.  After an HMAC handshake it
+#   forwards already-encrypted bytes between peers and never inspects the
+#   payload.  The daemon publishes its reachable candidates to the relay
+#   (and optionally to an announce Worker) so that remote peers can find
+#   and connect to it.  End-to-end TLS is established by the peers; the
+#   relay operator sees only ciphertext.
+#
+# Both services share CASCADE_P2P_RELAY_SECRET / CASCADE_RELAY_SHARED_SECRET.
+# Generate a single secret and set it in both places:
+#
+#   openssl rand -hex 32
+#
+# The daemon runs in seed mode by default (CASCADE_MOUNT=0).  Switch to
+# CASCADE_MOUNT=1 and add the FUSE privilege block from
+# docker-compose.mount.yml if you want a browsable mount point.
+#
+# For standalone configurations see:
+#   docker-compose.seed.yml  — seed mode only, no relay
+#   docker-compose.mount.yml — FUSE mount, no relay
+
+services:
+
+  # --------------------------------------------------------------------------
+  # cascade-relay
+  #
+  # Opaque byte-pipe relay for peers behind NATs.  Receives encrypted frames
+  # from two peers and forwards them to each other without inspecting content.
+  # --------------------------------------------------------------------------
+  relay:
+    image: ghcr.io/mearman/cascade-relay:latest
+    container_name: cascade-relay
+    restart: unless-stopped
+
+    environment:
+      # 64-char hex HMAC secret.  Must match CASCADE_P2P_RELAY_SECRET below.
+      # Generate with: openssl rand -hex 32
+      CASCADE_RELAY_SHARED_SECRET: "replace-with-64-char-hex-secret-generated-by-openssl-rand-hex-32"
+
+      # Bind address for the peer listener.
+      CASCADE_RELAY_LISTEN: "0.0.0.0:9999"
+
+      # Optional metrics / health endpoint.  Uncomment to enable.
+      # CASCADE_RELAY_METRICS: "0.0.0.0:9998"
+
+    ports:
+      # Peer listener — open this port in the firewall so remote peers can reach
+      # the relay.  The daemon's CASCADE_P2P_RELAY_ENDPOINT must point here.
+      - "9999:9999"
+      # Metrics and /health endpoint (uncomment when CASCADE_RELAY_METRICS is set).
+      # - "9998:9998"
+
+    healthcheck:
+      # Health check only works when CASCADE_RELAY_METRICS is set.
+      # When the metrics endpoint is disabled the check always exits 0.
+      test: ["CMD-SHELL",
+             "if [ -n \"${CASCADE_RELAY_METRICS:-}\" ]; then wget -qO- http://${CASCADE_RELAY_METRICS}/health | grep -q ok; else exit 0; fi"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  # --------------------------------------------------------------------------
+  # cascade daemon
+  #
+  # Runs in seed mode (no FUSE mount) with posture=public so it registers
+  # with the relay and is discoverable across WAN.
+  # --------------------------------------------------------------------------
+  cascade:
+    image: ghcr.io/mearman/cascade:latest
+    container_name: cascade
+    restart: unless-stopped
+    depends_on:
+      relay:
+        condition: service_started
+
+    environment:
+      # -----------------------------------------------------------------
+      # Backend — required.  Pick ONE type and fill in its credentials.
+      # -----------------------------------------------------------------
+
+      CASCADE_BACKEND_TYPE: "gdrive"
+      # CASCADE_BACKEND_NAME: "gdrive"
+
+      # --- Google Drive credentials ---
+      CASCADE_GDRIVE_CLIENT_ID: "your-client-id.apps.googleusercontent.com"
+      CASCADE_GDRIVE_CLIENT_SECRET: "your-client-secret"
+      # CASCADE_GDRIVE_ACCOUNT: "gdrive"
+
+      # --- S3 credentials (uncomment and remove gdrive vars if using S3) ---
+      # CASCADE_S3_ENDPOINT: "https://s3.amazonaws.com"
+      # CASCADE_S3_BUCKET: "my-cascade-bucket"
+      # CASCADE_S3_REGION: "us-east-1"
+      # CASCADE_S3_ACCESS_KEY_ID: "AKIAIOSFODNN7EXAMPLE"
+      # CASCADE_S3_SECRET_ACCESS_KEY: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+
+      # --- P2P-only backend (uncomment if CASCADE_BACKEND_TYPE=p2p) ---
+      # CASCADE_BACKEND_TYPE: "p2p"
+      # CASCADE_P2P_LISTEN: "0.0.0.0:22000"
+
+      # -----------------------------------------------------------------
+      # Paths
+      # -----------------------------------------------------------------
+
+      CASCADE_CONFIG_DIR: "/config"
+      CASCADE_DATA_DIR: "/data"
+      CASCADE_MOUNT_POINT: "/mnt/cascade"
+
+      # -----------------------------------------------------------------
+      # Mount mode — seed mode (no FUSE mount).
+      # -----------------------------------------------------------------
+
+      CASCADE_MOUNT: "0"
+      CASCADE_WEBDAV_BIND: "0.0.0.0:8080"
+
+      # -----------------------------------------------------------------
+      # P2P — enable the optimisation layer and WAN relay.
+      # -----------------------------------------------------------------
+
+      # Enable the engine's P2P block-sharing layer.
+      CASCADE_P2P: "1"
+
+      # public: LAN discovery, gossip, hole-punching, relay, DHT, and
+      # announce servers.  Required for WAN relay to activate.
+      CASCADE_P2P_POSTURE: "public"
+
+      # Relay endpoint — point at the relay service on this compose network.
+      # For a relay on a separate host substitute the public IP or hostname.
+      CASCADE_P2P_RELAY_ENDPOINT: "relay:9999"
+
+      # 64-char hex HMAC secret.  Must match CASCADE_RELAY_SHARED_SECRET above.
+      CASCADE_P2P_RELAY_SECRET: "replace-with-64-char-hex-secret-generated-by-openssl-rand-hex-32"
+
+      # Optional announce server (cross-reference docs/docker.md for setup).
+      # CASCADE_P2P_ANNOUNCE_URL: "https://cascade-announce.<your-account>.workers.dev"
+      # CASCADE_P2P_ANNOUNCE_SECRET: "replace-with-64-char-hex-secret"
+
+      # BEP listener — bind to a fixed port so port-forwarding is possible.
+      CASCADE_P2P_LISTEN: "0.0.0.0:22000"
+
+      # -----------------------------------------------------------------
+      # Logging
+      # -----------------------------------------------------------------
+      RUST_LOG: "info"
+
+    volumes:
+      - cascade-config:/config
+      - cascade-data:/data
+
+    ports:
+      # WebDAV browse port.
+      - "8080:8080"
+      # BEP peer listener.  Port-forward this from the router for WAN inbound.
+      - "22000:22000"
+
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/ > /dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+volumes:
+  cascade-config:
+  cascade-data:

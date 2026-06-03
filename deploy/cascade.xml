@@ -1,0 +1,460 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>cascade</Name>
+  <Repository>ghcr.io/mearman/cascade</Repository>
+  <Registry>https://github.com/Mearman/cascade/pkgs/container/cascade</Registry>
+  <Network>bridge</Network>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/Mearman/cascade/issues</Support>
+  <Project>https://github.com/Mearman/cascade</Project>
+  <Overview>
+    Cascade is a cross-platform cloud storage filesystem client that streams file content on demand and presents multiple backends — Google Drive, S3, local storage, and P2P — as a single virtual tree.
+
+    This container runs the Cascade daemon in headless seed mode by default (CASCADE_MOUNT=0): no FUSE mount is attempted, no extra capabilities are required, and the tree is browsable over an in-process WebDAV server at the configured port.
+
+    To enable a FUSE-based filesystem mount inside the container (so that the host or sibling containers can access files directly at a path), set CASCADE_MOUNT=1 and switch to Extra Parameters: --cap-add SYS_ADMIN --device /dev/fuse and add the rshared bind-mount for the mount point. See the template config notes and docs/docker.md in the project repository for the full privilege requirements.
+
+    For Google Drive: after starting the container for the first time, run the one-time device-code authorisation step from the UnRAID console:
+      docker exec -it cascade cascade --config /config backend auth gdrive
+    Tokens are persisted under /config and refreshed silently on subsequent starts.
+  </Overview>
+  <Category>Cloud: Tools:</Category>
+  <WebUI>http://[IP]:[PORT:8080]/</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/Mearman/cascade/main/deploy/cascade.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/Mearman/cascade/main/docs/cascade-icon.png</Icon>
+  <ExtraParams></ExtraParams>
+  <PostArgs></PostArgs>
+  <CPUset></CPUset>
+  <DateInstalled></DateInstalled>
+  <DonateText></DonateText>
+  <DonateLink></DonateLink>
+  <Description>
+    Cross-platform cloud storage filesystem daemon. Streams files on demand from Google Drive, S3, local storage, and P2P backends. Default seed mode requires no elevated capabilities; set CASCADE_MOUNT=1 for an in-container FUSE mount (requires --cap-add SYS_ADMIN and --device /dev/fuse).
+  </Description>
+  <Networking>
+    <Mode>bridge</Mode>
+    <Publish>
+      <Port>
+        <HostPort>8080</HostPort>
+        <ContainerPort>8080</ContainerPort>
+        <Protocol>tcp</Protocol>
+      </Port>
+      <Port>
+        <HostPort>22000</HostPort>
+        <ContainerPort>22000</ContainerPort>
+        <Protocol>tcp</Protocol>
+      </Port>
+    </Publish>
+  </Networking>
+
+  <!-- ===================================================================
+       VOLUMES
+       /config — config.toml, per-backend TOML, state.db, gdrive tokens.
+                 Use fast storage (SSD cache). Survives container updates.
+       /data   — P2P block store, cache, local-backend roots.
+                 Point at an UnRAID array share for bulk storage.
+       =================================================================== -->
+  <Data>
+    <Volume>
+      <HostDir>/mnt/user/appdata/cascade/config</HostDir>
+      <ContainerDir>/config</ContainerDir>
+      <Mode>rw</Mode>
+    </Volume>
+    <Volume>
+      <HostDir>/mnt/user/cascade</HostDir>
+      <ContainerDir>/data</ContainerDir>
+      <Mode>rw</Mode>
+    </Volume>
+  </Data>
+
+  <!-- ===================================================================
+       ENVIRONMENT VARIABLES
+       =================================================================== -->
+  <Environment>
+
+    <!-- ================================================================
+         Backend — required.  Set CASCADE_BACKEND_TYPE first; then fill
+         in the credentials for that type.
+         ================================================================ -->
+
+    <Variable>
+      <Value>gdrive</Value>
+      <Name>CASCADE_BACKEND_TYPE</Name>
+      <Mode></Mode>
+      <Mask>false</Mask>
+      <Description>
+        Type of the primary backend to provision on first boot.
+        One of: gdrive, s3, local, p2p.
+        Required — the daemon exits cleanly (no work) when no backends are configured.
+        Drives which other CASCADE_* variables are relevant.
+      </Description>
+    </Variable>
+
+    <Variable>
+      <Value></Value>
+      <Name>CASCADE_BACKEND_NAME</Name>
+      <Mode></Mode>
+      <Mask>false</Mask>
+      <Description>
+        Logical name for the backend entry.
+        Becomes the [backends.&lt;name&gt;] key in config.toml and the per-backend &lt;name&gt;.toml filename.
+        Defaults to the value of CASCADE_BACKEND_TYPE when left empty.
+      </Description>
+    </Variable>
+
+    <!-- Google Drive -->
+
+    <Variable>
+      <Value></Value>
+      <Name>CASCADE_GDRIVE_CLIENT_ID</Name>
+      <Mode></Mode>
+      <Mask>false</Mask>
+      <Description>
+        Google OAuth2 Desktop client ID.
+        Required when CASCADE_BACKEND_TYPE=gdrive.
+        Obtain from the Google Cloud Console (project credentials, Desktop application type).
+        After first start, run the one-time device-code authorisation:
+          docker exec -it cascade cascade --config /config backend auth gdrive
+        Tokens are persisted under /config/gdrive-tokens/ and refreshed automatically.
+      </Description>
+    </Variable>
+
+    <Variable>
+      <Value></Value>
+      <Name>CASCADE_GDRIVE_CLIENT_SECRET</Name>
+      <Mode></Mode>
+      <Mask>true</Mask>
+      <Description>
+        Google OAuth2 client secret.
+        Required when CASCADE_BACKEND_TYPE=gdrive.
+        Stored in the container's config file (mode 0600), never placed on the command line.
+      </Description>
+    </Variable>
+
+    <Variable>
+      <Value></Value>
+      <Name>CASCADE_GDRIVE_ACCOUNT</Name>
+      <Mode></Mode>
+      <Mask>false</Mask>
+      <Description>
+        Account identifier used for token persistence.
+        Tokens are stored at /config/gdrive-tokens/&lt;account&gt;.json.
+        Defaults to the value of CASCADE_BACKEND_NAME when left empty.
+      </Description>
+    </Variable>
+
+    <!-- S3 -->
+
+    <Variable>
+      <Value></Value>
+      <Name>CASCADE_S3_ENDPOINT</Name>
+      <Mode></Mode>
+      <Mask>false</Mask>
+      <Description>
+        S3 endpoint URL — e.g. https://s3.amazonaws.com or a MinIO URL.
+        Required when CASCADE_BACKEND_TYPE=s3.
+      </Description>
+    </Variable>
+
+    <Variable>
+      <Value></Value>
+      <Name>CASCADE_S3_BUCKET</Name>
+      <Mode></Mode>
+      <Mask>false</Mask>
+      <Description>
+        S3 bucket name.
+        Required when CASCADE_BACKEND_TYPE=s3.
+      </Description>
+    </Variable>
+
+    <Variable>
+      <Value>us-east-1</Value>
+      <Name>CASCADE_S3_REGION</Name>
+      <Mode></Mode>
+      <Mask>false</Mask>
+      <Description>
+        S3 region.
+        Optional; defaults to us-east-1.
+        Required when CASCADE_BACKEND_TYPE=s3.
+      </Description>
+    </Variable>
+
+    <Variable>
+      <Value></Value>
+      <Name>CASCADE_S3_ACCESS_KEY_ID</Name>
+      <Mode></Mode>
+      <Mask>false</Mask>
+      <Description>
+        S3 access key ID.
+        Required when CASCADE_BACKEND_TYPE=s3.
+        Stored in the per-backend config file, never placed on the command line.
+      </Description>
+    </Variable>
+
+    <Variable>
+      <Value></Value>
+      <Name>CASCADE_S3_SECRET_ACCESS_KEY</Name>
+      <Mode></Mode>
+      <Mask>true</Mask>
+      <Description>
+        S3 secret access key.
+        Required when CASCADE_BACKEND_TYPE=s3.
+        Stored in the per-backend config file (mode 0600), never placed on the command line.
+      </Description>
+    </Variable>
+
+    <!-- Local backend -->
+
+    <Variable>
+      <Value></Value>
+      <Name>CASCADE_LOCAL_ROOT</Name>
+      <Mode></Mode>
+      <Mask>false</Mask>
+      <Description>
+        Filesystem root for a local (adopt-and-sync) backend.
+        Required when CASCADE_BACKEND_TYPE=local.
+        Should be a path under CASCADE_DATA_DIR, e.g. /data/local.
+      </Description>
+    </Variable>
+
+    <!-- Paths -->
+
+    <Variable>
+      <Value>/config</Value>
+      <Name>CASCADE_CONFIG_DIR</Name>
+      <Mode></Mode>
+      <Mask>false</Mask>
+      <Description>
+        Root config directory the daemon reads.
+        Must be a writable bind-mount or named volume so config.toml, per-backend TOML files,
+        state.db, cascade.pid, and gdrive tokens survive container restarts and updates.
+        Maps to the --config global flag.
+      </Description>
+    </Variable>
+
+    <Variable>
+      <Value>/data</Value>
+      <Name>CASCADE_DATA_DIR</Name>
+      <Mode></Mode>
+      <Mask>false</Mask>
+      <Description>
+        Base directory for bulky runtime state: P2P block store and index, local-backend roots,
+        and cache.
+        Use a separate volume mapped to an UnRAID array share so it can be sized independently
+        of the config volume.
+      </Description>
+    </Variable>
+
+    <Variable>
+      <Value>/mnt/cascade</Value>
+      <Name>CASCADE_MOUNT_POINT</Name>
+      <Mode></Mode>
+      <Mask>false</Mask>
+      <Description>
+        Mount point written to [mount].point in config.toml.
+        In seed mode (CASCADE_MOUNT=0) this path is recorded but nothing is mounted there.
+        In CASCADE_MOUNT=1 mode the FUSE filesystem appears here; with rshared bind propagation
+        it is also visible on the host at the corresponding host path.
+      </Description>
+    </Variable>
+
+    <!-- Mount mode -->
+
+    <Variable>
+      <Value>0</Value>
+      <Name>CASCADE_MOUNT</Name>
+      <Mode></Mode>
+      <Mask>false</Mask>
+      <Description>
+        Browsable-optional toggle.
+
+        0 (default) — seed mode: the entrypoint adds --no-mount and forces the WebDAV presenter.
+        The daemon runs without any FUSE mount; no extra capabilities are required.
+        The tree is accessible over WebDAV at CASCADE_WEBDAV_BIND.
+
+        1 — browsable mode: enables the in-container FUSE mount at CASCADE_MOUNT_POINT.
+        REQUIRES all of the following:
+          Extra Parameters: --cap-add SYS_ADMIN --device /dev/fuse
+          A bind-mount of CASCADE_MOUNT_POINT with rshared propagation
+            (add a host path mapping for CASCADE_MOUNT_POINT and set propagation to rshared
+             in the advanced volume settings, or use the compose templates in deploy/).
+        Do not enable this unless you understand the privilege trade-off.
+      </Description>
+    </Variable>
+
+    <!-- WebDAV -->
+
+    <Variable>
+      <Value>0.0.0.0:8080</Value>
+      <Name>CASCADE_WEBDAV_BIND</Name>
+      <Mode></Mode>
+      <Mask>false</Mask>
+      <Description>
+        Bind address for the in-process WebDAV server.
+        Set to 0.0.0.0:&lt;port&gt; to make the tree browsable from the host or other containers
+        without a FUSE mount.  Set to 127.0.0.1:8080 to restrict access to the container itself.
+        The mapped port (default 8080) must match the port published in Networking above.
+      </Description>
+    </Variable>
+
+    <!-- P2P optimisation layer -->
+
+    <Variable>
+      <Value>0</Value>
+      <Name>CASCADE_P2P</Name>
+      <Mode></Mode>
+      <Mask>false</Mask>
+      <Description>
+        Enables the engine's P2P block-sharing optimisation layer in front of cloud backends.
+        Independent of a pure p2p-type backend — set this to 1 when a cloud-backed node should
+        also fetch blocks from nearby peers (e.g. other Cascade nodes on the same LAN).
+        Maps to [p2p] enabled in config.toml.
+      </Description>
+    </Variable>
+
+    <Variable>
+      <Value>private</Value>
+      <Name>CASCADE_P2P_POSTURE</Name>
+      <Mode></Mode>
+      <Mask>false</Mask>
+      <Description>
+        Discovery reach for P2P.  One of: lan-only, private, public.
+
+        lan-only — UDP multicast on the local network only.
+        private  — LAN discovery plus gossip, hole-punching, and relay within a trusted mesh.
+                   Nothing is published to any global directory.  The default for most nodes.
+        public   — Everything in private plus announce-server registration and Mainline DHT.
+                   Required for WAN relay (CASCADE_P2P_RELAY_ENDPOINT) to activate.
+                   A NAS node that needs to reach peers across the internet should set this.
+      </Description>
+    </Variable>
+
+    <Variable>
+      <Value></Value>
+      <Name>CASCADE_P2P_RELAY_ENDPOINT</Name>
+      <Mode></Mode>
+      <Mask>false</Mask>
+      <Description>
+        host:port of the cascade-relay server used for WAN NAT traversal.
+        Required for the relay path to be usable when CASCADE_P2P_POSTURE=public and
+        the node is behind NAT.
+        Must match CASCADE_RELAY_SHARED_SECRET on the relay side.
+        Example: relay.example.com:9999
+        See deploy/docker-compose.full.yml for a co-located relay setup.
+      </Description>
+    </Variable>
+
+    <Variable>
+      <Value></Value>
+      <Name>CASCADE_P2P_RELAY_SECRET</Name>
+      <Mode></Mode>
+      <Mask>true</Mask>
+      <Description>
+        64-character hex HMAC secret authenticating this node to the relay.
+        Must match CASCADE_RELAY_SHARED_SECRET on the cascade-relay container.
+        Generate with: openssl rand -hex 32
+        Stored in the per-backend config file (mode 0600), never placed on the command line.
+      </Description>
+    </Variable>
+
+    <Variable>
+      <Value>0.0.0.0:0</Value>
+      <Name>CASCADE_P2P_LISTEN</Name>
+      <Mode></Mode>
+      <Mask>false</Mask>
+      <Description>
+        BEP listener bind address for a p2p-type backend.
+        A bound listener is required for LAN discovery, hole-punch, and DHT/announce
+        self-activation.  Set to a fixed port (e.g. 0.0.0.0:22000) when the operator
+        port-forwards or publishes the container port to the host.
+        The mapped port must match the port published in Networking above.
+      </Description>
+    </Variable>
+
+    <Variable>
+      <Value></Value>
+      <Name>CASCADE_P2P_ANNOUNCE_URL</Name>
+      <Mode></Mode>
+      <Mask>false</Mask>
+      <Description>
+        Optional announce-server base URL for serverless peer discovery at posture=public.
+        Example: https://cascade-announce.&lt;your-account&gt;.workers.dev
+        Requires CASCADE_P2P_ANNOUNCE_SECRET.
+        Leave empty if not using an announce server.
+      </Description>
+    </Variable>
+
+    <Variable>
+      <Value></Value>
+      <Name>CASCADE_P2P_ANNOUNCE_SECRET</Name>
+      <Mode></Mode>
+      <Mask>true</Mask>
+      <Description>
+        64-character hex HMAC write key for the announce server.
+        Required when CASCADE_P2P_ANNOUNCE_URL is set.
+        Generate with: openssl rand -hex 32
+        Stored in the per-backend config file, never placed on the command line.
+      </Description>
+    </Variable>
+
+    <!-- Logging -->
+
+    <Variable>
+      <Value>info</Value>
+      <Name>RUST_LOG</Name>
+      <Mode></Mode>
+      <Mask>false</Mask>
+      <Description>
+        Standard tracing log filter for the daemon.
+        Common values: error, warn, info (default), debug, trace.
+        Use debug for initial bring-up diagnosis; revert to info for normal operation
+        to avoid filling the UnRAID log.
+      </Description>
+    </Variable>
+
+  </Environment>
+
+  <Labels/>
+
+  <Config Name="Config directory"
+          Target="/config"
+          Default="/mnt/user/appdata/cascade/config"
+          Mode="rw"
+          Description="Config volume — config.toml, per-backend TOML files, state.db, gdrive tokens. Use fast (SSD) storage."
+          Type="Path"
+          Display="always"
+          Required="true"
+          Mask="false">/mnt/user/appdata/cascade/config</Config>
+
+  <Config Name="Data directory"
+          Target="/data"
+          Default="/mnt/user/cascade"
+          Mode="rw"
+          Description="Data volume — P2P block store, cache, local-backend roots. Point at an UnRAID array share for bulk storage."
+          Type="Path"
+          Display="always"
+          Required="true"
+          Mask="false">/mnt/user/cascade</Config>
+
+  <Config Name="WebDAV port"
+          Target="8080"
+          Default="8080"
+          Mode="tcp"
+          Description="WebDAV browse port. Browse the virtual tree at http://&lt;host&gt;:&lt;port&gt;/ from any WebDAV-capable client."
+          Type="Port"
+          Display="always"
+          Required="false"
+          Mask="false">8080</Config>
+
+  <Config Name="P2P listener port"
+          Target="22000"
+          Default="22000"
+          Mode="tcp"
+          Description="BEP peer listener port. Port-forward this from your router for WAN inbound connections (posture=public). Only needed when CASCADE_P2P=1 or CASCADE_BACKEND_TYPE=p2p."
+          Type="Port"
+          Display="advanced"
+          Required="false"
+          Mask="false">22000</Config>
+
+</Container>

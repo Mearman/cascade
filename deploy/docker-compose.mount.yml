@@ -1,0 +1,138 @@
+# Cascade daemon — browsable FUSE-mount mode (CASCADE_MOUNT=1).
+#
+# The daemon mounts the virtual tree at CASCADE_MOUNT_POINT inside the
+# container using libfuse3.  With rshared bind propagation the mount is
+# visible on the host and to sibling containers that bind-mount the same
+# host path.
+#
+# REQUIRED privileges for this configuration:
+#   cap_add: [SYS_ADMIN]
+#     libfuse3's fusermount3 requires the SYS_ADMIN capability inside a
+#     container — the mount(2) syscall is otherwise blocked.
+#   devices: [/dev/fuse]
+#     The kernel FUSE character device must be exposed to the container.
+#   bind propagation: rshared
+#     Without rshared propagation the mount created inside the container's
+#     namespace does not propagate to the host mount namespace or to other
+#     containers.  The volumes block below sets this explicitly.
+#
+# If your host kernel or container runtime does not support rshared
+# propagation, use seed mode (docker-compose.seed.yml) and browse via
+# WebDAV instead — it requires no special capabilities.
+#
+# Quick start:
+#   1. Create the host-side mount directory:
+#        mkdir -p /mnt/cascade
+#   2. Edit the environment block below.
+#   3. docker compose -f docker-compose.mount.yml up -d
+#   4. The tree appears at /mnt/cascade on the host.
+#
+# For the unprivileged seed-only variant see docker-compose.seed.yml.
+# For the full stack with WAN relay see docker-compose.full.yml.
+
+services:
+  cascade:
+    image: ghcr.io/mearman/cascade:latest
+    container_name: cascade
+    restart: unless-stopped
+
+    # --- Required capabilities for in-container FUSE mount ---
+    cap_add:
+      - SYS_ADMIN
+
+    # Expose the FUSE kernel device to the container.
+    devices:
+      - /dev/fuse
+
+    # The no-new-privileges security option is incompatible with fusermount3's
+    # set-uid bit and must be absent for the FUSE mount to succeed.
+    # (seed mode does not need this override — add no-new-privileges: true there.)
+    security_opt:
+      - apparmor:unconfined
+
+    environment:
+      # -----------------------------------------------------------------
+      # Backend — required.  Pick ONE type and fill in its credentials.
+      # -----------------------------------------------------------------
+
+      CASCADE_BACKEND_TYPE: "gdrive"
+      # CASCADE_BACKEND_NAME: "gdrive"
+
+      # --- Google Drive credentials ---
+      CASCADE_GDRIVE_CLIENT_ID: "your-client-id.apps.googleusercontent.com"
+      CASCADE_GDRIVE_CLIENT_SECRET: "your-client-secret"
+      # CASCADE_GDRIVE_ACCOUNT: "gdrive"
+
+      # --- S3 credentials (uncomment and remove gdrive vars if using S3) ---
+      # CASCADE_S3_ENDPOINT: "https://s3.amazonaws.com"
+      # CASCADE_S3_BUCKET: "my-cascade-bucket"
+      # CASCADE_S3_REGION: "us-east-1"
+      # CASCADE_S3_ACCESS_KEY_ID: "AKIAIOSFODNN7EXAMPLE"
+      # CASCADE_S3_SECRET_ACCESS_KEY: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+
+      # --- Local backend root (required when CASCADE_BACKEND_TYPE=local) ---
+      # CASCADE_LOCAL_ROOT: "/data/local"
+
+      # -----------------------------------------------------------------
+      # Paths
+      # -----------------------------------------------------------------
+
+      CASCADE_CONFIG_DIR: "/config"
+      CASCADE_DATA_DIR: "/data"
+
+      # Mount point inside the container — the FUSE filesystem appears here.
+      # Must match the container path in the volumes bind-mount below.
+      CASCADE_MOUNT_POINT: "/mnt/cascade"
+
+      # -----------------------------------------------------------------
+      # Mount mode — set to "1" to enable the in-container FUSE mount.
+      # -----------------------------------------------------------------
+
+      # Browsable mode: entrypoint runs `cascade start` without --no-mount.
+      # The Linux FUSE presenter is attempted first (FUSE -> NFS fallback).
+      CASCADE_MOUNT: "1"
+
+      # -----------------------------------------------------------------
+      # P2P optimisation layer (optional).
+      # -----------------------------------------------------------------
+
+      CASCADE_P2P: "0"
+      # CASCADE_P2P_POSTURE: "private"
+
+      # -----------------------------------------------------------------
+      # Logging
+      # -----------------------------------------------------------------
+      RUST_LOG: "info"
+
+    volumes:
+      # Config and data volumes — same as seed mode.
+      - cascade-config:/config
+      - cascade-data:/data
+
+      # Browsable mount point.
+      # rshared propagation makes the FUSE mount created inside the container
+      # visible in the host mount namespace and to other containers that bind-
+      # mount this path.  Without it the mount is invisible outside the container.
+      #
+      # The host directory (/mnt/cascade here) must exist before compose up.
+      - type: bind
+        source: /mnt/cascade
+        target: /mnt/cascade
+        bind:
+          propagation: rshared
+
+    ports:
+      # WebDAV is still available in mount mode as an alternative access path.
+      # Set CASCADE_WEBDAV_BIND=0.0.0.0:8080 to enable it.
+      - "8080:8080"
+
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/ > /dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+volumes:
+  cascade-config:
+  cascade-data:

@@ -1,0 +1,130 @@
+# Cascade daemon — headless seed mode (unprivileged).
+#
+# The daemon starts without a filesystem mount (--no-mount, CASCADE_PRESENTER=webdav).
+# Backends, the state database, sync, and the optional P2P layer run normally;
+# the tree is browsable over WebDAV at CASCADE_WEBDAV_BIND.
+#
+# No SYS_ADMIN capability, no /dev/fuse device, and no elevated privileges
+# of any kind are required for this configuration.
+#
+# Quick start:
+#   1. Edit the environment block below — at minimum set CASCADE_BACKEND_TYPE
+#      and the corresponding credentials.
+#   2. docker compose -f docker-compose.seed.yml up -d
+#   3. Browse the tree via WebDAV: http://localhost:8080/
+#
+# For Google Drive, run the one-time auth step after the container is up:
+#   docker compose -f docker-compose.seed.yml exec cascade \
+#     cascade --config /config backend auth gdrive
+#
+# For the browsable FUSE-mount variant see docker-compose.mount.yml.
+# For the full stack with WAN relay see docker-compose.full.yml.
+
+services:
+  cascade:
+    image: ghcr.io/mearman/cascade:latest
+    container_name: cascade
+    restart: unless-stopped
+
+    environment:
+      # -----------------------------------------------------------------
+      # Backend — required.  Pick ONE type and fill in its credentials.
+      # -----------------------------------------------------------------
+
+      # Type of the primary backend.  One of: gdrive, s3, local, p2p.
+      CASCADE_BACKEND_TYPE: "gdrive"
+
+      # Logical name for the backend entry (defaults to CASCADE_BACKEND_TYPE).
+      # CASCADE_BACKEND_NAME: "gdrive"
+
+      # --- Google Drive credentials (required when CASCADE_BACKEND_TYPE=gdrive) ---
+      # Desktop OAuth2 client id and secret from Google Cloud Console.
+      CASCADE_GDRIVE_CLIENT_ID: "your-client-id.apps.googleusercontent.com"
+      CASCADE_GDRIVE_CLIENT_SECRET: "your-client-secret"
+      # Account identifier used for token persistence (defaults to CASCADE_BACKEND_NAME).
+      # CASCADE_GDRIVE_ACCOUNT: "gdrive"
+
+      # --- S3 credentials (required when CASCADE_BACKEND_TYPE=s3) ---
+      # CASCADE_S3_ENDPOINT: "https://s3.amazonaws.com"
+      # CASCADE_S3_BUCKET: "my-cascade-bucket"
+      # CASCADE_S3_REGION: "us-east-1"
+      # CASCADE_S3_ACCESS_KEY_ID: "AKIAIOSFODNN7EXAMPLE"
+      # CASCADE_S3_SECRET_ACCESS_KEY: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+
+      # --- Local backend root (required when CASCADE_BACKEND_TYPE=local) ---
+      # Path inside the container; should sit under CASCADE_DATA_DIR.
+      # CASCADE_LOCAL_ROOT: "/data/local"
+
+      # -----------------------------------------------------------------
+      # Paths
+      # -----------------------------------------------------------------
+
+      # Directory for config.toml, per-backend TOML files, state.db,
+      # cascade.pid, and gdrive tokens.  Must be a writable bind-mount.
+      CASCADE_CONFIG_DIR: "/config"
+
+      # Directory for P2P block store and index, local-backend roots,
+      # and cache.  Size this volume to your storage budget.
+      CASCADE_DATA_DIR: "/data"
+
+      # Mount point written to [mount].point in config.toml.
+      # In seed mode nothing is mounted here; the value is recorded only.
+      CASCADE_MOUNT_POINT: "/mnt/cascade"
+
+      # -----------------------------------------------------------------
+      # Mount mode — leave unset or "0" for seed mode (the default here).
+      # -----------------------------------------------------------------
+
+      # Seed mode: entrypoint adds --no-mount and forces WebDAV presenter.
+      # No FUSE, no SYS_ADMIN, no /dev/fuse required.
+      CASCADE_MOUNT: "0"
+
+      # -----------------------------------------------------------------
+      # WebDAV server — browse the tree without a FUSE mount.
+      # -----------------------------------------------------------------
+
+      # Bind address for the in-process WebDAV server.
+      # Change to 127.0.0.1:8080 to restrict to localhost.
+      CASCADE_WEBDAV_BIND: "0.0.0.0:8080"
+
+      # -----------------------------------------------------------------
+      # P2P optimisation layer (optional, cloud-backed nodes).
+      # -----------------------------------------------------------------
+
+      # Enable the engine's P2P block-sharing layer in front of cloud backends.
+      # Independent of a pure p2p backend; set "1" to use P2P alongside gdrive/s3.
+      CASCADE_P2P: "0"
+
+      # Discovery reach for the P2P layer: lan-only, private, or public.
+      # CASCADE_P2P_POSTURE: "private"
+
+      # -----------------------------------------------------------------
+      # Logging
+      # -----------------------------------------------------------------
+      RUST_LOG: "info"
+
+    volumes:
+      # Config volume: config.toml, backend TOML files, state.db, gdrive tokens.
+      # Keep this volume on fast storage (SSD).
+      - cascade-config:/config
+
+      # Data volume: P2P block store, cache, local-backend roots.
+      # Size this to your total storage budget; place on array storage if preferred.
+      - cascade-data:/data
+
+    ports:
+      # WebDAV browse port.  Clients (other containers, host, Kodi, etc.) can
+      # access the mounted tree over HTTP at http://<host>:8080/
+      - "8080:8080"
+
+    # Healthcheck: probe the WebDAV root.  Adjust port if CASCADE_WEBDAV_BIND changes.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/ > /dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+volumes:
+  cascade-config:
+  cascade-data:
