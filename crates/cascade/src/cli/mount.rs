@@ -74,6 +74,54 @@ impl PresenterResources {
     }
 }
 
+/// Upper bound on the daemon's own unmount-and-teardown after a stop signal,
+/// before it forces an exit.
+///
+/// Sits comfortably inside the 5 s grace `cascade stop` allows after `SIGTERM`,
+/// so in a wedged shutdown the daemon self-terminates before the external
+/// `SIGKILL` escalation fires, while still guaranteeing it never hangs — for
+/// example on a macOS `webdavfs` unmount that stalls because the in-process
+/// `WebDAV` server it is talking to is itself tearing down.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Run the post-signal shutdown sequence, bounded by [`SHUTDOWN_GRACE`].
+///
+/// The OS unmount is a blocking subprocess (`diskutil`/`umount`/`net use`), so
+/// it runs on a blocking thread rather than a runtime worker: unmounting a
+/// self-hosted mount makes the kernel client issue its final requests to the
+/// in-process presenter server, which must stay responsive to answer them, and
+/// occupying a worker with the blocking call can wedge that exchange.
+/// `teardown` then stops the presenter and engine. If the whole sequence does
+/// not finish within the grace period the daemon removes its PID file and
+/// forces an exit rather than hanging with an unkillable process and a stale
+/// mount — which the next `cascade start` reclaims, and which `cascade stop`
+/// also clears once the process is gone.
+async fn finish_shutdown(
+    pid_path: &Path,
+    mount_path: Option<PathBuf>,
+    teardown: impl std::future::Future<Output = ()>,
+) -> Result<()> {
+    let sequence = async move {
+        if let Some(mount_path) = mount_path {
+            let _ = tokio::task::spawn_blocking(move || unmount_path(&mount_path)).await;
+        }
+        teardown.await;
+    };
+
+    if tokio::time::timeout(SHUTDOWN_GRACE, sequence).await.is_err() {
+        tracing::warn!(
+            grace_secs = SHUTDOWN_GRACE.as_secs(),
+            "graceful shutdown timed out; forcing exit"
+        );
+        let _ = std::fs::remove_file(pid_path);
+        std::process::exit(0);
+    }
+
+    let _ = std::fs::remove_file(pid_path);
+    tracing::info!("Cascade stopped.");
+    Ok(())
+}
+
 /// Start the Cascade daemon.
 ///
 /// `p2p_override` lets the CLI flag (`--p2p` / `--no-p2p`) override the
@@ -343,16 +391,13 @@ async fn try_fskit(
 
     tracing::info!("Shutting down...");
 
-    unmount_path(mount_path)?;
-    if let Err(e) = presenter.stop().await {
-        tracing::warn!(error = %e, "FSKit presenter stop returned an error");
-    }
-    resources.shutdown();
-
-    let _ = std::fs::remove_file(&ctx.pid_path);
-
-    tracing::info!("Cascade stopped.");
-    Ok(())
+    finish_shutdown(&ctx.pid_path, Some(mount_path.to_path_buf()), async move {
+        if let Err(e) = presenter.stop().await {
+            tracing::warn!(error = %e, "FSKit presenter stop returned an error");
+        }
+        resources.shutdown();
+    })
+    .await
 }
 
 /// A presenter that consumes nothing.
@@ -661,15 +706,13 @@ async fn try_projfs(
 
     tracing::info!("Shutting down...");
 
-    if let Err(e) = presenter.stop().await {
-        tracing::warn!(error = %e, "ProjFS presenter stop returned an error");
-    }
-    resources.shutdown();
-
-    let _ = std::fs::remove_file(&ctx.pid_path);
-
-    tracing::info!("Cascade stopped.");
-    Ok(())
+    finish_shutdown(&ctx.pid_path, None, async move {
+        if let Err(e) = presenter.stop().await {
+            tracing::warn!(error = %e, "ProjFS presenter stop returned an error");
+        }
+        resources.shutdown();
+    })
+    .await
 }
 
 /// Try to mount via the `WebDAV` presenter.
@@ -785,19 +828,15 @@ async fn try_webdav(
 
     tracing::info!("Shutting down...");
 
-    if !no_mount {
-        unmount_path(mount_path)?;
-    }
-    if let Err(e) = presenter.stop().await {
-        tracing::warn!(error = %e, "WebDAV presenter stop returned an error");
-    }
-    drop(items);
-    resources.shutdown();
-
-    let _ = std::fs::remove_file(&ctx.pid_path);
-
-    tracing::info!("Cascade stopped.");
-    Ok(())
+    let mount = (!no_mount).then(|| mount_path.to_path_buf());
+    finish_shutdown(&ctx.pid_path, mount, async move {
+        if let Err(e) = presenter.stop().await {
+            tracing::warn!(error = %e, "WebDAV presenter stop returned an error");
+        }
+        drop(items);
+        resources.shutdown();
+    })
+    .await
 }
 
 /// Try to mount via the FUSE presenter (Linux only).
@@ -869,15 +908,13 @@ async fn try_fuse(
 
     tracing::info!("Shutting down...");
 
-    if let Err(e) = presenter.stop().await {
-        tracing::warn!(error = %e, "FUSE presenter stop returned an error");
-    }
-    resources.shutdown();
-
-    let _ = std::fs::remove_file(&ctx.pid_path);
-
-    tracing::info!("Cascade stopped.");
-    Ok(())
+    finish_shutdown(&ctx.pid_path, None, async move {
+        if let Err(e) = presenter.stop().await {
+            tracing::warn!(error = %e, "FUSE presenter stop returned an error");
+        }
+        resources.shutdown();
+    })
+    .await
 }
 
 /// Try to mount via the NFS presenter.
@@ -972,23 +1009,36 @@ async fn try_nfs(
 
     tracing::info!("Shutting down...");
 
-    if !no_mount {
-        unmount_path(mount_path)?;
-    }
-    if let Err(e) = server.stop() {
-        tracing::warn!(error = %e, "NFS server stop returned an error");
-    }
-    resources.shutdown();
-
-    let _ = std::fs::remove_file(&ctx.pid_path);
-
-    tracing::info!("Cascade stopped.");
-    Ok(())
+    let mount = (!no_mount).then(|| mount_path.to_path_buf());
+    finish_shutdown(&ctx.pid_path, mount, async move {
+        if let Err(e) = server.stop() {
+            tracing::warn!(error = %e, "NFS server stop returned an error");
+        }
+        resources.shutdown();
+    })
+    .await
 }
 
 // ---------------------------------------------------------------------------
 // Stop
 // ---------------------------------------------------------------------------
+
+/// Poll until the process with `pid` is gone or `grace` elapses.
+///
+/// Returns `true` if the process exited within the grace period. The number of
+/// polls is derived from `grace / poll` so the timing is expressed once, in the
+/// caller's units, rather than as a magic iteration count.
+#[cfg(unix)]
+fn wait_for_pid_exit(pid: u32, grace: std::time::Duration, poll: std::time::Duration) -> bool {
+    let polls = grace.as_millis().div_ceil(poll.as_millis().max(1));
+    for _ in 0..polls {
+        if !is_process_alive(pid) {
+            return true;
+        }
+        std::thread::sleep(poll);
+    }
+    !is_process_alive(pid)
+}
 
 /// Stop the Cascade daemon.
 #[cfg(unix)]
@@ -1025,23 +1075,40 @@ pub fn stop(ctx: &CliContext) -> anyhow::Result<()> {
         }
     }
 
-    // Wait up to 5 seconds for the process to exit (10 × 500 ms polls).
-    let mut exited = false;
-    for _ in 0..10 {
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        if nix::sys::signal::kill(pid, None) == Err(nix::errno::Errno::ESRCH) {
-            exited = true;
-            break;
-        }
-    }
+    // Wait for the daemon to exit after SIGTERM. It runs a bounded graceful
+    // shutdown of its own (see `SHUTDOWN_GRACE`), so it normally exits well
+    // inside this window.
+    let poll = std::time::Duration::from_millis(500);
+    let term_grace = std::time::Duration::from_secs(5);
+    let mut exited = wait_for_pid_exit(pid_u32, term_grace, poll);
 
     if !exited {
-        eprintln!("Warning: process {pid_u32} did not exit within 5 seconds after SIGTERM.");
+        // The SIGTERM grace elapsed — escalate to SIGKILL so `stop` actually
+        // stops the daemon rather than reporting success and leaving an orphan
+        // (the Windows path force-kills here too). SIGKILL cannot be caught, so
+        // all that remains is to wait for the kernel to reap the process.
+        eprintln!(
+            "Warning: PID {pid_u32} did not exit within {}s of SIGTERM; sending SIGKILL.",
+            term_grace.as_secs()
+        );
+        match nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+            Err(e) => {
+                return Err(anyhow::anyhow!("failed to SIGKILL PID {pid_u32}: {e}"));
+            }
+        }
+        let kill_grace = std::time::Duration::from_secs(2);
+        exited = wait_for_pid_exit(pid_u32, kill_grace, poll);
+        if !exited {
+            eprintln!("Warning: PID {pid_u32} still present after SIGKILL.");
+        }
     }
 
     let _ = std::fs::remove_file(&ctx.pid_path);
 
-    // Unmount the mount point if it's still mounted.
+    // Clean up a stale mount only now the daemon is gone, so this never races
+    // the daemon's own unmount. A graceful exit has already unmounted; this
+    // covers the SIGKILL case, where it could not.
     let mount_path = resolve_mount_path_from_config(&ctx.config_dir);
     if mount_path.is_dir()
         && let Err(e) = unmount_path(&mount_path)
