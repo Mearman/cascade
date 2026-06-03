@@ -1,6 +1,7 @@
 pub mod schema;
 
 use crate::db::schema::SchemaVersion;
+use crate::manage::token::CapabilityToken;
 use crate::manage::{Capability, DeviceId, Grant, Scope};
 use crate::types::{CacheState, Cursor, FileEntry, ItemId};
 use anyhow::Result;
@@ -897,6 +898,127 @@ impl StateDb {
             outcome: row.get(7)?,
         })
     }
+
+    // ── Capability-token operations ──
+
+    /// Record an issued [`CapabilityToken`].
+    ///
+    /// The full signed token is stored as JSON so the owner can list and reprint
+    /// it; the indexed columns mirror the claims for querying. `issued_at` is the
+    /// wall clock at issuance. A token id is unique, so re-issuing the same id is
+    /// a hard error rather than a silent overwrite.
+    pub fn insert_token(&self, token: &CapabilityToken, issued_at: DateTime<Utc>) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let claims = &token.claims;
+        let (scope_kind, scope_path) = claims.scope.to_columns();
+        let token_json = serde_json::to_string(token)?;
+        conn.execute(
+            "INSERT INTO capability_tokens
+                 (token_id, issuer, bearer, capability, scope_kind, scope_path,
+                  expires, issued_at, token_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            (
+                &claims.token_id,
+                claims.issuer.as_str(),
+                claims.bearer.as_str(),
+                claims.capability.as_wire(),
+                scope_kind,
+                scope_path,
+                claims.expires.timestamp(),
+                issued_at.timestamp(),
+                &token_json,
+            ),
+        )?;
+        Ok(())
+    }
+
+    /// List every token this node has issued, in issuance order, validating the
+    /// stored JSON back into a typed [`CapabilityToken`].
+    pub fn list_tokens(&self) -> Result<Vec<TokenRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT token_id, issued_at, token_json
+             FROM capability_tokens ORDER BY issued_at ASC, token_id ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                let token_id: String = row.get(0)?;
+                let issued_at_ts: i64 = row.get(1)?;
+                let token_json: String = row.get(2)?;
+                Ok((token_id, issued_at_ts, token_json))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(token_id, issued_at_ts, token_json)| {
+                let issued_at = DateTime::from_timestamp(issued_at_ts, 0).ok_or_else(|| {
+                    anyhow::anyhow!("invalid issued_at timestamp for token {token_id}")
+                })?;
+                let token: CapabilityToken = serde_json::from_str(&token_json)
+                    .map_err(|e| anyhow::anyhow!("invalid stored token {token_id}: {e}"))?;
+                Ok(TokenRecord { issued_at, token })
+            })
+            .collect()
+    }
+
+    /// Add a token id to the append-only revocation list. Returns `true` if the
+    /// id was newly revoked, `false` if it was already on the list. `revoked_at`
+    /// is the wall clock at revocation.
+    pub fn revoke_token(&self, token_id: &str, revoked_at: DateTime<Utc>) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let rows = conn.execute(
+            "INSERT OR IGNORE INTO token_revocations (token_id, revoked_at)
+             VALUES (?1, ?2)",
+            (token_id, revoked_at.timestamp()),
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Whether `token_id` is on the revocation list. Consulted by the verify
+    /// path for every token in a presented chain.
+    pub fn is_token_revoked(&self, token_id: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM token_revocations WHERE token_id = ?1",
+            [token_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// The full set of revoked token ids, for building an in-memory predicate
+    /// that does not touch the database per token in a chain.
+    pub fn revoked_token_ids(&self) -> Result<std::collections::HashSet<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let mut stmt = conn.prepare("SELECT token_id FROM token_revocations")?;
+        let ids = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<std::collections::HashSet<_>, _>>()?;
+        Ok(ids)
+    }
+}
+
+/// An issued capability-token row read back from the database.
+#[derive(Debug, Clone)]
+pub struct TokenRecord {
+    /// When the token was issued.
+    pub issued_at: DateTime<Utc>,
+    /// The full signed token.
+    pub token: CapabilityToken,
 }
 
 /// Raw column values for a `grants` row, before validation.
@@ -1304,5 +1426,58 @@ mod tests {
         let listed = db.list_audit().unwrap();
         let commands: Vec<&str> = listed.iter().map(|r| r.entry.command.as_str()).collect();
         assert_eq!(commands, ["first", "second", "third"]);
+    }
+
+    // ── Capability-token store tests ──
+
+    fn sample_token() -> CapabilityToken {
+        CapabilityToken::issue(
+            "tok-store-1",
+            &DeviceId::new("NODE"),
+            &DeviceId::new("BEARER"),
+            Capability::PinWrite,
+            Scope::folder("/work"),
+            chrono::DateTime::from_timestamp(2_000_000_000, 0).unwrap(),
+        )
+    }
+
+    #[test]
+    fn token_insert_and_list_round_trip() {
+        let db = StateDb::open_in_memory().unwrap();
+        assert!(db.list_tokens().unwrap().is_empty());
+
+        let token = sample_token();
+        let issued_at = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        db.insert_token(&token, issued_at).unwrap();
+
+        let listed = db.list_tokens().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].token, token);
+        assert_eq!(listed[0].issued_at, issued_at);
+    }
+
+    #[test]
+    fn token_revocation_is_recorded_and_queryable() {
+        let db = StateDb::open_in_memory().unwrap();
+        let now = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        assert!(!db.is_token_revoked("tok-store-1").unwrap());
+
+        // First revocation is new; a second is a no-op.
+        assert!(db.revoke_token("tok-store-1", now).unwrap());
+        assert!(!db.revoke_token("tok-store-1", now).unwrap());
+
+        assert!(db.is_token_revoked("tok-store-1").unwrap());
+        assert!(db.revoked_token_ids().unwrap().contains("tok-store-1"));
+    }
+
+    #[test]
+    fn duplicate_token_id_is_rejected() {
+        let db = StateDb::open_in_memory().unwrap();
+        let token = sample_token();
+        let issued_at = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        db.insert_token(&token, issued_at).unwrap();
+        // Re-issuing the same token id must be a hard error, never a silent
+        // overwrite.
+        assert!(db.insert_token(&token, issued_at).is_err());
     }
 }

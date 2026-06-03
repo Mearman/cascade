@@ -9,7 +9,7 @@ impl SchemaVersion {
     /// Current schema version.
     #[must_use]
     pub const fn current() -> Self {
-        Self(2)
+        Self(3)
     }
 }
 
@@ -20,6 +20,9 @@ pub fn migrate(conn: &Connection, from: SchemaVersion, _to: SchemaVersion) -> Re
     }
     if from < SchemaVersion(2) {
         v2_manage_plane(conn)?;
+    }
+    if from < SchemaVersion(3) {
+        v3_capability_tokens(conn)?;
     }
 
     Ok(())
@@ -154,6 +157,45 @@ fn v2_manage_plane(conn: &Connection) -> Result<()> {
         );
 
         CREATE INDEX IF NOT EXISTS idx_manage_audit_ts ON manage_audit(timestamp);
+        ",
+    )?;
+
+    Ok(())
+}
+
+/// Schema v3 — signed capability tokens.
+///
+/// Two tables back the portable-grant model in [`crate::manage::token`].
+/// `capability_tokens` records every token this node issued, so the owner can
+/// list and reprint them; the full signed token is stored as JSON because a
+/// token is a self-contained credential the bearer carries offline.
+/// `token_revocations` is the append-only revocation list the verify path
+/// consults — a token id appearing here is a hard rejection at verify time.
+/// Neither table has a typed `DELETE` path: an issued token is a historical
+/// fact and a revocation is permanent, so a compromised manager cannot un-issue
+/// or un-revoke to cover its tracks. Issue and revoke events are additionally
+/// recorded in the existing `manage_audit` log.
+fn v3_capability_tokens(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS capability_tokens (
+            token_id      TEXT PRIMARY KEY,
+            issuer        TEXT NOT NULL,
+            bearer        TEXT NOT NULL,
+            capability    TEXT NOT NULL,
+            scope_kind    TEXT NOT NULL,
+            scope_path    TEXT,
+            expires       INTEGER NOT NULL,
+            issued_at     INTEGER NOT NULL,
+            token_json    TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_capability_tokens_bearer ON capability_tokens(bearer);
+
+        CREATE TABLE IF NOT EXISTS token_revocations (
+            token_id      TEXT PRIMARY KEY,
+            revoked_at    INTEGER NOT NULL
+        );
         ",
     )?;
 
