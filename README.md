@@ -115,7 +115,7 @@ cascade service stop       # stop the service
 cascade service uninstall  # deregister the service and remove its definition
 ```
 
-The scope is selected in this order: an explicit `--user` or `--system` flag, then inference from the session (an interactive GUI desktop session picks the user scope; a headless host picks the system scope), then — only when there is both a GUI desktop and a terminal — a prompt that defaults to the user scope. The chosen scope and the reason for it are always printed. The `--system` scope (machine-wide service) is scaffolded in the contract but its platform backends are not yet implemented; selecting it will error clearly. On macOS and Windows, a system-scoped service could not drive the native filesystem mount anyway, since that requires a user session.
+The scope is selected in this order: an explicit `--user` or `--system` flag, then inference from the session (an interactive GUI desktop session picks the user scope; a headless host picks the system scope), then — only when there is both a GUI desktop and a terminal — a prompt that defaults to the user scope. The chosen scope and the reason for it are always printed. The `--system` scope installs a machine-wide service: on Linux it writes a systemd system unit (requires root); on macOS and Windows it errors clearly — a system-scoped service in session 0 cannot drive File Provider, FSKit, ProjFS, or WebDAV, which all require a user session, and this is a documented platform limitation rather than a missing feature.
 
 If you installed via Homebrew, `brew services start cascade` works out of the box — the formula ships a `service` block that delegates to `cascade start`.
 
@@ -138,8 +138,7 @@ The design is documented in full at [`docs/design.md`](docs/design.md). This sec
 ```
 ┌──────────────────────────────────────────────────────────┐
 │  Platform Layer (per-OS)                                 │
-│  macOS:   FSKit (15.4+) · WebDAV · NFS                   │
-│  (File Provider planned — see roadmap)                   │
+│  macOS:   File Provider · FSKit (15.4+) · WebDAV · NFS   │
 │  Linux:   FUSE · NFS (root)                              │
 │  Windows: ProjFS · WebDAV via WebClient                  │
 │  Universal fallback: NFS server · WebDAV server          │
@@ -233,11 +232,11 @@ SQLite at `~/.config/cascade/state.db`. Tables: `files`, `backends`, `pin_rules`
 | v2 | Pinning + lifecycle + cache manager |
 | v3 | Write-back + multi-backend + nested mounts + conflict resolution |
 | v4 | Conditional rules (expressions + context providers) |
-| v5 | macOS File Provider presenter (Swift extension) |
+| v5 | macOS File Provider presenter (Swift extension), implemented |
 | v6 | Adopt existing directories (local backend, adopt-and-sync, adopt-in-place) |
 | v7 | P2P block sharing (LAN) |
 | v8 | Windows native ProjFS presenter, implemented (Linux FUSE delivered earlier) |
-| v9 | Full P2P (WAN discovery, NAT traversal) |
+| v9 | Full P2P (WAN discovery, NAT traversal), implemented |
 | v10 | Node management plane (capability grants, remote administration over BEP), implemented |
 | v11 | OS background service (`cascade service install|start|stop|status|uninstall`): per-user LaunchAgent on macOS, systemd `--user` unit on Linux, logon Scheduled Task on Windows, implemented |
 
