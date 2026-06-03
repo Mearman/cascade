@@ -21,6 +21,7 @@ A cross-platform cloud storage filesystem client built in Rust. Combines on-dema
 - [macOS File Provider extension](#macos-file-provider-extension)
 - [Google Drive backend](#google-drive-backend)
 - [Conflict resolution](#conflict-resolution)
+- [Background service](#background-service)
 - [Build and run](#build-and-run)
 - [Roadmap](#roadmap)
 
@@ -1308,6 +1309,14 @@ Commands:
   remote <device-id> cache evict  Run cache eviction on a remote node
   remote <device-id> cache warm <path>  Warm a path on a remote node
 
+  service install               Write the service definition and register it
+  service uninstall             Deregister the service and remove its definition
+  service start                 Start the registered service
+  service stop                  Stop the registered service
+  service status                Report whether the service is registered and running
+    --user                      Force the per-user scope (no elevation)
+    --system                    Force the machine-wide scope (not yet implemented)
+
 Global options:
   --config <path>               Config file path (default: ~/.config/cascade/config.toml)
   --verbose, -v                 Increase verbosity
@@ -1532,6 +1541,43 @@ Conflict copies are never deleted automatically — the user resolves them manua
 
 For P2P-only folders (no cloud authority), last-write-wins on a per-block basis, with conflict copies for simultaneous full-file edits.
 
+## Background service
+
+`cascade service` manages the daemon as an OS background service. Each platform uses the standard per-user mechanism — no administrator rights required.
+
+| Platform | Mechanism | Definition written to |
+|----------|-----------|----------------------|
+| macOS | launchd `LaunchAgent` | `~/Library/LaunchAgents/io.cascade.daemon.plist` |
+| Linux | systemd `--user` unit | `~/.config/systemd/user/io.cascade.daemon.service` |
+| Windows | logon Scheduled Task | registered under the current user via `schtasks` |
+
+### Architecture
+
+Each platform module is split into two halves:
+
+- **Pure generator** — a `generate` free function that turns a `ServiceSpec` into the platform's service-definition text (plist / unit / task XML). No OS calls, no `cfg(target_os)` gate — compiled and unit-tested on every host.
+- **Platform adapter** — the `ServiceManager` trait implementation that writes the generated file and drives the OS register command (`launchctl bootstrap gui/<uid>` / `systemctl --user` / `schtasks /Create /XML`). Only this half is `cfg(target_os)`-gated.
+
+### Scope selection
+
+The install scope is resolved in this order:
+
+1. An explicit `--user` or `--system` flag always wins.
+2. Otherwise the session is inspected: an interactive GUI desktop session (X11/Wayland on Linux, a non-SSH login on macOS, any logon on Windows) picks the user scope; a headless host (SSH, no display, system boot) picks the system scope.
+3. At the boundary where a person is at a real desktop terminal without a flag, the resolver shows a prompt that defaults to the user scope. A non-interactive invocation never blocks — it uses the deterministic inference.
+
+The chosen scope and the reason for the choice are always printed before any action is taken, so the operator is never surprised by a silent escalation.
+
+The `System` scope is part of the `ServiceScope` enum and the `ServiceManager` contract, but its platform adapters are deferred in this pass — every adapter rejects it with a clear error. On macOS and Windows the system scope would also be unable to drive the native filesystem mount, which requires a user session.
+
+### Homebrew integration
+
+The Homebrew formula ships a `service do` block so `brew services start cascade` works without any manual configuration: it delegates to `cascade start`, sets `keep_alive true`, and routes logs to `$(brew --prefix)/var/log/cascade.log`. This path is independent of `cascade service install`; both result in the daemon running as a launchd agent, but `brew services` manages the plist inside the Homebrew prefix while `cascade service install` writes to `~/Library/LaunchAgents`.
+
+### Graceful empty start
+
+The daemon exits cleanly with a log message and exit code 0 when no backends are configured. This means a freshly-installed service does not crash-loop before `cascade backend add` has been run.
+
 ## Build and run
 
 ### Prerequisites
@@ -1652,6 +1698,7 @@ Grants are kept as a local list with the connection's authenticated device ID as
 | v8 | Linux FUSE presenter + Windows native ProjFS presenter (implemented) | +4-6 weeks | +2,000 |
 | v9 | Full P2P (WAN discovery, NAT traversal), implemented — includes rendezvous-by-presence | +8-12 weeks | +4,000 |
 | v10 | Node management plane (capability grants, remote administration over BEP), implemented — includes signed capability tokens, delegation chains, and revocation | +6-10 weeks | +3,000 |
+| v11 | OS background service (`cascade service install|start|stop|status|uninstall`): per-user LaunchAgent on macOS, systemd `--user` unit on Linux, logon Scheduled Task on Windows, implemented | +1-2 weeks | +500 |
 
 ## Dependencies
 

@@ -103,6 +103,24 @@ cascade pin Documents/Accounts/
 cascade stop
 ```
 
+### Running as a background service
+
+`cascade service` manages the daemon as an OS background service. The default scope is per-user and requires no administrator rights: a launchd `LaunchAgent` on macOS, a systemd `--user` unit on Linux, and a logon Scheduled Task on Windows.
+
+```bash
+cascade service install    # write the service definition and register it
+cascade service start      # start the registered service
+cascade service status     # show whether the service is registered and running
+cascade service stop       # stop the service
+cascade service uninstall  # deregister the service and remove its definition
+```
+
+The scope is selected in this order: an explicit `--user` or `--system` flag, then inference from the session (an interactive GUI desktop session picks the user scope; a headless host picks the system scope), then — only when there is both a GUI desktop and a terminal — a prompt that defaults to the user scope. The chosen scope and the reason for it are always printed. The `--system` scope (machine-wide service) is scaffolded in the contract but its platform backends are not yet implemented; selecting it will error clearly. On macOS and Windows, a system-scoped service could not drive the native filesystem mount anyway, since that requires a user session.
+
+If you installed via Homebrew, `brew services start cascade` works out of the box — the formula ships a `service` block that delegates to `cascade start`.
+
+The daemon exits cleanly with a log message when no backends are configured, so a freshly-installed service does not crash-loop before `cascade backend add` has been run.
+
 ## Build, test, and lint
 
 ```bash
@@ -221,6 +239,7 @@ SQLite at `~/.config/cascade/state.db`. Tables: `files`, `backends`, `pin_rules`
 | v8 | Windows native ProjFS presenter, implemented (Linux FUSE delivered earlier) |
 | v9 | Full P2P (WAN discovery, NAT traversal) |
 | v10 | Node management plane (capability grants, remote administration over BEP), implemented |
+| v11 | OS background service (`cascade service install|start|stop|status|uninstall`): per-user LaunchAgent on macOS, systemd `--user` unit on Linux, logon Scheduled Task on Windows, implemented |
 
 Full timeline estimates, dependency list, and reference implementations in [`docs/design.md`](docs/design.md).
 
