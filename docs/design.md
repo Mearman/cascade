@@ -375,6 +375,8 @@ fn create_backend_by_name(name: &str, config: &toml::Value) -> Result<Box<dyn Ba
 | OneDrive | OAuth2 (device code + refresh) | Delta query | Supported | String IDs | Moderate |
 | Local | N/A | FSEvents / inotify / ReadDirectoryChanges | Supported | Path | N/A |
 
+**S3 upload path.** Objects up to 5 GiB are uploaded via a single `PutObject` request. Objects larger than 5 GiB use the S3 multipart upload API: the object is split into parts, each uploaded via `UploadPart`, then finalised with `CompleteMultipartUpload`. Part size is computed from the total object size — the smallest multiple of 5 MiB (the S3 minimum) that keeps the part count within S3's 10,000-part ceiling. No object size limit applies above `PutObject`'s 5 GiB threshold; the multipart path handles arbitrarily large objects up to the S3 service maximum.
+
 ## VFS tree
 
 The VFS composes multiple backends into a single tree. Backends are bound to path prefixes. Operations are routed by longest-prefix match.
@@ -554,10 +556,24 @@ deserialised straight from the export config:
 
 `minimal` is the default — on-demand reads, write-capable, minimal disk usage.
 Write support keys off the mode rather than a separate flag: an `off` export
-refuses every write procedure with `NFS3ERR_ROFS` / `NFS4ERR_ROFS`, while a
-write-capable export (`minimal` or `full`) reports `NFS3ERR_NOTSUPP` /
-`NFS4ERR_NOTSUPP` until the write path lands — distinguishing a deliberately
-read-only mount from one whose writes are merely unimplemented. The mode
+refuses every write procedure with `NFS3ERR_ROFS` / `NFS4ERR_ROFS`. A
+write-capable export (`minimal` or `full`) implements the full write procedure
+set for both NFSv3 and NFSv4:
+
+| Procedure | NFSv3 | NFSv4 op |
+|-----------|-------|----------|
+| Write data at offset | `WRITE` | `WRITE` |
+| Create a regular file | `CREATE` | `OPEN` with `CREATE` flag |
+| Create a directory | `MKDIR` | `CREATE` (type NF4DIR) |
+| Set file attributes (size, mtime) | `SETATTR` | `SETATTR` |
+| Remove a file | `REMOVE` | `REMOVE` |
+| Remove a directory | `RMDIR` | `REMOVE` |
+| Rename / move | `RENAME` | `RENAME` |
+| Flush pending writes | `COMMIT` | `COMMIT` |
+
+All write procedures route through the shared `write` helper module, which
+translates them into the same backend operations (`upload`, `update`,
+`create_dir`, `delete`, `rename`) as the WebDAV presenter uses. The mode
 threads from `NfsServerConfig` through dispatch into both the NFSv3 and NFSv4
 procedure handlers.
 
@@ -1071,6 +1087,14 @@ The announce server and the DHT are both blind, untrusted directories — neithe
 Verification derives the verifying key from the device ID being resolved — the envelope carries no public key — so a set signed by device A only verifies when resolved as A. The claimed ID must match the resolved ID, the signature must verify against the canonical bytes, and the expiry must be unexpired; any failure is a hard, logged rejection, never a panic and never a silent acceptance. `AnnounceDiscovery` and `DhtDiscovery` both verify on read through that shared path. The DHT stores the same envelope and re-signs the set after the byte-budget trim so the signature always covers exactly the stored bytes; the relay-server announce directory stores and serves the opaque blob verbatim and never inspects it.
 
 The guarantee is deliberately bounded. Because the verifying key is derivable from the public device ID (itself a hash of the TLS certificate exchanged on every handshake), so is the signing key — anyone who knows the ID can re-derive the keypair and mint a valid envelope. The construction therefore resists substitution, relabelling, single-ID tampering, and replay, but it is not forgery- or MITM-resistant against a party that already knows the ID. The authenticated TLS handshake (trusted fingerprints pinned at the rustls verifier) is the connect-time backstop: a forged candidate set at most points at the wrong address, and the handshake fails for any peer whose certificate does not match the pinned ID. Binding the signature to the TLS private key instead would break the ID-derivable-verifying-key property the rendezvous depends on, so the weaker guarantee is the documented limitation.
+
+#### Rendezvous-by-presence
+
+The lookup-style discovery sources (announce server, DHT) turn a device id into a candidate set that may have been published minutes earlier. Rendezvous-by-presence is a complementary *live-pairing* path for two peers that happen to be online at the same instant but have no prior relationship.
+
+Both peers register under the same rendezvous key with the broker (the relay server's session registry). The broker holds **no persistent state** — a registration is an in-memory slot, alive only while the registering peer holds its handle, and swept after a TTL if no counterpart arrives. When the second peer registers, the broker exchanges each side's `RendezvousOffer` — a candidate set plus a `SyncPunchAgreement` — and both sides immediately drive `run_hole_punch` to open a direct or hole-punched connection, without the broker carrying any further traffic.
+
+Activation requires both the `public` posture and a configured rendezvous endpoint. The broker itself is posture-agnostic; gating happens at the site that decides whether to register a presence at all, mirroring how other server-assisted discovery sources activate. Broker capacity is bounded by an absolute count (matching the relay session cap) to prevent a flood of half-open registrations exhausting memory.
 
 #### Deployment
 
@@ -1604,7 +1628,15 @@ The managed side enforces through a shared dispatch core (`manage::dispatch::run
 
 The CLI exists on both sides. On the managed node, `cascade grant add|list|revoke|audit` administers the capabilities this node confers and reads its audit log. On the manager, `cascade remote <device-id>` sends the full command set to a target addressed by device ID — `status`, `pin` / `unpin`, `cache evict` / `cache warm`, `config push`, `policy set`, `backend add` / `backend remove`, `restart` / `stop`, and `grant add` / `grant revoke`. The file-bearing variants (`config push`, `backend add`) read their body from disk and carry it as a literal TOML or `.cascade` document, never an interpolated path. The target is reached over the same `DiscoveryService` and [connectivity ladder](#nat-traversal) as any other connection, so management works across NAT through the existing rungs. "One or more nodes managing one or more others" is just a many-to-many grant relationship; each node owns its own grant list, so the model stays decentralised with no fleet registry.
 
-Grants are kept as a local list with the connection's authenticated device ID as the principal. This on-node grant list is the model in force. The one v10 follow-on not yet built is the signed capability-token model: issuing a token signed by the managed node's key would add offline issuance, portable bounded delegation, and revocation lists on top of the subset/no-escalation guard the grant list already enforces. Until that lands, authority is conferred only by a grant entry on the node it applies to.
+Grants are kept as a local list with the connection's authenticated device ID as the principal. This on-node grant list is the base authority model. On top of it sits the signed capability-token model:
+
+**Capability tokens** are portable, offline-issuable grants. A token is a JSON structure the issuing node signs with its real device-identity private key (the key behind its TLS certificate). It carries the issuer device id, the bearer device id, the capability, the scope, and an expiry — there is no never-expiring token. The bearer presents the token alongside a `cascade remote` command using `--token <file>`; the receiving node verifies the signature by re-deriving the verifying key from the issuer id (the id is the certificate hash, so the public key is recoverable from the id), checks that the bearer matches the authenticated connection, checks the expiry against its clock, checks the token id against its revocation list, and then feeds the token's grant through the same `authorises` path an on-node grant takes.
+
+**CLI.** `cascade token issue <bearer> --cap <capability> --scope <path|*> --expires <RFC 3339>` mints and signs a token, records it in the node's state database, and prints the JSON. `cascade token revoke <token-id>` adds the id to the append-only revocation list. `cascade token list` shows all tokens this node has issued with their status.
+
+**Bounded delegation.** A holder of `grant:admin` may mint a delegated token — a child token that carries its parent inline. `verify` walks the chain to a root issued by the verifying node and enforces subset-containment at every hop: the child's capability must equal the parent's, its scope must be covered by the parent's, and its expiry must not exceed the parent's. A chain can only narrow authority, never widen it. The maximum delegation depth is eight hops.
+
+**Revocation.** `cascade token revoke` writes to an append-only table (`token_revocations`) in the state database; every `verify` call checks every id in the presented chain against this list. Revoking a parent invalidates the whole chain below it.
 
 ## Roadmap
 
@@ -1618,8 +1650,8 @@ Grants are kept as a local list with the connection's authenticated device ID as
 | v6 | Adopt existing directories (local backend, adopt-and-sync, adopt-in-place) | +4-6 weeks | +2,000 |
 | v7 | P2P block sharing (LAN) | +10-14 weeks | +6,000 |
 | v8 | Linux FUSE presenter + Windows native ProjFS presenter (implemented) | +4-6 weeks | +2,000 |
-| v9 | Full P2P (WAN discovery, NAT traversal) | +8-12 weeks | +4,000 |
-| v10 | Node management plane (capability grants, remote administration over BEP) (implemented) | +6-10 weeks | +3,000 |
+| v9 | Full P2P (WAN discovery, NAT traversal), implemented — includes rendezvous-by-presence | +8-12 weeks | +4,000 |
+| v10 | Node management plane (capability grants, remote administration over BEP), implemented — includes signed capability tokens, delegation chains, and revocation | +6-10 weeks | +3,000 |
 
 ## Dependencies
 
@@ -1642,6 +1674,10 @@ Grants are kept as a local list with the connection's authenticated device ID as
 | `tracing` | Structured logging | v1 |
 | `clap` | CLI argument parsing | v1 |
 | `anyhow` + `thiserror` | Error handling | v1 |
+
+## Deployment
+
+The announce Worker and relay server that enable WAN peer discovery and NAT traversal across the internet are documented separately: [`docs/deployment.md`](deployment.md).
 
 ## Reference implementations
 
