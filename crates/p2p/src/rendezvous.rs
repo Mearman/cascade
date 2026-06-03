@@ -290,12 +290,16 @@ impl RendezvousBroker {
                     // send) and park it: the previously-parked peer is gone.
                     return Self::park_locked(&mut inner, key, returned, ttl, max_presences);
                 }
-                // `send` only ever returns the value we passed, which is
-                // always the `Paired` variant; the other arms are
-                // unreachable but enumerated to avoid a catch-all that could
-                // mask a future variant being mishandled.
+                // `oneshot::Sender::send` returns `Err(T)` carrying exactly
+                // the value it was called with, and we always send `Paired`.
+                // These variants therefore cannot appear here; a future
+                // refactor that sent a different variant would trip this
+                // loudly rather than silently returning a wrong outcome.
                 Err(RendezvousResolution::Expired | RendezvousResolution::BrokerShutdown) => {
-                    return RegisterOutcome::AtCapacity;
+                    unreachable!(
+                        "oneshot::Sender::send returns the value it was called with; \
+                         we always send Paired, so Expired and BrokerShutdown cannot appear here"
+                    )
                 }
             }
         }
@@ -525,6 +529,50 @@ mod tests {
             .await;
         assert!(matches!(paired, RegisterOutcome::Paired(_)));
         assert_eq!(broker.parked_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn ghost_slot_reparks_incoming_caller() {
+        // Peer A parks, then drops its handle (and with it the oneshot
+        // receiver) *without* calling `drop_presence`. The slot lingers in
+        // the map with a dead sender. When peer B arrives under the same
+        // key, the broker removes the ghost slot, the `Paired` send fails,
+        // and B's own offer must be re-parked rather than silently lost.
+        let broker = RendezvousBroker::new();
+
+        let parked = broker
+            .register("k", offer(1, 1), DEFAULT_PRESENCE_TTL, 8)
+            .await;
+        let RegisterOutcome::Parked(handle) = parked else {
+            panic!("expected A to park");
+        };
+        // Drop A's receiver without cancelling: the ghost slot persists.
+        drop(handle);
+        assert_eq!(broker.parked_count().await, 1);
+
+        let b_offer = offer(2, 2);
+        let outcome = broker
+            .register("k", b_offer.clone(), DEFAULT_PRESENCE_TTL, 8)
+            .await;
+
+        // B does not pair with the dead slot — it re-parks.
+        let RegisterOutcome::Parked(b_handle) = outcome else {
+            panic!("expected B to re-park, got {outcome:?}");
+        };
+        assert_eq!(broker.parked_count().await, 1);
+
+        // The lingering slot is now B's: a third peer pairs and receives
+        // B's offer, proving B's offer was preserved through the fallthrough.
+        let third = broker
+            .register("k", offer(3, 3), DEFAULT_PRESENCE_TTL, 8)
+            .await;
+        let RegisterOutcome::Paired(PairedPeer { offer: got_b }) = third else {
+            panic!("expected third peer to pair with re-parked B, got {third:?}");
+        };
+        assert_eq!(got_b, b_offer);
+
+        let got_third = b_handle.paired().await.expect("B pairs with third");
+        assert_eq!(got_third.offer, offer(3, 3));
     }
 
     #[tokio::test]
