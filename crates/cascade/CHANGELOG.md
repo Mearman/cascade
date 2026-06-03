@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.60](https://github.com/Mearman/cascade/compare/cascade-v0.1.59...cascade-v0.1.60) - 2026-06-03
+
+### Added
+
+- *(cascade)* resolve the service install scope from flags, session, and a desktop prompt
+- *(cascade)* implement the Windows per-user scheduled-task service backend
+- *(cascade)* implement the Linux systemd --user service backend
+- *(cascade)* implement the macOS launchd service backend
+- *(cascade)* wire cascade service into the clap command tree
+- *(cascade)* scaffold the service module framework
+
+### Fixed
+
+- *(cascade)* satisfy Windows-gated clippy in the service backend
+- *(cascade)* make async-trait an unconditional dependency
+- *(cascade)* exit cleanly when no backends are configured
+
 ## [0.1.59](https://github.com/Mearman/cascade/compare/cascade-v0.1.58...cascade-v0.1.59) - 2026-06-03
 
 ### Other
