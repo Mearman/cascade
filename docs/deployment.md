@@ -148,3 +148,90 @@ Keep secrets out of shell history. Prefer reading from a file or a secrets manag
 - **Gossip** — peers exchange peer-book snapshots over established connections; runs without any server.
 - **NAT hole-punching** — coordinated by the two peers themselves over existing connections; no server needed beyond the relay for the initial rendezvous.
 - **Mainline DHT** — uses the public BitTorrent DHT bootstrap nodes; no operator deployment needed, just set `exposure = "public"`.
+
+---
+
+## Running the daemon on a NAS or UnRAID server
+
+The `ghcr.io/mearman/cascade` image packages the Cascade daemon for container
+deployment. It is a separate image from `ghcr.io/mearman/cascade-relay` and
+built for both `linux/amd64` and `linux/arm64`. Full operator documentation —
+environment variables, volume layout, the two operating modes, backend-specific
+setup — is in [`docs/docker.md`](docker.md). This section covers the
+relationship between the daemon image and the relay.
+
+### Pairing a NAS node with the relay
+
+A NAS behind NAT that wants WAN reachability needs the relay for the fallback
+path. The daemon and relay share a single 64-char hex HMAC secret (`openssl
+rand -hex 32`). On the relay side that secret is `CASCADE_RELAY_SHARED_SECRET`;
+on the daemon side it is `CASCADE_P2P_RELAY_SECRET`.
+
+The same relay that serves laptop-to-laptop NAT traversal can serve the NAS.
+No separate relay instance is needed.
+
+```sh
+# On the relay host (if not already running):
+docker run -d \
+  --name cascade-relay \
+  --restart unless-stopped \
+  -p 9999:9999 \
+  -p 9998:9998 \
+  -e CASCADE_RELAY_SHARED_SECRET="<shared-secret>" \
+  -e CASCADE_RELAY_LISTEN="0.0.0.0:9999" \
+  -e CASCADE_RELAY_METRICS="0.0.0.0:9998" \
+  ghcr.io/mearman/cascade-relay:latest
+
+# On the NAS (headless seed mode, P2P backend, public posture):
+docker run -d \
+  --name cascade \
+  --restart unless-stopped \
+  -v /mnt/user/appdata/cascade:/config \
+  -v /mnt/user/cascade-data:/data \
+  -e CASCADE_BACKEND_TYPE=p2p \
+  -e CASCADE_BACKEND_NAME=my-mesh \
+  -e CASCADE_P2P_POSTURE=public \
+  -e CASCADE_P2P_LISTEN=0.0.0.0:22000 \
+  -e CASCADE_P2P_RELAY_ENDPOINT=relay.example.com:9999 \
+  -e CASCADE_P2P_RELAY_SECRET="<shared-secret>" \
+  -p 22000:22000 \
+  ghcr.io/mearman/cascade:latest
+```
+
+With this setup the NAS node registers its current candidates with the
+announce directory, accepts BEP connections from peers that reach it directly,
+and falls back through the relay when hole-punching fails. Other devices in the
+mesh configure the same relay endpoint and secret in their own P2P backend
+TOML (see [Pointing cascade at the infrastructure](#pointing-cascade-at-the-infrastructure)
+above).
+
+For a single Compose file that runs both services together on one Docker
+network, see [`deploy/docker-compose.full.yml`](../deploy/docker-compose.full.yml).
+That template also demonstrates the seed-vs-mount choice (commented inline) so
+the operator can pick the mode that suits the NAS without editing anything
+beyond environment variables.
+
+### Seed vs mount on a NAS
+
+The default seed mode is the right choice for most NAS deployments: no
+elevated privileges, no kernel extension, no `/dev/fuse` on the host. The
+daemon keeps cloud folders and P2P block stores alive, and other hosts on the
+LAN browse the tree over WebDAV. If a directly mounted filesystem is needed
+(for example, to feed a media server that requires a local path), set
+`CASCADE_MOUNT=1` and follow the privilege requirements documented in
+[`docs/docker.md`](docker.md#browsable-mount-mode-cascade_mount1).
+
+### Cloud-backed node with P2P block sharing
+
+A NAS running a Google Drive or S3 backend can also participate in P2P block
+exchange by setting `CASCADE_P2P=1`. This enables the engine's optimisation
+layer — nearby peers that hold copies of the same files exchange blocks
+directly instead of each fetching from the cloud. The relay path is used when
+those peers are behind different NATs.
+
+`CASCADE_P2P_POSTURE` and `CASCADE_P2P_RELAY_*` drive both a `p2p`-type backend
+and the cloud-backed optimisation layer: set `CASCADE_P2P=1` with the posture
+and relay variables and the daemon threads them into the engine's P2P layer, so
+no hand-edited backend TOML is needed. The relay endpoint accepts a DNS hostname
+or a Docker service name (such as `relay:9999` on a shared compose network),
+resolved when the daemon starts.
