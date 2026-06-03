@@ -315,6 +315,121 @@ pub fn encode_post_op_attr(buf: &mut Vec<u8>, poa: &PostOpAttr) {
     }
 }
 
+/// Encode `post_op_fh3` — an optional file handle (RFC 1813 §2.6).
+///
+/// `Some` emits `handle_follows = true` and the handle; `None` emits
+/// `handle_follows = false` only.
+pub fn encode_post_op_fh3(buf: &mut Vec<u8>, fh: Option<&NfsFh3>) {
+    match fh {
+        Some(handle) => {
+            encode_bool(buf, true);
+            encode_fh(buf, handle);
+        }
+        None => encode_bool(buf, false),
+    }
+}
+
+/// Encode `wcc_data` (RFC 1813 §2.6) — the weak cache-consistency data
+/// returned by every modifying operation.
+///
+/// The `before` attributes are emitted as an absent `pre_op_attr` (Cascade does
+/// not snapshot pre-operation state), and `after` as the supplied
+/// `post_op_attr`.
+pub fn encode_wcc_data(buf: &mut Vec<u8>, after: &PostOpAttr) {
+    // pre_op_attr: attributes_follow = false.
+    encode_bool(buf, false);
+    // post_op_attr.
+    encode_post_op_attr(buf, after);
+}
+
+// ── WRITE stable-storage levels (RFC 1813 §3.3.7) ──
+
+/// Data may be buffered; the server need not commit it before replying.
+pub const NFS3_UNSTABLE: u32 = 0;
+/// Data and metadata committed to stable storage before reply.
+pub const NFS3_FILE_SYNC: u32 = 2;
+
+// ── CREATE modes (createmode3, RFC 1813 §3.3.8) ──
+
+/// Create without checking for an existing file.
+pub const NFS3_CREATE_UNCHECKED: u32 = 0;
+/// Fail if the file already exists.
+pub const NFS3_CREATE_GUARDED: u32 = 1;
+/// Exclusive create using a client verifier.
+pub const NFS3_CREATE_EXCLUSIVE: u32 = 2;
+
+/// Mutable file attributes requested by SETATTR / CREATE (sattr3, RFC 1813
+/// §2.6). Only the fields the client chose to set are `Some`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Sattr3 {
+    pub mode: Option<u32>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub size: Option<u64>,
+}
+
+/// Decode an optional `set_*3` field: a discriminant bool followed by the value
+/// when set.
+fn decode_set_u32(data: &[u8]) -> io::Result<(Option<u32>, &[u8])> {
+    let (is_set, rest) = decode_bool(data)?;
+    if is_set {
+        let (value, rest) = decode_u32(rest)?;
+        Ok((Some(value), rest))
+    } else {
+        Ok((None, rest))
+    }
+}
+
+/// Decode an optional `set_size3` field.
+fn decode_set_u64(data: &[u8]) -> io::Result<(Option<u64>, &[u8])> {
+    let (is_set, rest) = decode_bool(data)?;
+    if is_set {
+        let (value, rest) = decode_u64(rest)?;
+        Ok((Some(value), rest))
+    } else {
+        Ok((None, rest))
+    }
+}
+
+/// Decode a `set_atime` / `set_mtime` field: a `time_how` discriminant, plus an
+/// `nfstime3` (8 bytes) only when the client supplies its own time (value `2`,
+/// `SET_TO_CLIENT_TIME`). The decoded time is discarded — Cascade does not let
+/// clients set timestamps — but the bytes must be consumed to stay framed.
+fn decode_set_time(data: &[u8]) -> io::Result<&[u8]> {
+    const SET_TO_CLIENT_TIME: u32 = 2;
+    let (how, rest) = decode_u32(data)?;
+    if how == SET_TO_CLIENT_TIME {
+        let (_secs, rest) = decode_u32(rest)?;
+        let (_nsecs, rest) = decode_u32(rest)?;
+        Ok(rest)
+    } else {
+        Ok(rest)
+    }
+}
+
+/// Decode `sattr3` (RFC 1813 §2.6).
+///
+/// # Errors
+///
+/// Returns an error if the buffer is truncated.
+pub fn decode_sattr3(data: &[u8]) -> io::Result<(Sattr3, &[u8])> {
+    let (mode, rest) = decode_set_u32(data)?;
+    let (uid, rest) = decode_set_u32(rest)?;
+    let (gid, rest) = decode_set_u32(rest)?;
+    let (size, rest) = decode_set_u64(rest)?;
+    let rest = decode_set_time(rest)?; // atime
+    let rest = decode_set_time(rest)?; // mtime
+    Ok((
+        Sattr3 {
+            mode,
+            uid,
+            gid,
+            size,
+        },
+        rest,
+    ))
+}
+
 // ── XDR decoding ──
 
 /// Decode a uint32 from XDR data.

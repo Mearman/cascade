@@ -130,6 +130,11 @@ pub const NF4REG_CREATE: u32 = 0; // UNCHECKED4
 pub const NF4REG_GUARDED: u32 = 1; // GUARDED4
 pub const NF4REG_EXCLUSIVE: u32 = 2; // EXCLUSIVE4
 
+// ── WRITE stable_how4 (RFC 7530 §16.36) ──
+
+/// Data and metadata committed to stable storage before the WRITE reply.
+pub const FILE_SYNC4: u32 = 2;
+
 // ── `NFSv4` RPC constants ──
 
 /// `NFSv4` program number (same as v3).
@@ -512,15 +517,21 @@ pub fn decode_attr_bitmap(data: &[u8]) -> io::Result<(Vec<u32>, &[u8])> {
 /// Build a set of default attributes for a path.
 #[must_use]
 pub fn make_fattr4(path: &str, is_dir: bool) -> Fattr4 {
+    make_fattr4_with_size(path, is_dir, 0)
+}
+
+/// Build `fattr4` for a path with a known content size.
+#[must_use]
+pub fn make_fattr4_with_size(path: &str, is_dir: bool, size: u64) -> Fattr4 {
     Fattr4 {
         ftype: if is_dir { NF4DIR } else { NF4REG },
-        size: 0,
+        size,
         fileid: id_hash(path),
         mode: if is_dir { 0o755 } else { 0o644 },
         numlinks: if is_dir { 2 } else { 1 },
         owner: "nobody".to_string(),
         owner_group: "nogroup".to_string(),
-        space_used: 0,
+        space_used: size,
         time_access: NfsTime4::epoch(),
         time_modify: NfsTime4::epoch(),
         time_create: NfsTime4::epoch(),
