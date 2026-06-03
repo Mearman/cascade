@@ -2,9 +2,7 @@
 
 ## Status
 
-**partial** — the Xcode project builds clean on the canonical host and produces both a `.app` and an embedded `.appex`. The Rust ↔ Swift bridge protocol matches between sides at the JSON-method level but has not been exercised end-to-end; loading the extension into a real Finder session and watching it round-trip a directory listing is still a follow-up. The bridge today supports lookup, enumeration, fetch, import, create-directory, delete, and move; the replicated File Provider API also wants a sync-anchor enumeration cursor and an attribute round-trip, neither of which the Rust side has yet.
-
-The roadmap in the top-level `README.md` (aliased as `CLAUDE.md` and `AGENTS.md`) lists "macOS File Provider presenter (Swift extension)" at v5. With the rewrite in place the Swift target is no longer broken-as-found; it is a buildable scaffold that needs the remaining bridge methods and a real signing identity before it can be shipped.
+**wired** — the Xcode project builds clean and produces both a `.app` and an embedded `.appex`. The inbound RPC handlers on the Rust side are wired: the engine dispatches `getItem`, `enumerateItems`, `fetchContents`, `importDocument`, `createDirectory`, `deleteItem`, and `moveItem` to its VFS and `StateDb` handlers, and `currentSyncCursor` / `enumerateChanges` are connected so the replicated File Provider enumeration protocol carries live cursors. What remains before a production-signed release is a real signing identity, an App Group provisioning profile, and a distribution mechanism for the host app.
 
 ## Build environment
 
@@ -134,16 +132,13 @@ The Swift `ActionHandler` issues these RPCs to the engine:
 - `deleteItem({ id })`
 - `moveItem({ id, new_parent_id, new_name })`
 
-Both sets coexist on the same socket; the engine routes incoming requests to its handler and outgoing notifications to the Swift extension. The Rust crate exposes outbound notifiers but does not yet host the inbound RPC handlers — that integration is the next concrete step.
+Both sets coexist on the same socket; the engine routes incoming requests to its handler and outgoing notifications to the Swift extension. The Rust crate hosts both the outbound notifiers and the inbound RPC handlers; the VFS and `StateDb` dispatch paths are wired for all methods listed above.
 
 ## Follow-ups
 
-- Wire the inbound RPC handlers on the Rust side so the Swift extension's `getItem`, `enumerateItems`, `importDocument`, `createDirectory`, `deleteItem`, and `moveItem` calls actually reach the engine. The Swift TODO comments name each gap (`Sources/ActionHandler.swift`, `Sources/CascadeFileProvider.swift`, `Sources/FileProviderEnumerator.swift`).
-- Add a real sync anchor cursor to the bridge so `FileProviderEnumerator.enumerateChanges` can return deltas instead of always reporting "no changes since". The replicated API will fall back to full enumeration without it, so this is an optimisation rather than a correctness issue.
 - Add a `setAttributes` RPC for capability and metadata round-trips; `ActionHandler.modifyItem` currently re-reads the item rather than persisting attribute-only changes.
 - Replace ad-hoc signing with a real signing identity once the project has a team and a provisioned App Group: flip `CODE_SIGN_STYLE` to `Automatic`, set `DEVELOPMENT_TEAM`, set `CODE_SIGNING_REQUIRED = YES`, and uncomment the `com.apple.security.application-groups` block in both `*.entitlements` files. The four bundle identifiers must match what the team has registered.
 - Decide a distribution mechanism for the host app (Sparkle, App Store, signed `.zip`, embedded in the daemon installer). The host is only useful to register the domain; once registered, it can be quit.
-- Smoke-test by running the host app, clicking "Register File Provider", and observing the Cascade domain appear under Locations in Finder. Listing a directory should round-trip through the engine over the bridge.
 
 ## Sources
 

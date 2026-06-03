@@ -31,10 +31,10 @@ A cross-platform cloud storage filesystem client built in Rust. Combines on-dema
 ┌──────────────────────────────────────────────────────────┐
 │  Platform Layer (per-OS)                                 │
 │                                                          │
-│  macOS: File Provider extension (Swift)                  │
-│  Linux: FUSE (fuser)                                     │
-│  Windows: native ProjFS                                  │
-│  Fallback: NFS server (all platforms)                    │
+│  macOS: File Provider (Swift) · FSKit (15.4+) · WebDAV · NFS │
+│  Linux: FUSE · NFS (root)                                │
+│  Windows: ProjFS · WebDAV via WebClient                  │
+│  Universal fallback: NFS server · WebDAV server          │
 └────────────────────┬─────────────────────────────────────┘
                      │ VfsPresenter trait
 ┌────────────────────▼─────────────────────────────────────┐
@@ -1315,7 +1315,7 @@ Commands:
   service stop                  Stop the registered service
   service status                Report whether the service is registered and running
     --user                      Force the per-user scope (no elevation)
-    --system                    Force the machine-wide scope (not yet implemented)
+    --system                    Force the machine-wide scope (Linux: systemd system unit, requires root; macOS/Windows: unsupported — native mounts require a user session)
 
 Global options:
   --config <path>               Config file path (default: ~/.config/cascade/config.toml)
@@ -1568,7 +1568,7 @@ The install scope is resolved in this order:
 
 The chosen scope and the reason for the choice are always printed before any action is taken, so the operator is never surprised by a silent escalation.
 
-The `System` scope is part of the `ServiceScope` enum and the `ServiceManager` contract, but its platform adapters are deferred in this pass — every adapter rejects it with a clear error. On macOS and Windows the system scope would also be unable to drive the native filesystem mount, which requires a user session.
+The `System` scope is part of the `ServiceScope` enum and the `ServiceManager` contract. On Linux, `--system` writes a systemd system unit to `/etc/systemd/system/` and manages it with `systemctl` (without `--user`), which requires root. On macOS and Windows the `System` scope errors clearly: File Provider, FSKit, ProjFS, and WebDAV all require a user session, so a session-0 system service cannot drive the native filesystem mount. This is a documented platform limitation, not a missing feature.
 
 ### Homebrew integration
 
@@ -1692,7 +1692,7 @@ Grants are kept as a local list with the connection's authenticated device ID as
 | v2 | Pinning + lifecycle + cache manager | +8-12 weeks | +5,000 |
 | v3 | Write-back + multi-backend + nested mounts + conflict resolution | +6-8 weeks | +3,000 |
 | v4 | Conditional rules (expressions + context providers) | +7-10 weeks | +3,700 |
-| v5 | macOS File Provider presenter (Swift extension) | +4-6 weeks | +1,500 |
+| v5 | macOS File Provider presenter (Swift extension), implemented | +4-6 weeks | +1,500 |
 | v6 | Adopt existing directories (local backend, adopt-and-sync, adopt-in-place) | +4-6 weeks | +2,000 |
 | v7 | P2P block sharing (LAN) | +10-14 weeks | +6,000 |
 | v8 | Linux FUSE presenter + Windows native ProjFS presenter (implemented) | +4-6 weeks | +2,000 |
