@@ -85,7 +85,7 @@ ed25519-dalek = "3.0.0-rc.0"
 data-encoding = "2"
 
 # OS process management (Unix-only)
-nix = { version = "0.30", features = ["signal", "process"] }
+nix = { version = "0.31", features = ["signal", "process"] }
 
 # Platform config / cache paths
 dirs = "6"
