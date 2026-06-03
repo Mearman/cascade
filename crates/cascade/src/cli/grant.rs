@@ -80,7 +80,7 @@ fn parse_expiry(raw: Option<&str>) -> Result<Option<DateTime<Utc>>> {
 /// configured P2P backend's identity (the device-wide identity the data plane
 /// also uses); without a configured P2P backend a node has no device identity
 /// to stamp, so the command fails loudly rather than inventing a placeholder.
-fn resolve_owner_device(ctx: &CliContext) -> Result<DeviceId> {
+pub(super) fn resolve_owner_device(ctx: &CliContext) -> Result<DeviceId> {
     let main_config_path = ctx.config_dir.join("config.toml");
     let main_config: CascadeConfig = if main_config_path.exists() {
         let raw = std::fs::read_to_string(&main_config_path)

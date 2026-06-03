@@ -405,16 +405,32 @@ fn open_p2p_backend(ctx: &CliContext) -> Result<P2pBackend> {
 /// authorisation denial is reported as such and the process exits with a
 /// non-zero status via the returned `Err`, distinguishing "the node refused
 /// you" from "the command ran and failed".
-pub async fn run(ctx: &CliContext, device_id: &str, command: RemoteCommand) -> Result<()> {
+pub async fn run(
+    ctx: &CliContext,
+    device_id: &str,
+    command: RemoteCommand,
+    token: Option<String>,
+) -> Result<()> {
     if device_id.trim().is_empty() {
         anyhow::bail!("remote requires a non-empty device id");
     }
     let backend = open_p2p_backend(ctx)?;
     let result = backend
-        .manage_remote(device_id, command.to_wire(), command.wire_scope())
+        .manage_remote(device_id, command.to_wire(), command.wire_scope(), token)
         .await
         .with_context(|| format!("administering remote node {device_id}"))?;
     render(device_id, &result)
+}
+
+/// Read a capability token's JSON from `path`, validating it parses as a token
+/// before it travels — a malformed token file fails loudly here rather than
+/// earning an opaque rejection from the remote node.
+pub fn read_token_file(path: &std::path::Path) -> Result<String> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading capability token file {}", path.display()))?;
+    let _: cascade_engine::manage::token::CapabilityToken = serde_json::from_str(&raw)
+        .with_context(|| format!("parsing capability token file {}", path.display()))?;
+    Ok(raw)
 }
 
 /// Render a [`ManageResult`] to stdout, returning an `Err` for any non-`Ok`

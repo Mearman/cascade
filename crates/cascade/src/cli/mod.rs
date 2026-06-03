@@ -12,6 +12,7 @@ pub mod mount;
 pub mod projfs_provider;
 pub mod remote;
 pub mod status;
+pub mod token;
 
 use std::path::PathBuf;
 
@@ -314,9 +315,74 @@ pub enum Commands {
         /// Device ID of the node to administer
         device_id: String,
 
+        /// Path to a signed capability token (JSON) to present, authorising the
+        /// command without a live grant row on the node. Issue one with
+        /// `cascade token issue`.
+        #[arg(long, global = true)]
+        token: Option<PathBuf>,
+
         #[command(subcommand)]
         command: RemoteCommands,
     },
+
+    /// Issue, revoke, and list signed capability tokens this node confers
+    Token {
+        #[command(subcommand)]
+        command: TokenCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum TokenCommands {
+    /// Mint a token for a bearer device and print its JSON
+    Issue {
+        /// Device ID of the bearer the token authorises
+        bearer: String,
+
+        /// Capability conferred (e.g. status:read, pin:write)
+        #[arg(long)]
+        cap: String,
+
+        /// Scope: a path prefix, or `*` for node-wide
+        #[arg(long)]
+        scope: String,
+
+        /// RFC 3339 expiry timestamp (a token always expires)
+        #[arg(long)]
+        expires: String,
+    },
+
+    /// Revoke a token by its id
+    Revoke {
+        /// Token ID (as printed by `token issue` / `token list`)
+        token_id: String,
+    },
+
+    /// List every token this node has issued
+    List,
+}
+
+impl TokenCommands {
+    /// Map the parsed clap subcommand to the [`token::TokenCommand`] the handler
+    /// runs.
+    #[must_use]
+    pub fn into_token_command(self) -> token::TokenCommand {
+        match self {
+            Self::Issue {
+                bearer,
+                cap,
+                scope,
+                expires,
+            } => token::TokenCommand::Issue {
+                bearer,
+                capability: cap,
+                scope,
+                expires,
+            },
+            Self::Revoke { token_id } => token::TokenCommand::Revoke { token_id },
+            Self::List => token::TokenCommand::List,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -742,10 +808,16 @@ impl Cli {
                 GrantCommands::Revoke { grant_id } => grant::revoke(ctx, grant_id),
                 GrantCommands::Audit => grant::audit(ctx),
             },
-            Commands::Remote { device_id, command } => {
+            Commands::Remote {
+                device_id,
+                token,
+                command,
+            } => {
                 let remote_command = command.into_remote_command()?;
-                remote::run(ctx, &device_id, remote_command).await
+                let token_json = token.as_deref().map(remote::read_token_file).transpose()?;
+                remote::run(ctx, &device_id, remote_command, token_json).await
             }
+            Commands::Token { command } => token::run(ctx, command.into_token_command()),
         }
     }
 }
@@ -764,9 +836,9 @@ mod tests {
     fn parse_remote(args: &[&str]) -> (String, remote::RemoteCommand) {
         let cli = Cli::try_parse_from(args).expect("arguments should parse");
         match cli.command {
-            Commands::Remote { device_id, command } => {
-                (device_id, command.into_remote_command().unwrap())
-            }
+            Commands::Remote {
+                device_id, command, ..
+            } => (device_id, command.into_remote_command().unwrap()),
             _ => panic!("expected a remote subcommand"),
         }
     }
@@ -1191,6 +1263,7 @@ mod tests {
             grants: Vec<Grant>,
             audit: Mutex<Vec<AuditEntry>>,
             calls: Mutex<Vec<String>>,
+            node_device_id: DeviceId,
         }
 
         impl TestNode {
@@ -1199,6 +1272,7 @@ mod tests {
                     grants,
                     audit: Mutex::new(Vec::new()),
                     calls: Mutex::new(Vec::new()),
+                    node_device_id: DeviceId::new("CLI-TEST-NODE"),
                 }
             }
 
@@ -1235,6 +1309,16 @@ mod tests {
                     .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?
                     .push(entry.clone());
                 Ok(())
+            }
+
+            fn manage_node_device_id(&self) -> anyhow::Result<DeviceId> {
+                Ok(self.node_device_id.clone())
+            }
+
+            fn manage_revoked_token_ids(
+                &self,
+            ) -> anyhow::Result<std::collections::HashSet<String>> {
+                Ok(std::collections::HashSet::new())
             }
         }
 
@@ -1340,9 +1424,10 @@ mod tests {
                 caller: &DeviceId,
                 command: ManageCommand,
                 scope: ManageScope,
+                token: Option<String>,
                 now: DateTime<Utc>,
             ) -> ManageResult {
-                run_dispatch(self, self, caller, command, scope, now).await
+                run_dispatch(self, self, caller, command, scope, token, now).await
             }
         }
 
@@ -1448,6 +1533,7 @@ mod tests {
                     &target_id,
                     remote_command.to_wire(),
                     remote_command.wire_scope(),
+                    None,
                 )
                 .await
                 .expect("policy set round-trip should not fail at the transport");
@@ -1478,7 +1564,7 @@ mod tests {
             };
             let outside = command.into_remote_command().unwrap();
             let denied = manager
-                .send_manage_request(&target_id, outside.to_wire(), outside.wire_scope())
+                .send_manage_request(&target_id, outside.to_wire(), outside.wire_scope(), None)
                 .await
                 .expect("an unauthorised policy set still returns a typed reply");
             assert!(
