@@ -442,6 +442,7 @@ impl PeerHandle {
         &self,
         command: ManageCommand,
         scope: ManageScope,
+        token: Option<String>,
     ) -> Result<ManageResult> {
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
@@ -454,6 +455,7 @@ impl PeerHandle {
                 request_id,
                 command,
                 scope,
+                token,
             })
             .map_err(|_| anyhow::anyhow!("peer outbound channel closed"))?;
 
@@ -2342,6 +2344,7 @@ impl SyncEngine {
                 request_id,
                 command,
                 scope,
+                token,
             } => {
                 self.handle_manage_request(
                     peer_device_id,
@@ -2349,6 +2352,7 @@ impl SyncEngine {
                     request_id,
                     command,
                     scope,
+                    token,
                     outbound,
                 )
                 .await;
@@ -2410,6 +2414,7 @@ impl SyncEngine {
         request_id: u64,
         command: ManageCommand,
         scope: ManageScope,
+        token: Option<String>,
         outbound: &mpsc::UnboundedSender<BepMessage>,
     ) {
         let result = if caller_auth.permits_management() {
@@ -2421,7 +2426,7 @@ impl SyncEngine {
                 Some(dispatch) => {
                     let caller = DeviceId::new(peer_device_id.to_owned());
                     dispatch
-                        .dispatch(&caller, command, scope, chrono::Utc::now())
+                        .dispatch(&caller, command, scope, token, chrono::Utc::now())
                         .await
                 }
                 None => ManageResult::Err {
@@ -2985,6 +2990,7 @@ impl SyncEngine {
         device_id: &str,
         command: ManageCommand,
         scope: ManageScope,
+        token: Option<String>,
     ) -> Result<ManageResult> {
         // Clone the handle out under the lock so the request — which awaits a
         // reply for up to `MANAGE_REQUEST_TIMEOUT` — does not hold the peer map
@@ -3002,7 +3008,7 @@ impl SyncEngine {
         let Some(handle) = handle else {
             anyhow::bail!("no live session to device {device_id}");
         };
-        handle.send_manage(command, scope).await
+        handle.send_manage(command, scope, token).await
     }
 }
 
@@ -5149,6 +5155,7 @@ mod tests {
             caller: &DeviceId,
             _command: ManageCommand,
             _scope: ManageScope,
+            _token: Option<String>,
             _now: chrono::DateTime<chrono::Utc>,
         ) -> ManageResult {
             if let Ok(mut seen) = self.seen_caller.lock() {
@@ -5174,6 +5181,7 @@ mod tests {
                 7,
                 ManageCommand::StatusRead,
                 ManageScope::Node,
+                None,
                 &tx,
             )
             .await;
@@ -5209,6 +5217,7 @@ mod tests {
                 3,
                 ManageCommand::CacheEvict,
                 ManageScope::Node,
+                None,
                 &tx,
             )
             .await;
@@ -5252,6 +5261,7 @@ mod tests {
                 11,
                 ManageCommand::CacheEvict,
                 ManageScope::Node,
+                None,
                 &tx,
             )
             .await;

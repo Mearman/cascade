@@ -833,6 +833,7 @@ impl P2pBackend {
         device_id: &str,
         command: ManageCommand,
         scope: ManageScope,
+        token: Option<String>,
     ) -> Result<ManageResult> {
         // Reuse an existing session only when it is TLS-verified — the data
         // plane may already hold a connection to this device, but a relayed or
@@ -870,7 +871,7 @@ impl P2pBackend {
         }
 
         self.sync
-            .send_manage_request(device_id, command, scope)
+            .send_manage_request(device_id, command, scope, token)
             .await
     }
 
