@@ -1250,7 +1250,30 @@ CREATE TABLE p2p_block_index (
 );
 
 CREATE INDEX idx_block_hash ON p2p_block_index(block_hash);
+
+-- Receive-only conflict quarantine. A write-denied peer's proposed file rows
+-- (a peer we will not accept writes from under a directional data:read-only or
+-- no-share posture) are kept here as flagged local additions rather than merged
+-- into the authoritative index or silently discarded. Surfaced to the operator
+-- as "N rejected local additions from <peer>"; a newer proposal for a path
+-- replaces the older one, keeping the table bounded.
+CREATE TABLE data_receive_quarantine (
+    folder_id     TEXT NOT NULL,
+    peer_device   TEXT NOT NULL,
+    path          TEXT NOT NULL,
+    file_json     TEXT NOT NULL,            -- serialised proposed FileInfo
+    observed_at   INTEGER NOT NULL,         -- Unix seconds when observed
+    PRIMARY KEY (folder_id, peer_device, path)
+);
 ```
+
+The two data-plane capabilities `data:read` and `data:write` are ordinary
+folder-scoped (never dangerous) capabilities in the same `grants` table and the
+same signed/delegatable/revocable token machinery as the management-plane verbs;
+they gate the BEP sync serve and accept directions per (peer, folder). See
+[`docs/directional-data-sharing.md`](directional-data-sharing.md) for the
+default-open ACL decision, the enforcement points in the sync path, and the
+receive-only / write-only conflict semantics.
 
 ## CLI interface
 
@@ -1650,6 +1673,10 @@ The principal is the existing [device identity](#device-identity) (the TLS-certi
 | `backend:manage` | add / remove backends (dangerous) |
 | `lifecycle:control` | start / stop / restart the daemon (dangerous) |
 | `grant:admin` | delegate a subset of held grants (dangerous) |
+| `data:read` | serve our index and blocks to a peer for a folder (directional, not dangerous) |
+| `data:write` | accept and merge a peer's index and blocks for a folder (directional, not dangerous) |
+
+The two `data:*` capabilities are the data plane's directional sharing controls, carried by the same grant rows and token machinery as the management verbs but enforced in the BEP sync serve/accept path rather than the management command surface. Unlike the management verbs, they are evaluated *default-open*: a trusted peer with no data grant keeps full bidirectional sharing, and configuring a `data:read` or `data:write` grant only ever narrows that peer to one direction. The full model — the default-open ACL decision, the sync-path enforcement points, and the receive-only / write-only conflict semantics — is documented in [`docs/directional-data-sharing.md`](directional-data-sharing.md).
 
 `Scope` is either node-wide (`Scope::Node`, written `*`) or a folder subtree identified by a path prefix. Coverage matches on normalised path *components*, never raw substrings, so `/work` covers `/work/reports` but not `/workspace`, and a crafted `/work/../personal` target fails to normalise into the granted subtree rather than slipping through. A `Grant` is `{ grantee, capability, scope, granted_by, expires }`. The three dangerous capabilities (`backend:manage`, `lifecycle:control`, `grant:admin`) are never satisfied implicitly by a node-wide grant — including a folder scope that normalises to the root, which is node-wide in everything but name — so each must be granted explicitly for the exact folder it is exercised over. Grants are persisted in two `state.db` tables: `grants` (decomposed into `scope_kind` / `scope_path` columns) and an append-only `manage_audit` log of every command the node processed. The audit table has no `UPDATE` or `DELETE` path in the typed API, so a compromised manager cannot erase its tracks. Grants are optionally declared in the root device config (root-only merge, matching the existing device-config rule), so a fleet provisions declaratively rather than imperatively.
 

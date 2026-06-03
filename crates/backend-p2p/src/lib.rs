@@ -1343,6 +1343,16 @@ impl Backend for P2pBackend {
         // remote management".
         self.sync.set_manage_dispatch(dispatch).await;
     }
+
+    async fn set_data_authority(&self, authority: Arc<dyn cascade_engine::manage::DataAuthority>) {
+        // Hand the engine's data-plane authority to the sync engine. As with the
+        // management dispatcher, the session loops share the authority slot behind
+        // an `Arc<RwLock>`, so a sync frame arriving after this point is gated on
+        // the engine's directional data-access decision. Until this is wired the
+        // sync path is default-open — every trusted peer keeps full bidirectional
+        // access — matching the pre-feature behaviour.
+        self.sync.set_data_authority(authority).await;
+    }
 }
 
 /// Retry loop: try to keep an outbound BEP connection to `peer` up.

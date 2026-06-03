@@ -258,7 +258,7 @@ pub fn audit(ctx: &CliContext) -> Result<()> {
 
 /// Human-readable label for a scope: the wildcard token for a node-wide scope,
 /// the path for a folder scope.
-fn scope_label(scope: &Scope) -> String {
+pub fn scope_label(scope: &Scope) -> String {
     match scope {
         Scope::Node => SCOPE_WILDCARD.to_owned(),
         Scope::Folder { path } => path.clone(),

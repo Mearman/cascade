@@ -1010,6 +1010,138 @@ impl StateDb {
             .collect::<Result<std::collections::HashSet<_>, _>>()?;
         Ok(ids)
     }
+
+    // ── Data-plane grant helpers ──
+
+    /// List every grant whose capability is a data verb (`data:read` or
+    /// `data:write`). Used by the `DataAuthority` implementation to evaluate
+    /// per-peer, per-folder data-plane access.
+    ///
+    /// Returns the same [`GrantRecord`] type as [`Self::list_grants`] so callers
+    /// share the same validation and conversion path.
+    pub fn list_data_grants(&self) -> Result<Vec<GrantRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, grantee, capability, scope_kind, scope_path, granted_by, expires
+             FROM grants
+             WHERE capability IN ('data:read', 'data:write')
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt
+            .query_map([], Self::grant_record_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter().map(GrantRecord::try_from_raw).collect()
+    }
+
+    // ── Data-receive quarantine operations ──
+
+    /// Insert or replace a quarantine record. A newer proposal for the same
+    /// `(folder_id, peer_device, path)` primary key silently replaces the
+    /// older one, keeping the table bounded by the number of distinct paths
+    /// per peer per folder.
+    pub fn upsert_quarantine(&self, record: &QuarantineRecord) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO data_receive_quarantine
+                 (folder_id, peer_device, path, file_json, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            (
+                &record.folder_id,
+                &record.peer_device,
+                &record.path,
+                &record.file_json,
+                record.observed_at.timestamp(),
+            ),
+        )?;
+        Ok(())
+    }
+
+    /// List all quarantined rows for a given `(folder_id, peer_device)` pair,
+    /// ordered by path for deterministic iteration.
+    pub fn list_quarantine(
+        &self,
+        folder_id: &str,
+        peer_device: &str,
+    ) -> Result<Vec<QuarantineRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT folder_id, peer_device, path, file_json, observed_at
+             FROM data_receive_quarantine
+             WHERE folder_id = ?1 AND peer_device = ?2
+             ORDER BY path ASC",
+        )?;
+        let rows = stmt
+            .query_map([folder_id, peer_device], |row| {
+                let observed_ts: i64 = row.get(4)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    observed_ts,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        rows.into_iter()
+            .map(|(folder_id, peer_device, path, file_json, observed_ts)| {
+                let observed_at = DateTime::from_timestamp(observed_ts, 0).ok_or_else(|| {
+                    anyhow::anyhow!("invalid observed_at timestamp in quarantine row for {path}")
+                })?;
+                Ok(QuarantineRecord {
+                    folder_id,
+                    peer_device,
+                    path,
+                    file_json,
+                    observed_at,
+                })
+            })
+            .collect()
+    }
+
+    /// Count quarantined rows for a given `(folder_id, peer_device)` pair.
+    /// Useful for the operator-facing surface ("N rejected local additions
+    /// from `<peer>`") without loading all the rows.
+    pub fn quarantine_count(&self, folder_id: &str, peer_device: &str) -> Result<u64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM data_receive_quarantine
+             WHERE folder_id = ?1 AND peer_device = ?2",
+            [folder_id, peer_device],
+            |row| row.get(0),
+        )?;
+        u64::try_from(count).map_err(|e| anyhow::anyhow!("quarantine count overflow: {e}"))
+    }
+
+    /// Prune all quarantined rows for a given `(folder_id, peer_device)` pair.
+    /// Called by the operator to clear the quarantine after reviewing or
+    /// granting `data:write`, or to discard stale proposals.
+    ///
+    /// Returns the number of rows deleted.
+    pub fn prune_quarantine(&self, folder_id: &str, peer_device: &str) -> Result<u64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let rows = conn.execute(
+            "DELETE FROM data_receive_quarantine
+             WHERE folder_id = ?1 AND peer_device = ?2",
+            [folder_id, peer_device],
+        )?;
+        u64::try_from(rows).map_err(|e| anyhow::anyhow!("prune count overflow: {e}"))
+    }
 }
 
 /// An issued capability-token row read back from the database.
@@ -1191,6 +1323,23 @@ pub struct PeerRecord {
     pub addresses: Option<String>,
     pub last_seen: Option<DateTime<Utc>>,
     pub online: bool,
+}
+
+/// A quarantined receive row — a proposed file from a peer whose `data:write`
+/// grant was absent or expired for the folder at the time the index frame was
+/// processed.
+#[derive(Debug, Clone)]
+pub struct QuarantineRecord {
+    /// The folder this proposal belongs to.
+    pub folder_id: String,
+    /// The peer device that sent the proposal.
+    pub peer_device: String,
+    /// The path the file would occupy.
+    pub path: String,
+    /// The serialised `FileInfo` JSON as sent by the peer.
+    pub file_json: String,
+    /// Unix timestamp (seconds) when the proposal was observed.
+    pub observed_at: DateTime<Utc>,
 }
 
 #[cfg(test)]
@@ -1483,5 +1632,138 @@ mod tests {
         // Re-issuing the same token id must be a hard error, never a silent
         // overwrite.
         assert!(db.insert_token(&token, issued_at).is_err());
+    }
+
+    // ── Data-verb grant filter tests ──
+
+    #[test]
+    fn list_data_grants_returns_only_data_verbs() {
+        let db = StateDb::open_in_memory().unwrap();
+        // Insert a mix of data and non-data grants.
+        db.insert_grant(&Grant {
+            grantee: DeviceId::new("PEER"),
+            capability: Capability::DataRead,
+            scope: Scope::folder("/work"),
+            granted_by: DeviceId::new("OWNER"),
+            expires: None,
+        })
+        .unwrap();
+        db.insert_grant(&Grant {
+            grantee: DeviceId::new("PEER"),
+            capability: Capability::PinWrite,
+            scope: Scope::folder("/work"),
+            granted_by: DeviceId::new("OWNER"),
+            expires: None,
+        })
+        .unwrap();
+        db.insert_grant(&Grant {
+            grantee: DeviceId::new("PEER"),
+            capability: Capability::DataWrite,
+            scope: Scope::folder("/work"),
+            granted_by: DeviceId::new("OWNER"),
+            expires: None,
+        })
+        .unwrap();
+
+        let all = db.list_grants().unwrap();
+        assert_eq!(all.len(), 3, "three grants total");
+
+        let data = db.list_data_grants().unwrap();
+        assert_eq!(data.len(), 2, "two data-verb grants");
+        assert!(
+            data.iter().all(|r| r.grant.capability.is_data_verb()),
+            "every returned grant must be a data verb"
+        );
+    }
+
+    #[test]
+    fn list_data_grants_empty_when_no_data_grants() {
+        let db = StateDb::open_in_memory().unwrap();
+        db.insert_grant(&sample_grant()).unwrap();
+        assert!(
+            db.list_data_grants().unwrap().is_empty(),
+            "no data grants when only admin grants exist"
+        );
+    }
+
+    // ── Data-receive quarantine tests ──
+
+    fn quarantine_record(folder_id: &str, peer: &str, path: &str) -> QuarantineRecord {
+        QuarantineRecord {
+            folder_id: folder_id.to_owned(),
+            peer_device: peer.to_owned(),
+            path: path.to_owned(),
+            file_json: "{\"name\":\"test\"}".to_owned(),
+            observed_at: chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap(),
+        }
+    }
+
+    #[test]
+    fn quarantine_upsert_list_count_round_trip() {
+        let db = StateDb::open_in_memory().unwrap();
+        let rec = quarantine_record("folder1", "PEER", "/work/a.txt");
+        db.upsert_quarantine(&rec).unwrap();
+
+        let count = db.quarantine_count("folder1", "PEER").unwrap();
+        assert_eq!(count, 1);
+
+        let listed = db.list_quarantine("folder1", "PEER").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].path, "/work/a.txt");
+        assert_eq!(listed[0].file_json, "{\"name\":\"test\"}");
+    }
+
+    #[test]
+    fn quarantine_upsert_replaces_same_key() {
+        let db = StateDb::open_in_memory().unwrap();
+        let rec = quarantine_record("folder1", "PEER", "/work/a.txt");
+        db.upsert_quarantine(&rec).unwrap();
+        // A newer proposal for the same path replaces the older row.
+        let updated = QuarantineRecord {
+            file_json: "{\"name\":\"updated\"}".to_owned(),
+            ..rec
+        };
+        db.upsert_quarantine(&updated).unwrap();
+        let listed = db.list_quarantine("folder1", "PEER").unwrap();
+        assert_eq!(listed.len(), 1, "upsert must replace, not append");
+        assert_eq!(listed[0].file_json, "{\"name\":\"updated\"}");
+    }
+
+    #[test]
+    fn quarantine_prune_removes_all_rows_for_peer_folder() {
+        let db = StateDb::open_in_memory().unwrap();
+        db.upsert_quarantine(&quarantine_record("folder1", "PEER", "/work/a.txt"))
+            .unwrap();
+        db.upsert_quarantine(&quarantine_record("folder1", "PEER", "/work/b.txt"))
+            .unwrap();
+        // A row for a different peer must not be pruned.
+        db.upsert_quarantine(&quarantine_record("folder1", "OTHER", "/work/c.txt"))
+            .unwrap();
+
+        let pruned = db.prune_quarantine("folder1", "PEER").unwrap();
+        assert_eq!(pruned, 2);
+        assert_eq!(db.quarantine_count("folder1", "PEER").unwrap(), 0);
+        // The OTHER peer's row must still exist.
+        assert_eq!(db.quarantine_count("folder1", "OTHER").unwrap(), 1);
+    }
+
+    #[test]
+    fn quarantine_different_folders_are_isolated() {
+        let db = StateDb::open_in_memory().unwrap();
+        db.upsert_quarantine(&quarantine_record("folder1", "PEER", "/work/a.txt"))
+            .unwrap();
+        db.upsert_quarantine(&quarantine_record("folder2", "PEER", "/work/a.txt"))
+            .unwrap();
+
+        assert_eq!(db.quarantine_count("folder1", "PEER").unwrap(), 1);
+        assert_eq!(db.quarantine_count("folder2", "PEER").unwrap(), 1);
+
+        db.prune_quarantine("folder1", "PEER").unwrap();
+        assert_eq!(db.quarantine_count("folder1", "PEER").unwrap(), 0);
+        assert_eq!(
+            db.quarantine_count("folder2", "PEER").unwrap(),
+            1,
+            "pruning folder1 must not affect folder2"
+        );
     }
 }

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use crate::manage::ManageDispatch;
+use crate::manage::{DataAuthority, ManageDispatch};
 use crate::types::{Change, Cursor, FileEntry, FileId, Quota};
 
 /// A backend-level error category that presenters can map to specific
@@ -195,6 +195,24 @@ pub trait Backend: Send + Sync {
     /// session loops observe it.
     async fn set_manage_dispatch(&self, dispatch: Arc<dyn ManageDispatch>) {
         let _ = dispatch;
+    }
+
+    /// Inject the data-plane authority port the daemon's engine implements.
+    ///
+    /// A backend that runs its own peer-to-peer transport (the P2P backend)
+    /// gates serving its index and blocks to a peer, and accepting a peer's
+    /// index and blocks, on the engine's [`DataAuthority`] decision for that
+    /// (peer, folder) pair. The daemon calls this once, after constructing the
+    /// engine, before the backend begins serving sync frames.
+    ///
+    /// The default is a no-op: backends with no transport of their own never
+    /// serve sync frames, so they have nothing to gate. The P2P backend
+    /// overrides this and stores the port behind interior mutability so the
+    /// already-running session loops observe it. When the port is never wired,
+    /// the BEP path is default-open — every trusted peer keeps full
+    /// bidirectional access — preserving the pre-feature behaviour.
+    async fn set_data_authority(&self, authority: Arc<dyn DataAuthority>) {
+        let _ = authority;
     }
 }
 

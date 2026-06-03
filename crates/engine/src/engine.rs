@@ -26,9 +26,10 @@ use crate::backend::{Backend, BackendFactory};
 use crate::cache::manager::{CacheManager, CacheManagerConfig};
 use crate::changefeed::ChangeFeed;
 use crate::config::ConfigResolver;
-use crate::db::{AuditEntry, PinRuleRecord, StateDb};
+use crate::db::{AuditEntry, PinRuleRecord, QuarantineRecord, StateDb};
 use crate::manage::{
-    DeviceId, Grant, ManageCommandExecutor, ManageDispatch, ManageGrantStore, Scope, run_dispatch,
+    DataAccess, DataAuthority, DeviceId, Grant, ManageCommandExecutor, ManageDispatch,
+    ManageGrantStore, Scope, data_access, run_dispatch, verify_data_token,
 };
 use crate::p2p_bridge::P2pBridge;
 use crate::presenter::VfsPresenter;
@@ -237,22 +238,25 @@ impl Engine {
         tree.unmount(prefix);
     }
 
-    /// Wire the management-plane dispatch port into every backend that serves
-    /// remote management.
+    /// Wire the management-plane dispatch port and the data-plane authority port
+    /// into every backend that serves a peer transport.
     ///
-    /// The engine is the production [`ManageDispatch`] implementation — it owns
-    /// the grant store, the audit log, and the command executor. A backend that
-    /// runs its own peer transport (the P2P backend) receives inbound
-    /// `ManageRequest` frames and needs this port to authorise, audit, and
-    /// execute them through the same core the local CLI drives. Backends with no
-    /// transport ignore the call (the trait default is a no-op).
+    /// The engine is the production [`ManageDispatch`] and [`DataAuthority`]
+    /// implementation — it owns the grant store, the audit log, the command
+    /// executor, and the data-grant ACL. A backend that runs its own peer
+    /// transport (the P2P backend) receives inbound `ManageRequest` frames
+    /// (authorised, audited, and executed through [`ManageDispatch`]) and gates
+    /// serving/accepting index and blocks on the [`DataAuthority`] decision.
+    /// Backends with no transport ignore both calls (the trait defaults are
+    /// no-ops).
     ///
     /// Called once at daemon startup, after the engine is constructed and before
     /// its presenter begins accepting connections. Takes `self: &Arc<Self>` so
-    /// the engine can hand a clone of itself, as an `Arc<dyn ManageDispatch>`, to
-    /// each backend.
+    /// the engine can hand a clone of itself, as an `Arc<dyn ManageDispatch>` and
+    /// an `Arc<dyn DataAuthority>`, to each backend.
     pub async fn wire_manage_dispatch(self: &Arc<Self>) {
         let dispatch: Arc<dyn ManageDispatch> = self.clone();
+        let authority: Arc<dyn DataAuthority> = self.clone();
         let backends: Vec<Arc<dyn Backend>> = {
             let tree = self
                 .vfs
@@ -266,6 +270,7 @@ impl Engine {
         };
         for backend in backends {
             backend.set_manage_dispatch(dispatch.clone()).await;
+            backend.set_data_authority(authority.clone()).await;
         }
     }
 
@@ -775,6 +780,66 @@ impl ManageDispatch for Engine {
         now: DateTime<Utc>,
     ) -> ManageResult {
         run_dispatch(self, self, caller, command, scope, token, now).await
+    }
+}
+
+/// The engine is the data-plane authority for the BEP sync path: it resolves a
+/// peer's directional read/write access to a folder from the on-node data
+/// grants, the token revocation list, and any signed data-verb token the peer
+/// presented on its sync `ClusterConfig`.
+///
+/// The decision is **default-open** (see [`data_access`]): a trusted peer with
+/// no data grant configured keeps full bidirectional access, and the feature
+/// only ever narrows. Both the grant rows and the revocation list are read on
+/// every call, so revoking or expiring a grant takes effect at the next frame
+/// rather than at restart.
+#[async_trait]
+impl DataAuthority for Engine {
+    async fn data_access(
+        &self,
+        peer: &DeviceId,
+        folder: &str,
+        presented_token: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<DataAccess> {
+        // On-node data grants. Read every call so a freshly added or revoked
+        // grant is honoured promptly. A grant row carries no token, so the
+        // revocation list does not touch these — only a presented token below.
+        let mut grants: Vec<Grant> = self
+            .db
+            .list_data_grants()?
+            .into_iter()
+            .map(|record| record.grant)
+            .collect();
+
+        // Fold in the peer's presented data-verb token, if it verifies against
+        // this node (signed by us or a chain rooting in us, unexpired, not
+        // revoked, bearer == this peer). A token that does not verify, or that
+        // carries a non-data verb, confers nothing — it can never widen access.
+        if let Some(token_json) = presented_token
+            && let Some(token_grant) = verify_data_token(self, peer, token_json, now)
+        {
+            grants.push(token_grant);
+        }
+
+        Ok(data_access(&grants, peer, folder, now))
+    }
+
+    async fn quarantine_received(
+        &self,
+        peer: &DeviceId,
+        folder: &str,
+        path: &str,
+        file_json: &str,
+        observed_at: DateTime<Utc>,
+    ) -> Result<()> {
+        self.db.upsert_quarantine(&QuarantineRecord {
+            folder_id: folder.to_string(),
+            peer_device: peer.as_str().to_string(),
+            path: path.to_string(),
+            file_json: file_json.to_string(),
+            observed_at,
+        })
     }
 }
 

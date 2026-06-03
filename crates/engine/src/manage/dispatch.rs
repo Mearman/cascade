@@ -394,6 +394,98 @@ where
     }
 }
 
+/// Verify a presented capability token for the **data plane** and project it to
+/// the data-verb [`Grant`] it confers, if any.
+///
+/// Unlike the management-plane token verification, this never returns an error:
+/// the BEP data path is default-open, so a token that does not parse, does not
+/// verify, or carries a non-data verb simply confers nothing and the decision
+/// falls back to the on-node data grants. The reason a token is unusable is
+/// logged (so an
+/// operator can diagnose a peer presenting a stale or wrong token), but it can
+/// never *widen* access, only narrow-or-grant a direction the bearer was issued.
+///
+/// A token carrying a data verb that verifies cleanly yields its
+/// [`to_grant`](crate::manage::TokenClaims::to_grant) projection, ready to be
+/// folded into the grant slice passed to [`data_access`](crate::manage::data_access).
+#[must_use]
+pub fn verify_data_token<S>(
+    store: &S,
+    peer: &DeviceId,
+    token_json: &str,
+    now: DateTime<Utc>,
+) -> Option<Grant>
+where
+    S: ManageGrantStore + ?Sized,
+{
+    if token_json.len() > MAX_TOKEN_JSON_BYTES {
+        tracing::debug!(
+            target: "cascade::manage::data",
+            len = token_json.len(),
+            max = MAX_TOKEN_JSON_BYTES,
+            "ignoring oversized data token presented on sync frame",
+        );
+        return None;
+    }
+
+    let token: CapabilityToken = match serde_json::from_str(token_json) {
+        Ok(token) => token,
+        Err(e) => {
+            tracing::debug!(
+                target: "cascade::manage::data",
+                error = %e,
+                "ignoring unparseable data token presented on sync frame",
+            );
+            return None;
+        }
+    };
+
+    let node_device_id = match store.manage_node_device_id() {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::debug!(
+                target: "cascade::manage::data",
+                error = %e,
+                "cannot resolve node device id to verify data token — ignoring token",
+            );
+            return None;
+        }
+    };
+
+    let revoked = match store.manage_revoked_token_ids() {
+        Ok(set) => set,
+        Err(e) => {
+            tracing::debug!(
+                target: "cascade::manage::data",
+                error = %e,
+                "cannot read token revocation list to verify data token — ignoring token",
+            );
+            return None;
+        }
+    };
+
+    let is_revoked = |id: &str| revoked.contains(id);
+    match token.verify(&node_device_id, peer, now, &is_revoked) {
+        Ok(claims) if claims.capability.is_data_verb() => Some(claims.to_grant()),
+        Ok(claims) => {
+            tracing::debug!(
+                target: "cascade::manage::data",
+                capability = claims.capability.as_wire(),
+                "data token carries a non-data verb — not folded into data-plane decision",
+            );
+            None
+        }
+        Err(e) => {
+            tracing::debug!(
+                target: "cascade::manage::data",
+                error = %e,
+                "data token presented on sync frame rejected — not folded into decision",
+            );
+            None
+        }
+    }
+}
+
 /// Run the authorise → audit → execute flow for one decoded command.
 ///
 /// This is the shared dispatch core, parameterised over the grant store and the
