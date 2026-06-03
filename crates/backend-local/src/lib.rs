@@ -509,7 +509,22 @@ impl Backend for LocalBackend {
         let abs = self.root.join(relative);
 
         if abs.is_dir() {
-            tokio::fs::remove_dir_all(&abs).await?;
+            // Non-recursive: `remove_dir` errors on a non-empty directory rather
+            // than recursively destroying its contents. A recursive delete here
+            // is silent data loss for callers (e.g. an NFS RMDIR), which must see
+            // a not-empty refusal — RFC 1813 §3.3.13 NFS3ERR_NOTEMPTY — not a
+            // wiped subtree. The not-empty case is tagged `Conflict` so presenters
+            // can map it to the protocol's not-empty status.
+            tokio::fs::remove_dir(&abs).await.map_err(|err| {
+                if err.kind() == std::io::ErrorKind::DirectoryNotEmpty {
+                    anyhow::Error::from(BackendError::Conflict(format!(
+                        "directory not empty: {}",
+                        abs.display()
+                    )))
+                } else {
+                    anyhow::Error::from(err)
+                }
+            })?;
         } else {
             tokio::fs::remove_file(&abs).await?;
         }
