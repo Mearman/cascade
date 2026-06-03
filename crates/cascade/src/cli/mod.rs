@@ -873,17 +873,11 @@ impl Cli {
                 user,
                 system,
             } => {
-                // Scope inference is deferred to the Integrate phase. For now an
-                // explicit `--system` selects the (scaffolded) system scope;
-                // everything else — including the default and `--user` — is the
-                // implemented per-user scope.
-                let _ = user;
-                let scope = if system {
-                    service::ServiceScope::System
-                } else {
-                    service::ServiceScope::User
-                };
-                service::run(ctx, command.into_action(), scope).await
+                // Scope resolution is owned by the service module: an explicit
+                // flag wins, otherwise the session is inferred, with a
+                // TTY-gated prompt only at the interactive-desktop boundary.
+                let request = service::ScopeRequest::from_flags(user, system);
+                service::run(ctx, command.into_action(), request).await
             }
         }
     }

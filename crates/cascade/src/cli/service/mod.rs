@@ -8,18 +8,20 @@
 //!
 //! The architecture keeps two halves cleanly apart:
 //!
-//! * a **pure generator** — [`ServiceManager::generate`] turns a [`ServiceSpec`]
-//!   into the platform's service-definition text (plist / unit / task XML). It
-//!   is plain string work with no OS calls, so it is unit-tested on every host
-//!   regardless of `target_os`.
-//! * a **platform adapter** — the `install` / `uninstall` / `start` / `stop` /
-//!   `status` methods write the generated file and drive the OS register
-//!   command. Only this half is `cfg(target_os)`-gated.
+//! * a **pure generator** — each platform module exposes a `generate` free
+//!   function that turns a [`ServiceSpec`] into the platform's
+//!   service-definition text (plist / unit / task XML). It is plain string work
+//!   with no OS calls, compiled and unit-tested on every host regardless of
+//!   `target_os`.
+//! * a **platform adapter** — the [`ServiceManager`] `install` / `uninstall` /
+//!   `start` / `stop` / `status` methods write the generated file and drive the
+//!   OS register command. Only this half is `cfg(target_os)`-gated.
 //!
 //! The `System` scope is scaffolded — the [`ServiceScope`] enum and the
 //! manager contract both admit it — but its platform backends are deferred in
 //! this pass. Only the no-admin `User` scope is implemented.
 
+use std::io::IsTerminal as _;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -119,28 +121,16 @@ impl ServiceSpec {
     }
 }
 
-/// A platform's service manager: a pure generator plus the OS-facing lifecycle
-/// adapter.
+/// A platform's service manager: the OS-facing lifecycle adapter.
 ///
-/// The generator ([`generate`](ServiceManager::generate)) is host-independent
-/// string work. The lifecycle methods are the `cfg(target_os)`-gated adapter
-/// that writes the generated definition and drives the OS register / control
-/// commands.
+/// Each platform pairs this adapter with a module-level `generate` free
+/// function that renders the service-definition text. That generator is
+/// host-independent string work, compiled and unit-tested on every host; the
+/// adapter's `install` writes its output before registering it with the OS.
+/// The lifecycle methods here are the `cfg(target_os)`-gated half that touches
+/// the filesystem and drives the OS register / control commands.
 #[async_trait]
 pub trait ServiceManager: Send + Sync {
-    /// Render the platform service-definition text for `spec`.
-    ///
-    /// Pure: no filesystem or process side effects, so it is exercised on every
-    /// host in unit tests.
-    ///
-    /// The consumer is the `install` adapter, which writes the rendered
-    /// definition before registering it with the OS. That call site lands in
-    /// the parallel phase that implements `install`; until then the method has
-    /// no non-test caller, so its dead-code denial is allowed here for the
-    /// Foundation skeleton with that explicit justification.
-    #[allow(dead_code)]
-    fn generate(&self, spec: &ServiceSpec) -> String;
-
     /// Write the service definition and register it with the OS.
     async fn install(&self, spec: &ServiceSpec) -> Result<()>;
 
@@ -198,26 +188,226 @@ pub enum ServiceAction {
     Status,
 }
 
+/// What the operator asked for on the command line: an explicit scope flag, or
+/// nothing (leave it to inference).
+///
+/// The two booleans on the `service` subcommand (`--user` / `--system`) are
+/// mutually exclusive at the clap layer, so only these three states are
+/// reachable. Modelling the request explicitly — rather than threading two
+/// bools through the resolver — keeps [`resolve_scope`] a total function over a
+/// closed set of inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeRequest {
+    /// `--user` was given: force the per-user scope.
+    User,
+    /// `--system` was given: force the machine-wide scope.
+    System,
+    /// No scope flag: infer from the session.
+    Infer,
+}
+
+impl ScopeRequest {
+    /// Build the request from the two mutually-exclusive clap flags.
+    #[must_use]
+    pub const fn from_flags(user: bool, system: bool) -> Self {
+        match (user, system) {
+            (true, _) => Self::User,
+            (_, true) => Self::System,
+            (false, false) => Self::Infer,
+        }
+    }
+}
+
+/// The session the daemon-installer is running in, as far as scope inference
+/// cares.
+///
+/// Two independent axes: whether the invocation is attached to a terminal (so a
+/// prompt could be shown and answered), and whether there is an interactive GUI
+/// desktop session for the current user (so a per-user agent would have a login
+/// context to run in). Headless boxes — CI, SSH without a display, system boot
+/// — have no desktop session, which is the signal to prefer the machine-wide
+/// scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Session {
+    /// Standard input is a terminal, so a TTY prompt can be shown.
+    pub interactive: bool,
+    /// There is an interactive GUI desktop session for the current user.
+    pub gui_desktop: bool,
+}
+
+impl Session {
+    /// Probe the real environment for the current session.
+    ///
+    /// Interactivity is whether stdin is a terminal. The GUI-desktop signal is
+    /// platform-specific: a windowing-system handle on Linux, the absence of a
+    /// remote-shell marker on macOS, and always true on Windows (a logon task
+    /// is the only scope this pass installs).
+    #[must_use]
+    pub fn probe() -> Self {
+        Self {
+            interactive: std::io::stdin().is_terminal(),
+            gui_desktop: probe_gui_desktop(),
+        }
+    }
+}
+
+/// Detect an interactive GUI desktop session for the current user.
+///
+/// Linux: a session that owns a display has `DISPLAY` (X11) or
+/// `WAYLAND_DISPLAY` (Wayland) set; a headless login (SSH, console, system
+/// service) has neither.
+#[cfg(target_os = "linux")]
+fn probe_gui_desktop() -> bool {
+    std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some()
+}
+
+/// Detect an interactive GUI desktop session for the current user.
+///
+/// macOS: a locally logged-in user is in the Aqua GUI session by default. The
+/// signal that we are *not* — a headless or remote invocation — is an SSH
+/// connection marker; an `ssh` login sets `SSH_CONNECTION` (and `SSH_TTY`).
+#[cfg(target_os = "macos")]
+fn probe_gui_desktop() -> bool {
+    std::env::var_os("SSH_CONNECTION").is_none() && std::env::var_os("SSH_TTY").is_none()
+}
+
+/// Detect an interactive GUI desktop session for the current user.
+///
+/// Windows: the only scope this pass installs is a per-user logon Scheduled
+/// Task, which always runs in the user's session, so the GUI-desktop axis is
+/// not a discriminator here.
+#[cfg(target_os = "windows")]
+fn probe_gui_desktop() -> bool {
+    true
+}
+
+/// Detect an interactive GUI desktop session for the current user.
+///
+/// On targets without a platform probe there is no desktop session to speak
+/// of, so inference treats the host as headless.
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn probe_gui_desktop() -> bool {
+    false
+}
+
+/// The scope chosen for an invocation, with the reason it was chosen.
+///
+/// The reason is printed so the operator always sees both *what* scope is being
+/// used and *why* — the requirement that the chosen scope is never silent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScopeDecision {
+    scope: ServiceScope,
+    reason: String,
+}
+
+/// Resolve the install scope from the request and the session.
+///
+/// The order is fixed: an explicit flag always wins; otherwise the session is
+/// inferred — an interactive GUI desktop chooses the per-user scope, a headless
+/// or sessionless host chooses the machine-wide scope. The one place a prompt
+/// is warranted is the boundary where a person at a real desktop terminal has
+/// not said which scope they want: there `prompt` is consulted (it returns the
+/// chosen scope), defaulting to per-user. A non-interactive invocation never
+/// blocks — it takes the deterministic inference.
+///
+/// `prompt` is injected so the decision is a pure function of its inputs and is
+/// unit-tested on every host without touching a real terminal.
+fn resolve_scope(
+    request: ScopeRequest,
+    session: Session,
+    prompt: impl FnOnce(Session) -> ServiceScope,
+) -> ScopeDecision {
+    match request {
+        ScopeRequest::User => ScopeDecision {
+            scope: ServiceScope::User,
+            reason: "requested explicitly with --user".to_owned(),
+        },
+        ScopeRequest::System => ScopeDecision {
+            scope: ServiceScope::System,
+            reason: "requested explicitly with --system".to_owned(),
+        },
+        ScopeRequest::Infer => {
+            if !session.gui_desktop {
+                return ScopeDecision {
+                    scope: ServiceScope::System,
+                    reason: "inferred: no interactive GUI desktop session (headless host)"
+                        .to_owned(),
+                };
+            }
+            // A GUI desktop session leans towards the per-user scope. When the
+            // operator is also at a terminal that can answer, the per-user vs
+            // machine-wide trade-off is theirs to confirm; otherwise the
+            // deterministic per-user inference stands without blocking.
+            if session.interactive {
+                let chosen = prompt(session);
+                ScopeDecision {
+                    scope: chosen,
+                    reason: format!(
+                        "chosen at the interactive desktop prompt (default per-user): {}",
+                        chosen.label()
+                    ),
+                }
+            } else {
+                ScopeDecision {
+                    scope: ServiceScope::User,
+                    reason: "inferred: interactive GUI desktop session, non-interactive invocation"
+                        .to_owned(),
+                }
+            }
+        }
+    }
+}
+
+/// Prompt the operator at the desktop boundary for the install scope.
+///
+/// Shown only when there is both a GUI desktop session and a terminal to answer
+/// on. It states the per-user vs machine-wide trade-off and defaults to the
+/// per-user scope (the safe, no-elevation choice) on an empty answer or any
+/// read error — a read failure must not block or silently escalate.
+fn prompt_desktop_scope(_session: Session) -> ServiceScope {
+    use std::io::Write as _;
+
+    print!(
+        "You are at an interactive desktop session. Install Cascade as a per-user \
+         service (no administrator rights), or machine-wide (requires elevation, \
+         not yet implemented)?\n  [U]ser (default) / [s]ystem: "
+    );
+    // A failed flush must not escalate the scope; fall through to the default.
+    let _ = std::io::stdout().flush();
+
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return ServiceScope::User;
+    }
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "s" | "system" => ServiceScope::System,
+        _ => ServiceScope::User,
+    }
+}
+
 /// Run a `cascade service <action>` invocation.
 ///
-/// Resolves the scope (a stub defaulting to [`ServiceScope::User`] until the
-/// Integrate phase implements the real inference), prints the chosen scope and
-/// why, builds the [`ServiceSpec`] from the context, and dispatches into the
-/// platform manager.
+/// Resolves the install scope (explicit flag > session inference > a
+/// TTY-gated desktop prompt), prints the chosen scope and the reason, builds
+/// the [`ServiceSpec`] from the context, and dispatches into the platform
+/// manager. The machine-wide scope is scaffolded but unbuilt; selecting it
+/// reaches the platform adapter, which rejects it with a clear "not yet
+/// implemented" error rather than silently doing nothing.
 ///
 /// # Errors
 ///
 /// Propagates any error from spec construction or the platform adapter.
-pub async fn run(ctx: &CliContext, action: ServiceAction, scope: ServiceScope) -> Result<()> {
-    // Scope selection / inference is a stub for the Foundation phase; the
-    // Integrate phase replaces this with flag > inference > prompt resolution.
+pub async fn run(ctx: &CliContext, action: ServiceAction, request: ScopeRequest) -> Result<()> {
+    let session = Session::probe();
+    let decision = resolve_scope(request, session, prompt_desktop_scope);
     println!(
-        "Using {} scope (default; scope inference not yet implemented).",
-        scope.label()
+        "Using {} scope ({}).",
+        decision.scope.label(),
+        decision.reason
     );
 
     let spec = ServiceSpec::from_context(ctx)?;
-    let manager = manager_for(scope);
+    let manager = manager_for(decision.scope);
     match action {
         ServiceAction::Install => manager.install(&spec).await,
         ServiceAction::Uninstall => manager.uninstall(&spec).await,
@@ -249,10 +439,6 @@ mod unsupported {
 
     #[async_trait]
     impl ServiceManager for UnsupportedManager {
-        fn generate(&self, _spec: &ServiceSpec) -> String {
-            String::new()
-        }
-
         async fn install(&self, _spec: &ServiceSpec) -> Result<()> {
             anyhow::bail!("cascade service is not supported on this platform")
         }
@@ -308,5 +494,100 @@ mod tests {
     fn scope_labels_are_stable() {
         assert_eq!(ServiceScope::User.label(), "user");
         assert_eq!(ServiceScope::System.label(), "system");
+    }
+
+    /// A prompt that must never be called; panics if the resolver consults it.
+    fn never_prompt(_session: Session) -> ServiceScope {
+        panic!("the prompt must not be consulted for this case");
+    }
+
+    #[test]
+    fn scope_request_maps_the_clap_flags() {
+        assert_eq!(ScopeRequest::from_flags(true, false), ScopeRequest::User);
+        assert_eq!(ScopeRequest::from_flags(false, true), ScopeRequest::System);
+        assert_eq!(ScopeRequest::from_flags(false, false), ScopeRequest::Infer);
+    }
+
+    #[test]
+    fn explicit_user_flag_wins_over_any_session() {
+        for session in [
+            Session {
+                interactive: true,
+                gui_desktop: true,
+            },
+            Session {
+                interactive: false,
+                gui_desktop: false,
+            },
+        ] {
+            let decision = resolve_scope(ScopeRequest::User, session, never_prompt);
+            assert_eq!(decision.scope, ServiceScope::User);
+        }
+    }
+
+    #[test]
+    fn explicit_system_flag_wins_over_any_session() {
+        for session in [
+            Session {
+                interactive: true,
+                gui_desktop: true,
+            },
+            Session {
+                interactive: false,
+                gui_desktop: false,
+            },
+        ] {
+            let decision = resolve_scope(ScopeRequest::System, session, never_prompt);
+            assert_eq!(decision.scope, ServiceScope::System);
+        }
+    }
+
+    #[test]
+    fn headless_session_infers_system_without_prompting() {
+        let session = Session {
+            interactive: false,
+            gui_desktop: false,
+        };
+        let decision = resolve_scope(ScopeRequest::Infer, session, never_prompt);
+        assert_eq!(decision.scope, ServiceScope::System);
+        assert!(decision.reason.contains("headless"));
+    }
+
+    #[test]
+    fn headless_but_interactive_still_infers_system() {
+        // A terminal with no GUI desktop session — e.g. SSH into a server — is
+        // headless; the absent desktop decides before interactivity is weighed,
+        // so no prompt is shown.
+        let session = Session {
+            interactive: true,
+            gui_desktop: false,
+        };
+        let decision = resolve_scope(ScopeRequest::Infer, session, never_prompt);
+        assert_eq!(decision.scope, ServiceScope::System);
+    }
+
+    #[test]
+    fn desktop_non_interactive_infers_user_without_prompting() {
+        let session = Session {
+            interactive: false,
+            gui_desktop: true,
+        };
+        let decision = resolve_scope(ScopeRequest::Infer, session, never_prompt);
+        assert_eq!(decision.scope, ServiceScope::User);
+        assert!(decision.reason.contains("non-interactive"));
+    }
+
+    #[test]
+    fn desktop_interactive_consults_the_prompt() {
+        let session = Session {
+            interactive: true,
+            gui_desktop: true,
+        };
+        // The prompt picks System this time; the resolver honours it.
+        let decision = resolve_scope(ScopeRequest::Infer, session, |_| ServiceScope::System);
+        assert_eq!(decision.scope, ServiceScope::System);
+        // And per-user when the prompt defaults.
+        let decision = resolve_scope(ScopeRequest::Infer, session, |_| ServiceScope::User);
+        assert_eq!(decision.scope, ServiceScope::User);
     }
 }

@@ -175,10 +175,6 @@ mod adapter {
 
     #[async_trait]
     impl ServiceManager for SystemdManager {
-        fn generate(&self, spec: &ServiceSpec) -> String {
-            generate(spec)
-        }
-
         async fn install(&self, spec: &ServiceSpec) -> Result<()> {
             self.require_user_scope()?;
 

@@ -231,10 +231,6 @@ mod adapter {
 
     #[async_trait]
     impl ServiceManager for ScheduledTaskManager {
-        fn generate(&self, spec: &ServiceSpec) -> String {
-            generate(spec)
-        }
-
         async fn install(&self, spec: &ServiceSpec) -> Result<()> {
             self.ensure_user_scope()?;
             let xml = generate(spec);

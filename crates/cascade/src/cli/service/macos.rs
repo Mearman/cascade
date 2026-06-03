@@ -197,10 +197,6 @@ mod adapter {
 
     #[async_trait]
     impl ServiceManager for LaunchdManager {
-        fn generate(&self, spec: &ServiceSpec) -> String {
-            generate(spec)
-        }
-
         async fn install(&self, spec: &ServiceSpec) -> Result<()> {
             self.ensure_user_scope()?;
             let plist_path = Self::plist_path(spec)?;
