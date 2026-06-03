@@ -25,7 +25,7 @@ if-addrs = { workspace = true }
 reqwest = { workspace = true, optional = true }
 mainline = { version = "6.2.0", default-features = false, features = ["async", "node"], optional = true }
 ed25519-dalek = { workspace = true }
-cascade-announce-wire = { version = "0.1.54", path = "../cascade-announce-wire" }
+cascade-announce-wire = { version = "0.1.55", path = "../cascade-announce-wire" }
 ring = "0.17"
 x509-parser = "0.18"
 

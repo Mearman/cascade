@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.55](https://github.com/Mearman/cascade/compare/cascade-v0.1.54...cascade-v0.1.55) - 2026-06-03
+
+### Fixed
+
+- *(cascade)* shut the daemon down gracefully on SIGTERM as well as SIGINT
+
 ## [0.1.54](https://github.com/Mearman/cascade/compare/cascade-v0.1.53...cascade-v0.1.54) - 2026-06-03
 
 ### Added
