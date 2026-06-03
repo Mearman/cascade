@@ -45,8 +45,9 @@ pub const MIN_PART_SIZE: usize = 5 * 1024 * 1024;
 
 /// Compute the part size to use for a multipart upload of `total_bytes`.
 ///
-/// Returns the smallest multiple-of-`MIN_PART_SIZE` that keeps the part count
-/// within `MAX_PARTS`. For objects that fit into `MAX_PARTS` parts of
+/// Returns the larger of `MIN_PART_SIZE` and the value needed to keep the part
+/// count within `MAX_PARTS` — i.e. `max(ceil(total_bytes / MAX_PARTS),
+/// MIN_PART_SIZE)`. For objects that fit into `MAX_PARTS` parts of
 /// `MIN_PART_SIZE` each, this returns `MIN_PART_SIZE` directly.
 fn compute_part_size(total_bytes: usize) -> usize {
     // Ceiling division: the minimum part size needed so we do not exceed MAX_PARTS.
@@ -424,7 +425,13 @@ impl S3Backend {
         // it encounters a server-side error after it has begun streaming the
         // response. `check_response` only inspects the status code, so we must
         // inspect the body too.
-        let complete_text = complete_resp.text().await?;
+        let complete_text = match complete_resp.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                abort(upload_id).await;
+                return Err(e.into());
+            }
+        };
         if let Some(code) = xml_text(&complete_text, "Code") {
             abort(upload_id).await;
             return Err(anyhow::anyhow!(
