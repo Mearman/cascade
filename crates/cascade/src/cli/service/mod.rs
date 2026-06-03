@@ -277,7 +277,7 @@ fn probe_gui_desktop() -> bool {
 /// Task, which always runs in the user's session, so the GUI-desktop axis is
 /// not a discriminator here.
 #[cfg(target_os = "windows")]
-fn probe_gui_desktop() -> bool {
+const fn probe_gui_desktop() -> bool {
     true
 }
 
@@ -286,7 +286,7 @@ fn probe_gui_desktop() -> bool {
 /// On targets without a platform probe there is no desktop session to speak
 /// of, so inference treats the host as headless.
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn probe_gui_desktop() -> bool {
+const fn probe_gui_desktop() -> bool {
     false
 }
 

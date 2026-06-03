@@ -265,15 +265,15 @@ mod adapter {
             .await?;
             // Remove the definition file too; absence is fine on uninstall.
             let definition = Self::definition_path(spec);
-            if let Err(e) = tokio::fs::remove_file(&definition).await {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    return Err(e).with_context(|| {
-                        format!(
-                            "failed to remove the task definition {}",
-                            definition.display()
-                        )
-                    });
-                }
+            if let Err(e) = tokio::fs::remove_file(&definition).await
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(e).with_context(|| {
+                    format!(
+                        "failed to remove the task definition {}",
+                        definition.display()
+                    )
+                });
             }
             println!("Removed the Cascade scheduled task '{}'.", spec.label);
             Ok(())
