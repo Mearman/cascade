@@ -2074,6 +2074,19 @@ pub fn open_from_config(config: &toml::Value) -> Result<P2pBackend> {
 /// `granted_by` with this device's own id — the node owner — without spinning
 /// up the listener, discovery, and reconnect tasks a full backend open starts.
 pub fn device_id_from_config(config: &toml::Value) -> Result<String> {
+    Ok(identity_from_config(config)?.device_id)
+}
+
+/// Read (or generate) the local device identity for a P2P backend config,
+/// returning the full [`DeviceIdentity`] — certificate and private key included.
+///
+/// Resolves the `data_dir` / `identity` directory the same way
+/// [`open_from_config`] does, then loads the persistent device identity from it.
+/// Used by the management-plane CLI to *sign* a locally-issued capability token
+/// with this device's real private key — the secret behind its certificate —
+/// without spinning up the listener, discovery, and reconnect tasks a full
+/// backend open starts.
+pub fn identity_from_config(config: &toml::Value) -> Result<DeviceIdentity> {
     let name = config
         .get("name")
         .and_then(|v| v.as_str())
@@ -2084,9 +2097,8 @@ pub fn device_id_from_config(config: &toml::Value) -> Result<String> {
         .and_then(|v| v.as_str())
         .map_or_else(|| default_data_dir(&name), PathBuf::from);
     let identity_dir = data_dir.join("identity");
-    let identity = DeviceIdentity::load_or_generate(&identity_dir)
-        .context("loading P2P backend identity for management grant")?;
-    Ok(identity.device_id)
+    DeviceIdentity::load_or_generate(&identity_dir)
+        .context("loading P2P backend identity for management grant")
 }
 
 /// Parse the Kademlia/Mainline-DHT discovery configuration from a backend's

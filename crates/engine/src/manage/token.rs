@@ -14,29 +14,34 @@
 //!
 //! ## What signs a token
 //!
-//! A token is signed by the **issuing node's device-identity key** — the same
-//! ed25519 keypair the DHT and announce paths derive from the device id (see
-//! [`cascade_p2p::discovery::signing::keypair_for_device`]). There is no second
-//! key and no new crypto: the node that issues a token signs it with the one
-//! key its identity already implies, and any verifier re-derives the issuer's
-//! verifying key from the issuer device id carried in the token.
+//! A token is signed by the **issuing node's real device-identity private key** —
+//! the secret behind its TLS certificate (see
+//! [`cascade_p2p::identity::DeviceIdentity::sign_capability`]). The token carries
+//! the issuer's certificate; a verifier re-derives the issuer device id from that
+//! certificate (the id *is* the hash of the certificate), demands it equal the
+//! issuer the token names, and only then checks the signature against the public
+//! key inside the certificate. The signature is therefore a genuine proof that
+//! the author held the issuer's private key, not merely that it knew the public
+//! device id.
 //!
-//! ## Threat model — inherited, deliberately
+//! ## Threat model
 //!
-//! The signing key is *derived from the device id*, which is public (it is a
-//! hash of the device's TLS certificate, exchanged on every handshake). So the
-//! signature proves "the author knew the issuer's device id", not "the author
-//! holds the issuer's TLS private key" — the same limitation
-//! `cascade_announce_wire::signing` documents for signed candidate sets. A
-//! token is therefore **not** a bearer credential good on its own: presenting a
-//! validly-signed token is necessary but not sufficient. The load-bearing
-//! second factor is the connection. [`CapabilityToken::verify`] requires the
-//! bearer field to equal the device id the transport authenticated by mutual
-//! TLS, and the management plane only ever calls verify on a TLS-verified
-//! session (relayed / post-hole-punch sessions, whose device id is merely
-//! asserted, are refused before reaching the dispatcher). An attacker who knows
-//! the issuer device id can forge a token, but cannot present it as a bearer it
-//! does not control the TLS identity of.
+//! Because the signature requires the issuer's private key, a peer that knows
+//! only the public device id — which every trusted peer learns on the TLS
+//! handshake — cannot forge a node-issued token. This is the property the device
+//! identity exists to provide: possession of the private key is what
+//! distinguishes the node from a peer that has merely seen its id. Conflating the
+//! data-plane trust set (peers trusted to sync) with the management-plane
+//! authority set (peers a node has granted authority) is exactly what this
+//! closes: a trusted-but-ungranted peer can no longer mint itself a node-signed
+//! grant.
+//!
+//! The bearer binding remains a second, independent factor. [`CapabilityToken::verify`]
+//! requires the bearer field to equal the device id the transport authenticated
+//! by mutual TLS, and the management plane only ever calls verify on a
+//! TLS-verified session (relayed / post-hole-punch sessions, whose device id is
+//! merely asserted, are refused before reaching the dispatcher). A token is bound
+//! both to the node that signed it and to the device that may present it.
 //!
 //! ## Bounded delegation
 //!
@@ -46,27 +51,29 @@
 //! [`caller_can_delegate`](crate::manage::dispatch). A delegated token carries
 //! its parent token inline, forming a chain; [`CapabilityToken::verify`] walks
 //! the chain to a root signed by the verifying node and checks containment at
-//! every hop, so a chain can never widen authority.
+//! every hop, so a chain can never widen authority. Each hop carries the
+//! delegating party's certificate too, so every hop's signature is proven
+//! against a private key, not a public id.
 
 use chrono::{DateTime, Utc};
 use data_encoding::BASE32_NOPAD;
-use ed25519_dalek::{SIGNATURE_LENGTH, Signature, Signer, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use cascade_p2p::discovery::signing::{keypair_for_device, verifying_key_for_device};
+use cascade_p2p::identity::{
+    DEVICE_SIGNATURE_LENGTH, DeviceIdentity, DeviceKeyError, verify_capability_signature,
+};
 
 use crate::manage::{Capability, DeviceId, Grant, Scope};
 
 /// Domain-separation tag prefixed to every signed token payload.
 ///
-/// The device key is derived for, and used by, several unrelated purposes
-/// (announce candidate sets, DHT BEP44 items). Prefixing the signed bytes with a
-/// fixed, purpose-specific, versioned tag ensures a signature produced here can
-/// never be mistaken for — or replayed as — a signature over some other
-/// structure, and a future change to the signed layout is a clean break rather
-/// than a silent reinterpretation of old bytes.
+/// The device identity key signs for more than one purpose. Prefixing the signed
+/// bytes with a fixed, purpose-specific, versioned tag ensures a signature
+/// produced here can never be mistaken for — or replayed as — a signature over
+/// some other structure, and a future change to the signed layout is a clean
+/// break rather than a silent reinterpretation of old bytes.
 const TOKEN_SIGNING_DOMAIN: &[u8] = b"cascade-manage-capability-token-v1";
 
 /// The maximum depth of a delegation chain a verifier will walk.
@@ -128,12 +135,16 @@ pub fn derive_token_id(
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum TokenVerifyError {
     /// The token's signature did not verify against its signed bytes using the
-    /// key derived from the token's `issuer` device id — the token was forged,
-    /// tampered with, or signed by a different device than it claims.
-    #[error("token {token_id}: signature verification failed")]
+    /// public key bound to the carried issuer certificate, or that certificate
+    /// did not belong to the issuer the token names — the token was forged,
+    /// tampered with, or signed without the issuer's private key.
+    #[error("token {token_id}: signature verification failed: {source}")]
     BadSignature {
         /// The id of the token whose signature failed.
         token_id: String,
+        /// The underlying device-key failure (mismatched issuer certificate, a
+        /// malformed certificate, or a signature that did not verify).
+        source: DeviceKeyError,
     },
 
     /// The root of the delegation chain was not signed by the node verifying it.
@@ -302,13 +313,18 @@ impl TokenClaims {
 pub struct CapabilityToken {
     /// The claims this token asserts.
     pub claims: TokenClaims,
-    /// ed25519 signature (raw 64 bytes) over the claims' canonical signing
-    /// bytes,
-    /// produced by the issuer's device key. Carried as base64 on the wire
-    /// because serde does not derive (de)serialisation for byte arrays this
-    /// wide.
+    /// ECDSA P-256 signature (raw 64-byte fixed form) over the claims' canonical
+    /// signing bytes, produced by the issuer's real device-identity private key.
+    /// Carried as base64 on the wire because serde does not derive
+    /// (de)serialisation for byte arrays this wide.
     #[serde(with = "base64_signature")]
-    pub signature: [u8; SIGNATURE_LENGTH],
+    pub signature: [u8; DEVICE_SIGNATURE_LENGTH],
+    /// The DER bytes of the issuer's certificate — the public half of the key
+    /// that signed this token, carried so a verifier can both bind the
+    /// certificate to the issuer device id (the id is the hash of these bytes)
+    /// and check the signature against the public key inside it.
+    #[serde(with = "base64_cert")]
+    pub issuer_cert_der: Vec<u8>,
     /// The parent token this one was delegated from, when delegated. `None` for
     /// a node-issued token, which is itself a chain root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -317,54 +333,70 @@ pub struct CapabilityToken {
 
 impl CapabilityToken {
     /// Issue a node-signed token for `bearer`, signing with the issuing node's
-    /// device key.
+    /// real device-identity private key.
     ///
-    /// `issuer` must be the device id whose key is used to sign; the caller
-    /// holds the node identity and supplies its own id. The resulting token is a
-    /// chain root: it has no parent and verifies against `issuer` directly.
-    #[must_use]
+    /// `issuer` is the node's full [`DeviceIdentity`]: its `device_id` becomes the
+    /// token's issuer, its private key signs the claims, and its certificate is
+    /// carried so a verifier can prove the signature against the public key the
+    /// device id commits to. The resulting token is a chain root: it has no parent
+    /// and verifies against the issuer's id directly.
+    ///
+    /// Fails only if the identity's key or certificate is malformed — a
+    /// programming or on-disk-corruption error, never a routine outcome.
     pub fn issue(
         token_id: impl Into<String>,
-        issuer: &DeviceId,
+        issuer: &DeviceIdentity,
         bearer: &DeviceId,
         capability: Capability,
         scope: Scope,
         expires: DateTime<Utc>,
-    ) -> Self {
+    ) -> Result<Self, DeviceKeyError> {
         let claims = TokenClaims {
             token_id: token_id.into(),
-            issuer: issuer.clone(),
+            issuer: DeviceId::new(issuer.device_id.clone()),
             bearer: bearer.clone(),
             capability,
             scope,
             expires,
         };
-        let signature = sign_claims(&claims);
-        Self {
+        let signature = issuer.sign_capability(&claims.signing_bytes())?;
+        Ok(Self {
             claims,
             signature,
+            issuer_cert_der: issuer.cert_der()?,
             parent: None,
-        }
+        })
     }
 
-    /// Mint a delegated token from `self`, signed by the delegating bearer's own
-    /// device key, conferring a *subset* of `self` onto `bearer`.
+    /// Mint a delegated token from `self`, signed by the delegating party's own
+    /// device-identity private key, conferring a *subset* of `self` onto
+    /// `bearer`.
     ///
-    /// The delegating party is the bearer of `self`: it signs the child with its
-    /// own device key (so the child's `issuer` is the parent's bearer) and
-    /// carries `self` as the child's parent. The subset rule is checked here so a
-    /// minting party cannot escalate: the requested capability, scope, and
-    /// expiry must be contained in `self`'s claims. Returns `None` when the
-    /// requested grant exceeds what `self` confers.
-    #[must_use]
+    /// The delegating party is the bearer of `self`: `delegator` must be that
+    /// device's full [`DeviceIdentity`]. It signs the child with its own private
+    /// key (so the child's `issuer` is the parent's bearer, proven by the
+    /// delegator's certificate carried on the child) and carries `self` as the
+    /// child's parent. Two guards refuse a bad mint up front rather than emit a
+    /// token that would only fail verification later:
+    /// - [`DelegateError::NotDelegator`] if `delegator` is not the bearer of
+    ///   `self` — only the device a token authorises may delegate it; and
+    /// - [`DelegateError::Exceeds`] if the requested capability, scope, or expiry
+    ///   is not wholly contained in `self`'s claims.
+    ///
+    /// A malformed delegator key or certificate surfaces as
+    /// [`DelegateError::Key`].
     pub fn delegate(
         &self,
         token_id: impl Into<String>,
+        delegator: &DeviceIdentity,
         bearer: &DeviceId,
         capability: Capability,
         scope: Scope,
         expires: DateTime<Utc>,
-    ) -> Option<Self> {
+    ) -> Result<Self, DelegateError> {
+        if delegator.device_id != self.claims.bearer.as_str() {
+            return Err(DelegateError::NotDelegator);
+        }
         let child_claims = TokenClaims {
             token_id: token_id.into(),
             // The delegating bearer issues (and signs) the child.
@@ -375,15 +407,15 @@ impl CapabilityToken {
             expires,
         };
         // No-escalation: the child must be wholly contained in this token's
-        // authority. Refuse to mint a widening delegation rather than emit a
-        // token that would fail verification later.
+        // authority.
         if !self.claims.contains(&child_claims) {
-            return None;
+            return Err(DelegateError::Exceeds);
         }
-        let signature = sign_claims(&child_claims);
-        Some(Self {
+        let signature = delegator.sign_capability(&child_claims.signing_bytes())?;
+        Ok(Self {
             claims: child_claims,
             signature,
+            issuer_cert_der: delegator.cert_der()?,
             parent: Some(Box::new(self.clone())),
         })
     }
@@ -505,23 +537,48 @@ impl CapabilityToken {
         }
     }
 
-    /// Verify this single token's signature against its issuer's derived key.
+    /// Verify this single token's signature against the public key bound to its
+    /// carried issuer certificate, after binding that certificate to the issuer
+    /// the token names.
+    ///
+    /// The binding (the issuer device id must equal the hash of the carried
+    /// certificate) is what makes carrying the certificate safe: a forger cannot
+    /// substitute its own certificate (and its own valid signature) under a
+    /// victim's issuer id, because the substituted certificate hashes to the
+    /// forger's id, not the victim's.
     fn verify_signature(&self) -> Result<(), TokenVerifyError> {
-        let verifying_key: VerifyingKey = verifying_key_for_device(self.claims.issuer.as_str());
-        let message = self.claims.signing_bytes();
-        let signature = Signature::from_bytes(&self.signature);
-        verifying_key
-            .verify_strict(&message, &signature)
-            .map_err(|_| TokenVerifyError::BadSignature {
-                token_id: self.claims.token_id.clone(),
-            })
+        verify_capability_signature(
+            &self.issuer_cert_der,
+            self.claims.issuer.as_str(),
+            &self.claims.signing_bytes(),
+            &self.signature,
+        )
+        .map_err(|source| TokenVerifyError::BadSignature {
+            token_id: self.claims.token_id.clone(),
+            source,
+        })
     }
 }
 
-/// Sign a set of claims with the issuer's device key.
-fn sign_claims(claims: &TokenClaims) -> [u8; SIGNATURE_LENGTH] {
-    let key = keypair_for_device(claims.issuer.as_str());
-    key.sign(&claims.signing_bytes()).to_bytes()
+/// Why minting a delegated token failed.
+///
+/// Each variant is a refusal at mint time, so a widening or improperly-signed
+/// delegation is never emitted to fail verification later.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum DelegateError {
+    /// The delegating identity is not the bearer of the parent token. Only the
+    /// device a token authorises may delegate from it.
+    #[error("delegator is not the bearer of the parent token")]
+    NotDelegator,
+
+    /// The requested grant is not wholly contained in the parent token's
+    /// authority — a delegation may only narrow, never widen.
+    #[error("delegated grant exceeds the parent token's authority")]
+    Exceeds,
+
+    /// The delegating identity's key or certificate is malformed.
+    #[error("delegator device key error: {0}")]
+    Key(#[from] DeviceKeyError),
 }
 
 /// Append a length-prefixed variable-width field to the signing bytes.
@@ -542,12 +599,12 @@ fn push_field(bytes: &mut Vec<u8>, field: &[u8]) {
 /// compact, stable string field. The decode rejects a wrong-length blob loudly,
 /// which the signature check then catches.
 mod base64_signature {
+    use cascade_p2p::identity::DEVICE_SIGNATURE_LENGTH;
     use data_encoding::BASE64;
-    use ed25519_dalek::SIGNATURE_LENGTH;
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub(super) fn serialize<S: Serializer>(
-        bytes: &[u8; SIGNATURE_LENGTH],
+        bytes: &[u8; DEVICE_SIGNATURE_LENGTH],
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&BASE64.encode(bytes))
@@ -555,14 +612,36 @@ mod base64_signature {
 
     pub(super) fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
-    ) -> Result<[u8; SIGNATURE_LENGTH], D::Error> {
+    ) -> Result<[u8; DEVICE_SIGNATURE_LENGTH], D::Error> {
         let encoded = String::deserialize(deserializer)?;
         let decoded = BASE64
             .decode(encoded.as_bytes())
             .map_err(serde::de::Error::custom)?;
-        <[u8; SIGNATURE_LENGTH]>::try_from(decoded.as_slice()).map_err(|_| {
-            serde::de::Error::invalid_length(decoded.len(), &"64-byte ed25519 signature")
+        <[u8; DEVICE_SIGNATURE_LENGTH]>::try_from(decoded.as_slice()).map_err(|_| {
+            serde::de::Error::invalid_length(decoded.len(), &"64-byte ECDSA P-256 signature")
         })
+    }
+}
+
+/// Base64 (de)serialisation for the issuer certificate DER bytes.
+///
+/// The certificate is binary DER; base64 gives a compact, stable string field on
+/// the wire, the same shape the signature uses.
+mod base64_cert {
+    use data_encoding::BASE64;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&BASE64.encode(bytes))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<u8>, D::Error> {
+        let encoded = String::deserialize(deserializer)?;
+        BASE64
+            .decode(encoded.as_bytes())
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -577,48 +656,63 @@ mod tests {
             .expect("valid date")
     }
 
-    fn node() -> DeviceId {
-        DeviceId::new("NODE-ISSUER")
+    /// A freshly generated device identity. Its `device_id` is the hash of its
+    /// own certificate, so signing with it produces a signature that verifies
+    /// against the certificate the token carries — exactly the real-key property
+    /// under test.
+    fn identity() -> DeviceIdentity {
+        DeviceIdentity::generate().expect("generate a device identity")
     }
 
-    fn bearer() -> DeviceId {
-        DeviceId::new("BEARER-DEVICE")
+    fn id_of(identity: &DeviceIdentity) -> DeviceId {
+        DeviceId::new(identity.device_id.clone())
     }
 
     fn never_revoked(_id: &str) -> bool {
         false
     }
 
-    fn issued() -> CapabilityToken {
+    /// Issue a `pin:write` over `/work` token from `node` to `bearer`.
+    fn issued_by(node: &DeviceIdentity, bearer: &DeviceId) -> CapabilityToken {
         CapabilityToken::issue(
             "tok-1",
-            &node(),
-            &bearer(),
+            node,
+            bearer,
             Capability::PinWrite,
             Scope::folder("/work"),
             at(2026, 12, 31),
         )
+        .expect("issue a token with a fresh identity")
     }
 
     // ── Issue / verify round-trip ──
 
     #[test]
     fn issue_then_verify_round_trips() {
-        let token = issued();
+        let node = identity();
+        let bearer = identity();
+        let token = issued_by(&node, &id_of(&bearer));
         let claims = token
-            .verify(&node(), &bearer(), at(2026, 1, 1), &never_revoked)
+            .verify(
+                &id_of(&node),
+                &id_of(&bearer),
+                at(2026, 1, 1),
+                &never_revoked,
+            )
             .expect("a freshly issued token must verify");
         assert_eq!(claims.capability, Capability::PinWrite);
         assert_eq!(claims.scope, Scope::folder("/work"));
-        assert_eq!(claims.bearer, bearer());
+        assert_eq!(claims.bearer, id_of(&bearer));
     }
 
     #[test]
     fn verified_token_projects_to_a_grant() {
-        let token = issued();
+        let node = identity();
+        let bearer = identity();
+        let token = issued_by(&node, &id_of(&bearer));
         let grant = token.claims.to_grant();
-        assert_eq!(grant.grantee, bearer());
-        assert_eq!(grant.granted_by, node());
+        assert_eq!(grant.grantee, id_of(&bearer));
+        assert_eq!(grant.granted_by, id_of(&node));
         assert_eq!(grant.capability, Capability::PinWrite);
         assert_eq!(grant.scope, Scope::folder("/work"));
         assert_eq!(grant.expires, Some(at(2026, 12, 31)));
@@ -626,13 +720,20 @@ mod tests {
 
     #[test]
     fn json_round_trip_preserves_a_verifiable_token() {
-        let token = issued();
+        let node = identity();
+        let bearer = identity();
+        let token = issued_by(&node, &id_of(&bearer));
         let json = serde_json::to_string(&token).expect("serialise");
         let decoded: CapabilityToken = serde_json::from_str(&json).expect("deserialise");
         assert_eq!(decoded, token);
         assert!(
             decoded
-                .verify(&node(), &bearer(), at(2026, 1, 1), &never_revoked)
+                .verify(
+                    &id_of(&node),
+                    &id_of(&bearer),
+                    at(2026, 1, 1),
+                    &never_revoked
+                )
                 .is_ok()
         );
     }
@@ -642,73 +743,128 @@ mod tests {
     #[test]
     fn token_signed_by_a_different_node_is_rejected() {
         // A token whose root issuer is not the verifying node must be rejected:
-        // it was signed by another node's key.
-        let other = DeviceId::new("OTHER-NODE");
-        let token = CapabilityToken::issue(
-            "tok-2",
-            &other,
-            &bearer(),
-            Capability::PinWrite,
-            Scope::folder("/work"),
-            at(2026, 12, 31),
-        );
+        // it was signed by another node's key and carries that node's cert.
+        let node = identity();
+        let other = identity();
+        let bearer = identity();
+        let token = issued_by(&other, &id_of(&bearer));
         let err = token
-            .verify(&node(), &bearer(), at(2026, 1, 1), &never_revoked)
+            .verify(
+                &id_of(&node),
+                &id_of(&bearer),
+                at(2026, 1, 1),
+                &never_revoked,
+            )
             .expect_err("a token from another issuer must be rejected");
         assert!(matches!(err, TokenVerifyError::WrongIssuer { .. }));
     }
 
     #[test]
+    fn a_token_carrying_a_substituted_certificate_is_rejected() {
+        // An attacker keeps the victim node's issuer id in the claims but swaps in
+        // its own certificate and re-signs with its own key. The cert no longer
+        // hashes to the claimed issuer, so the binding check rejects it before the
+        // signature is even trusted.
+        let node = identity();
+        let attacker = identity();
+        let bearer = identity();
+        let mut token = issued_by(&node, &id_of(&bearer));
+        token.issuer_cert_der = attacker.cert_der().expect("attacker cert");
+        token.signature = attacker
+            .sign_capability(&token.claims.signing_bytes())
+            .expect("attacker signs");
+        let err = token
+            .verify(
+                &id_of(&node),
+                &id_of(&bearer),
+                at(2026, 1, 1),
+                &never_revoked,
+            )
+            .expect_err("a substituted certificate must be rejected");
+        assert!(matches!(err, TokenVerifyError::BadSignature { .. }));
+    }
+
+    #[test]
     fn tampered_claims_break_the_signature() {
-        let mut token = issued();
+        let node = identity();
+        let bearer = identity();
+        let mut token = issued_by(&node, &id_of(&bearer));
         // Widen the scope after signing: the signature no longer matches.
         token.claims.scope = Scope::Node;
         let err = token
-            .verify(&node(), &bearer(), at(2026, 1, 1), &never_revoked)
+            .verify(
+                &id_of(&node),
+                &id_of(&bearer),
+                at(2026, 1, 1),
+                &never_revoked,
+            )
             .expect_err("tampered claims must fail the signature check");
         assert!(matches!(err, TokenVerifyError::BadSignature { .. }));
     }
 
     #[test]
     fn tampered_signature_byte_is_rejected() {
-        let mut token = issued();
+        let node = identity();
+        let bearer = identity();
+        let mut token = issued_by(&node, &id_of(&bearer));
         token.signature[0] ^= 0x01;
         let err = token
-            .verify(&node(), &bearer(), at(2026, 1, 1), &never_revoked)
+            .verify(
+                &id_of(&node),
+                &id_of(&bearer),
+                at(2026, 1, 1),
+                &never_revoked,
+            )
             .expect_err("a flipped signature byte must be rejected");
         assert!(matches!(err, TokenVerifyError::BadSignature { .. }));
     }
 
     #[test]
     fn expired_token_is_rejected() {
-        let token = issued();
+        let node = identity();
+        let bearer = identity();
+        let token = issued_by(&node, &id_of(&bearer));
         // now == expiry is inclusive-past, and after expiry is stale.
         let err = token
-            .verify(&node(), &bearer(), at(2026, 12, 31), &never_revoked)
+            .verify(
+                &id_of(&node),
+                &id_of(&bearer),
+                at(2026, 12, 31),
+                &never_revoked,
+            )
             .expect_err("an expired token must be rejected");
         assert!(matches!(err, TokenVerifyError::Expired { .. }));
         assert!(matches!(
-            token.verify(&node(), &bearer(), at(2027, 1, 1), &never_revoked),
+            token.verify(
+                &id_of(&node),
+                &id_of(&bearer),
+                at(2027, 1, 1),
+                &never_revoked
+            ),
             Err(TokenVerifyError::Expired { .. })
         ));
     }
 
     #[test]
     fn revoked_token_is_rejected() {
-        let token = issued();
+        let node = identity();
+        let bearer = identity();
+        let token = issued_by(&node, &id_of(&bearer));
         let revoked = |id: &str| id == "tok-1";
         let err = token
-            .verify(&node(), &bearer(), at(2026, 1, 1), &revoked)
+            .verify(&id_of(&node), &id_of(&bearer), at(2026, 1, 1), &revoked)
             .expect_err("a revoked token must be rejected");
         assert!(matches!(err, TokenVerifyError::Revoked { .. }));
     }
 
     #[test]
     fn bearer_mismatch_is_rejected() {
-        let token = issued();
+        let node = identity();
+        let bearer = identity();
         let stranger = DeviceId::new("STRANGER-DEVICE");
+        let token = issued_by(&node, &id_of(&bearer));
         let err = token
-            .verify(&node(), &stranger, at(2026, 1, 1), &never_revoked)
+            .verify(&id_of(&node), &stranger, at(2026, 1, 1), &never_revoked)
             .expect_err("a token presented by the wrong bearer must be rejected");
         assert!(matches!(err, TokenVerifyError::BearerMismatch { .. }));
     }
@@ -720,86 +876,117 @@ mod tests {
         // Bearer holds pin:write over /work and delegates a narrower /work/sub
         // to a sub-bearer with an earlier expiry. The chain must verify against
         // the original issuing node.
-        let token = issued();
-        let sub = DeviceId::new("SUB-BEARER");
+        let node = identity();
+        let bearer = identity();
+        let sub = identity();
+        let token = issued_by(&node, &id_of(&bearer));
         let delegated = token
             .delegate(
                 "tok-1-a",
-                &sub,
+                &bearer,
+                &id_of(&sub),
                 Capability::PinWrite,
                 Scope::folder("/work/sub"),
                 at(2026, 6, 1),
             )
             .expect("a subset delegation must mint");
         let claims = delegated
-            .verify(&node(), &sub, at(2026, 1, 1), &never_revoked)
+            .verify(&id_of(&node), &id_of(&sub), at(2026, 1, 1), &never_revoked)
             .expect("a valid delegated chain must verify");
         assert_eq!(claims.scope, Scope::folder("/work/sub"));
-        assert_eq!(claims.bearer, sub);
+        assert_eq!(claims.bearer, id_of(&sub));
+    }
+
+    #[test]
+    fn delegate_by_a_non_bearer_is_refused() {
+        // Only the bearer of the parent token may delegate from it; a different
+        // identity attempting to mint a child is refused.
+        let node = identity();
+        let bearer = identity();
+        let imposter = identity();
+        let sub = identity();
+        let token = issued_by(&node, &id_of(&bearer));
+        assert_eq!(
+            token.delegate(
+                "tok-1-x",
+                &imposter,
+                &id_of(&sub),
+                Capability::PinWrite,
+                Scope::folder("/work/sub"),
+                at(2026, 6, 1),
+            ),
+            Err(DelegateError::NotDelegator)
+        );
     }
 
     #[test]
     fn delegate_widening_scope_is_refused_at_mint() {
-        let token = issued();
-        let sub = DeviceId::new("SUB-BEARER");
+        let node = identity();
+        let bearer = identity();
+        let sub = identity();
+        let token = issued_by(&node, &id_of(&bearer));
         // /work cannot delegate /personal — a sibling outside the subtree.
-        assert!(
-            token
-                .delegate(
-                    "tok-1-b",
-                    &sub,
-                    Capability::PinWrite,
-                    Scope::folder("/personal"),
-                    at(2026, 6, 1),
-                )
-                .is_none()
+        assert_eq!(
+            token.delegate(
+                "tok-1-b",
+                &bearer,
+                &id_of(&sub),
+                Capability::PinWrite,
+                Scope::folder("/personal"),
+                at(2026, 6, 1),
+            ),
+            Err(DelegateError::Exceeds)
         );
         // /work cannot delegate the node-wide scope.
-        assert!(
-            token
-                .delegate(
-                    "tok-1-c",
-                    &sub,
-                    Capability::PinWrite,
-                    Scope::Node,
-                    at(2026, 6, 1),
-                )
-                .is_none()
+        assert_eq!(
+            token.delegate(
+                "tok-1-c",
+                &bearer,
+                &id_of(&sub),
+                Capability::PinWrite,
+                Scope::Node,
+                at(2026, 6, 1),
+            ),
+            Err(DelegateError::Exceeds)
         );
     }
 
     #[test]
     fn delegate_different_capability_is_refused_at_mint() {
-        let token = issued();
-        let sub = DeviceId::new("SUB-BEARER");
-        assert!(
-            token
-                .delegate(
-                    "tok-1-d",
-                    &sub,
-                    Capability::CacheManage,
-                    Scope::folder("/work"),
-                    at(2026, 6, 1),
-                )
-                .is_none()
+        let node = identity();
+        let bearer = identity();
+        let sub = identity();
+        let token = issued_by(&node, &id_of(&bearer));
+        assert_eq!(
+            token.delegate(
+                "tok-1-d",
+                &bearer,
+                &id_of(&sub),
+                Capability::CacheManage,
+                Scope::folder("/work"),
+                at(2026, 6, 1),
+            ),
+            Err(DelegateError::Exceeds)
         );
     }
 
     #[test]
     fn delegate_expiry_beyond_parent_is_refused_at_mint() {
-        let token = issued();
-        let sub = DeviceId::new("SUB-BEARER");
+        let node = identity();
+        let bearer = identity();
+        let sub = identity();
+        let token = issued_by(&node, &id_of(&bearer));
         // Parent expires 2026-12-31; a child expiring later over-reaches.
-        assert!(
-            token
-                .delegate(
-                    "tok-1-e",
-                    &sub,
-                    Capability::PinWrite,
-                    Scope::folder("/work"),
-                    at(2027, 1, 1),
-                )
-                .is_none()
+        assert_eq!(
+            token.delegate(
+                "tok-1-e",
+                &bearer,
+                &id_of(&sub),
+                Capability::PinWrite,
+                Scope::folder("/work"),
+                at(2027, 1, 1),
+            ),
+            Err(DelegateError::Exceeds)
         );
     }
 
@@ -807,25 +994,31 @@ mod tests {
     fn forged_widening_delegation_is_rejected_at_verify() {
         // A hostile bearer mints a legitimate subset child, then rewrites the
         // child's claims to widen scope and re-signs with its own (the child
-        // issuer's) key. The signature is valid, but the containment check at
-        // verify time must reject the chain.
-        let token = issued();
-        let sub = DeviceId::new("SUB-BEARER");
+        // issuer's) key. The leaf signature itself is valid, but the containment
+        // check at verify time must reject the chain.
+        let node = identity();
+        let bearer = identity();
+        let sub = identity();
+        let token = issued_by(&node, &id_of(&bearer));
         let mut forged = token
             .delegate(
                 "tok-1-f",
-                &sub,
+                &bearer,
+                &id_of(&sub),
                 Capability::PinWrite,
                 Scope::folder("/work/sub"),
                 at(2026, 6, 1),
             )
             .expect("subset child mints");
         // Widen the child's scope past the parent and re-sign with the child's
-        // own issuer key so the leaf signature itself is valid.
+        // own issuer key (the delegating bearer) so the leaf signature itself is
+        // valid. The containment check, not the signature, must catch it.
         forged.claims.scope = Scope::Node;
-        forged.signature = sign_claims(&forged.claims);
+        forged.signature = bearer
+            .sign_capability(&forged.claims.signing_bytes())
+            .expect("the delegating bearer re-signs the forged claims");
         let err = forged
-            .verify(&node(), &sub, at(2026, 1, 1), &never_revoked)
+            .verify(&id_of(&node), &id_of(&sub), at(2026, 1, 1), &never_revoked)
             .expect_err("a widened delegation must be rejected at verify");
         assert!(matches!(
             err,
@@ -835,12 +1028,15 @@ mod tests {
 
     #[test]
     fn revoked_ancestor_invalidates_the_chain() {
-        let token = issued();
-        let sub = DeviceId::new("SUB-BEARER");
+        let node = identity();
+        let bearer = identity();
+        let sub = identity();
+        let token = issued_by(&node, &id_of(&bearer));
         let delegated = token
             .delegate(
                 "tok-1-g",
-                &sub,
+                &bearer,
+                &id_of(&sub),
                 Capability::PinWrite,
                 Scope::folder("/work/sub"),
                 at(2026, 6, 1),
@@ -849,7 +1045,7 @@ mod tests {
         // Revoking the root token must invalidate the delegated leaf.
         let revoked = |id: &str| id == "tok-1";
         let err = delegated
-            .verify(&node(), &sub, at(2026, 1, 1), &revoked)
+            .verify(&id_of(&node), &id_of(&sub), at(2026, 1, 1), &revoked)
             .expect_err("a revoked ancestor must invalidate the chain");
         assert!(matches!(err, TokenVerifyError::ParentInvalid { .. }));
     }

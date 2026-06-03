@@ -81,6 +81,20 @@ fn parse_expiry(raw: Option<&str>) -> Result<Option<DateTime<Utc>>> {
 /// also uses); without a configured P2P backend a node has no device identity
 /// to stamp, so the command fails loudly rather than inventing a placeholder.
 pub(super) fn resolve_owner_device(ctx: &CliContext) -> Result<DeviceId> {
+    let identity = resolve_owner_identity(ctx)?;
+    Ok(DeviceId::new(identity.device_id))
+}
+
+/// Resolve the local node owner's full device identity — certificate and private
+/// key — for signing a capability token.
+///
+/// Reads the same first-configured P2P backend identity `resolve_owner_device`
+/// resolves, but returns the whole [`DeviceIdentity`] so the caller can sign with
+/// the node's real private key. Without a configured P2P backend a node has no
+/// device identity, so the command fails loudly rather than inventing one.
+pub(super) fn resolve_owner_identity(
+    ctx: &CliContext,
+) -> Result<cascade_p2p::identity::DeviceIdentity> {
     let main_config_path = ctx.config_dir.join("config.toml");
     let main_config: CascadeConfig = if main_config_path.exists() {
         let raw = std::fs::read_to_string(&main_config_path)
@@ -113,9 +127,8 @@ pub(super) fn resolve_owner_device(ctx: &CliContext) -> Result<DeviceId> {
         .with_context(|| format!("reading {}", backend_config_path.display()))?;
     let backend_config: toml::Value = toml::from_str(&raw)
         .with_context(|| format!("parsing {}", backend_config_path.display()))?;
-    let device_id = cascade_backend_p2p::device_id_from_config(&backend_config)
-        .context("resolving local device identity")?;
-    Ok(DeviceId::new(device_id))
+    cascade_backend_p2p::identity_from_config(&backend_config)
+        .context("resolving local device identity")
 }
 
 /// `cascade grant add <device-id> --cap <c>[,<c>] --scope <path|*> [--expires <rfc3339>]`.

@@ -21,7 +21,7 @@ use cascade_engine::manage::{Capability, DeviceId, Scope};
 use chrono::{DateTime, Utc};
 
 use super::CliContext;
-use super::grant::resolve_owner_device;
+use super::grant::{resolve_owner_device, resolve_owner_identity};
 
 /// The wildcard scope token a user passes on the command line to mean
 /// "node-wide".
@@ -119,21 +119,26 @@ fn issue(
         );
     }
 
-    // The issuer is this node — the device whose key signs the token, the same
-    // identity a verifier roots the token's chain in.
-    let issuer = resolve_owner_device(ctx)?;
+    // The issuer is this node — the device whose real private key signs the
+    // token, the same identity a verifier roots the token's chain in. The full
+    // identity (certificate and private key) is loaded so the signature is a
+    // genuine proof of node-key possession, not anything derivable from the
+    // public device id.
+    let issuer_identity = resolve_owner_identity(ctx)?;
+    let issuer = DeviceId::new(issuer_identity.device_id.clone());
     let bearer_id = DeviceId::new(bearer.to_owned());
     let issued_at = Utc::now();
     let token_id = derive_token_id(&issuer, &bearer_id, capability, &scope, expiry, issued_at);
 
     let token = CapabilityToken::issue(
         token_id.clone(),
-        &issuer,
+        &issuer_identity,
         &bearer_id,
         capability,
         scope.clone(),
         expiry,
-    );
+    )
+    .context("signing the capability token with this node's device key")?;
     let token_json =
         serde_json::to_string(&token).context("serialising the issued capability token")?;
 

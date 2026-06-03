@@ -1431,14 +1431,18 @@ mod tests {
     // ── Capability-token store tests ──
 
     fn sample_token() -> CapabilityToken {
+        // The store only persists and reloads token JSON, so any validly-signed
+        // token serves. Sign with a freshly generated node identity.
+        let node = cascade_p2p::identity::DeviceIdentity::generate().unwrap();
         CapabilityToken::issue(
             "tok-store-1",
-            &DeviceId::new("NODE"),
+            &node,
             &DeviceId::new("BEARER"),
             Capability::PinWrite,
             Scope::folder("/work"),
             chrono::DateTime::from_timestamp(2_000_000_000, 0).unwrap(),
         )
+        .unwrap()
     }
 
     #[test]

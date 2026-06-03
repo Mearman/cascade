@@ -405,8 +405,11 @@ async fn token_authorises_a_command_over_loopback_with_no_grant() {
     let (_manager_dir, manager) = make_engine("shared");
     let manager_id = manager.device_id().to_owned();
 
-    let (_target_dir, target) = make_engine("shared");
+    let (target_dir, target) = make_engine("shared");
     let target_id = target.device_id().to_owned();
+    // The target node's real device identity, reloaded from where make_engine
+    // persisted it, so the token is signed with the node's actual private key.
+    let target_identity = DeviceIdentity::load(&target_dir.path().join("identity")).unwrap();
 
     // The node holds NO grants, and reports its real device id so a token issued
     // under it roots correctly.
@@ -441,12 +444,13 @@ async fn token_authorises_a_command_over_loopback_with_no_grant() {
     // far in the future so it is unexpired during the test.
     let token = CapabilityToken::issue(
         "loopback-tok-1",
-        &DeviceId::new(target_id.clone()),
+        &target_identity,
         &DeviceId::new(manager_id.clone()),
         Capability::PinWrite,
         Scope::folder("/work"),
         Utc::now() + chrono::Duration::days(365),
-    );
+    )
+    .unwrap();
     let token_json = serde_json::to_string(&token).unwrap();
 
     let result = manager

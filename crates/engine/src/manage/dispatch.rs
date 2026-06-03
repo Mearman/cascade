@@ -805,10 +805,6 @@ mod tests {
         DeviceId::new("OWNER")
     }
 
-    /// The node device id the [`FakeStore`] reports as its own — the identity a
-    /// presented token's chain must root in to verify against it.
-    const NODE_DEVICE_ID: &str = "THIS-NODE";
-
     /// In-memory grant store + audit sink double.
     struct FakeStore {
         grants: Vec<Grant>,
@@ -816,8 +812,11 @@ mod tests {
         /// resolve a `GrantRevoke` target the way the real DB does.
         stored: Vec<(i64, Scope)>,
         audit: Mutex<Vec<AuditEntry>>,
-        /// This node's own device id, for token-chain root verification.
-        node_device_id: DeviceId,
+        /// This node's own real device identity. The private key signs the
+        /// tokens issued for token-verify tests, and `manage_node_device_id`
+        /// reports its derived device id, so a presented token's chain roots in
+        /// the same identity that signed it.
+        node_identity: cascade_p2p::identity::DeviceIdentity,
         /// The revoked token ids the verify path consults.
         revoked: std::collections::HashSet<String>,
     }
@@ -828,9 +827,38 @@ mod tests {
                 grants,
                 stored: Vec::new(),
                 audit: Mutex::new(Vec::new()),
-                node_device_id: DeviceId::new(NODE_DEVICE_ID),
+                node_identity: cascade_p2p::identity::DeviceIdentity::generate()
+                    .expect("generate node identity"),
                 revoked: std::collections::HashSet::new(),
             }
+        }
+
+        /// This node's own device id, derived from its identity certificate.
+        fn node_device_id(&self) -> DeviceId {
+            DeviceId::new(self.node_identity.device_id.clone())
+        }
+
+        /// Issue a token signed by this store's node identity, as the JSON form
+        /// `run_dispatch` accepts. The token roots in this node, so it verifies
+        /// against the same store.
+        fn issue_token_json(
+            &self,
+            token_id: &str,
+            bearer: &DeviceId,
+            capability: Capability,
+            scope: Scope,
+            expires: DateTime<Utc>,
+        ) -> String {
+            let token = CapabilityToken::issue(
+                token_id,
+                &self.node_identity,
+                bearer,
+                capability,
+                scope,
+                expires,
+            )
+            .expect("issue a token with the node identity");
+            serde_json::to_string(&token).expect("serialise token")
         }
 
         /// Mark a token id revoked on this store, for token-verify tests.
@@ -876,7 +904,7 @@ mod tests {
         }
 
         fn manage_node_device_id(&self) -> anyhow::Result<DeviceId> {
-            Ok(self.node_device_id.clone())
+            Ok(self.node_device_id())
         }
 
         fn manage_revoked_token_ids(&self) -> anyhow::Result<std::collections::HashSet<String>> {
@@ -2107,26 +2135,6 @@ mod tests {
 
     // ── Presented capability tokens authorise end to end ──
 
-    /// A token issued by this node (`THIS-NODE`) for `bearer`, as the JSON form
-    /// `run_dispatch` accepts.
-    fn issued_token_json(
-        token_id: &str,
-        bearer: &DeviceId,
-        capability: Capability,
-        scope: Scope,
-        expires: DateTime<Utc>,
-    ) -> String {
-        let token = CapabilityToken::issue(
-            token_id,
-            &DeviceId::new(NODE_DEVICE_ID),
-            bearer,
-            capability,
-            scope,
-            expires,
-        );
-        serde_json::to_string(&token).expect("serialise token")
-    }
-
     #[tokio::test]
     async fn valid_token_authorises_a_command_with_no_on_node_grant() {
         // The node holds NO grant for the caller. A token issued by this node
@@ -2134,7 +2142,7 @@ mod tests {
         // offline-issued grant alone carries the authority.
         let store = FakeStore::new(Vec::new());
         let executor = FakeExecutor::default();
-        let token = issued_token_json(
+        let token = store.issue_token_json(
             "tok-pin",
             &manager(),
             Capability::PinWrite,
@@ -2175,14 +2183,18 @@ mod tests {
         // this node — it is unauthorised, the command never runs.
         let store = FakeStore::new(Vec::new());
         let executor = FakeExecutor::default();
+        // A different node, with its own identity and certificate, signs the
+        // token. Its root issuer is not this node, so verification rejects it.
+        let other_node = cascade_p2p::identity::DeviceIdentity::generate().unwrap();
         let foreign = CapabilityToken::issue(
             "tok-foreign",
-            &DeviceId::new("OTHER-NODE"),
+            &other_node,
             &manager(),
             Capability::PinWrite,
             Scope::folder("/work"),
             at(2026, 12, 31),
-        );
+        )
+        .unwrap();
         let token = serde_json::to_string(&foreign).unwrap();
         let result = run_dispatch(
             &store,
@@ -2213,7 +2225,7 @@ mod tests {
     async fn expired_token_is_refused() {
         let store = FakeStore::new(Vec::new());
         let executor = FakeExecutor::default();
-        let token = issued_token_json(
+        let token = store.issue_token_json(
             "tok-stale",
             &manager(),
             Capability::PinWrite,
@@ -2252,7 +2264,7 @@ mod tests {
         // revocation list — the command is refused.
         let store = FakeStore::new(Vec::new()).with_revoked_token("tok-revoked");
         let executor = FakeExecutor::default();
-        let token = issued_token_json(
+        let token = store.issue_token_json(
             "tok-revoked",
             &manager(),
             Capability::PinWrite,
@@ -2290,7 +2302,7 @@ mod tests {
         // third party cannot replay it.
         let store = FakeStore::new(Vec::new());
         let executor = FakeExecutor::default();
-        let token = issued_token_json(
+        let token = store.issue_token_json(
             "tok-other-bearer",
             &DeviceId::new("SOMEONE-ELSE"),
             Capability::PinWrite,
@@ -2329,7 +2341,7 @@ mod tests {
         // on-node grant does.
         let store = FakeStore::new(Vec::new());
         let executor = FakeExecutor::default();
-        let token = issued_token_json(
+        let token = store.issue_token_json(
             "tok-scoped",
             &manager(),
             Capability::PinWrite,

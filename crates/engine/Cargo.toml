@@ -18,7 +18,6 @@ rusqlite.workspace = true
 cascade-p2p = { path = "../p2p" }
 data-encoding.workspace = true
 sha2 = { workspace = true }
-ed25519-dalek.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

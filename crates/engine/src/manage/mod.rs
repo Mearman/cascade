@@ -27,7 +27,8 @@ pub use dispatch::{
     scope_from_wire,
 };
 pub use token::{
-    CapabilityToken, MAX_DELEGATION_DEPTH, TokenClaims, TokenVerifyError, derive_token_id,
+    CapabilityToken, DelegateError, MAX_DELEGATION_DEPTH, TokenClaims, TokenVerifyError,
+    derive_token_id,
 };
 
 /// A device identity — the principal of the management plane.
