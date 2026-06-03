@@ -17,9 +17,13 @@
 //!   `start` / `stop` / `status` methods write the generated file and drive the
 //!   OS register command. Only this half is `cfg(target_os)`-gated.
 //!
-//! The `System` scope is scaffolded — the [`ServiceScope`] enum and the
-//! manager contract both admit it — but its platform backends are deferred in
-//! this pass. Only the no-admin `User` scope is implemented.
+//! The `User` scope is implemented on every platform. The `System` scope is
+//! implemented on Linux — a machine-wide systemd unit under
+//! `/etc/systemd/system`, enabled in the system manager and requiring root. On
+//! macOS and Windows the `System` scope is still rejected: a session-0
+//! machine-wide service cannot drive the native filesystem mount, which needs
+//! a logged-in user session, so a machine-wide `LaunchDaemon` or service buys
+//! nothing there.
 
 use std::io::IsTerminal as _;
 use std::path::PathBuf;
@@ -42,15 +46,15 @@ pub const SERVICE_LABEL: &str = "io.cascade.daemon";
 
 /// Which OS scope a service is installed into.
 ///
-/// `User` is the per-user, no-admin scope implemented in this pass. `System`
-/// is the machine-wide scope; it is part of the contract so callers and
-/// generators can address it, but its platform backends are deferred — the
-/// adapters reject it until they are built.
+/// `User` is the per-user, no-admin scope, implemented on every platform.
+/// `System` is the machine-wide scope, requiring elevation; it is implemented
+/// on Linux (a systemd unit under `/etc/systemd/system`) and rejected on macOS
+/// and Windows, where a session-0 service cannot drive the native mount.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceScope {
     /// Per-user service in the user's own directories; no elevation.
     User,
-    /// Machine-wide service; requires elevation. Scaffolded, not yet built.
+    /// Machine-wide service; requires elevation. Implemented on Linux only.
     System,
 }
 
@@ -149,10 +153,10 @@ pub trait ServiceManager: Send + Sync {
 
 /// Select the platform [`ServiceManager`] for the chosen scope.
 ///
-/// The `System` scope is part of the contract but unimplemented in this pass;
-/// each platform manager rejects it from its adapter methods. The compile-time
-/// `cfg(target_os)` selection means only the current platform's manager is
-/// built into the binary.
+/// The `System` scope is implemented on Linux; on macOS and Windows the manager
+/// rejects it from its adapter methods, since a session-0 service cannot drive
+/// the native mount there. The compile-time `cfg(target_os)` selection means
+/// only the current platform's manager is built into the binary.
 #[must_use]
 pub fn manager_for(scope: ServiceScope) -> Box<dyn ServiceManager> {
     #[cfg(target_os = "macos")]
@@ -390,9 +394,9 @@ fn prompt_desktop_scope(_session: Session) -> ServiceScope {
 /// Resolves the install scope (explicit flag > session inference > a
 /// TTY-gated desktop prompt), prints the chosen scope and the reason, builds
 /// the [`ServiceSpec`] from the context, and dispatches into the platform
-/// manager. The machine-wide scope is scaffolded but unbuilt; selecting it
-/// reaches the platform adapter, which rejects it with a clear "not yet
-/// implemented" error rather than silently doing nothing.
+/// manager. The machine-wide scope is implemented on Linux (where it requires
+/// root); on macOS and Windows it reaches the platform adapter, which rejects
+/// it with a clear error rather than silently doing nothing.
 ///
 /// # Errors
 ///
@@ -466,10 +470,10 @@ mod unsupported {
 mod tests {
     use super::*;
 
-    // The platform generators return `todo!()` in the Foundation phase, so they
-    // are not exercised here; the parallel phase that implements each generator
-    // adds the rendering assertions alongside it. These tests cover the pieces
-    // that are real now: the spec built from context and the scope labels.
+    // The platform generators are exercised by each platform module's own unit
+    // tests (which render and assert over the emitted definition text). These
+    // tests cover the cross-platform pieces: the spec built from context, the
+    // scope labels, and the scope-resolution logic.
 
     #[test]
     fn from_context_builds_a_spec_under_the_config_dir() {
