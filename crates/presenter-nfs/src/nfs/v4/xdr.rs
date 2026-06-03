@@ -501,17 +501,98 @@ pub fn decode_attr_bitmap(data: &[u8]) -> io::Result<(Vec<u32>, &[u8])> {
     let count =
         usize::try_from(count).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let mut attrs = Vec::new();
-    for _ in 0..count {
+    for word_index in 0..count {
         let (word, remaining) = decode_u32(rest)?;
         rest = remaining;
-        // Extract set bits.
-        for bit in 0..32 {
+        // Each word covers attribute ids [word_index*32, word_index*32 + 32).
+        // The global attribute id is the word offset plus the local bit, so an
+        // attribute such as FATTR4_TIME_MODIFY (53) in word 1 bit 21 decodes
+        // back to 53, not 21.
+        let base = u32::try_from(word_index)
+            .unwrap_or(u32::MAX)
+            .saturating_mul(32);
+        for bit in 0..32u32 {
             if word & (1u32 << bit) != 0 {
-                attrs.push(bit);
+                attrs.push(base.saturating_add(bit));
             }
         }
     }
     Ok((attrs, rest))
+}
+
+/// Consume the encoded `fattr4` attribute-values blob that follows a SETATTR
+/// bitmap, returning the requested `FATTR4_SIZE` (when set) and the slice
+/// positioned immediately after the last value.
+///
+/// SETATTR encodes one value per set bit, in ascending attribute-number order,
+/// with no per-attribute framing (this codebase's `encode_fattr4` does not wrap
+/// the values in an `opaque<>`). To keep the surrounding COMPOUND framed, every
+/// set attribute's value must be consumed by its exact wire length — not just
+/// the one Cascade chooses to act on. The size value is read at its correct
+/// offset within the blob (after any lower-numbered attributes), and the cursor
+/// advances past the whole blob regardless of which attributes were set.
+///
+/// # Errors
+///
+/// Returns an error if the blob is truncated, or if it carries an attribute
+/// whose wire length is not known here — consuming an unknown-length attribute
+/// would desync the rest of the request, so the operation fails loudly instead.
+pub fn decode_setattr_values<'a>(
+    bitmap: &[u32],
+    values: &'a [u8],
+) -> io::Result<(Option<u64>, &'a [u8])> {
+    let mut ids: Vec<u32> = bitmap.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+
+    let mut size: Option<u64> = None;
+    let mut rest = values;
+    for id in ids {
+        match id {
+            FATTR4_TYPE | FATTR4_MODE | FATTR4_NUMLINKS => {
+                let (_v, r) = decode_u32(rest)?;
+                rest = r;
+            }
+            FATTR4_SIZE => {
+                let (v, r) = decode_u64(rest)?;
+                size = Some(v);
+                rest = r;
+            }
+            FATTR4_CHANGE | FATTR4_FILEID | FATTR4_SPACE_USED | FATTR4_MAXREAD
+            | FATTR4_MAXWRITE => {
+                let (_v, r) = decode_u64(rest)?;
+                rest = r;
+            }
+            FATTR4_FSID => {
+                // fsid4 is two uint64 (major, minor).
+                let (_major, r) = decode_u64(rest)?;
+                let (_minor, r) = decode_u64(r)?;
+                rest = r;
+            }
+            FATTR4_OWNER | FATTR4_OWNER_GROUP => {
+                let (_v, r) = decode_opaque(rest)?;
+                rest = r;
+            }
+            FATTR4_TIME_ACCESS | FATTR4_TIME_MODIFY | FATTR4_TIME_CREATE => {
+                // nfstime4 is uint64 seconds + uint32 nseconds.
+                let (_secs, r) = decode_u64(rest)?;
+                let (_nsecs, r) = decode_u32(r)?;
+                rest = r;
+            }
+            FATTR4_SUPPORTED_ATTRS => {
+                // A bitmap value; consume count + words.
+                let (_attrs, r) = decode_attr_bitmap(rest)?;
+                rest = r;
+            }
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("SETATTR carries attribute {other} of unknown wire length"),
+                ));
+            }
+        }
+    }
+    Ok((size, rest))
 }
 
 /// Build a set of default attributes for a path.
@@ -664,6 +745,36 @@ mod tests {
         assert_eq!(attr.ftype, NF4REG);
         assert_eq!(attr.mode, 0o644);
         assert_eq!(attr.numlinks, 1);
+    }
+
+    #[test]
+    fn setattr_values_size_and_mtime() {
+        // bitmap {size(4), time_modify(53)} then size(u64) + nfstime4.
+        let mut bitmap_buf = Vec::new();
+        encode_attr_bitmap(&mut bitmap_buf, &[FATTR4_SIZE, FATTR4_TIME_MODIFY]);
+        let (bitmap, _) = decode_attr_bitmap(&bitmap_buf).unwrap();
+
+        let mut values = Vec::new();
+        encode_u64(&mut values, 4); // size
+        encode_u64(&mut values, 1_700_000_000); // mtime secs
+        encode_u32(&mut values, 0); // mtime nsecs
+        // A trailing sentinel uint32 representing the next op.
+        encode_u32(&mut values, 0xABCD);
+
+        let (size, rest) = decode_setattr_values(&bitmap, &values).unwrap();
+        assert_eq!(size, Some(4));
+        // Exactly the trailing sentinel remains.
+        let (sentinel, tail) = decode_u32(rest).unwrap();
+        assert_eq!(sentinel, 0xABCD);
+        assert!(tail.is_empty());
+    }
+
+    #[test]
+    fn setattr_values_unknown_attr_errors() {
+        // Attribute id 99 has no known wire length; must fail rather than desync.
+        let bitmap = vec![99];
+        let values = [0u8; 8];
+        assert!(decode_setattr_values(&bitmap, &values).is_err());
     }
 
     #[test]
