@@ -1610,6 +1610,141 @@ jobs:
             "ghcr.io/${IMAGE_NAME}@${DIGEST_AMD64}" \
             "ghcr.io/${IMAGE_NAME}@${DIGEST_ARM64}"
 
+  # ===========================================================================
+  # Daemon Docker image — multi-arch (linux/amd64 + linux/arm64).
+  #
+  # Mirrors docker-amd64 / docker-arm64 / docker-manifest above but targets
+  # ghcr.io/mearman/cascade (the cascade daemon) rather than the relay image.
+  # Per-job IMAGE_NAME overrides the workflow-level mearman/cascade-relay so
+  # the buildcache refs, manifest tags, and push targets do not collide.
+  # ===========================================================================
+  docker-daemon-amd64:
+    name: Docker daemon image (amd64)
+    needs: [release]
+    if: needs.release.outputs.released == 'true'
+    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE_NAME: mearman/cascade
+    outputs:
+      digest: ${{ steps.export.outputs.digest }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ needs.release.outputs.version }}
+      - name: Set up buildx
+        run: |
+          docker buildx create --use --name daemon-builder --driver docker-container
+          docker buildx inspect --bootstrap
+      - name: Log in to ghcr.io
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+      - name: Build and push by digest
+        env:
+          TAG: ${{ needs.release.outputs.version }}
+        run: |
+          VERSION="${TAG#cascade-v}"
+          docker buildx build \
+            --platform linux/amd64 \
+            --file crates/cascade/Dockerfile \
+            --label "org.opencontainers.image.source=https://github.com/Mearman/cascade" \
+            --label "org.opencontainers.image.version=${VERSION}" \
+            --label "org.opencontainers.image.revision=${{ github.sha }}" \
+            --label "org.opencontainers.image.description=cascade daemon — cross-platform cloud storage filesystem client" \
+            --label "org.opencontainers.image.licenses=MIT" \
+            --cache-from "type=registry,ref=ghcr.io/${IMAGE_NAME}:buildcache-cascade-amd64" \
+            --cache-to "type=registry,ref=ghcr.io/${IMAGE_NAME}:buildcache-cascade-amd64,mode=max" \
+            --output "type=image,name=ghcr.io/${IMAGE_NAME},push-by-digest=true,name-canonical=true,push=true" \
+            --metadata-file metadata.json \
+            .
+      - name: Export digest
+        id: export
+        run: |
+          DIGEST=$(python3 -c "import json; print(json.load(open('metadata.json'))['containerimage.digest'])")
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+  docker-daemon-arm64:
+    name: Docker daemon image (arm64)
+    needs: [release]
+    if: needs.release.outputs.released == 'true'
+    timeout-minutes: 60
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE_NAME: mearman/cascade
+    outputs:
+      digest: ${{ steps.export.outputs.digest }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ needs.release.outputs.version }}
+      - name: Set up buildx
+        run: |
+          docker buildx create --use --name daemon-builder --driver docker-container
+          docker buildx inspect --bootstrap
+      - name: Log in to ghcr.io
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+      - name: Build and push by digest
+        env:
+          TAG: ${{ needs.release.outputs.version }}
+        run: |
+          VERSION="${TAG#cascade-v}"
+          docker buildx build \
+            --platform linux/arm64 \
+            --file crates/cascade/Dockerfile \
+            --label "org.opencontainers.image.source=https://github.com/Mearman/cascade" \
+            --label "org.opencontainers.image.version=${VERSION}" \
+            --label "org.opencontainers.image.revision=${{ github.sha }}" \
+            --label "org.opencontainers.image.description=cascade daemon — cross-platform cloud storage filesystem client" \
+            --label "org.opencontainers.image.licenses=MIT" \
+            --cache-from "type=registry,ref=ghcr.io/${IMAGE_NAME}:buildcache-cascade-arm64" \
+            --cache-to "type=registry,ref=ghcr.io/${IMAGE_NAME}:buildcache-cascade-arm64,mode=max" \
+            --output "type=image,name=ghcr.io/${IMAGE_NAME},push-by-digest=true,name-canonical=true,push=true" \
+            --metadata-file metadata.json \
+            .
+      - name: Export digest
+        id: export
+        run: |
+          DIGEST=$(python3 -c "import json; print(json.load(open('metadata.json'))['containerimage.digest'])")
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+  docker-daemon-manifest:
+    name: Docker daemon manifest (ghcr.io)
+    needs: [release, docker-daemon-amd64, docker-daemon-arm64]
+    if: needs.release.outputs.released == 'true'
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE_NAME: mearman/cascade
+    steps:
+      - name: Log in to ghcr.io
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+      - name: Create and push multi-arch manifest
+        env:
+          TAG: ${{ needs.release.outputs.version }}
+          DIGEST_AMD64: ${{ needs.docker-daemon-amd64.outputs.digest }}
+          DIGEST_ARM64: ${{ needs.docker-daemon-arm64.outputs.digest }}
+        run: |
+          VERSION="${TAG#cascade-v}"
+          docker buildx imagetools create \
+            --tag "ghcr.io/${IMAGE_NAME}:${VERSION}" \
+            --tag "ghcr.io/${IMAGE_NAME}:latest" \
+            "ghcr.io/${IMAGE_NAME}@${DIGEST_AMD64}" \
+            "ghcr.io/${IMAGE_NAME}@${DIGEST_ARM64}"
+
   build-relay-macos-arm:
     name: Build relay macOS ARM
     needs: [release]
