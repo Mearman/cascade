@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.63](https://github.com/Mearman/cascade/compare/cascade-v0.1.62...cascade-v0.1.63) - 2026-06-03
+
+### Fixed
+
+- *(cascade)* bound daemon shutdown so stop can't leave a hung process
+
+### Other
+
+- *(cascade)* wrap the shutdown timeout chain per rustfmt
+
 ## [0.1.62](https://github.com/Mearman/cascade/compare/cascade-v0.1.61...cascade-v0.1.62) - 2026-06-03
 
 ### Other
