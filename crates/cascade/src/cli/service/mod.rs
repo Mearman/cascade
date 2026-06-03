@@ -374,7 +374,7 @@ fn prompt_desktop_scope(_session: Session) -> ServiceScope {
     print!(
         "You are at an interactive desktop session. Install Cascade as a per-user \
          service (no administrator rights), or machine-wide (requires elevation, \
-         not yet implemented)?\n  [U]ser (default) / [s]ystem: "
+         Linux only)?\n  [U]ser (default) / [s]ystem: "
     );
     // A failed flush must not escalate the scope; fall through to the default.
     let _ = std::io::stdout().flush();
