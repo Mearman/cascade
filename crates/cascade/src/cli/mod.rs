@@ -11,6 +11,7 @@ pub mod mount;
 #[cfg(any(target_os = "windows", test))]
 pub mod projfs_provider;
 pub mod remote;
+pub mod service;
 pub mod status;
 pub mod token;
 
@@ -330,6 +331,55 @@ pub enum Commands {
         #[command(subcommand)]
         command: TokenCommands,
     },
+
+    /// Manage the Cascade daemon as an OS background service
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommands,
+
+        /// Install into the per-user scope (no administrator rights). This is
+        /// the default; the flag is accepted for explicitness.
+        #[arg(long, global = true, conflicts_with = "system")]
+        user: bool,
+
+        /// Install into the machine-wide scope (requires elevation). Scaffolded
+        /// but not yet implemented — selecting it errors with guidance.
+        #[arg(long, global = true)]
+        system: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ServiceCommands {
+    /// Write the service definition and register it with the OS
+    Install,
+
+    /// Deregister the service and remove its definition
+    Uninstall,
+
+    /// Start the registered service
+    Start,
+
+    /// Stop the registered service
+    Stop,
+
+    /// Show whether the service is registered and running
+    Status,
+}
+
+impl ServiceCommands {
+    /// Map the parsed clap subcommand to the [`service::ServiceAction`] the
+    /// handler runs.
+    #[must_use]
+    pub const fn into_action(self) -> service::ServiceAction {
+        match self {
+            Self::Install => service::ServiceAction::Install,
+            Self::Uninstall => service::ServiceAction::Uninstall,
+            Self::Start => service::ServiceAction::Start,
+            Self::Stop => service::ServiceAction::Stop,
+            Self::Status => service::ServiceAction::Status,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -818,6 +868,23 @@ impl Cli {
                 remote::run(ctx, &device_id, remote_command, token_json).await
             }
             Commands::Token { command } => token::run(ctx, command.into_token_command()),
+            Commands::Service {
+                command,
+                user,
+                system,
+            } => {
+                // Scope inference is deferred to the Integrate phase. For now an
+                // explicit `--system` selects the (scaffolded) system scope;
+                // everything else — including the default and `--user` — is the
+                // implemented per-user scope.
+                let _ = user;
+                let scope = if system {
+                    service::ServiceScope::System
+                } else {
+                    service::ServiceScope::User
+                };
+                service::run(ctx, command.into_action(), scope).await
+            }
         }
     }
 }
@@ -841,6 +908,60 @@ mod tests {
             } => (device_id, command.into_remote_command().unwrap()),
             _ => panic!("expected a remote subcommand"),
         }
+    }
+
+    #[test]
+    fn parse_service_install_defaults_to_user_scope() {
+        let cli = Cli::try_parse_from(["cascade", "service", "install"])
+            .expect("service install should parse");
+        let Commands::Service {
+            command,
+            user,
+            system,
+        } = cli.command
+        else {
+            panic!("expected a service subcommand");
+        };
+        assert!(!user, "no scope flag given");
+        assert!(!system, "no scope flag given");
+        assert_eq!(command.into_action(), service::ServiceAction::Install);
+    }
+
+    #[test]
+    fn parse_service_subcommands_map_to_actions() {
+        let cases = [
+            ("install", service::ServiceAction::Install),
+            ("uninstall", service::ServiceAction::Uninstall),
+            ("start", service::ServiceAction::Start),
+            ("stop", service::ServiceAction::Stop),
+            ("status", service::ServiceAction::Status),
+        ];
+        for (sub, expected) in cases {
+            let cli = Cli::try_parse_from(["cascade", "service", sub])
+                .expect("service subcommand should parse");
+            let Commands::Service { command, .. } = cli.command else {
+                panic!("expected a service subcommand");
+            };
+            assert_eq!(command.into_action(), expected);
+        }
+    }
+
+    #[test]
+    fn parse_service_scope_flags_are_mutually_exclusive() {
+        // --user and --system cannot both be given.
+        assert!(
+            Cli::try_parse_from(["cascade", "service", "install", "--user", "--system"]).is_err()
+        );
+    }
+
+    #[test]
+    fn parse_service_system_flag_selects_system_scope() {
+        let cli = Cli::try_parse_from(["cascade", "service", "install", "--system"])
+            .expect("service install --system should parse");
+        let Commands::Service { system, .. } = cli.command else {
+            panic!("expected a service subcommand");
+        };
+        assert!(system);
     }
 
     #[test]
