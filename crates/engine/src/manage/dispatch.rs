@@ -31,6 +31,7 @@ use cascade_p2p::protocol::{
 use chrono::{DateTime, Utc};
 
 use crate::db::AuditEntry;
+use crate::manage::token::CapabilityToken;
 use crate::manage::{Capability, DeviceId, Grant, Scope, authorises};
 
 /// Audit `outcome` column value for a command that was authorised and applied.
@@ -147,6 +148,15 @@ pub trait ManageGrantStore: Send + Sync {
 
     /// Append an audit row. The audit log is append-only.
     fn manage_append_audit(&self, entry: &AuditEntry) -> anyhow::Result<()>;
+
+    /// This node's own device id — the identity a presented capability token's
+    /// delegation chain must root in to authorise against this node.
+    fn manage_node_device_id(&self) -> anyhow::Result<DeviceId>;
+
+    /// The set of revoked token ids on this node, for building the revocation
+    /// predicate the token verify path consults. Returning the whole set lets a
+    /// chain be checked without a database round-trip per token.
+    fn manage_revoked_token_ids(&self) -> anyhow::Result<std::collections::HashSet<String>>;
 }
 
 /// The injected port the BEP message handler calls when a
@@ -164,13 +174,17 @@ pub trait ManageDispatch: Send + Sync {
     /// [`ManageResponse`](cascade_p2p::protocol::BepMessage::ManageResponse).
     ///
     /// `caller` is the authenticated peer device id from the TLS connection.
-    /// `now` is the wall-clock instant used for grant-expiry checks; the BEP
-    /// call site passes `Utc::now()`.
+    /// `token` is an optional signed capability token (in its JSON form)
+    /// presented to authorise the command; when present and valid, the
+    /// token-carried grant authorises the command in addition to any on-node
+    /// grant the caller holds. `now` is the wall-clock instant used for grant-
+    /// and token-expiry checks; the BEP call site passes `Utc::now()`.
     async fn dispatch(
         &self,
         caller: &DeviceId,
         command: ManageCommand,
         scope: WireScope,
+        token: Option<String>,
         now: DateTime<Utc>,
     ) -> ManageResult;
 }
@@ -319,6 +333,57 @@ fn command_summary(command: &ManageCommand) -> String {
     }
 }
 
+/// Verify a presented capability token against this node and project it to the
+/// [`Grant`] it confers, or return the typed [`ManageResult::Err`] that should
+/// be reported when the token is unusable.
+///
+/// Every failure is a hard rejection reported to the caller, never a silent
+/// fall-through: a token that does not deserialise is a `Failed` error (it is a
+/// malformed request, not an authorisation question), while a token that
+/// deserialises but does not verify — wrong issuer, expired, revoked, bearer
+/// mismatch, or an over-reaching delegation — is an `Unauthorised` error, the
+/// same code an insufficient on-node grant earns. The returned grant carries the
+/// token's `(bearer, capability, scope, expiry)` and is authorised by the same
+/// [`authorises`] path an on-node grant takes.
+fn verify_presented_token<S>(
+    store: &S,
+    caller: &DeviceId,
+    token_json: &str,
+    now: DateTime<Utc>,
+) -> Result<Grant, ManageResult>
+where
+    S: ManageGrantStore + ?Sized,
+{
+    let token: CapabilityToken =
+        serde_json::from_str(token_json).map_err(|e| ManageResult::Err {
+            kind: ManageErrorKind::Failed,
+            message: format!("could not parse presented capability token: {e}"),
+        })?;
+
+    let node_device_id = store
+        .manage_node_device_id()
+        .map_err(|e| ManageResult::Err {
+            kind: ManageErrorKind::Failed,
+            message: format!("could not resolve this node's device identity: {e}"),
+        })?;
+
+    let revoked = store
+        .manage_revoked_token_ids()
+        .map_err(|e| ManageResult::Err {
+            kind: ManageErrorKind::Failed,
+            message: format!("could not read token revocation list: {e}"),
+        })?;
+
+    let is_revoked = |id: &str| revoked.contains(id);
+    match token.verify(&node_device_id, caller, now, &is_revoked) {
+        Ok(claims) => Ok(claims.to_grant()),
+        Err(e) => Err(ManageResult::Err {
+            kind: ManageErrorKind::Unauthorised,
+            message: format!("presented capability token rejected: {e}"),
+        }),
+    }
+}
+
 /// Run the authorise → audit → execute flow for one decoded command.
 ///
 /// This is the shared dispatch core, parameterised over the grant store and the
@@ -334,6 +399,7 @@ pub async fn run_dispatch<S, E>(
     caller: &DeviceId,
     command: ManageCommand,
     wire_scope: WireScope,
+    token: Option<String>,
     now: DateTime<Utc>,
 ) -> ManageResult
 where
@@ -344,7 +410,7 @@ where
     let scope = scope_from_wire(&wire_scope);
     let command_text = command_summary(&command);
 
-    let grants = match store.manage_grants() {
+    let mut grants = match store.manage_grants() {
         Ok(grants) => grants,
         Err(e) => {
             // The grant store is unreadable — fail loudly to the caller rather
@@ -357,6 +423,21 @@ where
             };
         }
     };
+
+    // A presented capability token is a portable, offline-issued grant. Verify
+    // it against this node (signed by this node or a chain rooting in it,
+    // unexpired, not revoked, bearer == the authenticated caller) and, on
+    // success, fold the token-carried grant into the grant set so the command is
+    // authorised against it by the *same* `authorises` path an on-node grant
+    // takes. A presented-but-invalid token is a hard rejection — never a silent
+    // fall-through to "no token" — because accepting the command without the
+    // authority the caller tried to assert would mask the rejection.
+    if let Some(token_json) = token {
+        match verify_presented_token(store, caller, &token_json, now) {
+            Ok(token_grant) => grants.push(token_grant),
+            Err(rejection) => return rejection,
+        }
+    }
 
     // The scope the command's own payload actually mutates, derived from the
     // command rather than the caller-supplied wire `scope`. Authorising over
@@ -724,6 +805,10 @@ mod tests {
         DeviceId::new("OWNER")
     }
 
+    /// The node device id the [`FakeStore`] reports as its own — the identity a
+    /// presented token's chain must root in to verify against it.
+    const NODE_DEVICE_ID: &str = "THIS-NODE";
+
     /// In-memory grant store + audit sink double.
     struct FakeStore {
         grants: Vec<Grant>,
@@ -731,6 +816,10 @@ mod tests {
         /// resolve a `GrantRevoke` target the way the real DB does.
         stored: Vec<(i64, Scope)>,
         audit: Mutex<Vec<AuditEntry>>,
+        /// This node's own device id, for token-chain root verification.
+        node_device_id: DeviceId,
+        /// The revoked token ids the verify path consults.
+        revoked: std::collections::HashSet<String>,
     }
 
     impl FakeStore {
@@ -739,7 +828,15 @@ mod tests {
                 grants,
                 stored: Vec::new(),
                 audit: Mutex::new(Vec::new()),
+                node_device_id: DeviceId::new(NODE_DEVICE_ID),
+                revoked: std::collections::HashSet::new(),
             }
+        }
+
+        /// Mark a token id revoked on this store, for token-verify tests.
+        fn with_revoked_token(mut self, token_id: &str) -> Self {
+            self.revoked.insert(token_id.to_owned());
+            self
         }
 
         /// Seed a stored grant row with a given id and scope, for
@@ -776,6 +873,14 @@ mod tests {
                 .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?
                 .push(entry.clone());
             Ok(())
+        }
+
+        fn manage_node_device_id(&self) -> anyhow::Result<DeviceId> {
+            Ok(self.node_device_id.clone())
+        }
+
+        fn manage_revoked_token_ids(&self) -> anyhow::Result<std::collections::HashSet<String>> {
+            Ok(self.revoked.clone())
         }
     }
 
@@ -929,6 +1034,7 @@ mod tests {
             WireScope::Folder {
                 path: "/work/reports".to_owned(),
             },
+            None,
             at(2026, 1, 1),
         )
         .await;
@@ -971,6 +1077,7 @@ mod tests {
             WireScope::Folder {
                 path: "/work".to_owned(),
             },
+            None,
             at(2026, 1, 1),
         )
         .await;
@@ -1019,6 +1126,7 @@ mod tests {
             WireScope::Folder {
                 path: "/work".to_owned(),
             },
+            None,
             at(2026, 1, 1),
         )
         .await;
@@ -1044,6 +1152,7 @@ mod tests {
             WireScope::Folder {
                 path: "/work".to_owned(),
             },
+            None,
             at(2026, 1, 1),
         )
         .await;
@@ -1087,6 +1196,7 @@ mod tests {
             WireScope::Folder {
                 path: "/anywhere".to_owned(),
             },
+            None,
             at(2026, 1, 1),
         )
         .await;
@@ -1140,6 +1250,7 @@ mod tests {
             &manager(),
             ManageCommand::CacheEvict,
             WireScope::Node,
+            None,
             at(2026, 6, 1),
         )
         .await;
@@ -1175,6 +1286,7 @@ mod tests {
             &manager(),
             ManageCommand::StatusRead,
             WireScope::Node,
+            None,
             at(2026, 1, 1),
         )
         .await;
@@ -1223,6 +1335,7 @@ mod tests {
             &manager(),
             command,
             wire_scope,
+            None,
             at(2026, 1, 1),
         )
         .await;
@@ -1412,6 +1525,7 @@ mod tests {
             WireScope::Folder {
                 path: "/work".to_owned(),
             },
+            None,
             at(2026, 1, 1),
         )
         .await;
@@ -1451,6 +1565,7 @@ mod tests {
             WireScope::Folder {
                 path: "/work".to_owned(),
             },
+            None,
             at(2026, 1, 1),
         )
         .await;
@@ -1510,6 +1625,7 @@ mod tests {
                 WireScope::Folder {
                     path: "/work".to_owned(),
                 },
+                None,
                 at(2026, 1, 1),
             )
             .await;
@@ -1572,6 +1688,7 @@ mod tests {
             WireScope::Folder {
                 path: "/work/reports".to_owned(),
             },
+            None,
             at(2026, 1, 1),
         )
         .await;
@@ -1616,6 +1733,7 @@ mod tests {
             WireScope::Folder {
                 path: "/work".to_owned(),
             },
+            None,
             at(2026, 1, 1),
         )
         .await;
@@ -1663,6 +1781,7 @@ mod tests {
             WireScope::Folder {
                 path: "/work".to_owned(),
             },
+            None,
             at(2026, 1, 1),
         )
         .await;
@@ -1702,6 +1821,7 @@ mod tests {
             WireScope::Folder {
                 path: "/work".to_owned(),
             },
+            None,
             at(2026, 1, 1),
         )
         .await;
@@ -1742,6 +1862,7 @@ mod tests {
                 path: "/work".to_owned(),
             },
             // After the held pin grant's expiry.
+            None,
             at(2026, 6, 1),
         )
         .await;
@@ -1789,6 +1910,7 @@ mod tests {
             WireScope::Folder {
                 path: "/work".to_owned(),
             },
+            None,
             at(2026, 1, 1),
         )
         .await;
@@ -1847,6 +1969,7 @@ mod tests {
             WireScope::Folder {
                 path: "/work".to_owned(),
             },
+            None,
             at(2026, 1, 1),
         )
         .await;
@@ -1908,6 +2031,7 @@ mod tests {
             WireScope::Folder {
                 path: "/work".to_owned(),
             },
+            None,
             at(2026, 1, 1),
         )
         .await;
@@ -1958,6 +2082,7 @@ mod tests {
             WireScope::Folder {
                 path: "/work".to_owned(),
             },
+            None,
             at(2026, 1, 1),
         )
         .await;
@@ -1978,5 +2103,287 @@ mod tests {
             Some(Scope::Node),
             "the audit row records the stored node scope of the targeted grant",
         );
+    }
+
+    // ── Presented capability tokens authorise end to end ──
+
+    /// A token issued by this node (`THIS-NODE`) for `bearer`, as the JSON form
+    /// `run_dispatch` accepts.
+    fn issued_token_json(
+        token_id: &str,
+        bearer: &DeviceId,
+        capability: Capability,
+        scope: Scope,
+        expires: DateTime<Utc>,
+    ) -> String {
+        let token = CapabilityToken::issue(
+            token_id,
+            &DeviceId::new(NODE_DEVICE_ID),
+            bearer,
+            capability,
+            scope,
+            expires,
+        );
+        serde_json::to_string(&token).expect("serialise token")
+    }
+
+    #[tokio::test]
+    async fn valid_token_authorises_a_command_with_no_on_node_grant() {
+        // The node holds NO grant for the caller. A token issued by this node
+        // for the caller, covering the command, authorises it end to end — the
+        // offline-issued grant alone carries the authority.
+        let store = FakeStore::new(Vec::new());
+        let executor = FakeExecutor::default();
+        let token = issued_token_json(
+            "tok-pin",
+            &manager(),
+            Capability::PinWrite,
+            Scope::folder("/work"),
+            at(2026, 12, 31),
+        );
+        let result = run_dispatch(
+            &store,
+            &executor,
+            &manager(),
+            ManageCommand::Pin {
+                path_glob: "/work/reports".to_owned(),
+                recursive: true,
+            },
+            WireScope::Folder {
+                path: "/work".to_owned(),
+            },
+            Some(token),
+            at(2026, 1, 1),
+        )
+        .await;
+        assert!(
+            matches!(result, ManageResult::Ok { .. }),
+            "a valid token must authorise the command, got {result:?}",
+        );
+        assert_eq!(executor.calls(), vec!["pin /work/reports true".to_owned()]);
+        let audit = store.audit_rows();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(
+            audit.first().map(|r| r.outcome.as_str()),
+            Some(OUTCOME_ALLOWED)
+        );
+    }
+
+    #[tokio::test]
+    async fn token_signed_by_another_node_is_refused() {
+        // A token whose root issuer is some OTHER node does not verify against
+        // this node — it is unauthorised, the command never runs.
+        let store = FakeStore::new(Vec::new());
+        let executor = FakeExecutor::default();
+        let foreign = CapabilityToken::issue(
+            "tok-foreign",
+            &DeviceId::new("OTHER-NODE"),
+            &manager(),
+            Capability::PinWrite,
+            Scope::folder("/work"),
+            at(2026, 12, 31),
+        );
+        let token = serde_json::to_string(&foreign).unwrap();
+        let result = run_dispatch(
+            &store,
+            &executor,
+            &manager(),
+            ManageCommand::Pin {
+                path_glob: "/work".to_owned(),
+                recursive: false,
+            },
+            WireScope::Folder {
+                path: "/work".to_owned(),
+            },
+            Some(token),
+            at(2026, 1, 1),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            ManageResult::Err {
+                kind: ManageErrorKind::Unauthorised,
+                ..
+            }
+        ));
+        assert!(executor.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn expired_token_is_refused() {
+        let store = FakeStore::new(Vec::new());
+        let executor = FakeExecutor::default();
+        let token = issued_token_json(
+            "tok-stale",
+            &manager(),
+            Capability::PinWrite,
+            Scope::folder("/work"),
+            at(2026, 1, 1),
+        );
+        // now is past the token expiry.
+        let result = run_dispatch(
+            &store,
+            &executor,
+            &manager(),
+            ManageCommand::Pin {
+                path_glob: "/work".to_owned(),
+                recursive: false,
+            },
+            WireScope::Folder {
+                path: "/work".to_owned(),
+            },
+            Some(token),
+            at(2026, 6, 1),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            ManageResult::Err {
+                kind: ManageErrorKind::Unauthorised,
+                ..
+            }
+        ));
+        assert!(executor.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn revoked_token_is_refused() {
+        // The token is valid and unexpired, but its id is on the node's
+        // revocation list — the command is refused.
+        let store = FakeStore::new(Vec::new()).with_revoked_token("tok-revoked");
+        let executor = FakeExecutor::default();
+        let token = issued_token_json(
+            "tok-revoked",
+            &manager(),
+            Capability::PinWrite,
+            Scope::folder("/work"),
+            at(2026, 12, 31),
+        );
+        let result = run_dispatch(
+            &store,
+            &executor,
+            &manager(),
+            ManageCommand::Pin {
+                path_glob: "/work".to_owned(),
+                recursive: false,
+            },
+            WireScope::Folder {
+                path: "/work".to_owned(),
+            },
+            Some(token),
+            at(2026, 1, 1),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            ManageResult::Err {
+                kind: ManageErrorKind::Unauthorised,
+                ..
+            }
+        ));
+        assert!(executor.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn token_for_a_different_bearer_is_refused() {
+        // The token names a DIFFERENT bearer than the authenticated caller, so a
+        // third party cannot replay it.
+        let store = FakeStore::new(Vec::new());
+        let executor = FakeExecutor::default();
+        let token = issued_token_json(
+            "tok-other-bearer",
+            &DeviceId::new("SOMEONE-ELSE"),
+            Capability::PinWrite,
+            Scope::folder("/work"),
+            at(2026, 12, 31),
+        );
+        let result = run_dispatch(
+            &store,
+            &executor,
+            &manager(),
+            ManageCommand::Pin {
+                path_glob: "/work".to_owned(),
+                recursive: false,
+            },
+            WireScope::Folder {
+                path: "/work".to_owned(),
+            },
+            Some(token),
+            at(2026, 1, 1),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            ManageResult::Err {
+                kind: ManageErrorKind::Unauthorised,
+                ..
+            }
+        ));
+        assert!(executor.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn token_scope_outside_command_target_is_refused() {
+        // A token covering only /work cannot authorise a pin of /personal — the
+        // token-carried grant goes through the same scope-coverage check an
+        // on-node grant does.
+        let store = FakeStore::new(Vec::new());
+        let executor = FakeExecutor::default();
+        let token = issued_token_json(
+            "tok-scoped",
+            &manager(),
+            Capability::PinWrite,
+            Scope::folder("/work"),
+            at(2026, 12, 31),
+        );
+        let result = run_dispatch(
+            &store,
+            &executor,
+            &manager(),
+            ManageCommand::Pin {
+                path_glob: "/personal/secret".to_owned(),
+                recursive: false,
+            },
+            WireScope::Folder {
+                path: "/work".to_owned(),
+            },
+            Some(token),
+            at(2026, 1, 1),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            ManageResult::Err {
+                kind: ManageErrorKind::Unauthorised,
+                ..
+            }
+        ));
+        assert!(executor.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_token_is_a_failed_error() {
+        // A token that does not deserialise is a malformed request, reported as
+        // Failed (not an authorisation question), and the command never runs.
+        let store = FakeStore::new(Vec::new());
+        let executor = FakeExecutor::default();
+        let result = run_dispatch(
+            &store,
+            &executor,
+            &manager(),
+            ManageCommand::StatusRead,
+            WireScope::Node,
+            Some("not json".to_owned()),
+            at(2026, 1, 1),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            ManageResult::Err {
+                kind: ManageErrorKind::Failed,
+                ..
+            }
+        ));
+        assert!(executor.calls().is_empty());
     }
 }

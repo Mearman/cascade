@@ -573,6 +573,28 @@ impl ManageGrantStore for Engine {
     fn manage_append_audit(&self, entry: &AuditEntry) -> Result<()> {
         self.db.append_audit(entry).map(|_id| ())
     }
+
+    fn manage_node_device_id(&self) -> Result<DeviceId> {
+        // The management plane's identity is the P2P data-plane device identity —
+        // the same key a capability token's chain roots in. Without a configured
+        // P2P backend the node has no device identity, so token verification
+        // fails loudly rather than rooting a chain in a placeholder.
+        let id = self
+            .p2p
+            .as_ref()
+            .map(|b| b.device_id().to_owned())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no P2P backend configured — the node has no device identity to verify a \
+                 capability token against"
+                )
+            })?;
+        Ok(DeviceId::new(id))
+    }
+
+    fn manage_revoked_token_ids(&self) -> Result<std::collections::HashSet<String>> {
+        self.db.revoked_token_ids()
+    }
 }
 
 /// The engine is the command executor for the management plane. Each method is
@@ -707,9 +729,10 @@ impl ManageDispatch for Engine {
         caller: &DeviceId,
         command: ManageCommand,
         scope: WireScope,
+        token: Option<String>,
         now: DateTime<Utc>,
     ) -> ManageResult {
-        run_dispatch(self, self, caller, command, scope, now).await
+        run_dispatch(self, self, caller, command, scope, token, now).await
     }
 }
 
@@ -1051,6 +1074,7 @@ mod tests {
                 WireScope::Folder {
                     path: "/work/reports".to_owned(),
                 },
+                None,
                 Utc::now(),
             )
             .await;
@@ -1102,6 +1126,7 @@ mod tests {
                 WireScope::Folder {
                     path: "/work".to_owned(),
                 },
+                None,
                 Utc::now(),
             )
             .await;
@@ -1153,6 +1178,7 @@ mod tests {
                 WireScope::Folder {
                     path: "/work".to_owned(),
                 },
+                None,
                 Utc::now(),
             )
             .await;
@@ -1200,6 +1226,7 @@ mod tests {
                 &manager_id(),
                 ManageCommand::StatusRead,
                 WireScope::Node,
+                None,
                 Utc::now(),
             )
             .await;
@@ -1487,6 +1514,7 @@ mod tests {
                 WireScope::Folder {
                     path: "/work".to_owned(),
                 },
+                None,
                 Utc::now(),
             )
             .await;
