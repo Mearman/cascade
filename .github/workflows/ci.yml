@@ -101,8 +101,12 @@ jobs:
         run: sccache --show-stats
       - name: Save sccache
         # Mirror rust-cache's save-if policy: only main writes the cache so
-        # feature-branch churn can't evict the warm main-line entry.
-        if: github.ref == 'refs/heads/main'
+        # feature-branch churn can't evict the warm main-line entry. Also
+        # gate on a non-empty sccache dir: actions/cache/save emits a
+        # 'Cache save failed' run-summary annotation whenever the path is
+        # empty, which is noisy and not informative — a build that didn't
+        # touch sccache has nothing to save and should just skip the step.
+        if: github.ref == 'refs/heads/main' && hashFiles('${{ runner.temp }}/sccache/**') != ''
         # sccache is a build-time accelerator; an empty or failed cache save
         # is a noisy warning, not a real failure. Continue on error so the
         # post-build upload doesn't pollute the run summary.
