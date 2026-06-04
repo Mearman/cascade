@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.67](https://github.com/Mearman/cascade/compare/cascade-v0.1.66...cascade-v0.1.67) - 2026-06-04
+
+### Fixed
+
+- *(directional-share)* block node-wide data-verb grants and tokens (F4)
+- *(directional-share)* bind grant scope to the canonical BEP folder id (F1)
+
+### Other
+
+- apply cargo fmt to directional-share fix files
+- *(p2p)* directional data-sharing implementation (FAILS ADVERSARIAL REVIEW — do not merge)
+
 ## [0.1.66](https://github.com/Mearman/cascade/compare/cascade-v0.1.65...cascade-v0.1.66) - 2026-06-03
 
 ### Added
