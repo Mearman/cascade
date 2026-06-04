@@ -106,9 +106,7 @@ impl Session {
         // not within) → forbidden; otherwise the capability is absent →
         // unauthorised.
         let holds_capability = grants.iter().any(|grant: &Grant| {
-            grant.grantee == *self.caller()
-                && grant.capability == needed
-                && !grant.is_expired(now)
+            grant.grantee == *self.caller() && grant.capability == needed && !grant.is_expired(now)
         });
         if holds_capability {
             Err(ApiError::forbidden(format!(

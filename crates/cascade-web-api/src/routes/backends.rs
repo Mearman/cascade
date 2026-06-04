@@ -1,9 +1,9 @@
 //! Backend route — the PWA's folder picker.
 
 use axum::Json;
+use axum::Router;
 use axum::extract::State;
 use axum::routing::get;
-use axum::Router;
 use cascade_engine::manage::{Capability, Scope};
 
 use crate::auth::Session;

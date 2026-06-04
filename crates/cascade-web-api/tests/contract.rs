@@ -94,9 +94,23 @@ impl Harness {
     }
 
     /// Issue a node-signed token for `bearer`.
-    fn issue(&self, label: &str, bearer: &DeviceId, cap: Capability, scope: Scope) -> CapabilityToken {
+    fn issue(
+        &self,
+        label: &str,
+        bearer: &DeviceId,
+        cap: Capability,
+        scope: Scope,
+    ) -> CapabilityToken {
         let expires = Utc::now() + Duration::days(365);
-        CapabilityToken::issue(label.to_owned(), &self.identity, bearer, cap, scope, expires).unwrap()
+        CapabilityToken::issue(
+            label.to_owned(),
+            &self.identity,
+            bearer,
+            cap,
+            scope,
+            expires,
+        )
+        .unwrap()
     }
 
     /// Send a request and return the status, the request-id header, and the
@@ -158,10 +172,23 @@ fn authed_post(
 /// Assert an error body matches the envelope shape and carries `code`.
 fn assert_error(body: &Value, request_id: Option<&str>, code: &str) {
     let error = body.get("error").expect("error envelope");
-    assert_eq!(error.get("code").and_then(Value::as_str), Some(code), "code mismatch in {body}");
-    assert!(error.get("message").and_then(Value::as_str).is_some(), "message missing");
-    let envelope_id = error.get("request_id").and_then(Value::as_str).expect("request_id in envelope");
-    assert!(is_valid_request_id(envelope_id), "envelope request_id not valid: {envelope_id}");
+    assert_eq!(
+        error.get("code").and_then(Value::as_str),
+        Some(code),
+        "code mismatch in {body}"
+    );
+    assert!(
+        error.get("message").and_then(Value::as_str).is_some(),
+        "message missing"
+    );
+    let envelope_id = error
+        .get("request_id")
+        .and_then(Value::as_str)
+        .expect("request_id in envelope");
+    assert!(
+        is_valid_request_id(envelope_id),
+        "envelope request_id not valid: {envelope_id}"
+    );
     assert_eq!(
         Some(envelope_id),
         request_id,
@@ -172,18 +199,27 @@ fn assert_error(body: &Value, request_id: Option<&str>, code: &str) {
 /// Every response carries a valid request-id header.
 fn assert_request_id(request_id: Option<&str>) {
     let id = request_id.expect("X-Cascade-Request-Id header present");
-    assert!(is_valid_request_id(id), "request id not 26-char base32: {id}");
+    assert!(
+        is_valid_request_id(id),
+        "request id not 26-char base32: {id}"
+    );
 }
 
 #[tokio::test]
 async fn health_needs_no_auth() {
     let h = Harness::new();
-    let req = Request::builder().uri("/v1/health").body(Body::empty()).unwrap();
+    let req = Request::builder()
+        .uri("/v1/health")
+        .body(Body::empty())
+        .unwrap();
     let (status, request_id, body) = h.send(req).await;
     assert_eq!(status, StatusCode::OK);
     assert_request_id(request_id.as_deref());
     assert_eq!(body.get("status").and_then(Value::as_str), Some("ok"));
-    assert_eq!(body.get("version").and_then(Value::as_str), Some("test-version"));
+    assert_eq!(
+        body.get("version").and_then(Value::as_str),
+        Some("test-version")
+    );
     assert_eq!(
         body.get("node_device_id").and_then(Value::as_str),
         Some(h.node_id().as_str()),
@@ -193,7 +229,10 @@ async fn health_needs_no_auth() {
 #[tokio::test]
 async fn bundle_needs_no_auth() {
     let h = Harness::new();
-    let req = Request::builder().uri("/v1/bundle").body(Body::empty()).unwrap();
+    let req = Request::builder()
+        .uri("/v1/bundle")
+        .body(Body::empty())
+        .unwrap();
     let (status, request_id, body) = h.send(req).await;
     assert_eq!(status, StatusCode::OK);
     assert_request_id(request_id.as_deref());
@@ -201,13 +240,19 @@ async fn bundle_needs_no_auth() {
         body.get("bundle_url").and_then(Value::as_str),
         Some("https://pwa.example.com"),
     );
-    assert_eq!(body.get("build_sha").and_then(Value::as_str), Some("deadbeef"));
+    assert_eq!(
+        body.get("build_sha").and_then(Value::as_str),
+        Some("deadbeef")
+    );
 }
 
 #[tokio::test]
 async fn missing_token_is_unauthorised() {
     let h = Harness::new();
-    let req = Request::builder().uri("/v1/session").body(Body::empty()).unwrap();
+    let req = Request::builder()
+        .uri("/v1/session")
+        .body(Body::empty())
+        .unwrap();
     let (status, request_id, body) = h.send(req).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_request_id(request_id.as_deref());
@@ -242,11 +287,13 @@ async fn session_returns_owner_view() {
         Some("owner"),
     );
     assert_eq!(
-        body.pointer("/session/verified_bearer").and_then(Value::as_str),
+        body.pointer("/session/verified_bearer")
+            .and_then(Value::as_str),
         Some(node.as_str()),
     );
     assert_eq!(
-        body.pointer("/abilities/status_read").and_then(Value::as_bool),
+        body.pointer("/abilities/status_read")
+            .and_then(Value::as_bool),
         Some(true),
     );
     // The abilities view parses as the typed schema.
@@ -263,21 +310,36 @@ async fn ready_is_unavailable_until_data_plane_up() {
 
     let (status, _id, body) = h.send(authed_get("/v1/ready", &token, &node)).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(body.pointer("/error/code").and_then(Value::as_str), Some("unavailable"));
+    assert_eq!(
+        body.pointer("/error/code").and_then(Value::as_str),
+        Some("unavailable")
+    );
 
     h.set_ready();
     let (status, _id, body) = h.send(authed_get("/v1/ready", &token, &node)).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
-    assert_eq!(body.get("data_plane_ready").and_then(Value::as_bool), Some(true));
+    assert_eq!(
+        body.get("data_plane_ready").and_then(Value::as_bool),
+        Some(true)
+    );
 }
 
 #[tokio::test]
 async fn data_route_is_blocked_until_ready() {
     let h = Harness::new();
     let node = h.node_id();
-    let token = h.issue("dr", &node, Capability::DataRead, Scope::folder("p2p-shared"));
+    let token = h.issue(
+        "dr",
+        &node,
+        Capability::DataRead,
+        Scope::folder("p2p-shared"),
+    );
     let (status, request_id, body) = h
-        .send(authed_get("/v1/files/p2p-shared/entries/file.txt", &token, &node))
+        .send(authed_get(
+            "/v1/files/p2p-shared/entries/file.txt",
+            &token,
+            &node,
+        ))
         .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_error(&body, request_id.as_deref(), "data_plane_not_ready");
@@ -301,7 +363,12 @@ async fn capability_held_over_wrong_scope_is_forbidden() {
     // route, but the caller does hold status:read — so it is 403, not 401.
     let h = Harness::new();
     let node = h.node_id();
-    let token = h.issue("sr-folder", &node, Capability::StatusRead, Scope::folder("/x"));
+    let token = h.issue(
+        "sr-folder",
+        &node,
+        Capability::StatusRead,
+        Scope::folder("/x"),
+    );
     let (status, request_id, body) = h.send(authed_get("/v1/audit", &token, &node)).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
     assert_error(&body, request_id.as_deref(), "forbidden");
@@ -331,24 +398,41 @@ async fn token_data_verb_node_wide_is_forbidden() {
         "scope": { "kind": "node" },
         "expires": (Utc::now() + Duration::days(1)).to_rfc3339(),
     });
-    let (status, request_id, resp) = h.send(authed_post("/v1/tokens", &token, &node, &body)).await;
+    let (status, request_id, resp) = h
+        .send(authed_post("/v1/tokens", &token, &node, &body))
+        .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {resp}");
-    assert_error(&resp, request_id.as_deref(), "data_verb_node_wide_forbidden");
+    assert_error(
+        &resp,
+        request_id.as_deref(),
+        "data_verb_node_wide_forbidden",
+    );
 }
 
 #[tokio::test]
 async fn grant_data_verb_node_wide_is_forbidden() {
     let h = Harness::new();
     let node = h.node_id();
-    let token = h.issue("admin", &node, Capability::GrantAdmin, Scope::folder("p2p-shared"));
+    let token = h.issue(
+        "admin",
+        &node,
+        Capability::GrantAdmin,
+        Scope::folder("p2p-shared"),
+    );
     let body = serde_json::json!({
         "grantee": "PEER-DEVICE",
         "capability": "data:write",
         "scope": { "kind": "node" },
     });
-    let (status, request_id, resp) = h.send(authed_post("/v1/grants", &token, &node, &body)).await;
+    let (status, request_id, resp) = h
+        .send(authed_post("/v1/grants", &token, &node, &body))
+        .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {resp}");
-    assert_error(&resp, request_id.as_deref(), "data_verb_node_wide_forbidden");
+    assert_error(
+        &resp,
+        request_id.as_deref(),
+        "data_verb_node_wide_forbidden",
+    );
 }
 
 #[tokio::test]
@@ -362,7 +446,12 @@ async fn non_owner_cannot_exceed_its_own_authority_issuing_a_token() {
     let delegate_id = DeviceId::new(delegate.device_id.clone());
 
     // node -> delegator: data:read over p2p-shared.
-    let parent = h.issue("parent", &delegator_id, Capability::DataRead, Scope::folder("p2p-shared"));
+    let parent = h.issue(
+        "parent",
+        &delegator_id,
+        Capability::DataRead,
+        Scope::folder("p2p-shared"),
+    );
     // delegator -> delegate: a subset delegation (same verb, same scope).
     let leaf = parent
         .delegate(

@@ -8,11 +8,11 @@
 use std::collections::BTreeMap;
 
 use axum::Json;
+use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
-use axum::Router;
 use cascade_engine::manage::{Capability, DeviceId, Grant, Scope};
 
 use crate::auth::Session;
@@ -204,7 +204,10 @@ async fn remove(
         &state,
         &session,
         &scope,
-        &format!("share revoke {grantee} over {folder_id} [request {}]", request_id.0),
+        &format!(
+            "share revoke {grantee} over {folder_id} [request {}]",
+            request_id.0
+        ),
     )?;
     Ok(StatusCode::NO_CONTENT)
 }

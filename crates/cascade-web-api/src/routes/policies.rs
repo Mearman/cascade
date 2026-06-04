@@ -2,11 +2,11 @@
 //! engine's `lifecycle_policies` table.
 
 use axum::Json;
+use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get};
-use axum::Router;
 use cascade_engine::manage::{Capability, Scope};
 
 use crate::auth::Session;
@@ -90,6 +90,8 @@ async fn remove(
     if removed {
         Ok(StatusCode::NO_CONTENT)
     } else {
-        Err(ApiError::not_found(format!("no lifecycle policy with id {id}")))
+        Err(ApiError::not_found(format!(
+            "no lifecycle policy with id {id}"
+        )))
     }
 }

@@ -65,12 +65,8 @@ fn crockford() -> &'static Encoding {
         spec.symbols.push_str("0123456789ABCDEFGHJKMNPQRSTVWXYZ");
         // Decode is case-insensitive and accepts the Crockford ambiguity
         // aliases: lowercase maps to its uppercase symbol, and I/L→1, O→0.
-        spec.translate
-            .from
-            .push_str("abcdefghjkmnpqrstvwxyzILilOo");
-        spec.translate
-            .to
-            .push_str("ABCDEFGHJKMNPQRSTVWXYZ111100");
+        spec.translate.from.push_str("abcdefghjkmnpqrstvwxyzILilOo");
+        spec.translate.to.push_str("ABCDEFGHJKMNPQRSTVWXYZ111100");
         // A valid specification by construction (32 distinct symbols, no
         // padding); a malformed spec is a programming error caught in tests.
         spec.encoding()

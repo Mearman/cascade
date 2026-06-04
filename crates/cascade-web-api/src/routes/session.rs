@@ -1,9 +1,9 @@
 //! Session routes — the verified session view and a stateless logout.
 
 use axum::Json;
+use axum::Router;
 use axum::extract::State;
 use axum::routing::{get, post};
-use axum::Router;
 use cascade_engine::manage::{Capability, Grant, ManageGrantStore, Scope, TokenClaims};
 use chrono::Utc;
 
@@ -37,18 +37,22 @@ async fn revoke(
     State(state): State<AppState>,
     session: Session,
 ) -> Result<Json<SessionResponse>, ApiError> {
-    Ok(Json(build_response(&state, &session, Abilities {
-        status_read: false,
-        pin_write: false,
-        cache_manage: false,
-        config_push: false,
-        policy_set: false,
-        backend_manage: false,
-        lifecycle_control: false,
-        grant_admin: false,
-        data_read: Vec::new(),
-        data_write: Vec::new(),
-    })?))
+    Ok(Json(build_response(
+        &state,
+        &session,
+        Abilities {
+            status_read: false,
+            pin_write: false,
+            cache_manage: false,
+            config_push: false,
+            policy_set: false,
+            backend_manage: false,
+            lifecycle_control: false,
+            grant_admin: false,
+            data_read: Vec::new(),
+            data_write: Vec::new(),
+        },
+    )?))
 }
 
 /// Build the session response, denormalising the verified claims and abilities.

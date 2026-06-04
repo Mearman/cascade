@@ -8,11 +8,11 @@
 //! bearer as actor and the request id recorded in the command column.
 
 use axum::Json;
+use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
-use axum::Router;
 use cascade_engine::db::AuditEntry;
 use cascade_engine::manage::{Capability, DeviceId, Grant, Scope};
 use chrono::Utc;

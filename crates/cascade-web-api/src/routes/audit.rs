@@ -2,9 +2,9 @@
 //! writes to.
 
 use axum::Json;
+use axum::Router;
 use axum::extract::{Query, State};
 use axum::routing::get;
-use axum::Router;
 use cascade_engine::manage::{Capability, Scope};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
@@ -44,7 +44,9 @@ async fn list(
         .map(|raw| {
             DateTime::parse_from_rfc3339(raw)
                 .map(|dt| dt.with_timezone(&Utc))
-                .map_err(|_| ApiError::unprocessable(format!("`since` is not an RFC 3339 timestamp: {raw}")))
+                .map_err(|_| {
+                    ApiError::unprocessable(format!("`since` is not an RFC 3339 timestamp: {raw}"))
+                })
         })
         .transpose()?;
     let after_id = query.cursor.as_deref().map(decode_cursor).transpose()?;

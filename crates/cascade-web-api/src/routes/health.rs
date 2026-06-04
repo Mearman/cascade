@@ -35,20 +35,25 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
 ///
 /// `503 unavailable` while starting up, while the F3 data-plane bit is unset, or
 /// when the state database is unreadable; the specific reason is in `details`.
-async fn ready(State(state): State<AppState>, _session: Session) -> Result<Json<ReadyResponse>, ApiError> {
+async fn ready(
+    State(state): State<AppState>,
+    _session: Session,
+) -> Result<Json<ReadyResponse>, ApiError> {
     // The state database backs readiness; an unreadable database is a hard
     // `unavailable`, not a silent "no backends".
     let status = state.engine.status();
     let started_at = state.readiness.started_at();
 
     if !state.readiness.data_plane_ready() {
-        return Err(ApiError::unavailable("the data plane is not yet ready").with_details(
-            serde_json::json!({
-                "reason": "data_plane_not_ready",
-                "data_plane_ready": false,
-                "started_at": started_at,
-            }),
-        ));
+        return Err(
+            ApiError::unavailable("the data plane is not yet ready").with_details(
+                serde_json::json!({
+                    "reason": "data_plane_not_ready",
+                    "data_plane_ready": false,
+                    "started_at": started_at,
+                }),
+            ),
+        );
     }
 
     Ok(Json(ReadyResponse {

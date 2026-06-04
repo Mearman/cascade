@@ -12,12 +12,12 @@ use std::io::Write as _;
 use std::path::{Path as FsPath, PathBuf};
 
 use axum::Json;
+use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::Router;
 use cascade_engine::manage::{Capability, Scope};
 use cascade_engine::types::{Change, DirEntry, FileEntry as EngineFileEntry, FileId};
 use serde::Deserialize;
@@ -41,7 +41,10 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/folders/{folder}/archive", get(archive))
         .route(
             "/v1/files/{folder}/entries/{*path}",
-            get(get_file).head(head_file).put(put_file).delete(delete_file),
+            get(get_file)
+                .head(head_file)
+                .put(put_file)
+                .delete(delete_file),
         )
 }
 
@@ -114,7 +117,11 @@ async fn children(
     Path(folder): Path<String>,
     Query(query): Query<ChildrenQuery>,
 ) -> Result<Json<FolderChildren>, ApiError> {
-    session.require(&state, Capability::StatusRead, &Scope::folder(folder.clone()))?;
+    session.require(
+        &state,
+        Capability::StatusRead,
+        &Scope::folder(folder.clone()),
+    )?;
     require_known_folder(&state, &folder)?;
 
     let sub_path = query.path.clone().unwrap_or_default();
@@ -156,7 +163,11 @@ async fn folder_entry(
     session: Session,
     Path((folder, path)): Path<(String, String)>,
 ) -> Result<Json<FileEntry>, ApiError> {
-    session.require(&state, Capability::StatusRead, &Scope::folder(folder.clone()))?;
+    session.require(
+        &state,
+        Capability::StatusRead,
+        &Scope::folder(folder.clone()),
+    )?;
     require_known_folder(&state, &folder)?;
     let entry = metadata(&state, &folder, &path).await?;
     Ok(Json(engine_entry_to_schema(&path, &entry)))
@@ -170,7 +181,11 @@ async fn search(
     Path(folder): Path<String>,
     Query(query): Query<SearchQuery>,
 ) -> Result<Json<SearchResponse>, ApiError> {
-    session.require(&state, Capability::StatusRead, &Scope::folder(folder.clone()))?;
+    session.require(
+        &state,
+        Capability::StatusRead,
+        &Scope::folder(folder.clone()),
+    )?;
     require_known_folder(&state, &folder)?;
 
     let limit = query
@@ -225,7 +240,11 @@ async fn fetch_file(
     _headers: &HeaderMap,
 ) -> Result<Response, ApiError> {
     require_data_plane_ready(state)?;
-    session.require(state, Capability::DataRead, &Scope::folder(folder.to_owned()))?;
+    session.require(
+        state,
+        Capability::DataRead,
+        &Scope::folder(folder.to_owned()),
+    )?;
     require_known_folder(state, folder)?;
 
     let entry = metadata(state, folder, path).await?;
@@ -264,7 +283,11 @@ async fn put_file(
     body: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     require_data_plane_ready(&state)?;
-    session.require(&state, Capability::DataWrite, &Scope::folder(folder.clone()))?;
+    session.require(
+        &state,
+        Capability::DataWrite,
+        &Scope::folder(folder.clone()),
+    )?;
     require_known_folder(&state, &folder)?;
 
     if body.len() > state.bind.max_body_bytes {
@@ -319,7 +342,11 @@ async fn put_file(
         }
     };
 
-    Ok((StatusCode::OK, Json(engine_entry_to_schema(&path, &written))).into_response())
+    Ok((
+        StatusCode::OK,
+        Json(engine_entry_to_schema(&path, &written)),
+    )
+        .into_response())
 }
 
 /// `DELETE /v1/files/{folder}/entries/{path}` — capability: `data:write`.
@@ -329,7 +356,11 @@ async fn delete_file(
     Path((folder, path)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
     require_data_plane_ready(&state)?;
-    session.require(&state, Capability::DataWrite, &Scope::folder(folder.clone()))?;
+    session.require(
+        &state,
+        Capability::DataWrite,
+        &Scope::folder(folder.clone()),
+    )?;
     require_known_folder(&state, &folder)?;
 
     let entry = metadata(&state, &folder, &path).await?;
@@ -386,7 +417,11 @@ async fn archive(
 /// briefly — to clone the owning backend and the child mount names — then drops
 /// it before awaiting the backend, so the handler future stays `Send`. (The
 /// guard is `!Send`, so it can never be held across an `.await`.)
-async fn read_dir(state: &AppState, folder: &str, sub_path: &str) -> Result<Vec<DirEntry>, ApiError> {
+async fn read_dir(
+    state: &AppState,
+    folder: &str,
+    sub_path: &str,
+) -> Result<Vec<DirEntry>, ApiError> {
     let path = folder_base(folder).join(sub_path.trim_start_matches('/'));
     let vfs = state.engine.vfs();
     let (backend, child_dirs) = {

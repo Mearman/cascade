@@ -33,8 +33,8 @@ pub fn decode_cursor(cursor: &str) -> Result<i64, ApiError> {
     let bytes = BASE64URL_NOPAD
         .decode(cursor.as_bytes())
         .map_err(|_| ApiError::unprocessable("malformed pagination cursor"))?;
-    let text =
-        std::str::from_utf8(&bytes).map_err(|_| ApiError::unprocessable("malformed pagination cursor"))?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| ApiError::unprocessable("malformed pagination cursor"))?;
     text.parse::<i64>()
         .map_err(|_| ApiError::unprocessable("malformed pagination cursor"))
 }
@@ -97,10 +97,16 @@ pub fn require_known_folder(state: &AppState, folder_id: &str) -> Result<(), Api
 /// runtime data-plane gate consults.
 pub fn resolve_folder_name(state: &AppState, name: &str) -> Result<String, ApiError> {
     let known = known_p2p_folders(state)?;
-    if let Some((_, id)) = known.iter().find(|(operator_name, _)| operator_name == name) {
+    if let Some((_, id)) = known
+        .iter()
+        .find(|(operator_name, _)| operator_name == name)
+    {
         return Ok(id.clone());
     }
-    let folders_known: Vec<&str> = known.iter().map(|(operator_name, _)| operator_name.as_str()).collect();
+    let folders_known: Vec<&str> = known
+        .iter()
+        .map(|(operator_name, _)| operator_name.as_str())
+        .collect();
     Err(ApiError::new(
         crate::error::ErrorCode::UnknownFolder,
         format!("no P2P folder named `{name}` is registered"),

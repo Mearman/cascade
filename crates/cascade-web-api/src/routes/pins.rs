@@ -2,11 +2,11 @@
 //! `pin_rules` table.
 
 use axum::Json;
+use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{delete, get};
-use axum::Router;
 use cascade_engine::manage::{Capability, Scope};
 
 use crate::auth::Session;

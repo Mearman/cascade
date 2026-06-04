@@ -3,11 +3,11 @@
 use std::collections::HashSet;
 
 use axum::Json;
+use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
-use axum::Router;
 use cascade_engine::manage::{Capability, CapabilityToken, DeviceId, Scope, derive_token_id};
 use chrono::{DateTime, Utc};
 
@@ -134,7 +134,9 @@ async fn revoke(
     Path(id): Path<String>,
 ) -> Result<Json<TokenRevokeResponse>, ApiError> {
     if session.class != SessionClass::Owner {
-        return Err(ApiError::forbidden("only an owner session may revoke a token"));
+        return Err(ApiError::forbidden(
+            "only an owner session may revoke a token",
+        ));
     }
     let db = state.engine.db();
     if db
