@@ -15,6 +15,7 @@ cascade-config = { path = "../cascade-config" }
 cascade-expr = { path = "../expr" }
 serde_json.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
 serde = { workspace = true }
 chrono.workspace = true
 wasm-bindgen.workspace = true
