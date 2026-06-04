@@ -220,7 +220,7 @@ fn v3_capability_tokens(conn: &Connection) -> Result<()> {
 /// A newer proposal for the same path replaces the older (INSERT OR REPLACE),
 /// so the table is bounded by the number of distinct paths per peer per
 /// folder — it does not grow without bound. The rows are surfaced to the
-/// operator as "rejected local additions from <peer>". If the operator later
+/// operator as "rejected local additions from `<peer>`". If the operator later
 /// grants `data:write` for that peer, quarantined rows become eligible to
 /// merge on the next index exchange (the peer re-sends; the node does not
 /// auto-replay the quarantine, so a stale proposal cannot resurrect deleted
