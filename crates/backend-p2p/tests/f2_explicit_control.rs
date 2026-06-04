@@ -277,7 +277,7 @@ async fn f2_token_only_data_read_survives_token_expiry() {
     // successful verify above; the engine's in-memory mirror must still
     // carry the per-direction state, so the gate continues to allow read
     // and deny write even though the token no longer verifies.
-    let mirror = engine.explicit_data_control_snapshot().await;
+    let mirror = engine.explicit_data_control_snapshot();
     let stored = mirror
         .get(&(bearer.as_str().to_owned(), "p2p-shared".to_owned()))
         .expect("the explicit-control bit must persist after the token lapses");

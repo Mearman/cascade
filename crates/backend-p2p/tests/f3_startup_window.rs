@@ -39,7 +39,7 @@ use tempfile::TempDir;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
-/// Build a P2pBackend with a fresh identity, no peers, listener on
+/// Build a `P2pBackend` with a fresh identity, no peers, listener on
 /// `127.0.0.1:0`. Returns the temp dir, the bound address (read once
 /// the listener's accept loop has started), and the backend.
 async fn open_node_backend(register_name: &str) -> (TempDir, std::net::SocketAddr, P2pBackend) {

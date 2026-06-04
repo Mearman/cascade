@@ -548,20 +548,19 @@ pub fn data_access_with_explicit_control(
         // If a bit exists for this (peer, folder), apply it: the bit carries
         // the per-direction state observed on the first successful verify,
         // and it survives any token revocation or expiry.
-        if let Some(state) = explicit_control
+        explicit_control
             .iter()
             .find(|s| s.peer == peer.as_str() && s.folder == folder)
-        {
-            DataAccess {
-                read: state.data_read,
-                write: state.data_write,
-            }
-        } else {
-            DataAccess {
-                read: true,
-                write: true,
-            }
-        }
+            .map_or(
+                DataAccess {
+                    read: true,
+                    write: true,
+                },
+                |state| DataAccess {
+                    read: state.data_read,
+                    write: state.data_write,
+                },
+            )
     }
 }
 

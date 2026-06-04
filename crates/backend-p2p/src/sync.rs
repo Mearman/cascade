@@ -916,12 +916,12 @@ impl SyncEngine {
         }
     }
 
-    /// Public test helper: drive the same data-plane gate
-    /// [`data_access_for`](Self::data_access_for) drives, but with a
-    /// `TlsVerified` caller authentication. Exists so integration tests
-    /// (F1 namespace, F2 explicit-control) can walk the full chain from
-    /// the live `DataAuthority` through `data_access` without taking a
-    /// dependency on the private caller-authentication enum.
+    /// Public test helper: drive the same data-plane gate the internal
+    /// `data_access_for` drives, but with a `TlsVerified` caller
+    /// authentication. Exists so integration tests (F1 namespace, F2
+    /// explicit-control) can walk the full chain from the live
+    /// `DataAuthority` through `data_access` without taking a dependency
+    /// on the private caller-authentication enum.
     pub async fn data_access_for_tls_verified(&self, peer: &str) -> DataAccess {
         self.data_access_for(peer, CallerAuthentication::TlsVerified)
             .await
@@ -930,10 +930,10 @@ impl SyncEngine {
     /// Public test helper: drive the data-plane gate with a presented
     /// capability token. The token is staged in the engine's
     /// `presented_data_tokens` map exactly as the BEP `ClusterConfig`
-    /// handler does, then [`data_access_for`](Self::data_access_for) is
-    /// invoked with `TlsVerified` authentication so the verify path
-    /// runs. Exists so the F2 explicit-control test can observe the
-    /// full token-verify → record-bit → read-grant-set chain end to end.
+    /// handler does, then the internal `data_access_for` is invoked
+    /// with `TlsVerified` authentication so the verify path runs. Exists
+    /// so the F2 explicit-control test can observe the full
+    /// token-verify → record-bit → read-grant-set chain end to end.
     pub async fn data_access_for_token(
         &self,
         peer: &str,

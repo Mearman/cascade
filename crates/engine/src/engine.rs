@@ -606,12 +606,12 @@ impl Engine {
     /// the last successful token verify. Exists for the F2 integration
     /// test to assert the in-memory mirror reflects the durable state
     /// the engine just observed.
-    pub async fn explicit_data_control_snapshot(
+    #[must_use]
+    pub fn explicit_data_control_snapshot(
         &self,
     ) -> std::collections::HashMap<(String, String), (bool, bool)> {
-        let rows = match self.db.list_data_explicit_control() {
-            Ok(rows) => rows,
-            Err(_) => return std::collections::HashMap::new(),
+        let Ok(rows) = self.db.list_data_explicit_control() else {
+            return std::collections::HashMap::new();
         };
         rows.into_iter()
             .map(|r| ((r.peer_device, r.folder_id), (r.data_read, r.data_write)))
