@@ -1,102 +1,93 @@
 import { useEffect, useState } from 'preact/hooks';
-import { api } from '@/api';
-import type { StatusResponse } from '@/api/types';
+import { api } from '@/api/client';
+import type { HealthResponse, SessionResponse } from '@/api/types';
 import { ErrorBanner, Spinner } from '@/components';
 
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return '0 B';
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'] as const;
+  const k = 1024;
+  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(k)), units.length - 1);
+  const unit = units[i];
+  if (unit === undefined) return `${bytes} B`;
+  return `${(bytes / Math.pow(k, i)).toFixed(1)} ${unit}`;
+}
+
 export function DashboardPage() {
-  const [status, setStatus] = useState<StatusResponse | null>(null);
+  const [health, setHealth] = useState<HealthResponse | null>(null);
+  const [session, setSession] = useState<SessionResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    api
-      .status()
-      .then((s) => setStatus(s))
+    Promise.all([api.health(), api.session()])
+      .then(([h, s]) => {
+        setHealth(h);
+        setSession(s);
+      })
       .catch((err) => setError(err instanceof Error ? err.message : String(err)))
       .finally(() => setLoading(false));
   }, []);
 
   if (loading) return <Spinner />;
   if (error) return <ErrorBanner message={error} />;
-  if (!status) return null;
+  if (!health || !session) return null;
 
-  const { version, uptimeSeconds, backends, cache, peers } = status;
-
-  const hours = Math.floor(uptimeSeconds / 3600);
-  const minutes = Math.floor((uptimeSeconds % 3600) / 60);
+  const { abilities } = session;
 
   return (
     <div class="dashboard">
-      <h2>Status</h2>
-      <p>Version {version} — up {hours}h {minutes}m</p>
+      <h2>Dashboard</h2>
 
-      <section>
-        <h3>Backends</h3>
-        {backends.length === 0 ? (
-          <p class="muted">No backends configured.</p>
-        ) : (
-          <ul>
-            {backends.map((b) => (
-              <li key={b.id}>
-                <strong>{b.displayName}</strong> ({b.mountPath}){' '}
-                {b.healthy ? (
-                  <span class="badge ok">healthy</span>
-                ) : (
-                  <span class="badge danger">unhealthy</span>
-                )}
-                {b.quota && (
-                  <span class="quota">
-                    {' '}
-                    {formatBytes(b.quota.usedBytes ?? 0)} /{' '}
-                    {b.quota.totalBytes ? formatBytes(b.quota.totalBytes) : '?'}
-                  </span>
-                )}
-              </li>
-            ))}
-          </ul>
+      <section class="dashboard-section">
+        <h3>Node</h3>
+        <dl class="info-list">
+          <dt>Version</dt>
+          <dd>{health.version}</dd>
+          <dt>Device ID</dt>
+          <dd><code>{health.node_device_id}</code></dd>
+          <dt>Session class</dt>
+          <dd><span class={`badge badge-class badge-${session.session.class}`}>{session.session.class}</span></dd>
+        </dl>
+      </section>
+
+      <section class="dashboard-section">
+        <h3>Abilities</h3>
+        <ul class="abilities-list">
+          {abilities.status_read && <li><span class="badge ok">status:read</span></li>}
+          {abilities.pin_write && <li><span class="badge ok">pin:write</span></li>}
+          {abilities.cache_manage && <li><span class="badge ok">cache:manage</span></li>}
+          {abilities.config_push && <li><span class="badge ok">config:push</span></li>}
+          {abilities.policy_set && <li><span class="badge ok">policy:set</span></li>}
+          {abilities.backend_manage && <li><span class="badge ok">backend:manage</span></li>}
+          {abilities.lifecycle_control && <li><span class="badge ok">lifecycle:control</span></li>}
+          {abilities.grant_admin && <li><span class="badge ok">grant:admin</span></li>}
+        </ul>
+
+        {abilities.data_read.length > 0 && (
+          <div class="data-abilities">
+            <p><span class="badge ok">data:read</span> folders:</p>
+            <ul>
+              {abilities.data_read.map((f) => <li key={f}><code>{f}</code></li>)}
+            </ul>
+          </div>
         )}
-      </section>
 
-      <section>
-        <h3>Cache</h3>
-        <p>
-          {formatBytes(cache.usedBytes)} used of {formatBytes(cache.totalBytes)}
-        </p>
-        <p>
-          {cache.pinnedFiles} pinned, {cache.cachedFiles} cached
-        </p>
-      </section>
+        {abilities.data_write.length > 0 && (
+          <div class="data-abilities">
+            <p><span class="badge ok">data:write</span> folders:</p>
+            <ul>
+              {abilities.data_write.map((f) => <li key={f}><code>{f}</code></li>)}
+            </ul>
+          </div>
+        )}
 
-      <section>
-        <h3>Peers</h3>
-        {peers.length === 0 ? (
-          <p class="muted">No known peers.</p>
-        ) : (
-          <ul>
-            {peers.map((p) => (
-              <li key={p.deviceId}>
-                {p.name} ({p.deviceId}){' '}
-                {p.online ? (
-                  <span class="badge ok">online</span>
-                ) : (
-                  <span class="badge muted">offline</span>
-                )}
-                {p.folders.length > 0 && (
-                  <span class="folders"> {p.folders.join(', ')}</span>
-                )}
-              </li>
-            ))}
-          </ul>
+        {!abilities.status_read &&
+          abilities.data_read.length === 0 &&
+          abilities.data_write.length === 0 && (
+          <p class="muted">No abilities granted.</p>
         )}
       </section>
     </div>
   );
-}
-
-function formatBytes(bytes: number): string {
-  if (bytes === 0) return '0 B';
-  const k = 1024;
-  const sizes = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i] ?? 'B'}`;
 }

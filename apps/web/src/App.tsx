@@ -1,3 +1,4 @@
+import { useState } from 'preact/hooks';
 import { Route, Router, Switch } from 'wouter-preact';
 import { AppShell } from '@/components';
 import {
@@ -6,17 +7,67 @@ import {
   GrantsPage,
   LoginPage,
   SharesPage,
+  SettingsPage,
   TokensPage,
 } from '@/routes';
-import { loadToken } from '@/auth';
-import type { AuthToken, Role } from '@/api/types';
+import { loadToken, hasApiBase, saveApiBase } from '@/auth';
+import { ErrorBanner } from '@/components';
 
-// Lazy-load heavier routes.
-const LazyDashboard = () => import('@/routes/DashboardPage').then((m) => ({ default: m.DashboardPage }));
-const LazyFiles = () => import('@/routes/FilesPage').then((m) => ({ default: m.FilesPage }));
-const LazyGrants = () => import('@/routes/GrantsPage').then((m) => ({ default: m.GrantsPage }));
-const LazyShares = () => import('@/routes/SharesPage').then((m) => ({ default: m.SharesPage }));
-const LazyTokens = () => import('@/routes/TokensPage').then((m) => ({ default: m.TokensPage }));
+function ConnectionSetup({ onConnected }: { onConnected: () => void }) {
+  const [url, setUrl] = useState('');
+  const [testing, setTesting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function handleSubmit(ev: Event) {
+    ev.preventDefault();
+    setError(null);
+    setTesting(true);
+    const trimmed = url.trim().replace(/\/$/, '');
+    try {
+      const res = await fetch(`${trimmed}/v1/health`);
+      if (!res.ok) throw new Error(`Daemon returned ${res.status}`);
+      saveApiBase(trimmed);
+      onConnected();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not reach the daemon at that address');
+    } finally {
+      setTesting(false);
+    }
+  }
+
+  function useSameOrigin() {
+    saveApiBase('');
+    onConnected();
+  }
+
+  return (
+    <div class="setup-page">
+      <h1>Connect to Cascade</h1>
+      <p>Enter the address of your running Cascade daemon.</p>
+      <form onSubmit={handleSubmit}>
+        <input
+          type="url"
+          value={url}
+          placeholder="http://192.168.1.100:7842"
+          onInput={(e) => setUrl((e.target as HTMLInputElement).value)}
+          disabled={testing}
+        />
+        {error && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
+        <div class="setup-actions">
+          <button type="submit" disabled={testing || url.trim() === ''}>
+            {testing ? 'Connecting…' : 'Connect'}
+          </button>
+          <button type="button" class="secondary" onClick={useSameOrigin}>
+            Same origin
+          </button>
+        </div>
+      </form>
+      <p class="muted">
+        Use <em>Same origin</em> when the daemon is serving this PWA directly.
+      </p>
+    </div>
+  );
+}
 
 function RequireAuth({ children }: { children: preact.ComponentChildren }) {
   const token = loadToken();
@@ -24,46 +75,33 @@ function RequireAuth({ children }: { children: preact.ComponentChildren }) {
   return <>{children}</>;
 }
 
-function RequireCapability({ capability, children }: { capability: string; children: preact.ComponentChildren }) {
-  const token = loadToken();
-  if (!token) return <LoginPage />;
-  // Bearer tokens carry the granted capability in the token itself.
-  if (token.role === 'bearer' && token.scope !== capability) {
-    return <p class="muted">This page requires the {capability} capability.</p>;
-  }
-  return <>{children}</>;
-}
-
 export function App() {
+  const [connected, setConnected] = useState(hasApiBase);
+
+  if (!connected) {
+    return <ConnectionSetup onConnected={() => setConnected(true)} />;
+  }
+
   return (
     <AppShell>
       <Router>
         <Switch>
           <Route path="/login" component={LoginPage} />
+          <Route path="/settings" component={() => <SettingsPage />} />
           <Route path="/" component={() => (
-            <RequireAuth>
-              <DashboardPage />
-            </RequireAuth>
+            <RequireAuth><DashboardPage /></RequireAuth>
           )} />
           <Route path="/files" component={() => (
-            <RequireAuth>
-              <FilesPage />
-            </RequireAuth>
+            <RequireAuth><FilesPage /></RequireAuth>
           )} />
           <Route path="/grants" component={() => (
-            <RequireCapability capability="grant:admin">
-              <GrantsPage />
-            </RequireCapability>
+            <RequireAuth><GrantsPage /></RequireAuth>
           )} />
           <Route path="/shares" component={() => (
-            <RequireAuth>
-              <SharesPage />
-            </RequireAuth>
+            <RequireAuth><SharesPage /></RequireAuth>
           )} />
           <Route path="/tokens" component={() => (
-            <RequireCapability capability="grant:admin">
-              <TokensPage />
-            </RequireCapability>
+            <RequireAuth><TokensPage /></RequireAuth>
           )} />
           <Route>
             <p class="muted">Page not found.</p>

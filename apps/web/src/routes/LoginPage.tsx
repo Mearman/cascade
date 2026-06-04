@@ -1,62 +1,53 @@
 import { useState } from 'preact/hooks';
-import { saveToken } from '@/auth';
-import type { AuthToken, Role } from '@/api/types';
+import { validateToken, isCapabilityToken } from '@/auth';
+import { ApiError } from '@/api/types';
 
 export function LoginPage() {
   const [tokenJson, setTokenJson] = useState('');
   const [error, setError] = useState<string | null>(null);
-
-  function parseRole(raw: string): Role | null {
-    const trimmed = raw.trim().toLowerCase();
-    if (trimmed === 'owner' || trimmed === 'named-user' || trimmed === 'bearer') {
-      return trimmed;
-    }
-    return null;
-  }
+  const [loading, setLoading] = useState(false);
 
   async function handleSubmit(ev: Event) {
     ev.preventDefault();
     setError(null);
+    setLoading(true);
 
     try {
-      const parsed = JSON.parse(tokenJson);
-      if (typeof parsed !== 'object' || parsed === null) {
-        throw new Error('Token must be a JSON object.');
+      const parsed: unknown = JSON.parse(tokenJson);
+      if (!isCapabilityToken(parsed)) {
+        throw new Error(
+          'Token must be a CapabilityToken JSON object with token_id, issuer, bearer, capability, scope, expires, and issued_at fields.',
+        );
       }
-
-      const role = parseRole(parsed['role'] ?? '');
-      if (!role) {
-        throw new Error('Token must have a valid role: owner, named-user, or bearer.');
-      }
-
-      const token: AuthToken = {
-        role,
-        deviceId: parsed['deviceId'] ?? undefined,
-        issuerId: parsed['issuerId'] ?? undefined,
-        scope: parsed['scope'] ?? undefined,
-        expiresAt: parsed['expiresAt'] ?? undefined,
-      };
-
-      saveToken(token);
+      await validateToken(parsed);
       window.location.reload();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Invalid token');
+      if (err instanceof ApiError) {
+        setError(`${err.code}: ${err.message}`);
+      } else {
+        setError(err instanceof Error ? err.message : 'Invalid token');
+      }
+    } finally {
+      setLoading(false);
     }
   }
 
   return (
     <div class="login-page">
       <h1>Cascade</h1>
-      <p>Enter your authentication token to continue.</p>
+      <p>Paste your CapabilityToken JSON to continue.</p>
       <form onSubmit={handleSubmit}>
         <textarea
-          rows={8}
-          placeholder={'{\n  "role": "owner",\n  "deviceId": "…"\n}'}
+          rows={10}
+          placeholder={'{\n  "token_id": "…",\n  "bearer": "…",\n  "capability": "status:read",\n  …\n}'}
           value={tokenJson}
           onInput={(e) => setTokenJson((e.target as HTMLTextAreaElement).value)}
+          disabled={loading}
         />
         {error && <p class="error">{error}</p>}
-        <button type="submit">Connect</button>
+        <button type="submit" disabled={loading}>
+          {loading ? 'Verifying…' : 'Connect'}
+        </button>
       </form>
     </div>
   );

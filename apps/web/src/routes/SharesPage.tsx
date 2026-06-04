@@ -1,7 +1,13 @@
 import { useEffect, useState } from 'preact/hooks';
-import { api } from '@/api';
-import type { ShareEntry } from '@/api/types';
+import { api } from '@/api/client';
+import type { ShareEntry, SharePosture } from '@/api/types';
 import { ErrorBanner, Spinner } from '@/components';
+
+function postureBadgeClass(posture: SharePosture): string {
+  if (posture === 'read-only') return 'badge badge-read';
+  if (posture === 'write-only') return 'badge badge-write';
+  return 'badge badge-readwrite';
+}
 
 export function SharesPage() {
   const [shares, setShares] = useState<ShareEntry[]>([]);
@@ -9,23 +15,16 @@ export function SharesPage() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    api
-      .shares()
-      .then(setShares)
+    api.shares()
+      .then((r) => setShares(r.shares))
       .catch((err) => setError(err instanceof Error ? err.message : String(err)))
       .finally(() => setLoading(false));
   }, []);
 
-  async function revoke(peerId: string, folder: string, direction?: string) {
+  async function revoke(id: number) {
     try {
-      await api.revokeShare(peerId, folder, direction);
-      setShares((prev) =>
-        prev.filter(
-          (s) =>
-            !(s.peerId === peerId && s.folder === folder) ||
-            (direction !== undefined && s.direction !== direction),
-        ),
-      );
+      await api.deleteShare(id);
+      setShares((prev) => prev.filter((s) => !s.grant_ids.includes(id)));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -45,27 +44,32 @@ export function SharesPage() {
             <tr>
               <th>Peer</th>
               <th>Folder</th>
-              <th>Direction</th>
+              <th>Posture</th>
               <th>Expires</th>
               <th></th>
             </tr>
           </thead>
           <tbody>
             {shares.map((s) => (
-              <tr key={`${s.peerId}/${s.folder}/${s.direction}`}>
+              <tr key={`${s.peer_device_id}/${s.folder_id}`}>
+                <td><code>{s.peer_device_id}</code></td>
                 <td>
-                  <code>{s.peerId}</code>
+                  <span title={s.folder_id}>{s.folder}</span>
                 </td>
-                <td>{s.folder}</td>
-                <td>{s.direction}</td>
-                <td>{s.expiresAt ? new Date(s.expiresAt).toLocaleString() : 'never'}</td>
                 <td>
-                  <button
-                    class="danger"
-                    onClick={() => revoke(s.peerId, s.folder, s.direction)}
-                  >
-                    Revoke
-                  </button>
+                  <span class={postureBadgeClass(s.posture)}>{s.posture}</span>
+                </td>
+                <td>{s.expires ? new Date(s.expires).toLocaleString() : 'never'}</td>
+                <td>
+                  {s.grant_ids.map((id) => (
+                    <button
+                      key={id}
+                      class="danger"
+                      onClick={() => void revoke(id)}
+                    >
+                      Revoke
+                    </button>
+                  ))}
                 </td>
               </tr>
             ))}

@@ -1,70 +1,130 @@
 import { useEffect, useState } from 'preact/hooks';
-import { api } from '@/api';
-import type { FileEntry } from '@/api/types';
+import { api } from '@/api/client';
+import type { BackendEntry, FileEntry } from '@/api/types';
 import { ErrorBanner, Spinner } from '@/components';
 
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return '0 B';
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'] as const;
+  const k = 1024;
+  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(k)), units.length - 1);
+  const unit = units[i];
+  if (unit === undefined) return `${bytes} B`;
+  return `${(bytes / Math.pow(k, i)).toFixed(1)} ${unit}`;
+}
+
 export function FilesPage() {
+  const [backends, setBackends] = useState<BackendEntry[]>([]);
+  const [selectedFolder, setSelectedFolder] = useState<string | null>(null);
+  const [currentPath, setCurrentPath] = useState('');
+  const [breadcrumb, setBreadcrumb] = useState<string[]>(['']);
   const [entries, setEntries] = useState<FileEntry[]>([]);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [currentParent, setCurrentParent] = useState<string | null>(null);
-  const [path, setPath] = useState<Array<{ id: string | null; name: string }>>([
-    { id: null, name: 'Root' },
-  ]);
+  const [loadingBackends, setLoadingBackends] = useState(true);
+  const [loadingEntries, setLoadingEntries] = useState(false);
 
   useEffect(() => {
-    setLoading(true);
-    api
-      .listFolder(currentParent)
-      .then((e) => {
-        setEntries(e);
+    api.backends()
+      .then((r) => {
+        const p2p = r.backends.filter((b) => b.folder_id !== null);
+        setBackends(p2p);
+        const first = p2p[0];
+        if (first?.folder_id !== null && first !== undefined) {
+          setSelectedFolder(first.folder_id ?? null);
+        }
+      })
+      .catch((err) => setError(err instanceof Error ? err.message : String(err)))
+      .finally(() => setLoadingBackends(false));
+  }, []);
+
+  useEffect(() => {
+    if (selectedFolder === null) return;
+    setLoadingEntries(true);
+    setEntries([]);
+    setNextCursor(null);
+    api.folderChildren(selectedFolder, currentPath)
+      .then((r) => {
+        setEntries(r.entries);
+        setNextCursor(r.next_cursor);
         setError(null);
       })
       .catch((err) => setError(err instanceof Error ? err.message : String(err)))
-      .finally(() => setLoading(false));
-  }, [currentParent]);
+      .finally(() => setLoadingEntries(false));
+  }, [selectedFolder, currentPath]);
 
   function navigate(entry: FileEntry) {
-    if (!entry.isDir) return;
-    setPath((prev) => [...prev, { id: entry.id, name: entry.name }]);
-    setCurrentParent(entry.id);
+    if (entry.kind !== 'directory') return;
+    const next = currentPath === '' ? entry.name : `${currentPath}/${entry.name}`;
+    setBreadcrumb((prev) => [...prev, next]);
+    setCurrentPath(next);
   }
 
-  function navigateTo(index: number) {
-    const target = path[index]!;
-    setPath(path.slice(0, index + 1));
-    setCurrentParent(target.id);
+  function navigateToBreadcrumb(index: number) {
+    const target = breadcrumb[index];
+    if (target === undefined) return;
+    setBreadcrumb(breadcrumb.slice(0, index + 1));
+    setCurrentPath(target);
   }
 
-  async function handlePin(entry: FileEntry, pin: boolean) {
+  function handleFolderChange(e: Event) {
+    const value = (e.target as HTMLSelectElement).value;
+    setSelectedFolder(value);
+    setCurrentPath('');
+    setBreadcrumb(['']);
+  }
+
+  async function loadMore() {
+    if (!selectedFolder || nextCursor === null) return;
     try {
-      if (pin) {
-        await api.pin(entry.id);
-      } else {
-        await api.unpin(entry.id);
-      }
-      // Refresh.
-      const refreshed = await api.listFolder(currentParent);
-      setEntries(refreshed);
+      const r = await api.folderChildren(selectedFolder, currentPath, { cursor: nextCursor });
+      setEntries((prev) => [...prev, ...r.entries]);
+      setNextCursor(r.next_cursor);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
   }
 
-  if (loading) return <Spinner />;
+  if (loadingBackends) return <Spinner />;
+
+  if (backends.length === 0) {
+    return (
+      <div class="files-page">
+        <h2>Files</h2>
+        <p class="muted">No P2P backends configured.</p>
+      </div>
+    );
+  }
+
+  const folderLabel = backends.find((b) => b.folder_id === selectedFolder)?.name ?? selectedFolder ?? '';
 
   return (
     <div class="files-page">
+      <h2>Files</h2>
+
+      <div class="folder-picker">
+        <label>
+          Folder
+          <select value={selectedFolder ?? ''} onChange={handleFolderChange}>
+            {backends.map((b) => (
+              <option key={b.folder_id} value={b.folder_id ?? ''}>
+                {b.name} ({b.folder_id})
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+
       <nav class="breadcrumb">
-        {path.map((segment, i) => (
+        {breadcrumb.map((seg, i) => (
           <span key={i}>
             {i > 0 && ' / '}
             <button
               class="link"
-              onClick={() => navigateTo(i)}
-              disabled={i === path.length - 1}
+              onClick={() => navigateToBreadcrumb(i)}
+              disabled={i === breadcrumb.length - 1}
             >
-              {segment.name}
+              {i === 0 ? folderLabel : seg.split('/').pop() ?? seg}
             </button>
           </span>
         ))}
@@ -72,61 +132,46 @@ export function FilesPage() {
 
       {error && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
 
-      {entries.length === 0 ? (
+      {loadingEntries ? (
+        <Spinner />
+      ) : entries.length === 0 ? (
         <p class="muted">Empty directory.</p>
       ) : (
-        <table class="file-table">
-          <thead>
-            <tr>
-              <th>Name</th>
-              <th>Size</th>
-              <th>Modified</th>
-              <th>State</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>
-            {entries.map((entry) => (
-              <tr key={entry.id}>
-                <td>
-                  <button
-                    class="name-btn"
-                    onClick={() => navigate(entry)}
-                    disabled={!entry.isDir}
-                  >
-                    {entry.isDir ? (
-                      <span class="icon">📁</span>
-                    ) : (
-                      <span class="icon">📄</span>
-                    )}{' '}
-                    {entry.name}
-                  </button>
-                </td>
-                <td>{entry.size !== null ? formatBytes(entry.size) : '—'}</td>
-                <td>{entry.modTime ? new Date(entry.modTime).toLocaleString() : '—'}</td>
-                <td>
-                  <span class={`cache-badge ${entry.cacheState}`}>
-                    {entry.cacheState}
-                  </span>
-                </td>
-                <td>
-                  <button onClick={() => handlePin(entry, entry.cacheState !== 'pinned')}>
-                    {entry.cacheState === 'pinned' ? 'Unpin' : 'Pin'}
-                  </button>
-                </td>
+        <>
+          <table class="file-table">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Size</th>
+                <th>Modified</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {entries.map((entry) => (
+                <tr key={entry.name}>
+                  <td>
+                    <button
+                      class="name-btn"
+                      onClick={() => navigate(entry)}
+                      disabled={entry.kind !== 'directory'}
+                    >
+                      {entry.kind === 'directory' ? '📁 ' : '📄 '}
+                      {entry.name}
+                    </button>
+                  </td>
+                  <td>{entry.size !== null ? formatBytes(entry.size) : '—'}</td>
+                  <td>{entry.mtime ? new Date(entry.mtime).toLocaleString() : '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {nextCursor !== null && (
+            <button class="secondary" onClick={() => void loadMore()}>
+              Load more
+            </button>
+          )}
+        </>
       )}
     </div>
   );
-}
-
-function formatBytes(bytes: number): string {
-  if (bytes === 0) return '0 B';
-  const k = 1024;
-  const sizes = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i] ?? 'B'}`;
 }

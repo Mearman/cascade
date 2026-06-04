@@ -1,84 +1,85 @@
-/**
- * Auth store — token entry, localStorage persistence, and 401 interceptor.
- *
- * Tokens are stored in localStorage, which is only accessible from a Secure
- * Context (HTTPS or localhost). If the page is served over an insecure
- * connection the store refuses to persist or retrieve tokens.
- */
+import { api, API_BASE_KEY, TOKEN_KEY } from '@/api/client';
+import { ApiError } from '@/api/types';
+import type { CapabilityToken, SessionResponse } from '@/api/types';
 
-import { api } from '@/api';
-import type { AuthToken } from '@/api/types';
+export { API_BASE_KEY };
 
-const STORAGE_KEY = 'cascade-auth-token';
-
-function isSecureContext(): boolean {
-  return window.location.protocol === 'https:' || window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+export function isCapabilityToken(value: unknown): value is CapabilityToken {
+  if (typeof value !== 'object' || value === null) return false;
+  if (!('token_id' in value) || typeof value.token_id !== 'string') return false;
+  if (!('issuer' in value) || typeof value.issuer !== 'string') return false;
+  if (!('bearer' in value) || typeof value.bearer !== 'string') return false;
+  if (!('capability' in value) || typeof value.capability !== 'string') return false;
+  if (!('scope' in value) || typeof value.scope !== 'object' || value.scope === null) return false;
+  if (!('expires' in value) || typeof value.expires !== 'string') return false;
+  if (!('issued_at' in value) || typeof value.issued_at !== 'string') return false;
+  return true;
 }
 
-export function saveToken(token: AuthToken): void {
-  if (!isSecureContext()) {
-    console.warn('Auth: not a secure context, refusing to store token in localStorage');
-    return;
-  }
+export function saveToken(token: CapabilityToken): void {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(token));
+    localStorage.setItem(TOKEN_KEY, JSON.stringify(token));
     api.setToken(token);
   } catch (err) {
     console.error('Auth: failed to save token', err);
   }
 }
 
-export function loadToken(): AuthToken | null {
-  if (!isSecureContext()) {
-    return null;
-  }
+export function loadToken(): CapabilityToken | null {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw = localStorage.getItem(TOKEN_KEY);
     if (raw === null) return null;
-    const token = JSON.parse(raw) as AuthToken;
-    api.setToken(token);
-    return token;
+    const parsed: unknown = JSON.parse(raw);
+    if (!isCapabilityToken(parsed)) return null;
+    api.setToken(parsed);
+    return parsed;
   } catch {
     return null;
   }
 }
 
 export function clearToken(): void {
-  if (!isSecureContext()) return;
   try {
-    localStorage.removeItem(STORAGE_KEY);
+    localStorage.removeItem(TOKEN_KEY);
     api.setToken(null);
   } catch {
     // ignore
   }
 }
 
-export function getToken(): AuthToken | null {
+export function getToken(): CapabilityToken | null {
   return api.getToken();
 }
 
-// Interceptor: attach the stored token to every fetch request and redirect
-// to the login page on 401.
-export function init401Interceptor(on401: () => void): () => void {
-  const originalFetch = window.fetch.bind(window);
-  window.fetch = async function fetch(input: RequestInfo | URL, init?: RequestInit) {
-    const token = loadToken();
-    if (token) {
-      api.setToken(token);
-    }
-    try {
-      const response = await originalFetch(input, init);
-      if (response.status === 401) {
-        clearToken();
-        on401();
-      }
-      return response;
-    } catch (err) {
-      return originalFetch(input, init);
-    }
-  };
+export function getApiBase(): string {
+  return localStorage.getItem(API_BASE_KEY) ?? '';
+}
 
-  return () => {
-    window.fetch = originalFetch;
-  };
+export function saveApiBase(base: string): void {
+  localStorage.setItem(API_BASE_KEY, base);
+}
+
+export function clearApiBase(): void {
+  localStorage.removeItem(API_BASE_KEY);
+}
+
+export function hasApiBase(): boolean {
+  return localStorage.getItem(API_BASE_KEY) !== null;
+}
+
+// Validate token against the daemon by calling /v1/session.
+// Returns the session response on success, throws ApiError on failure.
+export async function validateToken(token: CapabilityToken): Promise<SessionResponse> {
+  saveToken(token);
+  try {
+    return await api.session();
+  } catch (err) {
+    clearToken();
+    throw err;
+  }
+}
+
+export function initAuth(on401: () => void): void {
+  loadToken();
+  api.setOn401(on401);
 }

@@ -4,3 +4,4 @@ export { FilesPage } from './FilesPage';
 export { GrantsPage } from './GrantsPage';
 export { SharesPage } from './SharesPage';
 export { TokensPage } from './TokensPage';
+export { SettingsPage } from './SettingsPage';

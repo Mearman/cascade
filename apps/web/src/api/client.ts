@@ -1,151 +1,347 @@
 import type {
-  AuthToken,
-  StatusResponse,
-  FileEntry,
-  GrantEntry,
+  CapabilityToken,
+  SessionResponse,
+  HealthResponse,
+  ReadyResponse,
+  FolderChildrenResponse,
+  EntryMetaResponse,
   ShareEntry,
+  SharesResponse,
+  CreateShareBody,
   TokenEntry,
-  CacheState,
+  TokensResponse,
+  RevokeTokenResponse,
+  CreateTokenBody,
+  GrantEntry,
+  GrantsResponse,
+  CreateGrantBody,
+  AuditResponse,
+  PeersResponse,
+  PinsResponse,
+  PinEntry,
+  CreatePinBody,
+  PoliciesResponse,
+  PolicyEntry,
+  CreatePolicyBody,
+  BackendsResponse,
+  CacheWarmBody,
+  CacheActionResponse,
+  ConfigPushBody,
+  PaginationParams,
+  ApiErrorResponse,
+  ApiErrorDetail,
+  ErrorCode,
 } from './types';
+import { ApiError } from './types';
 
-const BASE = import.meta.env['VITE_API_BASE'] ?? '/api';
+export const API_BASE_KEY = 'cascade-api-base';
+export const TOKEN_KEY = 'cascade-token';
 
-function isApiError(body: unknown): body is { error: string; detail?: string } {
-  return typeof body === 'object' && body !== null && 'error' in body;
+function getBase(): string {
+  return localStorage.getItem(API_BASE_KEY) ?? '';
 }
 
-class ApiClient {
-  private token: AuthToken | null = null;
+function getStoredToken(): CapabilityToken | null {
+  try {
+    const raw = localStorage.getItem(TOKEN_KEY);
+    if (raw === null) return null;
+    const parsed: unknown = JSON.parse(raw);
+    if (!isCapabilityToken(parsed)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
 
-  setToken(token: AuthToken | null): void {
+function isCapabilityToken(value: unknown): value is CapabilityToken {
+  if (typeof value !== 'object' || value === null) return false;
+  if (!('token_id' in value) || typeof value.token_id !== 'string') return false;
+  if (!('issuer' in value) || typeof value.issuer !== 'string') return false;
+  if (!('bearer' in value) || typeof value.bearer !== 'string') return false;
+  if (!('capability' in value) || typeof value.capability !== 'string') return false;
+  if (!('scope' in value) || typeof value.scope !== 'object') return false;
+  if (!('expires' in value) || typeof value.expires !== 'string') return false;
+  if (!('issued_at' in value) || typeof value.issued_at !== 'string') return false;
+  return true;
+}
+
+function isApiErrorResponse(body: unknown): body is ApiErrorResponse {
+  if (typeof body !== 'object' || body === null) return false;
+  if (!('error' in body) || typeof body.error !== 'object' || body.error === null) return false;
+  const e = body.error;
+  return 'code' in e && 'message' in e && 'request_id' in e;
+}
+
+function isErrorCode(code: unknown): code is ErrorCode {
+  const codes: ReadonlyArray<string> = [
+    'unauthorised', 'forbidden', 'not_found', 'conflict', 'gone',
+    'payload_too_large', 'unprocessable', 'rate_limited', 'internal',
+    'unavailable', 'timeout', 'bearer_mismatch', 'token_too_large',
+    'chain_too_deep', 'data_verb_node_wide_forbidden',
+    'delegation_exceeds_parent', 'data_plane_not_ready', 'precondition_failed',
+  ];
+  return typeof code === 'string' && codes.includes(code);
+}
+
+function parseApiError(body: unknown): ApiErrorDetail {
+  if (isApiErrorResponse(body)) {
+    const e = body.error;
+    const code = isErrorCode(e.code) ? e.code : ('internal' as ErrorCode);
+    const result: ApiErrorDetail = {
+      code,
+      message: String(e.message),
+      request_id: String(e.request_id),
+    };
+    if (typeof e.details === 'object' && e.details !== null && !Array.isArray(e.details)) {
+      result.details = e.details as Record<string, unknown>;
+    }
+    return result;
+  }
+  return { code: 'internal', message: 'Unknown error', request_id: '' };
+}
+
+export class ApiClient {
+  private token: CapabilityToken | null = null;
+  private on401: (() => void) | null = null;
+
+  setToken(token: CapabilityToken | null): void {
     this.token = token;
   }
 
-  getToken(): AuthToken | null {
-    return this.token;
+  getToken(): CapabilityToken | null {
+    return this.token ?? getStoredToken();
+  }
+
+  setOn401(handler: () => void): void {
+    this.on401 = handler;
   }
 
   private async request<T>(
-    method: 'GET' | 'POST' | 'PUT' | 'DELETE',
+    method: 'GET' | 'POST' | 'PUT' | 'DELETE' | 'HEAD',
     path: string,
     body?: unknown,
   ): Promise<T> {
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-    };
+    const token = this.getToken();
+    const headers: Record<string, string> = {};
 
-    if (this.token) {
-      headers['Authorization'] = `Bearer ${btoa(JSON.stringify(this.token))}`;
+    if (body !== undefined) {
+      headers['Content-Type'] = 'application/json';
     }
+
+    if (token !== null) {
+      headers['Authorization'] = `Bearer ${btoa(JSON.stringify(token))}`;
+      headers['X-Cascade-Bearer-Device'] = token.bearer;
+    }
+
+    // Generate a request id: 26-char base32 (Crockford) approximation using random bytes.
+    const reqBytes = crypto.getRandomValues(new Uint8Array(16));
+    headers['X-Cascade-Request-Id'] = Array.from(reqBytes)
+      .map((b) => '0123456789ABCDEFGHJKMNPQRSTVWXYZ'[b % 32] ?? '0')
+      .join('')
+      .slice(0, 26);
 
     const init: RequestInit = { method, headers };
     if (body !== undefined) {
-      init['body'] = JSON.stringify(body);
+      init.body = JSON.stringify(body);
     }
-    const res = await fetch(`${BASE}${path}`, init);
+
+    const url = `${getBase()}/v1${path}`;
+    const res = await fetch(url, init);
 
     if (res.status === 401) {
-      // Token missing, invalid, or expired — clear and let the UI handle redirect.
       this.token = null;
-      throw new Error('Unauthorised');
-    }
-
-    if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      let message = `HTTP ${res.status}`;
-      try {
-        const parsed = JSON.parse(text);
-        if (isApiError(parsed)) {
-          message = parsed.detail ?? parsed.error;
-        }
-      } catch {
-        // Use status text if JSON parsing fails.
-      }
-      throw new Error(message);
+      this.on401?.();
+      const raw: unknown = await res.json().catch(() => null);
+      throw new ApiError(parseApiError(raw));
     }
 
     if (res.status === 204) {
       return undefined as T;
     }
 
-    return res.json() as Promise<T>;
+    const raw: unknown = await res.json().catch(() => null);
+
+    if (!res.ok) {
+      throw new ApiError(parseApiError(raw));
+    }
+
+    return raw as T;
   }
 
-  // ─── Status ────────────────────────────────────────────────────────────────
+  // ─── Health / Readiness ────────────────────────────────────────────────────
 
-  status(): Promise<StatusResponse> {
-    return this.request('GET', '/status');
+  health(): Promise<HealthResponse> {
+    return fetch(`${getBase()}/v1/health`).then((r) => r.json() as Promise<HealthResponse>);
+  }
+
+  ready(): Promise<ReadyResponse> {
+    return this.request('GET', '/ready');
+  }
+
+  // ─── Session ──────────────────────────────────────────────────────────────
+
+  session(): Promise<SessionResponse> {
+    return this.request('GET', '/session');
+  }
+
+  revokeSession(): Promise<SessionResponse> {
+    return this.request('POST', '/session/revoke');
+  }
+
+  // ─── Folders ──────────────────────────────────────────────────────────────
+
+  folderChildren(
+    folder: string,
+    path: string,
+    pagination?: PaginationParams,
+  ): Promise<FolderChildrenResponse> {
+    const params = new URLSearchParams({ path });
+    if (pagination?.limit !== undefined) params.set('limit', String(pagination.limit));
+    if (pagination?.cursor !== undefined) params.set('cursor', pagination.cursor);
+    return this.request('GET', `/folders/${encodeURIComponent(folder)}/children?${params}`);
+  }
+
+  entryMeta(folder: string, path: string): Promise<EntryMetaResponse> {
+    return this.request('GET', `/folders/${encodeURIComponent(folder)}/entries/${encodeURIComponent(path)}`);
   }
 
   // ─── Files ─────────────────────────────────────────────────────────────────
 
-  listFolder(parentId: string | null): Promise<FileEntry[]> {
-    const q = parentId !== null ? `?parent=${encodeURIComponent(parentId)}` : '';
-    return this.request('GET', `/files${q}`);
+  downloadFile(folder: string, path: string): Promise<Response> {
+    const token = this.getToken();
+    const headers: Record<string, string> = {};
+    if (token !== null) {
+      headers['Authorization'] = `Bearer ${btoa(JSON.stringify(token))}`;
+      headers['X-Cascade-Bearer-Device'] = token.bearer;
+    }
+    return fetch(`${getBase()}/v1/files/${encodeURIComponent(folder)}/entries/${encodeURIComponent(path)}`, { headers });
   }
 
-  file(id: string): Promise<FileEntry> {
-    return this.request('GET', `/files/${encodeURIComponent(id)}`);
+  uploadFile(folder: string, path: string, content: Blob, etag?: string): Promise<EntryMetaResponse> {
+    const token = this.getToken();
+    const headers: Record<string, string> = {};
+    if (token !== null) {
+      headers['Authorization'] = `Bearer ${btoa(JSON.stringify(token))}`;
+      headers['X-Cascade-Bearer-Device'] = token.bearer;
+    }
+    if (etag !== undefined) headers['If-Match'] = etag;
+    return fetch(
+      `${getBase()}/v1/files/${encodeURIComponent(folder)}/entries/${encodeURIComponent(path)}`,
+      { method: 'PUT', headers, body: content },
+    ).then((r) => r.json() as Promise<EntryMetaResponse>);
   }
 
-  // ─── Pinning ───────────────────────────────────────────────────────────────
-
-  pin(id: string): Promise<void> {
-    return this.request('POST', `/files/${encodeURIComponent(id)}/pin`);
+  deleteFile(folder: string, path: string): Promise<void> {
+    return this.request('DELETE', `/files/${encodeURIComponent(folder)}/entries/${encodeURIComponent(path)}`);
   }
 
-  unpin(id: string): Promise<void> {
-    return this.request('POST', `/files/${encodeURIComponent(id)}/unpin`);
+  // ─── Shares ───────────────────────────────────────────────────────────────
+
+  shares(): Promise<SharesResponse> {
+    return this.request('GET', '/shares');
   }
 
-  // ─── Cache ─────────────────────────────────────────────────────────────────
-
-  cacheWarm(path: string): Promise<void> {
-    return this.request('POST', '/cache/warm', { path });
+  createShare(body: CreateShareBody): Promise<ShareEntry> {
+    return this.request('POST', '/shares', body);
   }
 
-  cacheEvict(path?: string): Promise<void> {
-    const q = path !== undefined ? `?path=${encodeURIComponent(path)}` : '';
-    return this.request('POST', `/cache/evict${q}`);
-  }
-
-  // ─── Grants / Sharing ─────────────────────────────────────────────────────
-
-  grants(): Promise<GrantEntry[]> {
-    return this.request('GET', '/grants');
-  }
-
-  addGrant(grantee: string, capability: string, scope: string, expiresAt?: string): Promise<GrantEntry> {
-    return this.request('POST', '/grants', { grantee, capability, scope, expiresAt });
-  }
-
-  revokeGrant(id: number): Promise<void> {
-    return this.request('DELETE', `/grants/${id}`);
-  }
-
-  shares(folder?: string): Promise<ShareEntry[]> {
-    const q = folder !== undefined ? `?folder=${encodeURIComponent(folder)}` : '';
-    return this.request('GET', `/shares${q}`);
-  }
-
-  addShare(peerId: string, folder: string, direction: string, expiresAt?: string): Promise<ShareEntry> {
-    return this.request('POST', '/shares', { peerId, folder, direction, expiresAt });
-  }
-
-  revokeShare(peerId: string, folder: string, direction?: string): Promise<void> {
-    const body: Record<string, string> = { peerId, folder };
-    if (direction) body['direction'] = direction;
-    return this.request('DELETE', '/shares', body);
+  deleteShare(id: number): Promise<void> {
+    return this.request('DELETE', `/shares/${id}`);
   }
 
   // ─── Tokens ───────────────────────────────────────────────────────────────
 
-  tokens(): Promise<TokenEntry[]> {
+  tokens(): Promise<TokensResponse> {
     return this.request('GET', '/tokens');
   }
 
-  revokeToken(id: string): Promise<void> {
-    return this.request('DELETE', `/tokens/${id}`);
+  createToken(body: CreateTokenBody): Promise<CapabilityToken> {
+    return this.request('POST', '/tokens', body);
+  }
+
+  revokeToken(id: string): Promise<RevokeTokenResponse> {
+    return this.request('POST', `/tokens/${encodeURIComponent(id)}/revoke`);
+  }
+
+  // ─── Grants ───────────────────────────────────────────────────────────────
+
+  grants(): Promise<GrantsResponse> {
+    return this.request('GET', '/grants');
+  }
+
+  createGrant(body: CreateGrantBody): Promise<GrantEntry> {
+    return this.request('POST', '/grants', body);
+  }
+
+  deleteGrant(id: number): Promise<void> {
+    return this.request('DELETE', `/grants/${id}`);
+  }
+
+  // ─── Audit ────────────────────────────────────────────────────────────────
+
+  audit(params?: { since?: string } & PaginationParams): Promise<AuditResponse> {
+    const qs = new URLSearchParams();
+    if (params?.since !== undefined) qs.set('since', params.since);
+    if (params?.limit !== undefined) qs.set('limit', String(params.limit));
+    if (params?.cursor !== undefined) qs.set('cursor', params.cursor);
+    const suffix = qs.toString() ? `?${qs}` : '';
+    return this.request('GET', `/audit${suffix}`);
+  }
+
+  // ─── Peers ────────────────────────────────────────────────────────────────
+
+  peers(): Promise<PeersResponse> {
+    return this.request('GET', '/peers');
+  }
+
+  // ─── Pins ─────────────────────────────────────────────────────────────────
+
+  pins(): Promise<PinsResponse> {
+    return this.request('GET', '/pins');
+  }
+
+  createPin(body: CreatePinBody): Promise<PinEntry> {
+    return this.request('POST', '/pins', body);
+  }
+
+  deletePin(id: number): Promise<void> {
+    return this.request('DELETE', `/pins/${id}`);
+  }
+
+  // ─── Policies ─────────────────────────────────────────────────────────────
+
+  policies(): Promise<PoliciesResponse> {
+    return this.request('GET', '/policies');
+  }
+
+  createPolicy(body: CreatePolicyBody): Promise<PolicyEntry> {
+    return this.request('POST', '/policies', body);
+  }
+
+  deletePolicy(id: number): Promise<void> {
+    return this.request('DELETE', `/policies/${id}`);
+  }
+
+  // ─── Backends ─────────────────────────────────────────────────────────────
+
+  backends(): Promise<BackendsResponse> {
+    return this.request('GET', '/backends');
+  }
+
+  // ─── Cache ────────────────────────────────────────────────────────────────
+
+  cacheEvict(): Promise<CacheActionResponse> {
+    return this.request('POST', '/cache/evict');
+  }
+
+  cacheWarm(body: CacheWarmBody): Promise<CacheActionResponse> {
+    return this.request('POST', '/cache/warm', body);
+  }
+
+  // ─── Config ───────────────────────────────────────────────────────────────
+
+  configPush(body: ConfigPushBody): Promise<void> {
+    return this.request('POST', '/config/push', body);
   }
 }
 
