@@ -42,11 +42,11 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use cascade_engine::manage::{DeviceId, ManageDispatch};
+use cascade_engine::manage::{DataAccess, DataAuthority, DeviceId, ManageDispatch};
 use cascade_p2p::block::BlockHash;
 use cascade_p2p::candidate::{Candidate, CandidateKind};
 use cascade_p2p::connection::ConnectionManager;
@@ -162,6 +162,18 @@ impl CallerAuthentication {
     const fn permits_management(self) -> bool {
         matches!(self, Self::TlsVerified)
     }
+
+    /// Whether a session with this authentication may write its index/blocks
+    /// into this node (the data-plane accept direction). Only a TLS-verified
+    /// principal qualifies: on a relayed or post-hole-punch session the device
+    /// id is asserted on the wire, not certificate-bound, so a data grant keyed
+    /// to that id must not be honoured — any party who can open a tunnel could
+    /// otherwise spoof a write-granted peer's device id and push content. An
+    /// unverified session is no-share for writes regardless of grants; its
+    /// proposed rows are routed to the receive quarantine instead.
+    const fn permits_data_write(self) -> bool {
+        matches!(self, Self::TlsVerified)
+    }
 }
 
 /// Object-safe trait the boxed reader half implements.
@@ -225,6 +237,55 @@ impl<W: TransportWriter + Send> AsyncBepWriter for SessionWriterBoxed<W> {
 const FILE_TYPE_FILE: u32 = 0;
 /// File-type code for directories.
 const FILE_TYPE_DIR: u32 = 1;
+
+/// JSON-serialisable snapshot of a peer-proposed [`FileInfo`], stored in the
+/// `data_receive_quarantine` table for a write-denied peer.
+///
+/// The wire [`FileInfo`] uses manual XDR encoding and is not itself serde-
+/// serialisable, so this dedicated DTO captures exactly the fields needed to
+/// surface a rejected local addition to the operator. It is deliberately a
+/// faithful mirror of the proposal rather than a lossy summary, so an operator
+/// inspecting the quarantine sees the peer's full claim. The block hashes are
+/// hex-encoded for a compact, human-inspectable JSON form.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct QuarantinedFile {
+    /// File path relative to the folder root.
+    name: String,
+    /// Total file size in bytes.
+    size: u64,
+    /// Last modification time (Unix seconds).
+    modified: i64,
+    /// Tombstone flag — a rejected delete proposal is preserved too.
+    deleted: bool,
+    /// Per-file version vector, as `(device_short_id, counter)` pairs.
+    version: Vec<(u64, u64)>,
+    /// Hex-encoded SHA-256 block hashes, in order.
+    block_hashes: Vec<String>,
+}
+
+impl From<&FileInfo> for QuarantinedFile {
+    fn from(file: &FileInfo) -> Self {
+        Self {
+            name: file.name.clone(),
+            size: file.size,
+            modified: file.modified,
+            deleted: file.deleted,
+            version: file.version.counters.clone(),
+            block_hashes: file.block_hashes.iter().map(hex_encode_hash).collect(),
+        }
+    }
+}
+
+/// Hex-encode a 32-byte block hash into a lowercase string.
+fn hex_encode_hash(hash: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    hash.iter()
+        .fold(String::with_capacity(64), |mut acc, byte| {
+            // Writing to a String never fails; the result is discarded deliberately.
+            let _ = write!(acc, "{byte:02x}");
+            acc
+        })
+}
 
 /// Wall-clock timeout for a block request to a single peer.
 const BLOCK_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -606,6 +667,40 @@ pub struct SyncEngine {
     /// `Arc` is what lets that late injection reach the loops already running on
     /// the cloned engines — a builder-style move setter could not.
     manage_dispatch: Arc<RwLock<Option<Arc<dyn ManageDispatch>>>>,
+    /// Data-plane authority port. When the inner `Option` is `Some`, the BEP
+    /// sync path gates serving our index and blocks to a peer on that peer's
+    /// `data:read` access, and accepting a peer's index and blocks on its
+    /// `data:write` access, for the folder — consulting the on-node data grants,
+    /// the token revocation list, and any data-verb token the peer presented on
+    /// its [`BepMessage::ClusterConfig`].
+    ///
+    /// When the port is **unset** (`None`) the path is *default-open*: every
+    /// trusted peer keeps full bidirectional access, matching the pre-feature
+    /// behaviour. That is also what keeps the bare-`SyncEngine` unit tests
+    /// behaving as before — they never inject the port.
+    ///
+    /// Held behind the same shared `RwLock` as [`Self::manage_dispatch`] and for
+    /// the same reason: the daemon wires it after the engine is constructed and
+    /// its clones handed to the spawned loops (see [`Self::set_data_authority`]).
+    data_authority: Arc<RwLock<Option<Arc<dyn DataAuthority>>>>,
+    /// The `data:read`/`data:write` capability token a peer presented on its
+    /// [`BepMessage::ClusterConfig`], keyed by the peer's device id. Captured
+    /// when the `ClusterConfig` frame arrives and consulted at every data gate for
+    /// that session, so a token-carried grant is folded into the access decision
+    /// exactly as an on-node grant is. Removed when the session ends.
+    presented_data_tokens: Arc<Mutex<HashMap<String, String>>>,
+    /// F3 readiness bit. Flips from `false` to `true` when the data
+    /// authority is wired (the seam the daemon drives after the engine is
+    /// constructed and before the BEP listener begins serving peers).
+    /// The BEP listener's accept loop consults this bit and closes any
+    /// inbound connection accepted while it is `false`, so the data plane
+    /// does not serve peers during the startup window between
+    /// `P2pBackend::open` and the engine's authority being installed.
+    /// A pre-feature engine that never installs an authority keeps the
+    /// bit at `false` only conceptually; the listener's port is still
+    /// bound and the bit is consulted per-accept so the gate is closed
+    /// by construction.
+    data_plane_ready: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for SyncEngine {
@@ -658,6 +753,18 @@ impl SyncEngine {
             relay_bridges: Arc::new(Mutex::new(HashMap::new())),
             relay_terminals: Arc::new(Mutex::new(HashMap::new())),
             manage_dispatch: Arc::new(RwLock::new(None)),
+            data_authority: Arc::new(RwLock::new(None)),
+            presented_data_tokens: Arc::new(Mutex::new(HashMap::new())),
+            // F3: the bit starts `true` (the pre-feature default — the BEP
+            // listener serves peers as soon as a stream is accepted). A
+            // deployment that wires the data authority post-construction
+            // calls `set_data_plane_ready(false)` immediately after
+            // `P2pBackend::open` and `set_data_plane_ready(true)` from
+            // `set_data_authority`, closing the startup window between
+            // those two seams. Bare engines (the pre-feature shape, and
+            // integration tests that never wire an authority) leave the
+            // bit at `true` and the listener serves as before.
+            data_plane_ready: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -689,6 +796,162 @@ impl SyncEngine {
     pub async fn set_manage_dispatch(&self, dispatch: Arc<dyn ManageDispatch>) {
         let mut slot = self.manage_dispatch.write().await;
         *slot = Some(dispatch);
+    }
+
+    /// Install (or replace) the data-plane authority port on a live engine.
+    ///
+    /// Mirrors [`Self::set_manage_dispatch`]: writing through the shared
+    /// `RwLock` lets every clone of this engine — including the ones already
+    /// driving spawned session loops — observe the port. The daemon calls this
+    /// once, after constructing the engine that implements [`DataAuthority`],
+    /// before peers exchange sync frames. Until then the path is default-open.
+    pub async fn set_data_authority(&self, authority: Arc<dyn DataAuthority>) {
+        let mut slot = self.data_authority.write().await;
+        *slot = Some(authority);
+        // F3: installing the data authority closes the startup window.
+        // The BEP listener's accept loop consults this bit and closes any
+        // inbound connection accepted while it is `false`. Flipping it here
+        // means the daemon's existing `wire_manage_dispatch` seam — which
+        // already calls `set_data_authority` — is also the F3 readiness
+        // seam, so a future refactor that drops one will surface the other.
+        self.data_plane_ready.store(true, Ordering::Release);
+    }
+
+    /// F3 readiness accessor. Returns `true` immediately after
+    /// construction (the pre-feature default — the BEP listener serves
+    /// peers as soon as a stream is accepted). A deployment that wires
+    /// the data authority post-construction calls
+    /// [`Self::set_data_plane_ready_flag`] with `false` immediately
+    /// after `P2pBackend::open` and then with `true` from
+    /// [`Self::set_data_authority`], closing the startup window between
+    /// those two seams. The BEP listener's accept loop is the primary
+    /// consumer — it closes any stream accepted while this returns
+    /// `false`.
+    #[must_use]
+    pub fn data_plane_ready(&self) -> bool {
+        self.data_plane_ready.load(Ordering::Acquire)
+    }
+
+    /// F3 opt-in / opt-out. Set the readiness bit directly. A deployment
+    /// that wires the data authority post-construction calls this with
+    /// `false` immediately after `P2pBackend::open` to close the startup
+    /// window, then [`Self::set_data_authority`] later flips it to `true`.
+    /// Bare engines and pre-feature tests leave the bit at its default
+    /// (`true`) and the listener serves as before.
+    pub fn set_data_plane_ready_flag(&self, ready: bool) {
+        self.data_plane_ready.store(ready, Ordering::Release);
+    }
+
+    /// Resolve the directional data-plane access a `peer` has for this engine's
+    /// folder, as of now, for a session authenticated as `caller_auth`.
+    ///
+    /// When the [`DataAuthority`] port is **unset**, the access is *default-open*
+    /// — `read = true, write = true` — so a bare engine and every pre-feature
+    /// deployment keep full bidirectional sharing with trusted peers, on every
+    /// transport including relayed and post-hole-punch sessions. This is the
+    /// non-breaking default: directional enforcement only engages once the
+    /// daemon wires the port.
+    ///
+    /// When the port is **set**, directional enforcement is active and the
+    /// peer's device id is the principal the grants key on. An
+    /// [`Unverified`](CallerAuthentication::Unverified) session (relayed or
+    /// post-hole-punch) asserts that device id on the wire rather than proving it
+    /// by mutual TLS, so a data grant keyed to it must not be honoured — the
+    /// session is **no-share in both directions**. Any party who can open a
+    /// tunnel could otherwise spoof a granted peer's device id. A
+    /// [`TlsVerified`](CallerAuthentication::TlsVerified) session folds the
+    /// on-node data grants, the revocation list, and any data-verb token the peer
+    /// presented on its `ClusterConfig` into the decision via the port.
+    ///
+    /// A port error is **not** silently treated as full access: it fails closed
+    /// to no-share in both directions so a faulty store cannot leak data to a
+    /// peer that should be restricted, and the error is logged.
+    async fn data_access_for(&self, peer: &str, caller_auth: CallerAuthentication) -> DataAccess {
+        let authority = { self.data_authority.read().await.clone() };
+        let Some(authority) = authority else {
+            // Port unset: default-open on every transport — the pre-feature
+            // behaviour, preserved unconditionally.
+            return DataAccess {
+                read: true,
+                write: true,
+            };
+        };
+        // Directional enforcement is engaged. An unverified session has no
+        // trustworthy principal to authorise a directional grant against, so it
+        // is no-share both ways — never consult the grants for a spoofable id.
+        if !caller_auth.permits_data_write() {
+            return DataAccess {
+                read: false,
+                write: false,
+            };
+        }
+        let token = {
+            let tokens = self.presented_data_tokens.lock().await;
+            tokens.get(peer).cloned()
+        };
+        let device = DeviceId::new(peer.to_string());
+        match authority
+            .data_access(
+                &device,
+                &self.folder_id,
+                token.as_deref(),
+                chrono::Utc::now(),
+            )
+            .await
+        {
+            Ok(access) => access,
+            Err(e) => {
+                warn!(
+                    target: "cascade::backend::p2p",
+                    peer = %peer,
+                    folder = %self.folder_id,
+                    error = %e,
+                    "data-plane authority lookup failed — failing closed to no-share",
+                );
+                DataAccess {
+                    read: false,
+                    write: false,
+                }
+            }
+        }
+    }
+
+    /// Public test helper: drive the same data-plane gate the internal
+    /// `data_access_for` drives, but with a `TlsVerified` caller
+    /// authentication. Exists so integration tests (F1 namespace, F2
+    /// explicit-control) can walk the full chain from the live
+    /// `DataAuthority` through `data_access` without taking a dependency
+    /// on the private caller-authentication enum.
+    pub async fn data_access_for_tls_verified(&self, peer: &str) -> DataAccess {
+        self.data_access_for(peer, CallerAuthentication::TlsVerified)
+            .await
+    }
+
+    /// Public test helper: drive the data-plane gate with a presented
+    /// capability token. The token is staged in the engine's
+    /// `presented_data_tokens` map exactly as the BEP `ClusterConfig`
+    /// handler does, then the internal `data_access_for` is invoked
+    /// with `TlsVerified` authentication so the verify path runs. Exists
+    /// so the F2 explicit-control test can observe the full
+    /// token-verify → record-bit → read-grant-set chain end to end.
+    pub async fn data_access_for_token(
+        &self,
+        peer: &str,
+        presented_token: Option<&str>,
+    ) -> DataAccess {
+        {
+            let mut tokens = self.presented_data_tokens.lock().await;
+            match presented_token {
+                Some(token) => {
+                    tokens.insert(peer.to_owned(), token.to_owned());
+                }
+                None => {
+                    tokens.remove(peer);
+                }
+            }
+        }
+        self.data_access_for(peer, CallerAuthentication::TlsVerified)
+            .await
     }
 
     /// Builder-style setter for the known relay endpoint pool. Threaded
@@ -1094,6 +1357,29 @@ impl SyncEngine {
                     accept_result = listener.accept() => {
                         match accept_result {
                             Ok((stream, peer_addr)) => {
+                                // F3: the data-plane readiness bit must be set
+                                // before any inbound connection proceeds past
+                                // the accept. The window between
+                                // `P2pBackend::open` and `set_data_authority`
+                                // — when the engine is constructed but the
+                                // data authority has not yet been installed —
+                                // is the gap the F3 invariant closes: a
+                                // connection that races this window would
+                                // either commit data to the local index or
+                                // block waiting for a token that never
+                                // arrives. Drop the stream immediately; the
+                                // remote peer sees a clean TCP close, not a
+                                // hung half-handshake.
+                                if !engine.data_plane_ready() {
+                                    drop(stream);
+                                    debug!(
+                                        target: "cascade::backend::p2p",
+                                        peer = %peer_addr,
+                                        "F3: closing inbound connection during startup window \
+                                         (data authority not yet installed)",
+                                    );
+                                    continue;
+                                }
                                 let engine = engine.clone();
                                 tokio::spawn(async move {
                                     if let Err(e) = engine.handle_inbound(stream, peer_addr).await {
@@ -1127,6 +1413,18 @@ impl SyncEngine {
     }
 
     /// Outbound: connect to a known peer and start a session.
+    ///
+    /// The F3 readiness bit is intentionally **not** consulted on the
+    /// outbound path. The bit guards the inbound listener (the side that
+    /// would serve the peer its index and blocks): an inbound connection
+    /// accepted during the startup window is closed without BEP
+    /// negotiation. An outbound dial, in contrast, is initiated by *us*
+    /// and ends in a BEP session the listener side will gate through the
+    /// same bit. Refusing dials here would break the natural pattern of
+    /// "dial after the engine is ready", where the engine's readiness is
+    /// already proven by the caller having just installed the authority.
+    /// The BEP layer still authenticates the peer, so a dial that races
+    /// the window is rejected at handshake, not silently granted.
     pub async fn connect_to(&self, peer: Peer) -> Result<()> {
         let trusted = self.trusted.lock().await.clone();
         if !trusted.contains(&peer.device_id) {
@@ -1995,17 +2293,39 @@ impl SyncEngine {
                 id: self.folder_id.clone(),
                 label: self.folder_id.clone(),
             }],
+            // The serving side presents no token of its own — a data token
+            // travels with the *bearer* presenting it (the `cascade remote
+            // --token` path), and is consulted on the side serving the bearer.
+            // A bare sync session asserts no token.
+            data_token: None,
         })
         .ok();
-        // Delta sync: only send rows whose row_version exceeds the
-        // highest sequence we have previously sent to this peer (which
-        // we approximate by the highest sequence the peer has reported
-        // back to us — they are equal once the previous session
-        // completed cleanly, and a conservative lower bound otherwise).
-        // First connect to a peer sees `0` and falls through to a full
-        // enumeration.
-        let last_seen = self.index.get_peer_max_sequence(&device_id).unwrap_or(0);
-        let snapshot = self.snapshot_since(last_seen)?;
+        // Read gate: only serve our index to a peer that may read this folder.
+        // A `data:read`-denied peer (write-only / no-share) is sent an empty
+        // Index — the honest no-share surface — never the snapshot. We never
+        // skip the frame silently: an empty Index keeps the handshake shape and
+        // tells a write-only peer it has nothing to pull. Default-open when the
+        // authority port is unset, so a trusted peer with no data grant still
+        // receives the full snapshot.
+        let snapshot = if self.data_access_for(&device_id, caller_auth).await.read {
+            // Delta sync: only send rows whose row_version exceeds the
+            // highest sequence we have previously sent to this peer (which
+            // we approximate by the highest sequence the peer has reported
+            // back to us — they are equal once the previous session
+            // completed cleanly, and a conservative lower bound otherwise).
+            // First connect to a peer sees `0` and falls through to a full
+            // enumeration.
+            let last_seen = self.index.get_peer_max_sequence(&device_id).unwrap_or(0);
+            self.snapshot_since(last_seen)?
+        } else {
+            debug!(
+                target: "cascade::backend::p2p",
+                peer = %device_id,
+                folder = %self.folder_id,
+                "data:read denied — serving empty index to peer",
+            );
+            Vec::new()
+        };
         tx.send(BepMessage::Index {
             folder: self.folder_id.clone(),
             files: snapshot,
@@ -2084,6 +2404,13 @@ impl SyncEngine {
             let mut peers = self.peers.lock().await;
             peers.remove(&device_id);
         }
+        // Drop any data-verb token the peer presented for this session so a
+        // later session cannot inherit stale authority — the next session
+        // re-presents its token on its own ClusterConfig.
+        {
+            let mut tokens = self.presented_data_tokens.lock().await;
+            tokens.remove(&device_id);
+        }
         // If this session was either half of a relay bridge we were
         // volunteering, tear the whole bridge down: remove both the entry
         // keyed by this device and the entry keyed by the bridge partner.
@@ -2143,13 +2470,48 @@ impl SyncEngine {
         manage_pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<ManageResult>>>>,
     ) -> Result<()> {
         match msg {
-            BepMessage::ClusterConfig { .. } | BepMessage::Ping => Ok(()),
+            BepMessage::Ping => Ok(()),
+            BepMessage::ClusterConfig { data_token, .. } => {
+                // Capture any data-verb capability token the peer presented for
+                // this session. It is folded into every subsequent data-access
+                // decision for this peer (read and write gates) exactly as an
+                // on-node grant is. A `None` clears any prior token so a peer
+                // cannot retain stale authority by reconnecting without one.
+                let mut tokens = self.presented_data_tokens.lock().await;
+                match data_token {
+                    Some(token) => {
+                        tokens.insert(peer_device_id.to_string(), token);
+                    }
+                    None => {
+                        tokens.remove(peer_device_id);
+                    }
+                }
+                Ok(())
+            }
             BepMessage::Index { folder, files } | BepMessage::IndexUpdate { folder, files } => {
                 if folder != self.folder_id {
                     debug!("ignoring frame for unknown folder {folder}");
                     return Ok(());
                 }
-                self.merge_files(peer_device_id, &files)?;
+                // Write gate: only merge a peer's index into our authoritative
+                // index if it may write this folder. `data_access_for` already
+                // denies an unverified session (relayed / post-punch — device id
+                // asserted, not TLS-bound) both directions whenever directional
+                // enforcement is engaged, so a spoofed device id can never push
+                // content. A peer that may not write has its proposed rows
+                // recorded as flagged local additions in the receive quarantine
+                // and the frame is consumed without error, so the session stays
+                // up. Default-open (port unset) keeps a trusted peer's writes
+                // flowing as before, on every transport.
+                if self
+                    .data_access_for(peer_device_id, caller_auth)
+                    .await
+                    .write
+                {
+                    self.merge_files(peer_device_id, &files)?;
+                } else {
+                    self.quarantine_received(peer_device_id, &files).await;
+                }
                 Ok(())
             }
             BepMessage::Request {
@@ -2161,6 +2523,27 @@ impl SyncEngine {
                 block_hash,
             } => {
                 if folder != self.folder_id {
+                    outbound
+                        .send(BepMessage::Response {
+                            request_id,
+                            data: Vec::new(),
+                        })
+                        .ok();
+                    return Ok(());
+                }
+                // Read gate: a `data:read`-denied peer (write-only / no-share)
+                // must learn nothing of our content. Reply with the same empty
+                // Response a genuine block miss yields, so it cannot distinguish
+                // "you may not read" from "no such block" — and we never reach
+                // the block store on its behalf. Default-open (port unset) serves
+                // the block as before.
+                if !self.data_access_for(peer_device_id, caller_auth).await.read {
+                    debug!(
+                        target: "cascade::backend::p2p",
+                        peer = %peer_device_id,
+                        folder = %self.folder_id,
+                        "data:read denied — refusing block request with empty response",
+                    );
                     outbound
                         .send(BepMessage::Response {
                             request_id,
@@ -2855,6 +3238,81 @@ impl SyncEngine {
         Ok(())
     }
 
+    /// Record a write-denied peer's proposed file rows as flagged local
+    /// additions in the receive quarantine, the receive-only conflict
+    /// semantics: a peer we will not accept writes from has its edits kept
+    /// (surfaced to the operator), never silently discarded, never merged into
+    /// our authoritative index, and never pushed back to us as authoritative.
+    ///
+    /// Directory rows and unhealthy rows (`invalid` / `no_permissions`) are
+    /// skipped — they are skipped by `merge_files` too, so there is nothing to
+    /// preserve. Each retained row is serialised to JSON and handed to the
+    /// data-plane authority port, which writes it to the `data_receive_quarantine`
+    /// table keyed `(folder, peer, path)`; a newer proposal for a path replaces
+    /// the older one.
+    ///
+    /// When the authority port is unset this is unreachable in practice (an
+    /// unset port is default-open, so the write gate never denies), but for
+    /// robustness an unset port here logs and drops rather than panicking.
+    async fn quarantine_received(&self, peer_device_id: &str, files: &[FileInfo]) {
+        let authority = { self.data_authority.read().await.clone() };
+        let Some(authority) = authority else {
+            debug!(
+                target: "cascade::backend::p2p",
+                peer = %peer_device_id,
+                "write denied but no data-authority port to quarantine into — dropping proposal",
+            );
+            return;
+        };
+        let peer = DeviceId::new(peer_device_id.to_string());
+        let observed_at = chrono::Utc::now();
+        let mut quarantined = 0usize;
+        for file in files {
+            if file.file_type != FILE_TYPE_FILE {
+                continue;
+            }
+            if file.invalid || file.no_permissions {
+                continue;
+            }
+            let file_json = match serde_json::to_string(&QuarantinedFile::from(file)) {
+                Ok(json) => json,
+                Err(e) => {
+                    warn!(
+                        target: "cascade::backend::p2p",
+                        peer = %peer_device_id,
+                        path = %file.name,
+                        error = %e,
+                        "could not serialise rejected row for quarantine — dropping it",
+                    );
+                    continue;
+                }
+            };
+            if let Err(e) = authority
+                .quarantine_received(&peer, &self.folder_id, &file.name, &file_json, observed_at)
+                .await
+            {
+                warn!(
+                    target: "cascade::backend::p2p",
+                    peer = %peer_device_id,
+                    path = %file.name,
+                    error = %e,
+                    "could not record rejected row in receive quarantine",
+                );
+                continue;
+            }
+            quarantined += 1;
+        }
+        if quarantined > 0 {
+            info!(
+                target: "cascade::backend::p2p",
+                peer = %peer_device_id,
+                folder = %self.folder_id,
+                count = quarantined,
+                "recorded rejected local additions from write-denied peer",
+            );
+        }
+    }
+
     /// Persist the local row at `original_path` as a conflict copy at
     /// a sibling path before the row is overwritten by an incoming
     /// concurrent write. The conflict copy is a snapshot of the local
@@ -2916,9 +3374,35 @@ impl SyncEngine {
             folder: self.folder_id.clone(),
             files: vec![file_info],
         };
-        let peers = self.peers.lock().await;
-        for handle in peers.values() {
-            let _ = handle.outbound.send(msg.clone());
+        // Per-peer read gate: an `IndexUpdate` advertises a local change, so it
+        // must only reach peers that may read this folder. A `data:read`-denied
+        // peer (write-only / no-share) is skipped — it never learns of our edits.
+        // Snapshot the peer ids and their session authentication first, then
+        // evaluate access per peer outside the peers lock, because
+        // `data_access_for` may itself take other locks (the authority port, the
+        // presented-token map). Default-open (port unset) sends to every peer as
+        // before.
+        let peer_sessions: Vec<(String, CallerAuthentication)> = {
+            let peers = self.peers.lock().await;
+            peers
+                .iter()
+                .map(|(id, handle)| (id.clone(), handle.caller_auth))
+                .collect()
+        };
+        for (peer_id, caller_auth) in peer_sessions {
+            if !self.data_access_for(&peer_id, caller_auth).await.read {
+                debug!(
+                    target: "cascade::backend::p2p",
+                    peer = %peer_id,
+                    folder = %self.folder_id,
+                    "data:read denied — skipping IndexUpdate broadcast to peer",
+                );
+                continue;
+            }
+            let peers = self.peers.lock().await;
+            if let Some(handle) = peers.get(&peer_id) {
+                let _ = handle.outbound.send(msg.clone());
+            }
         }
     }
 
@@ -5288,6 +5772,571 @@ mod tests {
             }
             other => panic!("expected an unauthorised ManageResponse, got {other:?}"),
         }
+    }
+
+    // ── Data-plane directional sharing gates ──
+
+    /// A configurable [`DataAuthority`] double. Returns a fixed [`DataAccess`]
+    /// for every (peer, folder) and records the quarantine rows it was handed,
+    /// so a test can assert both the access decision taken and the receive-only
+    /// conflict handling.
+    struct FixedDataAuthority {
+        access: DataAccess,
+        quarantined: StdMutex<Vec<(String, String, String)>>,
+    }
+
+    impl FixedDataAuthority {
+        fn new(read: bool, write: bool) -> Arc<Self> {
+            Arc::new(Self {
+                access: DataAccess { read, write },
+                quarantined: StdMutex::new(Vec::new()),
+            })
+        }
+
+        /// The `(peer, path, file_json)` triples quarantined so far.
+        fn quarantined(&self) -> Vec<(String, String, String)> {
+            self.quarantined
+                .lock()
+                .map(|q| q.clone())
+                .unwrap_or_default()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DataAuthority for FixedDataAuthority {
+        async fn data_access(
+            &self,
+            _peer: &DeviceId,
+            _folder: &str,
+            _presented_token: Option<&str>,
+            _now: chrono::DateTime<chrono::Utc>,
+        ) -> anyhow::Result<DataAccess> {
+            Ok(self.access)
+        }
+
+        async fn quarantine_received(
+            &self,
+            peer: &DeviceId,
+            _folder: &str,
+            path: &str,
+            file_json: &str,
+            _observed_at: chrono::DateTime<chrono::Utc>,
+        ) -> anyhow::Result<()> {
+            if let Ok(mut q) = self.quarantined.lock() {
+                q.push((
+                    peer.as_str().to_owned(),
+                    path.to_owned(),
+                    file_json.to_owned(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    /// A [`DataAuthority`] whose `data_access` always fails, to exercise the
+    /// fail-closed branch of [`SyncEngine::data_access_for`].
+    struct FailingDataAuthority;
+
+    #[async_trait::async_trait]
+    impl DataAuthority for FailingDataAuthority {
+        async fn data_access(
+            &self,
+            _peer: &DeviceId,
+            _folder: &str,
+            _presented_token: Option<&str>,
+            _now: chrono::DateTime<chrono::Utc>,
+        ) -> anyhow::Result<DataAccess> {
+            anyhow::bail!("data authority store is unavailable")
+        }
+
+        async fn quarantine_received(
+            &self,
+            _peer: &DeviceId,
+            _folder: &str,
+            _path: &str,
+            _file_json: &str,
+            _observed_at: chrono::DateTime<chrono::Utc>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn sample_file(name: &str) -> FileInfo {
+        FileInfo {
+            name: name.to_owned(),
+            file_type: FILE_TYPE_FILE,
+            size: 11,
+            modified: 1_700_000_000,
+            sequence: 1,
+            block_size: 128 * 1024,
+            deleted: false,
+            invalid: false,
+            no_permissions: false,
+            version: Version::default(),
+            block_hashes: vec![[7u8; 32]],
+        }
+    }
+
+    #[tokio::test]
+    async fn default_open_when_authority_unset_allows_both_directions() {
+        // The non-breaking default: with no DataAuthority wired, a trusted peer
+        // keeps full read-write access exactly as before the feature.
+        let (_dir, engine) = make_engine("f");
+        let access = engine
+            .data_access_for("PEER-A", CallerAuthentication::TlsVerified)
+            .await;
+        assert!(access.read, "unset authority must default-open read");
+        assert!(access.write, "unset authority must default-open write");
+    }
+
+    #[tokio::test]
+    async fn default_open_holds_for_unverified_session_when_port_unset() {
+        // The non-breaking default applies on every transport: an unverified
+        // (relayed / post-punch) session keeps full access while the port is
+        // unset, so the pre-feature relay sync behaviour is unchanged.
+        let (_dir, engine) = make_engine("f");
+        let access = engine
+            .data_access_for("PEER-A", CallerAuthentication::Unverified)
+            .await;
+        assert!(
+            access.read,
+            "unset authority + unverified must default-open read"
+        );
+        assert!(
+            access.write,
+            "unset authority + unverified must default-open write"
+        );
+    }
+
+    #[tokio::test]
+    async fn unverified_session_is_no_share_once_port_is_set() {
+        // Once directional enforcement engages, an unverified session has no
+        // trustworthy principal — it is no-share both ways regardless of grants.
+        let (_dir, engine) = make_engine("f");
+        engine
+            .set_data_authority(FixedDataAuthority::new(true, true))
+            .await;
+        let access = engine
+            .data_access_for("PEER-A", CallerAuthentication::Unverified)
+            .await;
+        assert!(
+            !access.read,
+            "unverified session must not read once port is set"
+        );
+        assert!(
+            !access.write,
+            "unverified session must not write once port is set"
+        );
+    }
+
+    #[tokio::test]
+    async fn authority_failure_fails_closed_to_no_share() {
+        // A faulty authority store must not leak data: the decision fails closed
+        // to no-share in both directions rather than defaulting to full access.
+        let (_dir, engine) = make_engine("f");
+        engine
+            .set_data_authority(Arc::new(FailingDataAuthority))
+            .await;
+        let access = engine
+            .data_access_for("PEER-A", CallerAuthentication::TlsVerified)
+            .await;
+        assert!(!access.read, "authority error must deny read");
+        assert!(!access.write, "authority error must deny write");
+    }
+
+    #[tokio::test]
+    async fn write_denied_peer_is_quarantined_not_merged() {
+        // Receive-only semantics: a peer we will not accept writes from has its
+        // proposed rows recorded as flagged local additions, never merged into
+        // the authoritative index, and the session is not torn down.
+        let (_dir, engine) = make_engine("f");
+        let authority = FixedDataAuthority::new(true, false);
+        engine.set_data_authority(authority.clone()).await;
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<u8>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let manage_pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ManageResult>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        engine
+            .handle_message(
+                "PEER-A",
+                CallerAuthentication::TlsVerified,
+                BepMessage::Index {
+                    folder: "f".to_owned(),
+                    files: vec![sample_file("drop.txt")],
+                },
+                &tx,
+                &pending,
+                &manage_pending,
+            )
+            .await
+            .expect("a write-denied frame is consumed without error");
+
+        // Not merged into our authoritative index.
+        assert!(
+            engine.index.get("drop.txt").unwrap().is_none(),
+            "a write-denied peer's row must not be merged",
+        );
+        // Recorded in the quarantine, keyed by peer + path, carrying the row.
+        let q = authority.quarantined();
+        assert_eq!(q.len(), 1, "the rejected row must be quarantined");
+        assert_eq!(q[0].0, "PEER-A");
+        assert_eq!(q[0].1, "drop.txt");
+        assert!(
+            q[0].2.contains("drop.txt"),
+            "the quarantined JSON must carry the proposed row, got {}",
+            q[0].2,
+        );
+    }
+
+    #[tokio::test]
+    async fn write_allowed_peer_is_merged() {
+        // A write-allowed peer merges as before, and nothing is quarantined.
+        let (_dir, engine) = make_engine("f");
+        let authority = FixedDataAuthority::new(true, true);
+        engine.set_data_authority(authority.clone()).await;
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<u8>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let manage_pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ManageResult>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        engine
+            .handle_message(
+                "PEER-A",
+                CallerAuthentication::TlsVerified,
+                BepMessage::Index {
+                    folder: "f".to_owned(),
+                    files: vec![sample_file("keep.txt")],
+                },
+                &tx,
+                &pending,
+                &manage_pending,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            engine.index.get("keep.txt").unwrap().is_some(),
+            "a write-allowed peer's row must be merged",
+        );
+        assert!(
+            authority.quarantined().is_empty(),
+            "nothing is quarantined when the peer may write",
+        );
+    }
+
+    #[tokio::test]
+    async fn unverified_session_cannot_write_even_with_write_grant() {
+        // A relayed / post-punch session asserts its device id on the wire; a
+        // data:write grant keyed to it must NOT be honoured, or a spoofed id
+        // could push content. The rows are quarantined, never merged.
+        let (_dir, engine) = make_engine("f");
+        let authority = FixedDataAuthority::new(true, true);
+        engine.set_data_authority(authority.clone()).await;
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<u8>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let manage_pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ManageResult>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        engine
+            .handle_message(
+                "PEER-A",
+                CallerAuthentication::Unverified,
+                BepMessage::Index {
+                    folder: "f".to_owned(),
+                    files: vec![sample_file("spoof.txt")],
+                },
+                &tx,
+                &pending,
+                &manage_pending,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            engine.index.get("spoof.txt").unwrap().is_none(),
+            "an unverified session must not write even with a write grant",
+        );
+        assert_eq!(
+            authority.quarantined().len(),
+            1,
+            "the unverified write is quarantined, not merged",
+        );
+    }
+
+    #[tokio::test]
+    async fn read_denied_peer_gets_empty_block_response() {
+        // A read-denied peer that requests a block we hold is told "no such
+        // block" uniformly: an empty Response, learning nothing of our content.
+        let (_dir, engine) = make_engine("f");
+        let authority = FixedDataAuthority::new(false, true);
+        engine.set_data_authority(authority).await;
+
+        // We DO hold the block — the gate must refuse before serving it.
+        let data = b"secret payload".repeat(8);
+        let hash = BlockHash::from_data(&data);
+        engine.blocks.store_block(&hash, &data).await.unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<u8>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let manage_pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ManageResult>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        engine
+            .handle_message(
+                "PEER-A",
+                CallerAuthentication::TlsVerified,
+                BepMessage::Request {
+                    request_id: 3,
+                    folder: "f".to_owned(),
+                    name: "secret.txt".to_owned(),
+                    block_offset: 0,
+                    block_size: 128 * 1024,
+                    block_hash: hash.0,
+                },
+                &tx,
+                &pending,
+                &manage_pending,
+            )
+            .await
+            .unwrap();
+
+        match rx.try_recv() {
+            Ok(BepMessage::Response { request_id, data }) => {
+                assert_eq!(request_id, 3);
+                assert!(
+                    data.is_empty(),
+                    "a read-denied peer must get an empty Response even when we hold the block",
+                );
+            }
+            other => panic!("expected an empty Response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_allowed_peer_gets_block() {
+        // The companion to the above: a read-allowed peer is served the block.
+        let (_dir, engine) = make_engine("f");
+        let authority = FixedDataAuthority::new(true, true);
+        engine.set_data_authority(authority).await;
+
+        let data = b"shared payload".repeat(8);
+        let hash = BlockHash::from_data(&data);
+        engine.blocks.store_block(&hash, &data).await.unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<u8>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let manage_pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ManageResult>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        engine
+            .handle_message(
+                "PEER-A",
+                CallerAuthentication::TlsVerified,
+                BepMessage::Request {
+                    request_id: 4,
+                    folder: "f".to_owned(),
+                    name: "shared.txt".to_owned(),
+                    block_offset: 0,
+                    block_size: 128 * 1024,
+                    block_hash: hash.0,
+                },
+                &tx,
+                &pending,
+                &manage_pending,
+            )
+            .await
+            .unwrap();
+
+        match rx.try_recv() {
+            Ok(BepMessage::Response {
+                request_id,
+                data: got,
+            }) => {
+                assert_eq!(request_id, 4);
+                assert_eq!(got, data, "a read-allowed peer must receive the block");
+            }
+            other => panic!("expected the block Response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cluster_config_captures_and_clears_presented_token() {
+        // A data token on the peer's ClusterConfig is captured for the session;
+        // a later ClusterConfig with no token clears it (no stale authority).
+        let (_dir, engine) = make_engine("f");
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<u8>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let manage_pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ManageResult>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        engine
+            .handle_message(
+                "PEER-A",
+                CallerAuthentication::TlsVerified,
+                BepMessage::ClusterConfig {
+                    folders: vec![Folder {
+                        id: "f".to_owned(),
+                        label: "f".to_owned(),
+                    }],
+                    data_token: Some("token-json".to_owned()),
+                },
+                &tx,
+                &pending,
+                &manage_pending,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            engine
+                .presented_data_tokens
+                .lock()
+                .await
+                .get("PEER-A")
+                .cloned(),
+            Some("token-json".to_owned()),
+        );
+
+        engine
+            .handle_message(
+                "PEER-A",
+                CallerAuthentication::TlsVerified,
+                BepMessage::ClusterConfig {
+                    folders: vec![],
+                    data_token: None,
+                },
+                &tx,
+                &pending,
+                &manage_pending,
+            )
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .presented_data_tokens
+                .lock()
+                .await
+                .get("PEER-A")
+                .is_none(),
+            "a ClusterConfig with no token must clear the prior token",
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_peer_cannot_push_an_accepted_change() {
+        // End-to-end over a live loopback session: peer B is read-only from A's
+        // point of view (A serves B, but will not accept B's writes). B uploads
+        // a file and broadcasts it; A must NOT merge it — B's edit stays local
+        // on B and is quarantined on A.
+        let (_dir_a, engine_a) = make_engine("shared");
+        let (_dir_b, engine_b) = make_engine("shared");
+
+        engine_a.trust(engine_b.device_id().to_string()).await;
+        engine_b.trust(engine_a.device_id().to_string()).await;
+
+        // A treats B as read-only: A serves B (read=true) but rejects B's
+        // writes (write=false). B has no restriction on A (default-open).
+        let a_authority = FixedDataAuthority::new(true, false);
+        engine_a.set_data_authority(a_authority.clone()).await;
+
+        let (_cancel_tx_a, cancel_rx_a) = tokio::sync::watch::channel(false);
+        let (addr_a, _a_task) = engine_a
+            .start_listener("127.0.0.1:0".parse().unwrap(), cancel_rx_a)
+            .await
+            .unwrap();
+        engine_b
+            .connect_to(Peer {
+                device_id: engine_a.device_id().to_string(),
+                address: addr_a,
+            })
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let entry = IndexEntry {
+            path: "from-b.txt".to_string(),
+            is_dir: false,
+            size: 11,
+            modified: 1_700_000_000,
+            block_hashes: vec![0u8; 32],
+            deleted: false,
+            row_version: 0,
+            version: Vec::new(),
+        };
+        engine_b.index.upsert(&entry).unwrap();
+        engine_b.broadcast_update(&entry).await;
+
+        // Give A time to receive and (correctly) reject the IndexUpdate.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert!(
+            engine_a.index.get("from-b.txt").unwrap().is_none(),
+            "a read-only peer must not be able to push an accepted change",
+        );
+        assert!(
+            a_authority
+                .quarantined()
+                .iter()
+                .any(|(_, path, _)| path == "from-b.txt"),
+            "the rejected change must be quarantined, not discarded",
+        );
+    }
+
+    #[tokio::test]
+    async fn default_trusted_peer_still_syncs_both_ways() {
+        // With no data grants configured (authority unset on both sides), two
+        // trusted peers keep full bidirectional sync — the non-breaking default.
+        let (_dir_a, engine_a) = make_engine("shared");
+        let (_dir_b, engine_b) = make_engine("shared");
+
+        engine_a.trust(engine_b.device_id().to_string()).await;
+        engine_b.trust(engine_a.device_id().to_string()).await;
+
+        let (_cancel_tx_b, cancel_rx_b) = tokio::sync::watch::channel(false);
+        let (addr_b, _b_task) = engine_b
+            .start_listener("127.0.0.1:0".parse().unwrap(), cancel_rx_b)
+            .await
+            .unwrap();
+        engine_a
+            .connect_to(Peer {
+                device_id: engine_b.device_id().to_string(),
+                address: addr_b,
+            })
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let entry = IndexEntry {
+            path: "hello.txt".to_string(),
+            is_dir: false,
+            size: 11,
+            modified: 1_700_000_000,
+            block_hashes: vec![0u8; 32],
+            deleted: false,
+            row_version: 0,
+            version: Vec::new(),
+        };
+        engine_a.index.upsert(&entry).unwrap();
+        engine_a.broadcast_update(&entry).await;
+
+        for _ in 0..40 {
+            if engine_b.index.get("hello.txt").unwrap().is_some() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("default trusted peer did not receive the update");
     }
 }
 

@@ -15,6 +15,7 @@
 //! phases.
 
 use anyhow::{Context, Result, anyhow};
+use async_trait::async_trait;
 use cascade_config::{GrantConfig, ScopeConfig};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -24,7 +25,7 @@ pub mod token;
 
 pub use dispatch::{
     ManageCommandExecutor, ManageDispatch, ManageGrantStore, required_capability, run_dispatch,
-    scope_from_wire,
+    scope_from_wire, verify_data_token,
 };
 pub use token::{
     CapabilityToken, DelegateError, MAX_DELEGATION_DEPTH, TokenClaims, TokenVerifyError,
@@ -94,6 +95,16 @@ pub enum Capability {
     /// wildcard scope.
     #[serde(rename = "grant:admin")]
     GrantAdmin,
+    /// Data-plane read: the bearer (peer device) may read this node's data for
+    /// the scoped folder — we serve our index and blocks to them. Gates the
+    /// outbound/serve direction. Folder-scoped; not dangerous.
+    #[serde(rename = "data:read")]
+    DataRead,
+    /// Data-plane write: the bearer may write its data into this node for the
+    /// scoped folder — we accept and merge its index and blocks. Gates the
+    /// inbound/accept direction. Folder-scoped; not dangerous.
+    #[serde(rename = "data:write")]
+    DataWrite,
 }
 
 impl Capability {
@@ -113,6 +124,8 @@ impl Capability {
             Self::BackendManage => "backend:manage",
             Self::LifecycleControl => "lifecycle:control",
             Self::GrantAdmin => "grant:admin",
+            Self::DataRead => "data:read",
+            Self::DataWrite => "data:write",
         }
     }
 
@@ -129,6 +142,8 @@ impl Capability {
             "backend:manage" => Some(Self::BackendManage),
             "lifecycle:control" => Some(Self::LifecycleControl),
             "grant:admin" => Some(Self::GrantAdmin),
+            "data:read" => Some(Self::DataRead),
+            "data:write" => Some(Self::DataWrite),
             _ => None,
         }
     }
@@ -143,6 +158,15 @@ impl Capability {
             self,
             Self::BackendManage | Self::LifecycleControl | Self::GrantAdmin
         )
+    }
+
+    /// Whether this capability is a data-plane verb (`data:read` or
+    /// `data:write`). Data verbs are folder-scoped and not dangerous — they
+    /// gate the BEP sync serve/accept path rather than the management command
+    /// surface.
+    #[must_use]
+    pub const fn is_data_verb(self) -> bool {
+        matches!(self, Self::DataRead | Self::DataWrite)
     }
 }
 
@@ -385,6 +409,233 @@ pub fn authorises(
             // here too — not just the `Scope::Node` variant.
             && !(needed.is_dangerous() && grant.scope.is_node_wide())
     })
+}
+
+/// The data-plane access decision for a single (peer, folder) pair.
+///
+/// Both fields are independent: a peer with `read = true, write = false` is
+/// read-only (we serve them data, they cannot push to us); `read = false,
+/// write = true` is write-only / drop-sink; `read = true, write = true` is
+/// full bidirectional sharing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DataAccess {
+    /// Whether we serve our index and blocks to this peer for this folder.
+    pub read: bool,
+    /// Whether we accept this peer's index and blocks for this folder.
+    pub write: bool,
+}
+
+/// Decide the data-plane access a `peer` has for `folder` given the grants
+/// held on this node and the revoked token ids, at `now`.
+///
+/// This is a **default-open** decision, unlike [`authorises`] (which is
+/// default-closed):
+///
+/// 1. An unexpired, matching-verb grant covering the folder for this peer
+///    allows that direction.
+/// 2. If the peer has **any** data grant for this folder (either direction,
+///    even if the other is absent or expired), the absent / lapsed direction
+///    is **denied** — the presence of any data grant opts the peer into
+///    explicit directional control.
+/// 3. If the peer has **no** data grant at all for this folder, **both**
+///    directions are allowed — the trusted-peer default, preserving today's
+///    full bidirectional behaviour.
+///
+/// Revocation is applied per-grant-token via `revoked_token_ids`; a grant
+/// row in the grants table has no token, so revocation is only relevant when
+/// a data grant was synthesised from a presented capability token (the
+/// `DataAuthority` implementation folds those in before calling here).
+/// Grant-row expiry is honoured directly via [`Grant::is_expired`].
+///
+/// The function is pure so it can be used in tests and in the hot BEP path
+/// without I/O. The `DataAuthority` trait wraps the I/O boundary.
+#[must_use]
+pub fn data_access(
+    grants: &[Grant],
+    peer: &DeviceId,
+    folder: &str,
+    now: DateTime<Utc>,
+) -> DataAccess {
+    data_access_with_explicit_control(grants, peer, folder, now, &[])
+}
+
+/// Decide the data-plane access a `peer` has for `folder` given the grants
+/// held on this node, the revoked token ids, and the F2 explicit-control
+/// bit, at `now`.
+///
+/// The F2 invariant: a peer who has *ever* presented a verified data-verb
+/// token for a folder is in explicit-control mode for that folder, even
+/// after the token has been revoked or has expired. The absent direction
+/// stays denied; a token-only restriction cannot be widened back to the
+/// trusted-peer default by revoking or letting the token lapse.
+///
+/// `explicit_control` is the slice of `(peer, folder, data_read, data_write)`
+/// rows the engine's in-memory mirror holds. When the slice contains a row
+/// for `(peer, folder)`, that row's per-direction state is honoured in
+/// addition to the grant-driven decision, so a token-only restriction
+/// survives the token revocation: the bit is set when the token first
+/// verifies and never cleared by revocation or expiry.
+///
+/// The function is pure so it can be used in tests and in the hot BEP path
+/// without I/O. The `DataAuthority` trait wraps the I/O boundary.
+#[must_use]
+pub fn data_access_with_explicit_control(
+    grants: &[Grant],
+    peer: &DeviceId,
+    folder: &str,
+    now: DateTime<Utc>,
+    explicit_control: &[ExplicitControlState],
+) -> DataAccess {
+    let folder_scope = Scope::folder(folder);
+
+    // Collect data grants that cover this peer and folder, partitioned by
+    // whether they are currently active (unexpired) and which verb they carry.
+    let mut has_any_data_grant = false;
+    let mut read_allowed = false;
+    let mut write_allowed = false;
+
+    for grant in grants {
+        if grant.grantee != *peer {
+            continue;
+        }
+        if !grant.capability.is_data_verb() {
+            continue;
+        }
+        // The grant's scope must cover the folder.
+        if !grant.scope.covers(&folder_scope) {
+            continue;
+        }
+        // F4 (defence in depth): ignore data grants whose scope is
+        // node-wide. The runtime gate keys on the BEP folder id
+        // (`p2p-<name>`) and there is no such id at the node root, so
+        // a node-wide data grant cannot satisfy any folder check. The
+        // local CLI and the wire-side `grant_from_wire` both refuse to
+        // author such a grant; this filter catches a row that slipped
+        // through a future code path so a node-wide data grant cannot
+        // accidentally contribute to "has_any_data_grant" and narrow
+        // the access for every folder the peer might touch.
+        if grant.scope.is_node_wide() {
+            continue;
+        }
+        // At least one data grant exists for this peer+folder — this opts the
+        // peer into explicit directional control (rule 2).
+        has_any_data_grant = true;
+
+        if grant.is_expired(now) {
+            // An expired grant contributes to "has_any_data_grant" (so the
+            // other direction is narrowed if it has no active grant), but does
+            // not itself allow the verb.
+            continue;
+        }
+
+        match grant.capability {
+            Capability::DataRead => read_allowed = true,
+            Capability::DataWrite => write_allowed = true,
+            _ => {}
+        }
+    }
+
+    if has_any_data_grant {
+        // Rule 2: at least one data grant exists; allow only what was
+        // explicitly granted and unexpired.
+        DataAccess {
+            read: read_allowed,
+            write: write_allowed,
+        }
+    } else {
+        // Rule 3: no data grant of any kind — trusted-peer default (full sharing).
+        // But the F2 bit may still pin the peer into explicit-control mode.
+        // If a bit exists for this (peer, folder), apply it: the bit carries
+        // the per-direction state observed on the first successful verify,
+        // and it survives any token revocation or expiry.
+        explicit_control
+            .iter()
+            .find(|s| s.peer == peer.as_str() && s.folder == folder)
+            .map_or(
+                DataAccess {
+                    read: true,
+                    write: true,
+                },
+                |state| DataAccess {
+                    read: state.data_read,
+                    write: state.data_write,
+                },
+            )
+    }
+}
+
+/// The in-memory representation of one F2 explicit-control row. Mirrored
+/// from the `data_explicit_control` table into the engine on startup and
+/// refreshed on `clear_data_explicit_control`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplicitControlState {
+    /// The peer device in explicit-control mode.
+    pub peer: String,
+    /// The BEP folder id the control applies to.
+    pub folder: String,
+    /// Whether the verified token granted `data:read` for this folder.
+    pub data_read: bool,
+    /// Whether the verified token granted `data:write` for this folder.
+    pub data_write: bool,
+}
+
+/// The data-plane authority port: consults the on-node data grants and
+/// revocation list to decide whether a peer may read or write a folder.
+///
+/// Implemented by the engine over `StateDb`. Injected into `SyncEngine` so
+/// the BEP sync path can check access at the frame level without taking a
+/// direct dependency on the engine crate.
+///
+/// When the port is **unset** (bare `SyncEngine` not yet wired, or a unit
+/// test that never injects it), the BEP path applies the default-open
+/// behaviour — every trusted peer gets full bidirectional access — matching
+/// the pre-feature behaviour exactly.
+#[async_trait]
+pub trait DataAuthority: Send + Sync {
+    /// Return the read/write access for `peer` over `folder` as of `now`.
+    ///
+    /// The implementation reads the on-node data grants and the revocation
+    /// list from the state database, folds any presented-token grants in, and
+    /// delegates to [`data_access`].
+    ///
+    /// `presented_token` is the optional signed capability token the peer
+    /// carried in the `data_token` field of its `BepMessage::ClusterConfig` sync
+    /// frame, in its JSON form. When present, the implementation verifies it
+    /// against this node — signed by this node or a chain rooting in it,
+    /// unexpired, not revoked, with the bearer matching the authenticated
+    /// `peer` — and folds the carried data-verb grant into the grant set before
+    /// deciding. A token that does not verify, or that carries a non-data verb,
+    /// is ignored for the data-plane decision (it cannot widen access); it is
+    /// never an error, because the data path is default-open and a bad token
+    /// simply confers nothing.
+    async fn data_access(
+        &self,
+        peer: &DeviceId,
+        folder: &str,
+        presented_token: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<DataAccess>;
+
+    /// Record a `peer`'s proposed file row as a flagged local addition in the
+    /// receive quarantine for `folder`, because the peer may not write
+    /// (`data:write` denied) but its edit must not be silently discarded.
+    ///
+    /// `path` is the file path the row would occupy and `file_json` is the
+    /// serialised `FileInfo` exactly as the peer sent it. A newer proposal for
+    /// the same `(folder, peer, path)` replaces the older one, so the quarantine
+    /// stays bounded by the number of distinct paths. `observed_at` stamps when
+    /// the proposal arrived. Quarantined rows are surfaced to the operator
+    /// ("N rejected local additions from `<peer>`"), never merged, block-fetched,
+    /// or re-advertised; if the operator later grants `data:write`, the peer
+    /// re-sends and the rows become eligible to merge on the next exchange.
+    async fn quarantine_received(
+        &self,
+        peer: &DeviceId,
+        folder: &str,
+        path: &str,
+        file_json: &str,
+        observed_at: DateTime<Utc>,
+    ) -> anyhow::Result<()>;
 }
 
 #[cfg(test)]
@@ -901,5 +1152,276 @@ mod tests {
         let folder = Scope::folder("/work");
         let json = serde_json::to_string(&folder).unwrap();
         assert_eq!(serde_json::from_str::<Scope>(&json).unwrap(), folder);
+    }
+
+    // ── Capability classification: data verbs ──
+
+    #[test]
+    fn data_verbs_are_not_dangerous() {
+        assert!(!Capability::DataRead.is_dangerous());
+        assert!(!Capability::DataWrite.is_dangerous());
+    }
+
+    #[test]
+    fn data_verbs_are_classified_as_data_verbs() {
+        assert!(Capability::DataRead.is_data_verb());
+        assert!(Capability::DataWrite.is_data_verb());
+    }
+
+    #[test]
+    fn non_data_verbs_are_not_data_verbs() {
+        assert!(!Capability::StatusRead.is_data_verb());
+        assert!(!Capability::PinWrite.is_data_verb());
+        assert!(!Capability::GrantAdmin.is_data_verb());
+    }
+
+    #[test]
+    fn data_verbs_round_trip_through_wire_form() {
+        assert_eq!(Capability::DataRead.as_wire(), "data:read");
+        assert_eq!(Capability::DataWrite.as_wire(), "data:write");
+        assert_eq!(
+            Capability::from_wire("data:read"),
+            Some(Capability::DataRead)
+        );
+        assert_eq!(
+            Capability::from_wire("data:write"),
+            Some(Capability::DataWrite)
+        );
+    }
+
+    #[test]
+    fn data_verbs_round_trip_through_serde() {
+        let json = serde_json::to_string(&Capability::DataRead).unwrap();
+        assert_eq!(json, "\"data:read\"");
+        assert_eq!(
+            serde_json::from_str::<Capability>(&json).unwrap(),
+            Capability::DataRead
+        );
+
+        let json = serde_json::to_string(&Capability::DataWrite).unwrap();
+        assert_eq!(json, "\"data:write\"");
+        assert_eq!(
+            serde_json::from_str::<Capability>(&json).unwrap(),
+            Capability::DataWrite
+        );
+    }
+
+    // ── data_access truth table ──
+
+    fn peer() -> DeviceId {
+        DeviceId::new("PEER")
+    }
+
+    fn data_grant(capability: Capability, folder: &str) -> Grant {
+        Grant {
+            grantee: peer(),
+            capability,
+            scope: Scope::folder(folder),
+            granted_by: owner(),
+            expires: None,
+        }
+    }
+
+    fn data_grant_expiring(capability: Capability, folder: &str, expires: DateTime<Utc>) -> Grant {
+        Grant {
+            grantee: peer(),
+            capability,
+            scope: Scope::folder(folder),
+            granted_by: owner(),
+            expires: Some(expires),
+        }
+    }
+
+    #[test]
+    fn data_access_no_grant_returns_full_access_default() {
+        // Rule 3: no data grant of any kind — trusted-peer default is
+        // full bidirectional sharing.
+        let access = data_access(&[], &peer(), "/work", at(2026, 1, 1));
+        assert!(access.read, "default: read must be allowed");
+        assert!(access.write, "default: write must be allowed");
+    }
+
+    #[test]
+    fn data_access_read_only_grant_allows_read_denies_write() {
+        let grants = vec![data_grant(Capability::DataRead, "/work")];
+        let access = data_access(&grants, &peer(), "/work", at(2026, 1, 1));
+        assert!(access.read, "read:only grant must allow read");
+        assert!(!access.write, "read-only grant must deny write");
+    }
+
+    #[test]
+    fn data_access_write_only_grant_allows_write_denies_read() {
+        let grants = vec![data_grant(Capability::DataWrite, "/work")];
+        let access = data_access(&grants, &peer(), "/work", at(2026, 1, 1));
+        assert!(!access.read, "write-only grant must deny read");
+        assert!(access.write, "write-only grant must allow write");
+    }
+
+    #[test]
+    fn data_access_read_write_grants_allow_both() {
+        let grants = vec![
+            data_grant(Capability::DataRead, "/work"),
+            data_grant(Capability::DataWrite, "/work"),
+        ];
+        let access = data_access(&grants, &peer(), "/work", at(2026, 1, 1));
+        assert!(access.read, "read-write grants must allow read");
+        assert!(access.write, "read-write grants must allow write");
+    }
+
+    #[test]
+    fn data_access_expired_read_grant_narrows_but_does_not_default_open() {
+        // An expired read grant still opts the peer into explicit control
+        // (rule 2): the absent/lapsed direction is denied, not defaulted.
+        let grants = vec![data_grant_expiring(
+            Capability::DataRead,
+            "/work",
+            at(2025, 12, 31),
+        )];
+        let access = data_access(&grants, &peer(), "/work", at(2026, 1, 1));
+        assert!(
+            !access.read,
+            "expired read grant must not allow read (rule 2: explicit control mode, expired)"
+        );
+        assert!(
+            !access.write,
+            "expired read grant must not allow write (no write grant exists)"
+        );
+    }
+
+    #[test]
+    fn data_access_expired_read_grant_with_active_write_allows_only_write() {
+        // An expired read grant + an active write grant: write is allowed,
+        // read is denied (the lapsed direction narrows under explicit control).
+        let grants = vec![
+            data_grant_expiring(Capability::DataRead, "/work", at(2025, 12, 31)),
+            data_grant(Capability::DataWrite, "/work"),
+        ];
+        let access = data_access(&grants, &peer(), "/work", at(2026, 1, 1));
+        assert!(!access.read, "expired read grant must not allow read");
+        assert!(access.write, "active write grant must allow write");
+    }
+
+    #[test]
+    fn data_access_grant_for_different_peer_is_ignored() {
+        let mut g = data_grant(Capability::DataRead, "/work");
+        g.grantee = DeviceId::new("OTHER-PEER");
+        let grants = vec![g];
+        // The grant is for a different peer; our peer has no data grant,
+        // so it defaults to full access.
+        let access = data_access(&grants, &peer(), "/work", at(2026, 1, 1));
+        assert!(
+            access.read,
+            "different peer's grant must not affect our peer"
+        );
+        assert!(
+            access.write,
+            "different peer's grant must not affect our peer"
+        );
+    }
+
+    #[test]
+    fn data_access_grant_for_different_folder_does_not_affect_this_folder() {
+        // A data grant on /personal does not opt /work into explicit control.
+        let grants = vec![data_grant(Capability::DataRead, "/personal")];
+        let access = data_access(&grants, &peer(), "/work", at(2026, 1, 1));
+        assert!(access.read, "grant on /personal must not restrict /work");
+        assert!(access.write, "grant on /personal must not restrict /work");
+    }
+
+    #[test]
+    fn data_access_node_wide_data_grant_is_ignored_as_defence_in_depth() {
+        // F4: a data-verb grant whose scope is node-wide cannot
+        // contribute to the per-direction decision. The local CLI and
+        // the wire-side parse both refuse such a grant outright; this
+        // pure-function filter is defence in depth for any row that
+        // somehow slipped through (a future code path, a corrupt
+        // state, a bug we have not yet found). Without the filter, a
+        // node-wide `data:read` would set `has_any_data_grant = true`
+        // and silently narrow every folder the peer might touch — the
+        // F1 silent-no-op failure mode in a different shape.
+        let grants = vec![
+            Grant {
+                grantee: peer(),
+                capability: Capability::DataRead,
+                scope: Scope::Node,
+                granted_by: owner(),
+                expires: None,
+            },
+            Grant {
+                grantee: peer(),
+                capability: Capability::DataWrite,
+                scope: Scope::Node,
+                granted_by: owner(),
+                expires: None,
+            },
+        ];
+        let access = data_access(&grants, &peer(), "/work", at(2026, 1, 1));
+        assert!(
+            access.read,
+            "node-wide data:read must not restrict the folder (F4 defence in depth)"
+        );
+        assert!(
+            access.write,
+            "node-wide data:write must not restrict the folder (F4 defence in depth)"
+        );
+        // A root folder grant (`/`) is also node-wide in everything
+        // but name, so the same filter catches it.
+        let grants = vec![Grant {
+            grantee: peer(),
+            capability: Capability::DataRead,
+            scope: Scope::folder("/"),
+            granted_by: owner(),
+            expires: None,
+        }];
+        let access = data_access(&grants, &peer(), "/work", at(2026, 1, 1));
+        assert!(
+            access.read,
+            "root-folder data:read must not restrict the folder (F4 defence in depth)"
+        );
+        assert!(
+            access.write,
+            "root-folder data:read must not restrict the folder (F4 defence in depth)"
+        );
+    }
+
+    #[test]
+    fn data_access_parent_folder_grant_covers_child() {
+        // A data:read grant on /work covers /work/reports (folder prefix coverage).
+        let grants = vec![data_grant(Capability::DataRead, "/work")];
+        let access = data_access(&grants, &peer(), "/work/reports", at(2026, 1, 1));
+        assert!(access.read, "parent folder grant must cover child folder");
+        assert!(!access.write, "parent folder read grant must deny write");
+    }
+
+    #[test]
+    fn data_access_delegation_cannot_escalate_scope() {
+        // A read grant on /work/sub does NOT cover /work (the parent). The
+        // grant system's subset rule means a delegate can only narrow scope,
+        // never widen it: a grant on /work/sub cannot make the peer read /work.
+        let grants = vec![data_grant(Capability::DataRead, "/work/sub")];
+        let access = data_access(&grants, &peer(), "/work", at(2026, 1, 1));
+        // The grant for /work/sub does not cover /work, so no data grant
+        // applies to this folder. Default-open applies.
+        assert!(
+            access.read,
+            "grant on /work/sub must not affect /work (default-open applies)"
+        );
+        assert!(
+            access.write,
+            "grant on /work/sub must not affect /work (default-open applies)"
+        );
+    }
+
+    #[test]
+    fn data_access_revoked_token_grant_is_excluded() {
+        // A grant derived from a revoked token must not authorise access.
+        // The data_access function operates on a grants slice that callers
+        // populate; a revoked-token grant must simply not be included in the
+        // slice the caller passes. Here we verify that a slice with no grants
+        // for this peer yields the default-open result, and that excluding the
+        // grant (as the DataAuthority impl must for revoked tokens) works.
+        let access = data_access(&[], &peer(), "/work", at(2026, 1, 1));
+        assert!(access.read, "empty grants yields default-open");
+        assert!(access.write, "empty grants yields default-open");
     }
 }

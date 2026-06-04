@@ -394,6 +394,116 @@ where
     }
 }
 
+/// Verify a presented capability token for the **data plane** and project it to
+/// the data-verb [`Grant`] it confers, if any.
+///
+/// Unlike the management-plane token verification, this never returns an error:
+/// the BEP data path is default-open, so a token that does not parse, does not
+/// verify, or carries a non-data verb simply confers nothing and the decision
+/// falls back to the on-node data grants. The reason a token is unusable is
+/// logged (so an
+/// operator can diagnose a peer presenting a stale or wrong token), but it can
+/// never *widen* access, only narrow-or-grant a direction the bearer was issued.
+///
+/// A token carrying a data verb that verifies cleanly yields its
+/// [`to_grant`](crate::manage::TokenClaims::to_grant) projection, ready to be
+/// folded into the grant slice passed to [`data_access`](crate::manage::data_access).
+#[must_use]
+pub fn verify_data_token<S>(
+    store: &S,
+    peer: &DeviceId,
+    token_json: &str,
+    now: DateTime<Utc>,
+) -> Option<Grant>
+where
+    S: ManageGrantStore + ?Sized,
+{
+    if token_json.len() > MAX_TOKEN_JSON_BYTES {
+        tracing::debug!(
+            target: "cascade::manage::data",
+            len = token_json.len(),
+            max = MAX_TOKEN_JSON_BYTES,
+            "ignoring oversized data token presented on sync frame",
+        );
+        return None;
+    }
+
+    let token: CapabilityToken = match serde_json::from_str(token_json) {
+        Ok(token) => token,
+        Err(e) => {
+            tracing::debug!(
+                target: "cascade::manage::data",
+                error = %e,
+                "ignoring unparseable data token presented on sync frame",
+            );
+            return None;
+        }
+    };
+
+    let node_device_id = match store.manage_node_device_id() {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::debug!(
+                target: "cascade::manage::data",
+                error = %e,
+                "cannot resolve node device id to verify data token — ignoring token",
+            );
+            return None;
+        }
+    };
+
+    let revoked = match store.manage_revoked_token_ids() {
+        Ok(set) => set,
+        Err(e) => {
+            tracing::debug!(
+                target: "cascade::manage::data",
+                error = %e,
+                "cannot read token revocation list to verify data token — ignoring token",
+            );
+            return None;
+        }
+    };
+
+    let is_revoked = |id: &str| revoked.contains(id);
+    match token.verify(&node_device_id, peer, now, &is_revoked) {
+        Ok(claims) if claims.capability.is_data_verb() => {
+            // F4 (defence in depth): a verified data-verb token whose
+            // scope is node-wide cannot satisfy any folder check at
+            // the runtime gate (the gate keys on the BEP folder id
+            // `p2p-<name>`). A token minted by a buggy issuer that
+            // somehow made it past the local `token issue` guard
+            // would still be a silent no-op; the data_access filter
+            // catches it. Refuse explicitly here too so a node-wide
+            // data token is logged and never folded into the grant
+            // set the gate consults.
+            if claims.scope.is_node_wide() {
+                tracing::debug!(
+                    target: "cascade::manage::data",
+                    "data token carries a node-wide scope — not folded into decision",
+                );
+                return None;
+            }
+            Some(claims.to_grant())
+        }
+        Ok(claims) => {
+            tracing::debug!(
+                target: "cascade::manage::data",
+                capability = claims.capability.as_wire(),
+                "data token carries a non-data verb — not folded into data-plane decision",
+            );
+            None
+        }
+        Err(e) => {
+            tracing::debug!(
+                target: "cascade::manage::data",
+                error = %e,
+                "data token presented on sync frame rejected — not folded into decision",
+            );
+            None
+        }
+    }
+}
+
 /// Run the authorise → audit → execute flow for one decoded command.
 ///
 /// This is the shared dispatch core, parameterised over the grant store and the
@@ -702,6 +812,23 @@ fn grant_from_wire(
         anyhow::anyhow!("unknown capability in delegated grant: {}", wire.capability)
     })?;
     let scope = scope_from_wire(&wire.scope);
+    // F4: refuse a data-verb grant over a node-wide / wildcard scope on the
+    // wire side too. The runtime data-plane gate keys on the BEP folder id
+    // (`p2p-<name>`) and there is no such id at the node root — a node-wide
+    // data grant is a silent no-op. The local `cascade grant` and
+    // `cascade token issue` CLIs apply the same bar (see
+    // `crate::cascade::cli::grant::add` and `crate::cascade::cli::token::issue`),
+    // so the wire-side parse is defence in depth, not the only line of
+    // defence. The check fires before `bound.clamp` and before the
+    // `Grant` is constructed, so a refused grant never reaches the store.
+    if scope.is_node_wide() && (capability.is_dangerous() || capability.is_data_verb()) {
+        anyhow::bail!(
+            "capability `{}` cannot be granted over a wildcard scope; \
+             name an explicit folder (data verbs are folder-scoped, not \
+             node-wide)",
+            capability.as_wire()
+        );
+    }
     let requested_expiry = wire
         .expires
         .as_deref()

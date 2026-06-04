@@ -9,7 +9,7 @@ impl SchemaVersion {
     /// Current schema version.
     #[must_use]
     pub const fn current() -> Self {
-        Self(3)
+        Self(5)
     }
 }
 
@@ -23,6 +23,12 @@ pub fn migrate(conn: &Connection, from: SchemaVersion, _to: SchemaVersion) -> Re
     }
     if from < SchemaVersion(3) {
         v3_capability_tokens(conn)?;
+    }
+    if from < SchemaVersion(4) {
+        v4_data_receive_quarantine(conn)?;
+    }
+    if from < SchemaVersion(5) {
+        v5_data_explicit_control(conn)?;
     }
 
     Ok(())
@@ -195,6 +201,76 @@ fn v3_capability_tokens(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS token_revocations (
             token_id      TEXT PRIMARY KEY,
             revoked_at    INTEGER NOT NULL
+        );
+        ",
+    )?;
+
+    Ok(())
+}
+
+/// Schema v4 — directional data-sharing receive-only quarantine.
+///
+/// `data_receive_quarantine` holds proposed index rows that arrived from a
+/// peer whose `data:write` grant for the folder was absent or expired. Rather
+/// than silently discarding the frame (which would hide what the peer is
+/// trying to push) or merging it into the authoritative index (which would
+/// violate the grant), rejected rows are parked here, keyed by
+/// `(folder_id, peer_device, path)`.
+///
+/// A newer proposal for the same path replaces the older (INSERT OR REPLACE),
+/// so the table is bounded by the number of distinct paths per peer per
+/// folder — it does not grow without bound. The rows are surfaced to the
+/// operator as "rejected local additions from <peer>". If the operator later
+/// grants `data:write` for that peer, quarantined rows become eligible to
+/// merge on the next index exchange (the peer re-sends; the node does not
+/// auto-replay the quarantine, so a stale proposal cannot resurrect deleted
+/// content). Rows may also be pruned explicitly by the operator.
+fn v4_data_receive_quarantine(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS data_receive_quarantine (
+            folder_id     TEXT NOT NULL,
+            peer_device   TEXT NOT NULL,
+            path          TEXT NOT NULL,
+            file_json     TEXT NOT NULL,
+            observed_at   INTEGER NOT NULL,
+            PRIMARY KEY (folder_id, peer_device, path)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_quarantine_folder_peer
+            ON data_receive_quarantine(folder_id, peer_device);
+        ",
+    )?;
+
+    Ok(())
+}
+
+/// Schema v5 — explicit-control bit for directional data sharing.
+///
+/// `data_explicit_control` is the durable backing for the F2 invariant: a
+/// peer who has *ever* presented a verified data-verb token for a folder is
+/// in explicit-control mode for that folder, even after the token has been
+/// revoked or has expired. The runtime data-plane gate consults the bit so
+/// the absent direction stays denied; a token-only restriction cannot be
+/// widened back to the trusted-peer default by revoking or letting the
+/// token lapse.
+///
+/// The bit is set on the first successful token verify (folded in by the
+/// `DataAuthority` impl) and persists across restarts, so a stale
+/// restart cannot re-introduce the F2 widening. An explicit
+/// `clear_data_explicit_control` row operation — the only path that
+/// removes a row — exists for the operator to return the peer to the
+/// trusted-peer default after they have removed the underlying grant.
+fn v5_data_explicit_control(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS data_explicit_control (
+            peer_device   TEXT NOT NULL,
+            folder_id     TEXT NOT NULL,
+            data_read     BOOLEAN NOT NULL,
+            data_write    BOOLEAN NOT NULL,
+            observed_at   INTEGER NOT NULL,
+            PRIMARY KEY (peer_device, folder_id)
         );
         ",
     )?;

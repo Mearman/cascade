@@ -271,6 +271,7 @@ mod tests {
                 id: "f1".into(),
                 label: "Folder One".into(),
             }],
+            data_token: None,
         };
         cw.send(&cluster).await.unwrap();
         let got = sr.recv().await.unwrap().unwrap();
@@ -330,6 +331,7 @@ mod tests {
                 id: "shared".into(),
                 label: "Shared".into(),
             }],
+            data_token: None,
         };
         client_w.send(&hello).await.unwrap();
         let got = server_r.recv().await.unwrap().unwrap();

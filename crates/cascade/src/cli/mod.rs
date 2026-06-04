@@ -12,6 +12,7 @@ pub mod mount;
 pub mod projfs_provider;
 pub mod remote;
 pub mod service;
+pub mod share;
 pub mod status;
 pub mod token;
 
@@ -341,6 +342,12 @@ pub enum Commands {
         device_code: bool,
     },
 
+    /// Configure per-peer, per-folder directional data sharing
+    Share {
+        #[command(subcommand)]
+        command: ShareCommands,
+    },
+
     /// Administer the capability grants this node confers on remote managers
     Grant {
         #[command(subcommand)]
@@ -502,6 +509,45 @@ pub enum GrantCommands {
 
     /// Print the management audit log
     Audit,
+}
+
+#[derive(Subcommand)]
+pub enum ShareCommands {
+    /// Grant a peer directional access to a folder
+    Add {
+        /// Device ID of the peer to share with
+        peer_device_id: String,
+
+        /// Folder path to share (must be an explicit folder, not `*`)
+        folder: String,
+
+        /// Sharing direction: read-only, write-only, or read-write
+        #[arg(long)]
+        direction: String,
+
+        /// Optional RFC 3339 expiry timestamp
+        #[arg(long)]
+        expires: Option<String>,
+    },
+
+    /// List directional shares per peer
+    List {
+        /// Restrict listing to a specific folder
+        folder: Option<String>,
+    },
+
+    /// Revoke a peer's directional access to a folder
+    Revoke {
+        /// Device ID of the peer
+        peer_device_id: String,
+
+        /// Folder path
+        folder: String,
+
+        /// Restrict revocation to a specific direction (read-only, write-only, read-write)
+        #[arg(long)]
+        direction: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -878,6 +924,26 @@ impl Cli {
                 )
                 .await
             }
+            Commands::Share { command } => match command {
+                ShareCommands::Add {
+                    peer_device_id,
+                    folder,
+                    direction,
+                    expires,
+                } => share::add(
+                    ctx,
+                    &peer_device_id,
+                    &folder,
+                    &direction,
+                    expires.as_deref(),
+                ),
+                ShareCommands::List { folder } => share::list(ctx, folder.as_deref()),
+                ShareCommands::Revoke {
+                    peer_device_id,
+                    folder,
+                    direction,
+                } => share::revoke(ctx, &peer_device_id, &folder, direction.as_deref()),
+            },
             Commands::Grant { command } => match command {
                 GrantCommands::Add {
                     device_id,

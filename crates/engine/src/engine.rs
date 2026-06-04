@@ -26,9 +26,11 @@ use crate::backend::{Backend, BackendFactory};
 use crate::cache::manager::{CacheManager, CacheManagerConfig};
 use crate::changefeed::ChangeFeed;
 use crate::config::ConfigResolver;
-use crate::db::{AuditEntry, PinRuleRecord, StateDb};
+use crate::db::{AuditEntry, PinRuleRecord, QuarantineRecord, StateDb};
 use crate::manage::{
-    DeviceId, Grant, ManageCommandExecutor, ManageDispatch, ManageGrantStore, Scope, run_dispatch,
+    DataAccess, DataAuthority, DeviceId, ExplicitControlState, Grant, ManageCommandExecutor,
+    ManageDispatch, ManageGrantStore, Scope, data_access_with_explicit_control, run_dispatch,
+    verify_data_token,
 };
 use crate::p2p_bridge::P2pBridge;
 use crate::presenter::VfsPresenter;
@@ -237,22 +239,25 @@ impl Engine {
         tree.unmount(prefix);
     }
 
-    /// Wire the management-plane dispatch port into every backend that serves
-    /// remote management.
+    /// Wire the management-plane dispatch port and the data-plane authority port
+    /// into every backend that serves a peer transport.
     ///
-    /// The engine is the production [`ManageDispatch`] implementation — it owns
-    /// the grant store, the audit log, and the command executor. A backend that
-    /// runs its own peer transport (the P2P backend) receives inbound
-    /// `ManageRequest` frames and needs this port to authorise, audit, and
-    /// execute them through the same core the local CLI drives. Backends with no
-    /// transport ignore the call (the trait default is a no-op).
+    /// The engine is the production [`ManageDispatch`] and [`DataAuthority`]
+    /// implementation — it owns the grant store, the audit log, the command
+    /// executor, and the data-grant ACL. A backend that runs its own peer
+    /// transport (the P2P backend) receives inbound `ManageRequest` frames
+    /// (authorised, audited, and executed through [`ManageDispatch`]) and gates
+    /// serving/accepting index and blocks on the [`DataAuthority`] decision.
+    /// Backends with no transport ignore both calls (the trait defaults are
+    /// no-ops).
     ///
     /// Called once at daemon startup, after the engine is constructed and before
     /// its presenter begins accepting connections. Takes `self: &Arc<Self>` so
-    /// the engine can hand a clone of itself, as an `Arc<dyn ManageDispatch>`, to
-    /// each backend.
+    /// the engine can hand a clone of itself, as an `Arc<dyn ManageDispatch>` and
+    /// an `Arc<dyn DataAuthority>`, to each backend.
     pub async fn wire_manage_dispatch(self: &Arc<Self>) {
         let dispatch: Arc<dyn ManageDispatch> = self.clone();
+        let authority: Arc<dyn DataAuthority> = self.clone();
         let backends: Vec<Arc<dyn Backend>> = {
             let tree = self
                 .vfs
@@ -266,6 +271,7 @@ impl Engine {
         };
         for backend in backends {
             backend.set_manage_dispatch(dispatch.clone()).await;
+            backend.set_data_authority(authority.clone()).await;
         }
     }
 
@@ -594,6 +600,23 @@ impl Engine {
     pub const fn db(&self) -> &Arc<StateDb> {
         &self.db
     }
+
+    /// Snapshot the F2 explicit-control bit. Returns a map keyed by
+    /// `(peer_device, folder_id)` with the per-direction state observed on
+    /// the last successful token verify. Exists for the F2 integration
+    /// test to assert the in-memory mirror reflects the durable state
+    /// the engine just observed.
+    #[must_use]
+    pub fn explicit_data_control_snapshot(
+        &self,
+    ) -> std::collections::HashMap<(String, String), (bool, bool)> {
+        let Ok(rows) = self.db.list_data_explicit_control() else {
+            return std::collections::HashMap::new();
+        };
+        rows.into_iter()
+            .map(|r| ((r.peer_device, r.folder_id), (r.data_read, r.data_write)))
+            .collect()
+    }
 }
 
 /// The engine is the grant store and audit sink for the management plane,
@@ -775,6 +798,100 @@ impl ManageDispatch for Engine {
         now: DateTime<Utc>,
     ) -> ManageResult {
         run_dispatch(self, self, caller, command, scope, token, now).await
+    }
+}
+
+/// The engine is the data-plane authority for the BEP sync path: it resolves a
+/// peer's directional read/write access to a folder from the on-node data
+/// grants, the token revocation list, and any signed data-verb token the peer
+/// presented on its sync `ClusterConfig`.
+///
+/// The decision is **default-open** (see [`data_access_with_explicit_control`]):
+/// a trusted peer with no data grant configured keeps full bidirectional
+/// access, and the feature only ever narrows. Both the grant rows and the
+/// revocation list are read on every call, so revoking or expiring a grant
+/// takes effect at the next frame rather than at restart. The F2
+/// explicit-control bit is consulted on every call too, so a verified-token
+/// restriction survives the token revocation or expiry that prompted it.
+#[async_trait]
+impl DataAuthority for Engine {
+    async fn data_access(
+        &self,
+        peer: &DeviceId,
+        folder: &str,
+        presented_token: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<DataAccess> {
+        // On-node data grants. Read every call so a freshly added or revoked
+        // grant is honoured promptly. A grant row carries no token, so the
+        // revocation list does not touch these — only a presented token below.
+        let mut grants: Vec<Grant> = self
+            .db
+            .list_data_grants()?
+            .into_iter()
+            .map(|record| record.grant)
+            .collect();
+
+        // Fold in the peer's presented data-verb token, if it verifies against
+        // this node (signed by us or a chain rooting in us, unexpired, not
+        // revoked, bearer == this peer). A token that does not verify, or that
+        // carries a non-data verb, confers nothing — it can never widen access.
+        if let Some(token_json) = presented_token
+            && let Some(token_grant) = verify_data_token(self, peer, token_json, now)
+        {
+            // The F2 invariant: a successful verify pins the peer into
+            // explicit-control mode for the folder. Record the bit so the
+            // absent direction stays denied even if the token is later
+            // revoked or allowed to expire. The data-plane gate keys on
+            // `folder`, the runtime value the BEP session is bound to, not
+            // the token's carried scope — the verify path's scope-cover
+            // check has already confirmed the two agree.
+            self.db.record_data_explicit_control(
+                peer.as_str(),
+                folder,
+                matches!(token_grant.capability, crate::manage::Capability::DataRead),
+                matches!(token_grant.capability, crate::manage::Capability::DataWrite),
+                now,
+            )?;
+            grants.push(token_grant);
+        }
+
+        let explicit_control: Vec<ExplicitControlState> = self
+            .db
+            .list_data_explicit_control()?
+            .into_iter()
+            .map(|record| ExplicitControlState {
+                peer: record.peer_device,
+                folder: record.folder_id,
+                data_read: record.data_read,
+                data_write: record.data_write,
+            })
+            .collect();
+
+        Ok(data_access_with_explicit_control(
+            &grants,
+            peer,
+            folder,
+            now,
+            &explicit_control,
+        ))
+    }
+
+    async fn quarantine_received(
+        &self,
+        peer: &DeviceId,
+        folder: &str,
+        path: &str,
+        file_json: &str,
+        observed_at: DateTime<Utc>,
+    ) -> Result<()> {
+        self.db.upsert_quarantine(&QuarantineRecord {
+            folder_id: folder.to_string(),
+            peer_device: peer.as_str().to_string(),
+            path: path.to_string(),
+            file_json: file_json.to_string(),
+            observed_at,
+        })
     }
 }
 

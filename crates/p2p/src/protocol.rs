@@ -579,7 +579,23 @@ const MANAGE_ERR_FAILED: u32 = 1;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BepMessage {
     /// Exchange folder configuration on connect.
-    ClusterConfig { folders: Vec<Folder> },
+    ///
+    /// `data_token` optionally carries a signed capability token (in its JSON
+    /// form) the connecting side presents to authorise directional data-plane
+    /// access — a `data:read` or `data:write` grant bound to this device for a
+    /// folder scope. The serving side verifies it (signed by it or a chain
+    /// rooting in it, unexpired, not revoked, bearer == the authenticated peer)
+    /// and folds the carried grant into its data-plane access decision. `None`
+    /// means no token is presented; the peer is then authorised solely by the
+    /// on-node data grants, defaulting to full bidirectional access for a
+    /// trusted peer with no data grant configured.
+    ClusterConfig {
+        /// The folders the sender participates in.
+        folders: Vec<Folder>,
+        /// An optional signed capability token authorising directional data
+        /// access for the sync session, in its JSON form.
+        data_token: Option<String>,
+    },
     /// Announce files and blocks.
     Index {
         folder: String,
@@ -803,7 +819,10 @@ pub fn encode_message(msg: &BepMessage) -> Result<Vec<u8>> {
     encode_u32(&mut body, msg.msg_type());
 
     match msg {
-        BepMessage::ClusterConfig { folders } => {
+        BepMessage::ClusterConfig {
+            folders,
+            data_token,
+        } => {
             encode_u32(
                 &mut body,
                 u32::try_from(folders.len()).map_err(|_| anyhow::anyhow!("too many folders"))?,
@@ -812,6 +831,7 @@ pub fn encode_message(msg: &BepMessage) -> Result<Vec<u8>> {
                 encode_string(&mut body, &folder.id)?;
                 encode_string(&mut body, &folder.label)?;
             }
+            encode_opt_string(&mut body, data_token.as_deref())?;
         }
         BepMessage::Index { folder, files } | BepMessage::IndexUpdate { folder, files } => {
             encode_string(&mut body, folder)?;
@@ -1506,7 +1526,11 @@ fn decode_cluster_config(data: &[u8]) -> Result<BepMessage> {
         folders.push(Folder { id, label });
         data = rest;
     }
-    Ok(BepMessage::ClusterConfig { folders })
+    let (data_token, _) = decode_opt_string(data)?;
+    Ok(BepMessage::ClusterConfig {
+        folders,
+        data_token,
+    })
 }
 
 fn decode_index(data: &[u8]) -> Result<BepMessage> {
@@ -1668,12 +1692,27 @@ mod tests {
                     label: "Photos".into(),
                 },
             ],
+            data_token: None,
+        });
+    }
+
+    #[test]
+    fn encode_decode_cluster_config_with_data_token() {
+        round_trip(BepMessage::ClusterConfig {
+            folders: vec![Folder {
+                id: "folder-1".into(),
+                label: "Documents".into(),
+            }],
+            data_token: Some("{\"signed\":\"token-json\"}".into()),
         });
     }
 
     #[test]
     fn encode_decode_cluster_config_empty() {
-        round_trip(BepMessage::ClusterConfig { folders: vec![] });
+        round_trip(BepMessage::ClusterConfig {
+            folders: vec![],
+            data_token: None,
+        });
     }
 
     #[test]

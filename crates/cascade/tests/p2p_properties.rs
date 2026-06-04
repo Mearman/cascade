@@ -157,8 +157,14 @@ fn bep_message_strategy() -> impl Strategy<Value = BepMessage> {
             },
         );
 
-    let cluster_config = prop::collection::vec(folder, 0..3)
-        .prop_map(|folders| BepMessage::ClusterConfig { folders });
+    let cluster_config = (
+        prop::collection::vec(folder, 0..3),
+        prop::option::of(".{0,40}"),
+    )
+        .prop_map(|(folders, data_token)| BepMessage::ClusterConfig {
+            folders,
+            data_token,
+        });
 
     let index = (".{0,20}", prop::collection::vec(file_info.clone(), 0..3))
         .prop_map(|(folder, files)| BepMessage::Index { folder, files });

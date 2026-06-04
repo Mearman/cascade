@@ -22,6 +22,48 @@ use chrono::{DateTime, Utc};
 use super::CliContext;
 use super::init::CascadeConfig;
 
+/// Resolve a P2P backend's user-facing name to its canonical BEP folder id.
+///
+/// The BEP folder id the runtime data-plane gate consults is always
+/// `p2p-<name>`, where `<name>` is the user-facing name the operator passed
+/// to `cascade backend add p2p --name <name>`. The data-plane gate and the
+/// `Scope::folder(...)` value a grant stores must live in the same namespace —
+/// otherwise `Scope::covers` returns `false` and the grant is a silent no-op.
+/// This function is the single path that authors a data-verb grant: it maps
+/// the operator-facing name to the canonical id at write time, so the stored
+/// scope matches the value the runtime gate checks.
+///
+/// Unknown names are refused loudly with a list of every registered P2P
+/// backend, so the operator can correct a typo without running
+/// `cascade backend list` first. A registered backend of a different type
+/// (for example `gdrive` or `s3`) is not eligible for directional sharing:
+/// directional sharing applies to P2P folders only, so its name does not
+/// appear in the registered-P2P list and the same loud error is returned.
+pub(super) fn resolve_p2p_folder_id(ctx: &CliContext, name: &str) -> Result<String> {
+    if name.trim().is_empty() {
+        anyhow::bail!("a P2P backend name is required");
+    }
+    let db = StateDb::open(&ctx.db_path).context("opening the state database")?;
+    let known: Vec<String> = db
+        .list_backends()?
+        .into_iter()
+        .filter(|record| record.backend_type == "p2p")
+        .map(|record| record.id)
+        .collect();
+    let resolved = known
+        .iter()
+        .find(|id| id.as_str() == name)
+        .cloned()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no P2P backend named `{name}` is registered; directional sharing only \
+                 applies to P2P folders. Registered P2P backends: [{}]",
+                known.join(", "),
+            )
+        })?;
+    Ok(format!("p2p-{resolved}"))
+}
+
 /// The wildcard scope token a user passes on the command line to mean
 /// "node-wide" — every path on the node.
 const SCOPE_WILDCARD: &str = "*";
@@ -155,11 +197,22 @@ pub fn add(
     // so refuse to write one rather than create a grant that can never
     // authorise the command it names. Check every capability up front so the
     // command is all-or-nothing.
+    //
+    // A data verb (`data:read` / `data:write`) is also never satisfied by a
+    // node-wide grant: the runtime data-plane gate keys on the BEP folder id
+    // (`p2p-<name>`) and there is no such id at the node root. A node-wide data
+    // grant is a silent no-op that would only confuse the operator, so it is
+    // refused the same way as a dangerous capability. `cascade share` applies
+    // the same bar by resolving the operator-facing name to the canonical id
+    // before storing the grant, but `cascade grant` and the wire-side
+    // `ManageCommand::GrantAdd` path are open-coded — they have to apply the
+    // bar themselves.
     for capability in &capabilities {
-        if capability.is_dangerous() && parsed_scope.is_node_wide() {
+        if parsed_scope.is_node_wide() && (capability.is_dangerous() || capability.is_data_verb()) {
             anyhow::bail!(
-                "capability `{}` is dangerous and cannot be granted over a wildcard scope; \
-                 name an explicit folder with --scope <path>",
+                "capability `{}` cannot be granted over a wildcard scope; \
+                 name an explicit folder with --scope <path> (data verbs are \
+                 folder-scoped, not node-wide)",
                 capability.as_wire()
             );
         }
@@ -258,7 +311,7 @@ pub fn audit(ctx: &CliContext) -> Result<()> {
 
 /// Human-readable label for a scope: the wildcard token for a node-wide scope,
 /// the path for a folder scope.
-fn scope_label(scope: &Scope) -> String {
+pub fn scope_label(scope: &Scope) -> String {
     match scope {
         Scope::Node => SCOPE_WILDCARD.to_owned(),
         Scope::Folder { path } => path.clone(),
@@ -365,8 +418,8 @@ mod tests {
         );
         let message = format!("{:#}", result.unwrap_err());
         assert!(
-            message.contains("dangerous") && message.contains("wildcard"),
-            "error must explain the wildcard rejection, got: {message}",
+            message.contains("wildcard") && message.contains("--scope"),
+            "error must explain the wildcard rejection and the fix, got: {message}",
         );
 
         let db = StateDb::open(&ctx.db_path).unwrap();
@@ -392,6 +445,34 @@ mod tests {
             db.list_grants().unwrap().is_empty(),
             "a refused dangerous capability must not leave a partial grant behind",
         );
+    }
+
+    #[test]
+    fn add_data_verb_over_wildcard_is_refused() {
+        // F4: a data-verb grant over a wildcard scope is a silent
+        // no-op at the runtime gate (the gate keys on `p2p-<name>`, not
+        // the node root), so refuse it here so the operator cannot
+        // accidentally write a row that can never authorise a frame.
+        let dir = TempDir::new().unwrap();
+        let ctx = make_ctx(&dir);
+        seed_p2p_owner(&ctx);
+
+        for cap in ["data:read", "data:write"] {
+            let result = add(&ctx, "PEER", cap, "*", None);
+            assert!(
+                result.is_err(),
+                "data-verb {cap} over wildcard must be refused (F4)"
+            );
+            let message = format!("{:#}", result.unwrap_err());
+            assert!(
+                message.contains("wildcard") && message.contains("--scope"),
+                "error must explain the wildcard rejection, got: {message}",
+            );
+        }
+
+        // Nothing was written.
+        let db = StateDb::open(&ctx.db_path).unwrap();
+        assert!(db.list_grants().unwrap().is_empty());
     }
 
     #[test]
