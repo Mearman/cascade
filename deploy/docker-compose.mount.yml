@@ -126,8 +126,15 @@ services:
       # Set CASCADE_WEBDAV_BIND=0.0.0.0:8080 to enable it.
       - "8080:8080"
 
+    # WebDAV is optional in mount mode (CASCADE_WEBDAV_BIND is unset by default).
+    # The healthcheck mirrors the image's built-in HEALTHCHECK: probe the WebDAV
+    # root when CASCADE_WEBDAV_BIND is configured to a non-loopback address, and
+    # exit 0 otherwise so the container does not cycle through unhealthy states
+    # when WebDAV is not in use.  $$ escapes Compose variable interpolation so
+    # that $CASCADE_WEBDAV_BIND is expanded by the shell inside the container.
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/ > /dev/null 2>&1 || exit 1"]
+      test: ["CMD-SHELL",
+             "if [ -n \"$$CASCADE_WEBDAV_BIND\" ] && [ \"$$CASCADE_WEBDAV_BIND\" != \"127.0.0.1:0\" ]; then PORT=\"$${CASCADE_WEBDAV_BIND##*:}\"; wget -qO- \"http://127.0.0.1:$$PORT/\" > /dev/null 2>&1 || exit 1; else exit 0; fi"]
       interval: 30s
       timeout: 5s
       start_period: 20s
