@@ -42,7 +42,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -689,6 +689,18 @@ pub struct SyncEngine {
     /// that session, so a token-carried grant is folded into the access decision
     /// exactly as an on-node grant is. Removed when the session ends.
     presented_data_tokens: Arc<Mutex<HashMap<String, String>>>,
+    /// F3 readiness bit. Flips from `false` to `true` when the data
+    /// authority is wired (the seam the daemon drives after the engine is
+    /// constructed and before the BEP listener begins serving peers).
+    /// The BEP listener's accept loop consults this bit and closes any
+    /// inbound connection accepted while it is `false`, so the data plane
+    /// does not serve peers during the startup window between
+    /// `P2pBackend::open` and the engine's authority being installed.
+    /// A pre-feature engine that never installs an authority keeps the
+    /// bit at `false` only conceptually; the listener's port is still
+    /// bound and the bit is consulted per-accept so the gate is closed
+    /// by construction.
+    data_plane_ready: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for SyncEngine {
@@ -743,6 +755,16 @@ impl SyncEngine {
             manage_dispatch: Arc::new(RwLock::new(None)),
             data_authority: Arc::new(RwLock::new(None)),
             presented_data_tokens: Arc::new(Mutex::new(HashMap::new())),
+            // F3: the bit starts `true` (the pre-feature default — the BEP
+            // listener serves peers as soon as a stream is accepted). A
+            // deployment that wires the data authority post-construction
+            // calls `set_data_plane_ready(false)` immediately after
+            // `P2pBackend::open` and `set_data_plane_ready(true)` from
+            // `set_data_authority`, closing the startup window between
+            // those two seams. Bare engines (the pre-feature shape, and
+            // integration tests that never wire an authority) leave the
+            // bit at `true` and the listener serves as before.
+            data_plane_ready: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -786,6 +808,38 @@ impl SyncEngine {
     pub async fn set_data_authority(&self, authority: Arc<dyn DataAuthority>) {
         let mut slot = self.data_authority.write().await;
         *slot = Some(authority);
+        // F3: installing the data authority closes the startup window.
+        // The BEP listener's accept loop consults this bit and closes any
+        // inbound connection accepted while it is `false`. Flipping it here
+        // means the daemon's existing `wire_manage_dispatch` seam — which
+        // already calls `set_data_authority` — is also the F3 readiness
+        // seam, so a future refactor that drops one will surface the other.
+        self.data_plane_ready.store(true, Ordering::Release);
+    }
+
+    /// F3 readiness accessor. Returns `true` immediately after
+    /// construction (the pre-feature default — the BEP listener serves
+    /// peers as soon as a stream is accepted). A deployment that wires
+    /// the data authority post-construction calls
+    /// [`Self::set_data_plane_ready_flag`] with `false` immediately
+    /// after `P2pBackend::open` and then with `true` from
+    /// [`Self::set_data_authority`], closing the startup window between
+    /// those two seams. The BEP listener's accept loop is the primary
+    /// consumer — it closes any stream accepted while this returns
+    /// `false`.
+    #[must_use]
+    pub fn data_plane_ready(&self) -> bool {
+        self.data_plane_ready.load(Ordering::Acquire)
+    }
+
+    /// F3 opt-in / opt-out. Set the readiness bit directly. A deployment
+    /// that wires the data authority post-construction calls this with
+    /// `false` immediately after `P2pBackend::open` to close the startup
+    /// window, then [`Self::set_data_authority`] later flips it to `true`.
+    /// Bare engines and pre-feature tests leave the bit at its default
+    /// (`true`) and the listener serves as before.
+    pub fn set_data_plane_ready_flag(&self, ready: bool) {
+        self.data_plane_ready.store(ready, Ordering::Release);
     }
 
     /// Resolve the directional data-plane access a `peer` has for this engine's
@@ -1303,6 +1357,29 @@ impl SyncEngine {
                     accept_result = listener.accept() => {
                         match accept_result {
                             Ok((stream, peer_addr)) => {
+                                // F3: the data-plane readiness bit must be set
+                                // before any inbound connection proceeds past
+                                // the accept. The window between
+                                // `P2pBackend::open` and `set_data_authority`
+                                // — when the engine is constructed but the
+                                // data authority has not yet been installed —
+                                // is the gap the F3 invariant closes: a
+                                // connection that races this window would
+                                // either commit data to the local index or
+                                // block waiting for a token that never
+                                // arrives. Drop the stream immediately; the
+                                // remote peer sees a clean TCP close, not a
+                                // hung half-handshake.
+                                if !engine.data_plane_ready() {
+                                    drop(stream);
+                                    debug!(
+                                        target: "cascade::backend::p2p",
+                                        peer = %peer_addr,
+                                        "F3: closing inbound connection during startup window \
+                                         (data authority not yet installed)",
+                                    );
+                                    continue;
+                                }
                                 let engine = engine.clone();
                                 tokio::spawn(async move {
                                     if let Err(e) = engine.handle_inbound(stream, peer_addr).await {
@@ -1336,6 +1413,18 @@ impl SyncEngine {
     }
 
     /// Outbound: connect to a known peer and start a session.
+    ///
+    /// The F3 readiness bit is intentionally **not** consulted on the
+    /// outbound path. The bit guards the inbound listener (the side that
+    /// would serve the peer its index and blocks): an inbound connection
+    /// accepted during the startup window is closed without BEP
+    /// negotiation. An outbound dial, in contrast, is initiated by *us*
+    /// and ends in a BEP session the listener side will gate through the
+    /// same bit. Refusing dials here would break the natural pattern of
+    /// "dial after the engine is ready", where the engine's readiness is
+    /// already proven by the caller having just installed the authority.
+    /// The BEP layer still authenticates the peer, so a dial that races
+    /// the window is rejected at handshake, not silently granted.
     pub async fn connect_to(&self, peer: Peer) -> Result<()> {
         let trusted = self.trusted.lock().await.clone();
         if !trusted.contains(&peer.device_id) {

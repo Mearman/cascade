@@ -364,6 +364,19 @@ impl Drop for P2pBackend {
 }
 
 impl P2pBackend {
+    /// F3 opt-in / opt-out. A deployment that wires the data authority
+    /// post-construction calls `set_data_plane_ready(false)` immediately
+    /// after `P2pBackend::open` to mark the BEP listener as not yet
+    /// ready to serve peers; `set_data_authority` later flips the bit
+    /// back to `true`. Bare engines and pre-feature tests leave the bit
+    /// at its default (`true`) and the listener serves as before.
+    ///
+    /// The `data_plane_ready` accessor on the underlying [`crate::sync::SyncEngine`]
+    /// is the public read side. Exposed here for symmetry with
+    /// `set_manage_dispatch` and `set_data_authority`.
+    pub fn set_data_plane_ready(&self, ready: bool) {
+        self.sync.set_data_plane_ready_flag(ready);
+    }
     /// Open or create a P2P backend at the given index + block store
     /// paths. Synchronous: filesystem setup happens up-front so this
     /// is callable from within a tokio runtime worker thread without
