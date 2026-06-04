@@ -18,8 +18,8 @@
 //! - `native` (default): uses `reqwest` for HTTP transport.
 //! - `portable`: uses the `cascade_engine::portable::HttpClient` trait instead,
 //!   allowing the backend to run in environments without `reqwest` (e.g. WASM).
-//!   When this feature is active, use [`create_backend_with_http_client`] instead
-//!   of [`create_backend`].
+//!   When this feature is active, use `create_backend_with_http_client` instead
+//!   of `create_backend`.
 
 pub mod signing;
 
