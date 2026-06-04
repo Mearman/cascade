@@ -1,5 +1,9 @@
 import { useState } from 'preact/hooks';
 import { Route, Router, Switch } from 'wouter-preact';
+
+// Vite sets BASE_URL to the configured `base` (e.g. "/cascade/").
+// Strip the trailing slash for wouter's `base` prop.
+const ROUTER_BASE = import.meta.env.BASE_URL.replace(/\/$/, '');
 import { AppShell } from '@/components';
 import {
   DashboardPage,
@@ -84,7 +88,7 @@ export function App() {
 
   return (
     <AppShell>
-      <Router>
+      <Router base={ROUTER_BASE}>
         <Switch>
           <Route path="/login" component={LoginPage} />
           <Route path="/settings" component={() => <SettingsPage />} />

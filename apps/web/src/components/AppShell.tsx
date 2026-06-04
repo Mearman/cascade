@@ -1,5 +1,5 @@
 import type { ComponentChildren } from 'preact';
-import { useLocation } from 'wouter-preact';
+import { Link, useLocation } from 'wouter-preact';
 
 interface Props {
   children: ComponentChildren;
@@ -30,9 +30,9 @@ export function AppShell({ children }: Props) {
           <ul class="nav-links">
             {NAV_LINKS.map(({ href, label }) => (
               <li key={href}>
-                <a href={href} class={isActive(href) ? 'nav-link active' : 'nav-link'}>
+                <Link href={href} class={isActive(href) ? 'nav-link active' : 'nav-link'}>
                   {label}
-                </a>
+                </Link>
               </li>
             ))}
           </ul>
