@@ -320,3 +320,90 @@ openssl rand -hex 32
 Keep secrets out of shell history. Use Docker secrets, environment files passed
 with `--env-file`, or a secrets manager rather than passing them inline on the
 command line.
+
+## The cascade-relay image
+
+`ghcr.io/mearman/cascade-relay` runs the relay server — a blind, stateless
+byte-pipe that pairs two peers over WebSocket and forwards already-encrypted
+frames between them. The relay never inspects payload; it only HMAC-authenticates
+the session negotiation and then becomes transparent. It is built for
+`linux/amd64` and `linux/arm64` alongside the daemon image and published on
+every release.
+
+You only need the relay when daemon nodes are behind NAT and need to reach each
+other across the internet. For LAN-only meshes or a mesh where at least one peer
+has a public IP, the relay is not required.
+
+Full deployment instructions — including Cloudflare Worker alternatives for the
+announce directory — are in [`docs/deployment.md`](deployment.md).
+
+### Relay environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CASCADE_RELAY_SHARED_SECRET` | — **(required)** | 64-char hex HMAC secret. Generate with `openssl rand -hex 32`. Must match `CASCADE_P2P_RELAY_SECRET` on every daemon that uses this relay. |
+| `CASCADE_RELAY_LISTEN` | `0.0.0.0:9999` | Bind address for the peer listener. |
+| `CASCADE_RELAY_METRICS` | *(unset)* | Bind address for the `/metrics` and `/health` HTTP endpoints. Set to `0.0.0.0:9998` to enable Prometheus scraping and the liveness probe. |
+| `CASCADE_RELAY_ANNOUNCE` | *(unset)* | Bind address for an in-process peer-announce directory endpoint. Requires the `announce` build feature. Set to `0.0.0.0:9997` to activate. |
+
+### Relay ports
+
+| Port | Purpose |
+|------|---------|
+| `9999` | Peer listener (encrypted BEP byte-pipe). Must be reachable from the internet for WAN NAT traversal. |
+| `9998` | `/metrics` (Prometheus) and `/health` HTTP endpoint. Enable with `CASCADE_RELAY_METRICS`. |
+| `9997` | Announce directory endpoint. Enable with `CASCADE_RELAY_ANNOUNCE` (requires the announce build feature). |
+
+### Relay health check
+
+The image's `HEALTHCHECK` probes `/health` on the metrics port when
+`CASCADE_RELAY_METRICS` is set and expects the response body to contain `ok`.
+When the metrics endpoint is disabled the check exits `0` immediately.
+In a production deployment set `CASCADE_RELAY_METRICS` so the orchestrator can
+distinguish a crashed relay from a healthy one.
+
+### Relay quick start
+
+```sh
+# Generate once and record the value — the daemon's CASCADE_P2P_RELAY_SECRET must match.
+openssl rand -hex 32
+
+docker run -d \
+  --name cascade-relay \
+  --restart unless-stopped \
+  -e CASCADE_RELAY_SHARED_SECRET=<64-char-hex-secret> \
+  -e CASCADE_RELAY_METRICS=0.0.0.0:9998 \
+  -p 9999:9999 \
+  -p 9998:9998 \
+  ghcr.io/mearman/cascade-relay:latest
+```
+
+Expose port `9999` in the host firewall and, if the relay host is behind NAT,
+port-forward `9999` from the router. The daemon's `CASCADE_P2P_RELAY_ENDPOINT`
+should point at the relay's public IP or hostname on port `9999`.
+
+## Compose templates
+
+Three ready-to-use Docker Compose templates live in `deploy/`:
+
+| File | What it runs | When to use |
+|------|-------------|-------------|
+| [`deploy/docker-compose.seed.yml`](../deploy/docker-compose.seed.yml) | Daemon in headless seed mode | Unprivileged NAS deployment; tree browsable over WebDAV at port 8080. No `SYS_ADMIN`, no `/dev/fuse`. |
+| [`deploy/docker-compose.mount.yml`](../deploy/docker-compose.mount.yml) | Daemon with in-container FUSE mount | Host filesystem access at `/mnt/cascade`. Requires `SYS_ADMIN`, `/dev/fuse`, and `rshared` bind propagation. |
+| [`deploy/docker-compose.full.yml`](../deploy/docker-compose.full.yml) | Daemon + relay on one Docker network | Daemon in seed mode paired with a relay on the same compose network for WAN NAT traversal. |
+
+Each template has detailed inline comments. Copy or symlink the closest one to
+your setup, supply credentials via a `.env` file, and run:
+
+```sh
+docker compose -f deploy/docker-compose.seed.yml up -d
+```
+
+For the full stack template, generate a shared secret before starting:
+
+```sh
+openssl rand -hex 32
+# Set CASCADE_RELAY_SHARED_SECRET in the relay service and CASCADE_P2P_RELAY_SECRET
+# in the cascade service to the same value in docker-compose.full.yml (or a .env file).
+docker compose -f deploy/docker-compose.full.yml up -d
+```
