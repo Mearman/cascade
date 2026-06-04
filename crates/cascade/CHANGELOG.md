@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.70](https://github.com/Mearman/cascade/compare/cascade-v0.1.69...cascade-v0.1.70) - 2026-06-04
+
+### Added
+
+- *(web-api)* add daemon HTTP JSON API for the v1 PWA
+
+### Fixed
+
+- *(clippy)* pass WebRuntimeOpt by value in mark_web_ready
+
 ## [0.1.69](https://github.com/Mearman/cascade/compare/cascade-v0.1.68...cascade-v0.1.69) - 2026-06-04
 
 ### Other

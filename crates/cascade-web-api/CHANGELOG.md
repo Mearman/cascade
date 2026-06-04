@@ -1,0 +1,18 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.1.70](https://github.com/Mearman/cascade/compare/cascade-web-api-v0.1.69...cascade-web-api-v0.1.70) - 2026-06-04
+
+### Added
+
+- *(web-api)* add daemon HTTP JSON API for the v1 PWA
+
+### Other
+
+- *(web-api)* apply cargo fmt to web-api crate
