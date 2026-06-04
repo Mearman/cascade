@@ -614,12 +614,7 @@ impl Engine {
             Err(_) => return std::collections::HashMap::new(),
         };
         rows.into_iter()
-            .map(|r| {
-                (
-                    (r.peer_device, r.folder_id),
-                    (r.data_read, r.data_write),
-                )
-            })
+            .map(|r| ((r.peer_device, r.folder_id), (r.data_read, r.data_write)))
             .collect()
     }
 }
@@ -855,10 +850,7 @@ impl DataAuthority for Engine {
                 peer.as_str(),
                 folder,
                 matches!(token_grant.capability, crate::manage::Capability::DataRead),
-                matches!(
-                    token_grant.capability,
-                    crate::manage::Capability::DataWrite
-                ),
+                matches!(token_grant.capability, crate::manage::Capability::DataWrite),
                 now,
             )?;
             grants.push(token_grant);

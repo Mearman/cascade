@@ -421,9 +421,11 @@ mod tests {
             grants.iter().map(|r| r.grant.capability).collect();
         assert!(caps.contains(&Capability::DataRead));
         assert!(caps.contains(&Capability::DataWrite));
-        assert!(grants
-            .iter()
-            .all(|g| g.grant.scope == Scope::folder("p2p-shared")));
+        assert!(
+            grants
+                .iter()
+                .all(|g| g.grant.scope == Scope::folder("p2p-shared"))
+        );
     }
 
     #[test]

@@ -208,9 +208,7 @@ pub fn add(
     // `ManageCommand::GrantAdd` path are open-coded — they have to apply the
     // bar themselves.
     for capability in &capabilities {
-        if parsed_scope.is_node_wide()
-            && (capability.is_dangerous() || capability.is_data_verb())
-        {
+        if parsed_scope.is_node_wide() && (capability.is_dangerous() || capability.is_data_verb()) {
             anyhow::bail!(
                 "capability `{}` cannot be granted over a wildcard scope; \
                  name an explicit folder with --scope <path> (data verbs are \

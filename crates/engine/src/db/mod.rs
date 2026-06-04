@@ -1218,32 +1218,31 @@ impl StateDb {
             .collect::<Result<Vec<_>, _>>()?;
 
         rows.into_iter()
-            .map(|(peer_device, folder_id, data_read, data_write, observed_ts)| {
-                let observed_at = DateTime::from_timestamp(observed_ts, 0).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "invalid observed_at timestamp in data_explicit_control row for \
+            .map(
+                |(peer_device, folder_id, data_read, data_write, observed_ts)| {
+                    let observed_at =
+                        DateTime::from_timestamp(observed_ts, 0).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "invalid observed_at timestamp in data_explicit_control row for \
                          {peer_device}/{folder_id}"
-                    )
-                })?;
-                Ok(ExplicitControlRecord {
-                    peer_device,
-                    folder_id,
-                    data_read,
-                    data_write,
-                    observed_at,
-                })
-            })
+                            )
+                        })?;
+                    Ok(ExplicitControlRecord {
+                        peer_device,
+                        folder_id,
+                        data_read,
+                        data_write,
+                        observed_at,
+                    })
+                },
+            )
             .collect()
     }
 
     /// Explicitly clear the bit for `(peer, folder)`. Returns `true` if a
     /// row was deleted, `false` if there was no row. This is the only path
     /// that removes a row; token revocation and token expiry never do.
-    pub fn clear_data_explicit_control(
-        &self,
-        peer_device: &str,
-        folder_id: &str,
-    ) -> Result<bool> {
+    pub fn clear_data_explicit_control(&self, peer_device: &str, folder_id: &str) -> Result<bool> {
         let conn = self
             .conn
             .lock()
