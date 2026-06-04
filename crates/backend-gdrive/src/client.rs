@@ -66,13 +66,7 @@ fn build_query_url(base_url: &str, params: &[(&str, &str)]) -> String {
     }
     let qs: String = params
         .iter()
-        .map(|(k, v)| {
-            format!(
-                "{}={}",
-                urlencoding::encode(k),
-                urlencoding::encode(v)
-            )
-        })
+        .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
         .collect::<Vec<_>>()
         .join("&");
     if base_url.contains('?') {
@@ -227,11 +221,7 @@ impl DriveClient {
     ) -> anyhow::Result<DriveHttpResponse> {
         self.rate_limiter.acquire().await;
         let url = build_query_url(&format!("{}/{path}", self.base_url), query);
-        let resp = Self::http()?
-            .get(&url)
-            .bearer_auth(token)
-            .send()
-            .await?;
+        let resp = Self::http()?.get(&url).bearer_auth(token).send().await?;
 
         let status = resp.status().as_u16();
         let body = resp.bytes().await?.to_vec();
@@ -607,7 +597,11 @@ impl DriveClient {
         .and_then(|resp| {
             if resp.status >= 400 {
                 let body_str = String::from_utf8_lossy(&resp.body).into_owned();
-                Err(drive_api_error("Drive download error", resp.status, body_str))
+                Err(drive_api_error(
+                    "Drive download error",
+                    resp.status,
+                    body_str,
+                ))
             } else {
                 Ok(resp)
             }
@@ -831,7 +825,9 @@ impl DriveClient {
     /// Trash (soft-delete) a file.
     pub async fn trash_file(&self, file_id: &str, token: &str) -> anyhow::Result<()> {
         let url = format!("{}/files/{file_id}", self.base_url);
-        let body = serde_json::json!({"trashed": true}).to_string().into_bytes();
+        let body = serde_json::json!({"trashed": true})
+            .to_string()
+            .into_bytes();
         self.authenticated_write(
             "PATCH",
             &url,
@@ -847,7 +843,9 @@ impl DriveClient {
     /// Restore a trashed file by clearing the `trashed` flag.
     pub async fn untrash_file(&self, file_id: &str, token: &str) -> anyhow::Result<()> {
         let url = format!("{}/files/{file_id}", self.base_url);
-        let body = serde_json::json!({"trashed": false}).to_string().into_bytes();
+        let body = serde_json::json!({"trashed": false})
+            .to_string()
+            .into_bytes();
         self.authenticated_write(
             "PATCH",
             &url,

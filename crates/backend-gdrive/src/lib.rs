@@ -108,7 +108,8 @@ pub fn create_backend_with_store_and_http(
     token_store: Arc<dyn TokenStore>,
     http: Arc<dyn cascade_engine::portable::HttpClient>,
 ) -> anyhow::Result<Box<dyn Backend>> {
-    let (oauth, drive_native, initial_tokens, instance_id) = parse_gdrive_config_portable(config, Arc::clone(&http))?;
+    let (oauth, drive_native, initial_tokens, instance_id) =
+        parse_gdrive_config_portable(config, Arc::clone(&http))?;
 
     Ok(Box::new(GdriveBackend {
         drive: drive_native,
@@ -135,7 +136,12 @@ pub fn create_backend_with_store_and_http(
 #[cfg(not(feature = "portable"))]
 fn parse_gdrive_config(
     config: &toml::Value,
-) -> (auth::OAuthConfig, DriveClient, Option<auth::AuthTokens>, String) {
+) -> (
+    auth::OAuthConfig,
+    DriveClient,
+    Option<auth::AuthTokens>,
+    String,
+) {
     const DEFAULT_TOKEN_LIFETIME_HOURS: i64 = 24;
 
     let client_id = config
@@ -188,7 +194,12 @@ fn parse_gdrive_config(
 fn parse_gdrive_config_portable(
     config: &toml::Value,
     http: Arc<dyn cascade_engine::portable::HttpClient>,
-) -> anyhow::Result<(auth::OAuthConfig, DriveClient, Option<auth::AuthTokens>, String)> {
+) -> anyhow::Result<(
+    auth::OAuthConfig,
+    DriveClient,
+    Option<auth::AuthTokens>,
+    String,
+)> {
     const DEFAULT_TOKEN_LIFETIME_HOURS: i64 = 24;
 
     let client_id = config
@@ -303,7 +314,6 @@ pub struct GdriveBackend {
 impl GdriveBackend {
     /// Get a valid access token, refreshing if necessary.
     async fn access_token(&self) -> anyhow::Result<String> {
-
         // Fast path: check if token is still valid without holding the lock
         // across an await.
         {

@@ -328,14 +328,8 @@ impl S3Backend {
         let host = self.endpoint_host();
         let now = Utc::now();
 
-        let params = self.signing_params(
-            method,
-            &uri_path,
-            query_params,
-            &host,
-            &payload_hash,
-            now,
-        );
+        let params =
+            self.signing_params(method, &uri_path, query_params, &host, &payload_hash, now);
         let signed = sign(&params);
 
         let request_url = if query_params.is_empty() {
@@ -404,14 +398,8 @@ impl S3Backend {
         let host = self.endpoint_host();
         let now = Utc::now();
 
-        let params = self.signing_params(
-            method,
-            &uri_path,
-            query_params,
-            &host,
-            &payload_hash,
-            now,
-        );
+        let params =
+            self.signing_params(method, &uri_path, query_params, &host, &payload_hash, now);
         let signed = sign(&params);
 
         let request_url = if query_params.is_empty() {
@@ -423,10 +411,7 @@ impl S3Backend {
 
         let mut headers = HeaderMap::new();
         headers.insert("x-amz-date", signed.x_amz_date.as_str());
-        headers.insert(
-            "x-amz-content-sha256",
-            signed.x_amz_content_sha256.as_str(),
-        );
+        headers.insert("x-amz-content-sha256", signed.x_amz_content_sha256.as_str());
         headers.insert("authorization", signed.authorization.as_str());
         headers.insert("host", host.as_str());
         for (name, value) in extra_headers {
@@ -894,7 +879,13 @@ impl Backend for S3Backend {
         let resp = self.signed_request("HEAD", &url, &[], &[], &[]).await?;
         let resp = Self::check_response(resp)?;
 
-        Ok(parse_head_response(&resp, &key, &name, &parent_id, &self.backend_id))
+        Ok(parse_head_response(
+            &resp,
+            &key,
+            &name,
+            &parent_id,
+            &self.backend_id,
+        ))
     }
 
     async fn download(
@@ -956,10 +947,7 @@ impl Backend for S3Backend {
                 .min(bytes.len());
             let len = usize::try_from(length).unwrap_or(usize::MAX);
             let slice_end = start.saturating_add(len).min(bytes.len());
-            bytes
-                .get(start..slice_end)
-                .unwrap_or_default()
-                .to_vec()
+            bytes.get(start..slice_end).unwrap_or_default().to_vec()
         };
 
         tracing::debug!(
