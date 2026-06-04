@@ -1,0 +1,25 @@
+[package]
+name = "cascade-wasm"
+version.workspace = true
+edition.workspace = true
+
+# Produces a WASM module (cdylib) for JavaScript consumption and an rlib for
+# Rust-to-Rust linking and test harness use.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# All dependencies are wasm32-only: on native targets the crate compiles as an
+# empty lib with no code and no deps, so `cargo check --workspace` succeeds.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+cascade-config = { path = "../cascade-config" }
+cascade-expr = { path = "../expr" }
+serde_json.workspace = true
+anyhow.workspace = true
+serde = { workspace = true }
+chrono.workspace = true
+wasm-bindgen.workspace = true
+js-sys.workspace = true
+wasm-bindgen-futures.workspace = true
+
+[lints]
+workspace = true

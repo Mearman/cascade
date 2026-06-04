@@ -19,6 +19,11 @@ members = [
     "crates/relay-server",
     "crates/cascade-announce-wire",
     "crates/cascade-web-api",
+    # cascade-wasm compiles to wasm32-unknown-unknown only. On native targets it
+    # builds as an empty lib — all public functions are cfg-gated on wasm32 and
+    # all deps are target-specific. Verify with:
+    #   cargo check -p cascade-wasm --target wasm32-unknown-unknown
+    "crates/cascade-wasm",
 ]
 # The announce Worker (workers/announce) compiles only to
 # wasm32-unknown-unknown — it links the `worker` crate's JS glue — so it is
@@ -84,6 +89,11 @@ ed25519-dalek = "3.0.0-rc.0"
 
 # Binary encodings (base32/base64 for opaque cursors and device IDs)
 data-encoding = "2"
+
+# WASM bindings (used by crates/cascade-wasm; pinned to the lockfile versions)
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+wasm-bindgen-futures = "0.4"
 
 # OS process management (Unix-only)
 nix = { version = "0.31", features = ["signal", "process"] }
