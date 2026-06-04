@@ -20,7 +20,7 @@ use cascade_engine::db::StateDb;
 use cascade_engine::manage::{Capability, DeviceId, Scope};
 
 use super::CliContext;
-use super::grant::{resolve_owner_device, scope_label};
+use super::grant::{resolve_owner_device, resolve_p2p_folder_id, scope_label};
 
 /// The sharing direction the operator wishes to express.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,18 +103,16 @@ pub fn add(
         anyhow::bail!("share add requires a non-empty peer device id");
     }
     let dir = ShareDirection::from_str(direction)?;
-    let scope = Scope::folder(folder);
-
-    // Data verbs are not dangerous, so a node-wide scope would technically be
-    // accepted by the grant machinery. However, data verbs are always
-    // per-folder by design — a node-wide data grant is nonsensical (there is
-    // no folder to gate). Refuse it here with a clear error.
-    if scope.is_node_wide() {
-        anyhow::bail!(
-            "data sharing grants must name an explicit folder (got `{folder}`); \
-             use `cascade grant add` if you need a node-wide administrative capability"
-        );
-    }
+    // The operator-facing P2P backend name is resolved to its canonical BEP
+    // folder id (`p2p-<name>`) at write time. The runtime data-plane gate
+    // consults `self.folder_id`, which is exactly that canonical id, so the
+    // stored `Scope::folder(...)` value must match it. Storing the raw
+    // operator input would make `Scope::folder("work").covers(Scope::folder("p2p-work"))`
+    // return `false` and the restriction would be a silent no-op (the F1
+    // failure mode). An unknown name is refused loudly with a list of every
+    // registered P2P backend.
+    let folder_id = resolve_p2p_folder_id(ctx, folder)?;
+    let scope = Scope::folder(folder_id.clone());
 
     let expiry = expires
         .map(|raw| {
@@ -142,13 +140,13 @@ pub fn add(
             |dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         );
         println!(
-            "Granted {} to {peer_device_id} over {folder} \
+            "Granted {} to {peer_device_id} over {folder} (folder id {folder_id}) \
              (expires {expiry_label}) [grant {id}]",
             capability.as_wire(),
         );
     }
     println!(
-        "Sharing posture for {peer_device_id} over {folder}: {}",
+        "Sharing posture for {peer_device_id} over {folder} (folder id {folder_id}): {}",
         dir.as_label()
     );
     Ok(())
@@ -158,7 +156,9 @@ pub fn add(
 ///
 /// Lists every peer that has a data-verb grant, rendered as the sharing
 /// posture rather than raw capability rows. When `folder` is given, only
-/// grants whose scope covers that folder are shown.
+/// grants whose scope covers that folder are shown. The folder is resolved
+/// to its canonical BEP folder id the same way `share add` does, so the
+/// filter applies to the same value the grant scope stores.
 pub fn list(ctx: &CliContext, folder: Option<&str>) -> Result<()> {
     let db = open_db(ctx)?;
     let records = db.list_data_grants()?;
@@ -167,6 +167,13 @@ pub fn list(ctx: &CliContext, folder: Option<&str>) -> Result<()> {
         println!("No directional sharing configured.");
         return Ok(());
     }
+
+    // Resolve the filter folder to the same canonical id the grants store.
+    // An unknown filter name is refused loudly — the operator may have a typo,
+    // and silently showing "no shares" would mask the failure.
+    let filter_scope = folder
+        .map(|name| resolve_p2p_folder_id(ctx, name).map(Scope::folder))
+        .transpose()?;
 
     // Aggregate by (grantee, scope_label) → (has_read, has_write).
     let mut postures: std::collections::BTreeMap<(String, String), (bool, bool)> =
@@ -177,8 +184,8 @@ pub fn list(ctx: &CliContext, folder: Option<&str>) -> Result<()> {
 
         // When a folder filter is given, skip grants whose scope does not
         // cover it.
-        if let Some(filter_folder) = folder
-            && !grant.scope.covers(&Scope::folder(filter_folder))
+        if let Some(ref fs) = filter_scope
+            && !grant.scope.covers(fs)
         {
             continue;
         }
@@ -214,7 +221,9 @@ pub fn list(ctx: &CliContext, folder: Option<&str>) -> Result<()> {
 /// Removes data-verb grants for the specified peer and folder. When
 /// `--direction` is given, only the grants for that direction are removed;
 /// without it all data grants for that peer+folder are revoked, returning
-/// the peer to the trusted-peer default (full sharing while trusted).
+/// the peer to the trusted-peer default (full sharing while trusted). The
+/// folder is resolved to its canonical BEP folder id the same way
+/// `share add` does, so revoke targets the same row the grant wrote.
 pub fn revoke(
     ctx: &CliContext,
     peer_device_id: &str,
@@ -231,7 +240,8 @@ pub fn revoke(
         .map(|dir| dir.capabilities().to_vec());
 
     let grantee = DeviceId::new(peer_device_id.to_owned());
-    let folder_scope = Scope::folder(folder);
+    let folder_id = resolve_p2p_folder_id(ctx, folder)?;
+    let folder_scope = Scope::folder(folder_id.clone());
     let db = open_db(ctx)?;
     let records = db.list_data_grants()?;
 
@@ -252,7 +262,7 @@ pub fn revoke(
         }
         if db.revoke_grant(record.id)? {
             println!(
-                "Revoked {} for {peer_device_id} over {folder}.",
+                "Revoked {} for {peer_device_id} over {folder} (folder id {folder_id}).",
                 grant.capability.as_wire()
             );
             removed += 1;
@@ -298,6 +308,17 @@ mod tests {
             data_dir.display()
         );
         std::fs::write(ctx.config_dir.join("shared.toml"), backend).unwrap();
+    }
+
+    /// Register the P2P backend row in the state DB so `resolve_p2p_folder_id`
+    /// can map the operator-facing name to its canonical BEP folder id. The
+    /// production code does this in `cascade backend add`; the share CLI
+    /// resolves the name against this row, so the test must set it up
+    /// directly. The backend row's `id` is the user-facing name; the folder
+    /// id the runtime gate checks is `p2p-<id>`.
+    fn register_p2p_backend(ctx: &CliContext, name: &str) {
+        let db = StateDb::open(&ctx.db_path).unwrap();
+        db.register_backend(name, "p2p", name, None, None).unwrap();
     }
 
     // ── ShareDirection parsing ──
@@ -354,15 +375,18 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let ctx = make_ctx(&dir);
         seed_p2p_owner(&ctx);
+        register_p2p_backend(&ctx, "shared");
 
-        add(&ctx, "PEER", "/work", "read-only", None).unwrap();
+        add(&ctx, "PEER", "shared", "read-only", None).unwrap();
 
         let db = StateDb::open(&ctx.db_path).unwrap();
         let grants = db.list_data_grants().unwrap();
         assert_eq!(grants.len(), 1);
         assert_eq!(grants[0].grant.capability, Capability::DataRead);
         assert_eq!(grants[0].grant.grantee, DeviceId::new("PEER"));
-        assert_eq!(grants[0].grant.scope, Scope::folder("/work"));
+        // The stored scope is the canonical BEP folder id, not the
+        // operator-facing name — the namespace the runtime gate consults.
+        assert_eq!(grants[0].grant.scope, Scope::folder("p2p-shared"));
     }
 
     #[test]
@@ -370,13 +394,15 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let ctx = make_ctx(&dir);
         seed_p2p_owner(&ctx);
+        register_p2p_backend(&ctx, "shared");
 
-        add(&ctx, "PEER", "/backup", "write-only", None).unwrap();
+        add(&ctx, "PEER", "shared", "write-only", None).unwrap();
 
         let db = StateDb::open(&ctx.db_path).unwrap();
         let grants = db.list_data_grants().unwrap();
         assert_eq!(grants.len(), 1);
         assert_eq!(grants[0].grant.capability, Capability::DataWrite);
+        assert_eq!(grants[0].grant.scope, Scope::folder("p2p-shared"));
     }
 
     #[test]
@@ -384,8 +410,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let ctx = make_ctx(&dir);
         seed_p2p_owner(&ctx);
+        register_p2p_backend(&ctx, "shared");
 
-        add(&ctx, "PEER", "/shared", "read-write", None).unwrap();
+        add(&ctx, "PEER", "shared", "read-write", None).unwrap();
 
         let db = StateDb::open(&ctx.db_path).unwrap();
         let grants = db.list_data_grants().unwrap();
@@ -394,17 +421,26 @@ mod tests {
             grants.iter().map(|r| r.grant.capability).collect();
         assert!(caps.contains(&Capability::DataRead));
         assert!(caps.contains(&Capability::DataWrite));
+        assert!(grants
+            .iter()
+            .all(|g| g.grant.scope == Scope::folder("p2p-shared")));
     }
 
     #[test]
-    fn add_node_wide_scope_is_refused() {
+    fn add_unknown_p2p_backend_is_refused_loudly() {
         let dir = TempDir::new().unwrap();
         let ctx = make_ctx(&dir);
         seed_p2p_owner(&ctx);
-
-        // An empty path normalises to node-wide and must be refused.
-        let result = add(&ctx, "PEER", "/", "read-only", None);
-        assert!(result.is_err(), "node-wide data share must be refused");
+        // No backend registered — every name is unknown.
+        let err = add(&ctx, "PEER", "shared", "read-only", None).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("no P2P backend named"),
+            "unknown backend error must name the missing backend, got: {message}",
+        );
+        // Nothing written.
+        let db = StateDb::open(&ctx.db_path).unwrap();
+        assert!(db.list_data_grants().unwrap().is_empty());
     }
 
     #[test]
@@ -412,7 +448,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let ctx = make_ctx(&dir);
         seed_p2p_owner(&ctx);
-        assert!(add(&ctx, "", "/work", "read-only", None).is_err());
+        register_p2p_backend(&ctx, "shared");
+        assert!(add(&ctx, "", "shared", "read-only", None).is_err());
     }
 
     // ── share revoke ──
@@ -422,14 +459,15 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let ctx = make_ctx(&dir);
         seed_p2p_owner(&ctx);
+        register_p2p_backend(&ctx, "shared");
 
-        add(&ctx, "PEER", "/work", "read-write", None).unwrap();
+        add(&ctx, "PEER", "shared", "read-write", None).unwrap();
         {
             let db = StateDb::open(&ctx.db_path).unwrap();
             assert_eq!(db.list_data_grants().unwrap().len(), 2);
         }
 
-        revoke(&ctx, "PEER", "/work", None).unwrap();
+        revoke(&ctx, "PEER", "shared", None).unwrap();
         let db = StateDb::open(&ctx.db_path).unwrap();
         assert!(
             db.list_data_grants().unwrap().is_empty(),
@@ -442,10 +480,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let ctx = make_ctx(&dir);
         seed_p2p_owner(&ctx);
+        register_p2p_backend(&ctx, "shared");
 
-        add(&ctx, "PEER", "/work", "read-write", None).unwrap();
+        add(&ctx, "PEER", "shared", "read-write", None).unwrap();
         // Revoke only the read direction.
-        revoke(&ctx, "PEER", "/work", Some("read-only")).unwrap();
+        revoke(&ctx, "PEER", "shared", Some("read-only")).unwrap();
 
         let db = StateDb::open(&ctx.db_path).unwrap();
         let grants = db.list_data_grants().unwrap();
@@ -458,8 +497,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let ctx = make_ctx(&dir);
         seed_p2p_owner(&ctx);
+        register_p2p_backend(&ctx, "shared");
         // Revoking when no grants exist must print a message but not error.
-        revoke(&ctx, "PEER", "/work", None).unwrap();
+        revoke(&ctx, "PEER", "shared", None).unwrap();
     }
 
     // ── list ──
@@ -469,7 +509,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let ctx = make_ctx(&dir);
         seed_p2p_owner(&ctx);
-        let _db = StateDb::open(&ctx.db_path).unwrap();
+        register_p2p_backend(&ctx, "shared");
         list(&ctx, None).unwrap();
     }
 
@@ -482,10 +522,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let ctx = make_ctx(&dir);
         seed_p2p_owner(&ctx);
-        add(&ctx, "PEER-A", "/work", "read-only", None).unwrap();
-        add(&ctx, "PEER-B", "/docs", "write-only", None).unwrap();
+        register_p2p_backend(&ctx, "shared");
+        register_p2p_backend(&ctx, "docs");
+        add(&ctx, "PEER-A", "shared", "read-only", None).unwrap();
+        add(&ctx, "PEER-B", "docs", "write-only", None).unwrap();
         list(&ctx, None).unwrap();
-        list(&ctx, Some("/work")).unwrap();
+        list(&ctx, Some("shared")).unwrap();
     }
 
     // ── posture_from_grants ──

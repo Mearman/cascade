@@ -22,6 +22,48 @@ use chrono::{DateTime, Utc};
 use super::CliContext;
 use super::init::CascadeConfig;
 
+/// Resolve a P2P backend's user-facing name to its canonical BEP folder id.
+///
+/// The BEP folder id the runtime data-plane gate consults is always
+/// `p2p-<name>`, where `<name>` is the user-facing name the operator passed
+/// to `cascade backend add p2p --name <name>`. The data-plane gate and the
+/// `Scope::folder(...)` value a grant stores must live in the same namespace —
+/// otherwise `Scope::covers` returns `false` and the grant is a silent no-op.
+/// This function is the single path that authors a data-verb grant: it maps
+/// the operator-facing name to the canonical id at write time, so the stored
+/// scope matches the value the runtime gate checks.
+///
+/// Unknown names are refused loudly with a list of every registered P2P
+/// backend, so the operator can correct a typo without running
+/// `cascade backend list` first. A registered backend of a different type
+/// (for example `gdrive` or `s3`) is not eligible for directional sharing:
+/// directional sharing applies to P2P folders only, so its name does not
+/// appear in the registered-P2P list and the same loud error is returned.
+pub(super) fn resolve_p2p_folder_id(ctx: &CliContext, name: &str) -> Result<String> {
+    if name.trim().is_empty() {
+        anyhow::bail!("a P2P backend name is required");
+    }
+    let db = StateDb::open(&ctx.db_path).context("opening the state database")?;
+    let known: Vec<String> = db
+        .list_backends()?
+        .into_iter()
+        .filter(|record| record.backend_type == "p2p")
+        .map(|record| record.id)
+        .collect();
+    let resolved = known
+        .iter()
+        .find(|id| id.as_str() == name)
+        .cloned()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no P2P backend named `{name}` is registered; directional sharing only \
+                 applies to P2P folders. Registered P2P backends: [{}]",
+                known.join(", "),
+            )
+        })?;
+    Ok(format!("p2p-{resolved}"))
+}
+
 /// The wildcard scope token a user passes on the command line to mean
 /// "node-wide" — every path on the node.
 const SCOPE_WILDCARD: &str = "*";
