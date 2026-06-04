@@ -13,7 +13,7 @@
 //! equivalents behind the very same contracts, so nothing downstream of the
 //! traits has to know which adapter is bound.
 //!
-//! [`StateDb`](crate::db::StateDb) is synchronous and guards a single
+//! [`StateDb`] is synchronous and guards a single
 //! `rusqlite` connection behind a mutex, so every storage call is offloaded to
 //! the runtime's blocking pool via [`super::RuntimeHandle::spawn_blocking`]
 //! rather than run on the async path. The filesystem adapter offloads its
