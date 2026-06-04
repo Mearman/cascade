@@ -626,6 +626,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "cascade-wasm"
+version = "0.1.73"
+dependencies = [
+ "anyhow",
+ "cascade-config",
+ "cascade-expr",
+ "chrono",
+ "js-sys",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+]
+
+[[package]]
 name = "cascade-web-api"
 version = "0.1.74"
 dependencies = [
