@@ -505,6 +505,18 @@ pub fn data_access_with_explicit_control(
         if !grant.scope.covers(&folder_scope) {
             continue;
         }
+        // F4 (defence in depth): ignore data grants whose scope is
+        // node-wide. The runtime gate keys on the BEP folder id
+        // (`p2p-<name>`) and there is no such id at the node root, so
+        // a node-wide data grant cannot satisfy any folder check. The
+        // local CLI and the wire-side `grant_from_wire` both refuse to
+        // author such a grant; this filter catches a row that slipped
+        // through a future code path so a node-wide data grant cannot
+        // accidentally contribute to "has_any_data_grant" and narrow
+        // the access for every folder the peer might touch.
+        if grant.scope.is_node_wide() {
+            continue;
+        }
         // At least one data grant exists for this peer+folder — this opts the
         // peer into explicit directional control (rule 2).
         has_any_data_grant = true;
@@ -1315,6 +1327,62 @@ mod tests {
         let access = data_access(&grants, &peer(), "/work", at(2026, 1, 1));
         assert!(access.read, "grant on /personal must not restrict /work");
         assert!(access.write, "grant on /personal must not restrict /work");
+    }
+
+    #[test]
+    fn data_access_node_wide_data_grant_is_ignored_as_defence_in_depth() {
+        // F4: a data-verb grant whose scope is node-wide cannot
+        // contribute to the per-direction decision. The local CLI and
+        // the wire-side parse both refuse such a grant outright; this
+        // pure-function filter is defence in depth for any row that
+        // somehow slipped through (a future code path, a corrupt
+        // state, a bug we have not yet found). Without the filter, a
+        // node-wide `data:read` would set `has_any_data_grant = true`
+        // and silently narrow every folder the peer might touch — the
+        // F1 silent-no-op failure mode in a different shape.
+        let grants = vec![
+            Grant {
+                grantee: peer(),
+                capability: Capability::DataRead,
+                scope: Scope::Node,
+                granted_by: owner(),
+                expires: None,
+            },
+            Grant {
+                grantee: peer(),
+                capability: Capability::DataWrite,
+                scope: Scope::Node,
+                granted_by: owner(),
+                expires: None,
+            },
+        ];
+        let access = data_access(&grants, &peer(), "/work", at(2026, 1, 1));
+        assert!(
+            access.read,
+            "node-wide data:read must not restrict the folder (F4 defence in depth)"
+        );
+        assert!(
+            access.write,
+            "node-wide data:write must not restrict the folder (F4 defence in depth)"
+        );
+        // A root folder grant (`/`) is also node-wide in everything
+        // but name, so the same filter catches it.
+        let grants = vec![Grant {
+            grantee: peer(),
+            capability: Capability::DataRead,
+            scope: Scope::folder("/"),
+            granted_by: owner(),
+            expires: None,
+        }];
+        let access = data_access(&grants, &peer(), "/work", at(2026, 1, 1));
+        assert!(
+            access.read,
+            "root-folder data:read must not restrict the folder (F4 defence in depth)"
+        );
+        assert!(
+            access.write,
+            "root-folder data:read must not restrict the folder (F4 defence in depth)"
+        );
     }
 
     #[test]

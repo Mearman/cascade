@@ -111,10 +111,18 @@ fn issue(
     let scope = parse_scope(scope);
     let expiry = parse_expiry(expires)?;
 
-    if capability.is_dangerous() && scope.is_node_wide() {
+    // A dangerous capability is never satisfied by a node-wide / wildcard
+    // token, and a data verb is never satisfied by a node-wide token either:
+    // the runtime data-plane gate keys on the BEP folder id (`p2p-<name>`)
+    // and there is no such id at the node root. Refuse loudly before signing
+    // so a node-wide data token is never minted in the first place — a
+    // `cascade share` path that authors the right scope is the only
+    // sanctioned route to issue a portable data-verb credential.
+    if scope.is_node_wide() && (capability.is_dangerous() || capability.is_data_verb()) {
         anyhow::bail!(
-            "capability `{}` is dangerous and cannot be issued over a wildcard scope; name an \
-             explicit folder with --scope <path>",
+            "capability `{}` cannot be issued over a wildcard scope; name an \
+             explicit folder with --scope <path> (data verbs are folder-scoped, \
+             not node-wide)",
             capability.as_wire()
         );
     }
@@ -309,7 +317,36 @@ mod tests {
         );
         assert!(result.is_err());
         let message = format!("{:#}", result.unwrap_err());
-        assert!(message.contains("dangerous") && message.contains("wildcard"));
+        assert!(message.contains("wildcard") && message.contains("--scope"));
+
+        // Nothing was written.
+        let db = StateDb::open(&ctx.db_path).unwrap();
+        assert!(db.list_tokens().unwrap().is_empty());
+    }
+
+    #[test]
+    fn issue_data_verb_over_wildcard_is_refused() {
+        // F4: a data-verb token over a wildcard scope is a silent
+        // no-op at the runtime gate (the gate keys on `p2p-<name>`, not
+        // the node root). Refuse to mint it so the operator cannot
+        // accidentally ship a credential that can never authorise a
+        // frame on a real folder.
+        let dir = TempDir::new().unwrap();
+        let ctx = make_ctx(&dir);
+        seed_p2p_owner(&ctx);
+
+        for cap in ["data:read", "data:write"] {
+            let result = issue(&ctx, "BEARER", cap, "*", "2027-01-01T00:00:00Z");
+            assert!(
+                result.is_err(),
+                "data-verb {cap} over wildcard must be refused (F4)"
+            );
+            let message = format!("{:#}", result.unwrap_err());
+            assert!(
+                message.contains("wildcard") && message.contains("--scope"),
+                "error must explain the wildcard rejection, got: {message}",
+            );
+        }
 
         // Nothing was written.
         let db = StateDb::open(&ctx.db_path).unwrap();

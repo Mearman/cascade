@@ -197,11 +197,24 @@ pub fn add(
     // so refuse to write one rather than create a grant that can never
     // authorise the command it names. Check every capability up front so the
     // command is all-or-nothing.
+    //
+    // A data verb (`data:read` / `data:write`) is also never satisfied by a
+    // node-wide grant: the runtime data-plane gate keys on the BEP folder id
+    // (`p2p-<name>`) and there is no such id at the node root. A node-wide data
+    // grant is a silent no-op that would only confuse the operator, so it is
+    // refused the same way as a dangerous capability. `cascade share` applies
+    // the same bar by resolving the operator-facing name to the canonical id
+    // before storing the grant, but `cascade grant` and the wire-side
+    // `ManageCommand::GrantAdd` path are open-coded — they have to apply the
+    // bar themselves.
     for capability in &capabilities {
-        if capability.is_dangerous() && parsed_scope.is_node_wide() {
+        if parsed_scope.is_node_wide()
+            && (capability.is_dangerous() || capability.is_data_verb())
+        {
             anyhow::bail!(
-                "capability `{}` is dangerous and cannot be granted over a wildcard scope; \
-                 name an explicit folder with --scope <path>",
+                "capability `{}` cannot be granted over a wildcard scope; \
+                 name an explicit folder with --scope <path> (data verbs are \
+                 folder-scoped, not node-wide)",
                 capability.as_wire()
             );
         }
@@ -407,8 +420,8 @@ mod tests {
         );
         let message = format!("{:#}", result.unwrap_err());
         assert!(
-            message.contains("dangerous") && message.contains("wildcard"),
-            "error must explain the wildcard rejection, got: {message}",
+            message.contains("wildcard") && message.contains("--scope"),
+            "error must explain the wildcard rejection and the fix, got: {message}",
         );
 
         let db = StateDb::open(&ctx.db_path).unwrap();
@@ -434,6 +447,34 @@ mod tests {
             db.list_grants().unwrap().is_empty(),
             "a refused dangerous capability must not leave a partial grant behind",
         );
+    }
+
+    #[test]
+    fn add_data_verb_over_wildcard_is_refused() {
+        // F4: a data-verb grant over a wildcard scope is a silent
+        // no-op at the runtime gate (the gate keys on `p2p-<name>`, not
+        // the node root), so refuse it here so the operator cannot
+        // accidentally write a row that can never authorise a frame.
+        let dir = TempDir::new().unwrap();
+        let ctx = make_ctx(&dir);
+        seed_p2p_owner(&ctx);
+
+        for cap in ["data:read", "data:write"] {
+            let result = add(&ctx, "PEER", cap, "*", None);
+            assert!(
+                result.is_err(),
+                "data-verb {cap} over wildcard must be refused (F4)"
+            );
+            let message = format!("{:#}", result.unwrap_err());
+            assert!(
+                message.contains("wildcard") && message.contains("--scope"),
+                "error must explain the wildcard rejection, got: {message}",
+            );
+        }
+
+        // Nothing was written.
+        let db = StateDb::open(&ctx.db_path).unwrap();
+        assert!(db.list_grants().unwrap().is_empty());
     }
 
     #[test]
