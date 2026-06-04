@@ -3,6 +3,13 @@ name = "cascade-backend-gdrive"
 version.workspace = true
 edition.workspace = true
 
+[features]
+## Native build: uses reqwest directly for HTTP. Enabled by default.
+default = ["native"]
+native = ["dep:reqwest"]
+## Portable build: uses the cascade-engine HttpClient trait instead of reqwest.
+portable = ["cascade-engine/portable"]
+
 [dependencies]
 cascade-engine = { path = "../engine" }
 async-trait.workspace = true
@@ -14,7 +21,7 @@ anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 chrono.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, optional = true }
 urlencoding.workspace = true
 futures-core.workspace = true
 dirs.workspace = true

@@ -31,9 +31,11 @@ use tokio::sync::{Mutex, RwLock};
 
 use auth::AuthTokens;
 use client::{DriveClient, ListQuery};
-use token_store::{PlatformTokenStore, TokenStore};
+#[cfg(not(feature = "portable"))]
+use token_store::PlatformTokenStore;
+use token_store::TokenStore;
 
-/// Create a Google Drive backend from config.
+/// Create a Google Drive backend from config (native build).
 ///
 /// Config keys expected:
 /// - `client_id` — Google `OAuth2` client ID
@@ -47,24 +49,93 @@ use token_store::{PlatformTokenStore, TokenStore};
 /// - `access_token` — pre-populate an access token, bypassing Keychain lookup
 /// - `refresh_token` — pre-populate a refresh token so the refresh path is reachable
 /// - `expires_in_secs` — seconds until the pre-populated token expires (default 24h)
+#[cfg(not(feature = "portable"))]
 pub fn create_backend(config: &toml::Value) -> anyhow::Result<Box<dyn Backend>> {
     create_backend_with_store(config, Arc::new(PlatformTokenStore))
 }
 
-/// Build a backend with an injected [`TokenStore`].
+/// Portable stub for `create_backend` — always returns an error.
+///
+/// When the `portable` feature is active, the backend requires an explicit
+/// `HttpClient`. Use [`create_backend_with_store_and_http`] instead.
+#[cfg(feature = "portable")]
+pub fn create_backend(_config: &toml::Value) -> anyhow::Result<Box<dyn Backend>> {
+    Err(anyhow::anyhow!(
+        "the Google Drive backend's `portable` feature requires an explicit HttpClient — \
+         use `create_backend_with_store_and_http`"
+    ))
+}
+
+/// Build a backend with an injected [`TokenStore`] (native build).
 ///
 /// Identical to [`create_backend`] but lets the caller supply the persistence
 /// backing for refreshed tokens. Integration tests use this to substitute an
 /// in-memory store so the token-refresh path can be exercised without writing
 /// to the host Keychain or config directory.
+#[cfg(not(feature = "portable"))]
 pub fn create_backend_with_store(
     config: &toml::Value,
     token_store: Arc<dyn TokenStore>,
 ) -> anyhow::Result<Box<dyn Backend>> {
-    // Number of hours a pre-populated access token stays valid when no explicit
-    // `expires_in_secs` is given. Long enough that normal tests never hit the
-    // refresh path; tests that want the refresh path set `expires_in_secs` to a
-    // value at or below `AuthTokens::is_expired`'s 60-second buffer.
+    let (oauth, drive, initial_tokens, instance_id) = parse_gdrive_config(config);
+
+    Ok(Box::new(GdriveBackend {
+        drive,
+        oauth,
+        account: config
+            .get("account")
+            .and_then(|v| v.as_str())
+            .unwrap_or("default")
+            .to_string(),
+        instance_id,
+        token_store,
+        tokens: Arc::new(Mutex::new(initial_tokens)),
+        shared_drive_ids: Arc::new(RwLock::new(HashSet::new())),
+        folder_drive_ids: Arc::new(RwLock::new(HashMap::new())),
+        my_drive_root_id: Arc::new(RwLock::new(None)),
+        trashed_ids: Arc::new(RwLock::new(HashSet::new())),
+    }))
+}
+
+/// Build a backend with an injected [`TokenStore`] and HTTP client (portable build).
+///
+/// Use this function when the `portable` feature is active. The `http` argument
+/// supplies the `HttpClient` implementation used for both Drive API calls and
+/// the `OAuth2` token-refresh path.
+#[cfg(feature = "portable")]
+pub fn create_backend_with_store_and_http(
+    config: &toml::Value,
+    token_store: Arc<dyn TokenStore>,
+    http: Arc<dyn cascade_engine::portable::HttpClient>,
+) -> anyhow::Result<Box<dyn Backend>> {
+    let (oauth, drive_native, initial_tokens, instance_id) = parse_gdrive_config_portable(config, Arc::clone(&http))?;
+
+    Ok(Box::new(GdriveBackend {
+        drive: drive_native,
+        oauth,
+        account: config
+            .get("account")
+            .and_then(|v| v.as_str())
+            .unwrap_or("default")
+            .to_string(),
+        instance_id,
+        token_store,
+        tokens: Arc::new(Mutex::new(initial_tokens)),
+        http,
+        shared_drive_ids: Arc::new(RwLock::new(HashSet::new())),
+        folder_drive_ids: Arc::new(RwLock::new(HashMap::new())),
+        my_drive_root_id: Arc::new(RwLock::new(None)),
+        trashed_ids: Arc::new(RwLock::new(HashSet::new())),
+    }))
+}
+
+/// Parse common config fields shared between native and portable backends.
+///
+/// Returns `(oauth_config, drive_client, initial_tokens, instance_id)`.
+#[cfg(not(feature = "portable"))]
+fn parse_gdrive_config(
+    config: &toml::Value,
+) -> (auth::OAuthConfig, DriveClient, Option<auth::AuthTokens>, String) {
     const DEFAULT_TOKEN_LIFETIME_HOURS: i64 = 24;
 
     let client_id = config
@@ -82,9 +153,6 @@ pub fn create_backend_with_store(
         .and_then(|v| v.as_str())
         .unwrap_or("default")
         .to_string();
-    // The OAuth2 token endpoint. Production callers leave this at Google's URL;
-    // integration tests override it to a local mock so the token-refresh path
-    // can be exercised without reaching the network.
     let token_url = config
         .get("token_url")
         .and_then(|v| v.as_str())
@@ -103,7 +171,77 @@ pub fn create_backend_with_store(
         _ => DriveClient::new(),
     };
 
-    let initial_tokens = config
+    let initial_tokens = build_initial_tokens(config, DEFAULT_TOKEN_LIFETIME_HOURS);
+    let instance_id = format!("gdrive-{account}");
+    let oauth = auth::OAuthConfig {
+        client_id,
+        client_secret,
+        token_url,
+    };
+
+    (oauth, drive, initial_tokens, instance_id)
+}
+
+/// Parse common config fields for the portable build, constructing a
+/// `DriveClient` with the supplied HTTP client.
+#[cfg(feature = "portable")]
+fn parse_gdrive_config_portable(
+    config: &toml::Value,
+    http: Arc<dyn cascade_engine::portable::HttpClient>,
+) -> anyhow::Result<(auth::OAuthConfig, DriveClient, Option<auth::AuthTokens>, String)> {
+    const DEFAULT_TOKEN_LIFETIME_HOURS: i64 = 24;
+
+    let client_id = config
+        .get("client_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let client_secret = config
+        .get("client_secret")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let account = config
+        .get("account")
+        .and_then(|v| v.as_str())
+        .unwrap_or("default")
+        .to_string();
+    let token_url = config
+        .get("token_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or(auth::GOOGLE_TOKEN_URL)
+        .to_string();
+
+    let base_url = config
+        .get("base_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("https://www.googleapis.com/drive/v3")
+        .to_string();
+    let upload_url = config
+        .get("upload_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("https://www.googleapis.com/upload/drive/v3")
+        .to_string();
+
+    let drive = DriveClient::with_http_client(base_url, upload_url, http);
+
+    let initial_tokens = build_initial_tokens(config, DEFAULT_TOKEN_LIFETIME_HOURS);
+    let instance_id = format!("gdrive-{account}");
+    let oauth = auth::OAuthConfig {
+        client_id,
+        client_secret,
+        token_url,
+    };
+
+    Ok((oauth, drive, initial_tokens, instance_id))
+}
+
+/// Build optional pre-populated tokens from test-harness config keys.
+fn build_initial_tokens(
+    config: &toml::Value,
+    default_lifetime_hours: i64,
+) -> Option<auth::AuthTokens> {
+    config
         .get("access_token")
         .and_then(|v| v.as_str())
         .map(|token| {
@@ -111,7 +249,7 @@ pub fn create_backend_with_store(
                 .get("expires_in_secs")
                 .and_then(toml::Value::as_integer)
                 .map_or_else(
-                    || chrono::Duration::hours(DEFAULT_TOKEN_LIFETIME_HOURS),
+                    || chrono::Duration::hours(default_lifetime_hours),
                     chrono::Duration::seconds,
                 );
             let refresh_token = config
@@ -124,26 +262,7 @@ pub fn create_backend_with_store(
                 refresh_token,
                 expires_at: chrono::Utc::now() + lifetime,
             }
-        });
-
-    let instance_id = format!("gdrive-{account}");
-
-    Ok(Box::new(GdriveBackend {
-        drive,
-        oauth: auth::OAuthConfig {
-            client_id,
-            client_secret,
-            token_url,
-        },
-        account,
-        instance_id,
-        token_store,
-        tokens: Arc::new(Mutex::new(initial_tokens)),
-        shared_drive_ids: Arc::new(RwLock::new(HashSet::new())),
-        folder_drive_ids: Arc::new(RwLock::new(HashMap::new())),
-        my_drive_root_id: Arc::new(RwLock::new(None)),
-        trashed_ids: Arc::new(RwLock::new(HashSet::new())),
-    }))
+        })
 }
 
 /// Google Drive backend implementation.
@@ -158,6 +277,11 @@ pub struct GdriveBackend {
     /// in-memory under test).
     token_store: Arc<dyn TokenStore>,
     tokens: Arc<Mutex<Option<AuthTokens>>>,
+    /// Injected HTTP client used for the token-refresh path under the
+    /// `portable` feature. Under the `native` feature a fresh unpooled
+    /// `reqwest::Client` is built per refresh call instead.
+    #[cfg(feature = "portable")]
+    http: Arc<dyn cascade_engine::portable::HttpClient>,
     /// IDs of shared drives this user is a member of.
     /// Populated on first `list_children("__shared_drives")` call.
     shared_drive_ids: Arc<RwLock<HashSet<String>>>,
@@ -179,8 +303,6 @@ pub struct GdriveBackend {
 impl GdriveBackend {
     /// Get a valid access token, refreshing if necessary.
     async fn access_token(&self) -> anyhow::Result<String> {
-        /// Per-request timeout for the `OAuth2` token-refresh call.
-        const REFRESH_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
         // Fast path: check if token is still valid without holding the lock
         // across an await.
@@ -230,14 +352,20 @@ impl GdriveBackend {
             // guard is dropped here — mutex released before the HTTP call.
         };
 
-        // Same per-request, unpooled, HTTP/1.1-only client as the Drive API
-        // path. See the extended rationale on `DriveClient::http` in client.rs
-        // for why pooling and HTTP/2 stay disabled: it is the confirmed
-        // workaround for the WebDAV-path TLS hang, not an oversight. The builder
-        // error is propagated, never swallowed — a default client would
-        // silently re-enable pooling and HTTP/2.
-        let http = client::build_unpooled_http1_client(REFRESH_REQUEST_TIMEOUT)?;
-        let refreshed = auth::refresh_access_token(&http, &self.oauth, &refresh_token).await?;
+        // Perform the token refresh. Under native the refresh uses a fresh
+        // unpooled HTTP/1.1-only client (the confirmed TLS deadlock workaround;
+        // see `DriveClient::http` in client.rs). Under portable the injected
+        // HttpClient is used instead.
+        #[cfg(not(feature = "portable"))]
+        let refreshed = {
+            /// Per-request timeout for the `OAuth2` token-refresh call.
+            const REFRESH_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+            let http = client::build_unpooled_http1_client(REFRESH_REQUEST_TIMEOUT)?;
+            auth::refresh_access_token(&http, &self.oauth, &refresh_token).await?
+        };
+        #[cfg(feature = "portable")]
+        let refreshed =
+            auth::refresh_access_token(self.http.as_ref(), &self.oauth, &refresh_token).await?;
         self.token_store.save(&self.account, &refreshed).await?;
 
         let mut guard = self.tokens.lock().await;
@@ -743,9 +871,7 @@ impl Backend for GdriveBackend {
 
         let resp = self.drive.download_content(remote_id, &token).await?;
 
-        // Read the full response body and write it out.
-        let bytes = resp.bytes().await?;
-        writer.write_all(&bytes).await?;
+        writer.write_all(&resp.body).await?;
         writer.flush().await?;
 
         tracing::debug!(file = %file.id, size = file.size.unwrap_or(0), "downloaded");

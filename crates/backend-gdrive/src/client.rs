@@ -25,24 +25,64 @@ pub enum ListQuery {
     SharedWithMe,
     /// Items currently in the user's Bin (`trashed=true`).
     Trashed,
-    /// Immediate children of a folder that is itself trashed. Uses
-    /// `q='<id>' in parents and trashed=true` so descendants of a trashed
-    /// folder become navigable inside the Bin view.
+    /// Immediate children of a folder that is itself trashed.
     ChildrenOfTrashed { parent_id: String },
 }
 
-/// Map a Drive API HTTP error response to a typed error so presenters can
-/// translate it to an accurate status code (403, 404, etc.) instead of a
-/// generic 500.
-fn drive_api_error(context: &str, status: reqwest::StatusCode, body: String) -> anyhow::Error {
-    let msg = format!("{context} ({status}): {body}");
-    match status.as_u16() {
+// ── Internal response type ───────────────────────────────────────────────────
+
+/// Normalised HTTP response shared between the native (reqwest) and portable
+/// (`HttpClient` trait) paths. Callers parse JSON from `body` directly rather
+/// than calling `.json()` on a streaming response.
+#[derive(Debug)]
+pub struct DriveHttpResponse {
+    pub status: u16,
+    pub body: Vec<u8>,
+}
+
+// ── Error helper ─────────────────────────────────────────────────────────────
+
+/// Map a Drive API HTTP error status to a typed `BackendError` where relevant.
+#[must_use]
+pub fn drive_api_error(context: &str, status: u16, body: String) -> anyhow::Error {
+    let msg = format!("{context} (HTTP {status}): {body}");
+    match status {
         403 => BackendError::Forbidden(msg).into(),
         404 => BackendError::NotFound(msg).into(),
         409 => BackendError::Conflict(msg).into(),
         _ => anyhow::Error::msg(msg),
     }
 }
+
+// ── URL helper ────────────────────────────────────────────────────────────────
+
+/// Append URL-encoded query parameters to `base_url`.
+///
+/// If `params` is empty, `base_url` is returned unchanged. If `base_url`
+/// already contains a `?`, the new parameters are appended with `&`.
+fn build_query_url(base_url: &str, params: &[(&str, &str)]) -> String {
+    if params.is_empty() {
+        return base_url.to_string();
+    }
+    let qs: String = params
+        .iter()
+        .map(|(k, v)| {
+            format!(
+                "{}={}",
+                urlencoding::encode(k),
+                urlencoding::encode(v)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    if base_url.contains('?') {
+        format!("{base_url}&{qs}")
+    } else {
+        format!("{base_url}?{qs}")
+    }
+}
+
+// ── Rate limiter ──────────────────────────────────────────────────────────────
 
 /// Token-bucket rate limiter for Google Drive API.
 /// Allows ~10,000 requests per 100 seconds per user.
@@ -95,31 +135,38 @@ impl RateLimiter {
     }
 }
 
+// ── Native-only helpers ───────────────────────────────────────────────────────
+
 /// Build the per-request `reqwest` client that the Drive TLS deadlock
 /// workaround mandates: connection pooling disabled and HTTP/1.1 forced.
 ///
 /// Both the Drive API request path and the `OAuth2` token-refresh path build
 /// their clients here so the workaround configuration lives in exactly one
-/// place. See the `DriveClient::http` rationale for the full background. The
-/// builder error is propagated rather than swallowed — a fallback to the
+/// place. See the `DriveClient::http` rationale below for the full background.
+/// The builder error is propagated rather than swallowed — a fallback to the
 /// default client would silently re-enable pooling and HTTP/2.
+#[cfg(not(feature = "portable"))]
 pub fn build_unpooled_http1_client(timeout: Duration) -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(timeout)
-        // Disable connection reuse: a pooled connection's second use is the
-        // exact moment the WebDAV-path hang manifested.
         .pool_max_idle_per_host(0)
-        // Force HTTP/1.1: avoids HTTP/2 stream multiplexing being reused across
-        // the server-response boundary that triggered the wedge.
         .http1_only()
         .build()
 }
 
+// ── DriveClient struct ────────────────────────────────────────────────────────
+
 /// Google Drive API HTTP client.
 pub struct DriveClient {
     rate_limiter: RateLimiter,
-    base_url: String,
-    upload_url: String,
+    pub(crate) base_url: String,
+    pub(crate) upload_url: String,
+    /// Injected HTTP client, present only under the `portable` feature.
+    ///
+    /// Under the `native` feature the backend builds a fresh unpooled
+    /// `reqwest::Client` per request instead (the TLS deadlock workaround).
+    #[cfg(feature = "portable")]
+    http: std::sync::Arc<dyn cascade_engine::portable::HttpClient>,
 }
 
 impl std::fmt::Debug for DriveClient {
@@ -131,12 +178,9 @@ impl std::fmt::Debug for DriveClient {
     }
 }
 
-impl Default for DriveClient {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// ── Native constructors and HTTP helpers ──────────────────────────────────────
 
+#[cfg(not(feature = "portable"))]
 impl DriveClient {
     #[must_use]
     pub fn new() -> Self {
@@ -146,58 +190,7 @@ impl DriveClient {
         )
     }
 
-    /// Build the HTTP client used for a single Drive API request.
-    ///
-    /// A fresh client per request with connection pooling disabled
-    /// (`pool_max_idle_per_host(0)`) and HTTP/1.1 only (`http1_only`) is a
-    /// deliberate workaround for a hang first seen on the `WebDAV` write path,
-    /// not an oversight. **Do not** restore pooling or HTTP/2 here without a
-    /// confirmed root cause and a passing reproduction — the standing rule is
-    /// recorded in `docs/design.md` ("Google Drive TLS deadlock workaround").
-    ///
-    /// What was investigated and ruled out (see the concurrency test
-    /// `concurrent_requests_through_shared_client_do_not_deadlock` in
-    /// `tests/gdrive_integration.rs`): nothing inside this crate deadlocks
-    /// under concurrent load. That test drives many concurrent requests through
-    /// one shared backend seeded with an *expired* token, so every task races
-    /// into the refresh slow path of `GdriveBackend::access_token` — the one
-    /// place a token `Mutex` guard is dropped before the refresh `.await` and
-    /// the lock is then re-taken. With a deliberately delayed mock token
-    /// endpoint the tasks genuinely contend on that re-acquisition, yet all
-    /// complete well inside the deadline. A guard held across the refresh await
-    /// would wedge them and trip it.
-    ///
-    /// What remains suspected and could not be reproduced offline: the hang
-    /// only ever appeared through the `WebDAV` presenter, where an
-    /// `axum`/`hyper`-1.x *server* and a `reqwest`/`hyper`-1.x *client* share
-    /// one `tokio` runtime. A new backend TLS handshake opened while the server
-    /// was mid-response never completed, so a pooled connection's second use
-    /// (or an HTTP/2 stream reused across that boundary) wedged the task. A
-    /// plain-HTTP mock cannot exercise that TLS handshake, which is why the test
-    /// above stays green and yet the workaround stays in place: the cause lives
-    /// at the `hyper` server+client boundary, outside this crate, and removing
-    /// the per-request client reintroduces the freeze on the real Drive
-    /// endpoint. Earlier work also tried (and reverted) `native-tls`,
-    /// `aws-lc-rs`, manual `serve_connection`, and `block_in_place`; the
-    /// per-request, unpooled, HTTP/1.1-only client is the combination that held.
-    ///
-    /// A builder failure (for example TLS backend initialisation failing) is
-    /// returned, never swallowed: falling back to `reqwest::Client::default()`
-    /// would silently re-enable pooling and HTTP/2 — the exact configuration
-    /// this workaround forbids — so the deadlock could return with no error
-    /// surfaced. Callers propagate the error with `?`.
-    ///
-    /// The client is built by [`build_unpooled_http1_client`], shared with the
-    /// `OAuth2` token-refresh path so the workaround configuration lives in one
-    /// place.
-    fn http() -> reqwest::Result<reqwest::Client> {
-        /// Per-request timeout for Drive API calls.
-        const DRIVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-        build_unpooled_http1_client(DRIVE_REQUEST_TIMEOUT)
-    }
-
-    /// Construct a client with custom base URLs — used in integration tests
-    /// to point at a mock server instead of the real Drive API.
+    /// Construct a client with custom base URLs — used in integration tests.
     #[must_use]
     #[allow(clippy::missing_const_for_fn)]
     pub fn with_urls(base_url: String, upload_url: String) -> Self {
@@ -208,30 +201,260 @@ impl DriveClient {
         }
     }
 
-    /// GET request to Drive API with rate limiting and auth.
-    async fn authenticated_get(
+    /// Build the per-request `reqwest` client.
+    ///
+    /// A fresh client per request with connection pooling disabled and
+    /// HTTP/1.1 only is a deliberate workaround for a hang first seen on the
+    /// `WebDAV` write path, not an oversight. **Do not** restore pooling or
+    /// HTTP/2 here without a confirmed root cause and a passing reproduction —
+    /// the standing rule is recorded in `docs/design.md` ("Google Drive TLS
+    /// deadlock workaround").
+    ///
+    /// The builder error is propagated, never swallowed; falling back to the
+    /// default client would silently re-enable pooling and HTTP/2.
+    fn http() -> reqwest::Result<reqwest::Client> {
+        const DRIVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+        build_unpooled_http1_client(DRIVE_REQUEST_TIMEOUT)
+    }
+
+    /// Issue an authenticated GET and return the response, rate-limited.
+    /// Returns `Err` for any 4xx/5xx status.
+    pub(crate) async fn authenticated_get(
         &self,
         path: &str,
         token: &str,
         query: &[(&str, &str)],
-    ) -> anyhow::Result<reqwest::Response> {
+    ) -> anyhow::Result<DriveHttpResponse> {
         self.rate_limiter.acquire().await;
-        let url = format!("{}/{path}", self.base_url);
+        let url = build_query_url(&format!("{}/{path}", self.base_url), query);
         let resp = Self::http()?
             .get(&url)
             .bearer_auth(token)
-            .query(query)
             .send()
             .await?;
 
-        let status = resp.status();
-        if status.is_client_error() || status.is_server_error() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(drive_api_error("Drive API error", status, body));
+        let status = resp.status().as_u16();
+        let body = resp.bytes().await?.to_vec();
+
+        if status >= 400 {
+            let body_str = String::from_utf8_lossy(&body).into_owned();
+            return Err(drive_api_error("Drive API error", status, body_str));
         }
-        Ok(resp)
+        Ok(DriveHttpResponse { status, body })
     }
 
+    /// Issue a request with a body (POST, PATCH, PUT) and return the response.
+    /// `url` is the full request URL including any embedded query parameters;
+    /// `extra_query` is appended via `build_query_url`.
+    pub(crate) async fn authenticated_write(
+        &self,
+        method: &str,
+        url: &str,
+        extra_query: &[(&str, &str)],
+        token: &str,
+        body: Vec<u8>,
+        content_type: &str,
+    ) -> anyhow::Result<DriveHttpResponse> {
+        self.rate_limiter.acquire().await;
+        let full_url = build_query_url(url, extra_query);
+        let m = method.parse::<reqwest::Method>()?;
+        let resp = Self::http()?
+            .request(m, &full_url)
+            .bearer_auth(token)
+            .header("content-type", content_type)
+            .body(body)
+            .send()
+            .await?;
+
+        let status = resp.status().as_u16();
+        let resp_body = resp.bytes().await?.to_vec();
+
+        if status >= 400 {
+            let body_str = String::from_utf8_lossy(&resp_body).into_owned();
+            return Err(drive_api_error("Drive API error", status, body_str));
+        }
+        Ok(DriveHttpResponse {
+            status,
+            body: resp_body,
+        })
+    }
+
+    /// Issue a GET with an HTTP `Range` header, returning the raw response
+    /// **without** error-checking the status (callers handle 416 specially).
+    pub(crate) async fn authenticated_get_range(
+        &self,
+        url: &str,
+        token: &str,
+        range: &str,
+        query: &[(&str, &str)],
+    ) -> anyhow::Result<DriveHttpResponse> {
+        self.rate_limiter.acquire().await;
+        let full_url = build_query_url(url, query);
+        let resp = Self::http()?
+            .get(&full_url)
+            .bearer_auth(token)
+            .header(reqwest::header::RANGE, range)
+            .send()
+            .await?;
+
+        let status = resp.status().as_u16();
+        let body = resp.bytes().await?.to_vec();
+        Ok(DriveHttpResponse { status, body })
+    }
+}
+
+#[cfg(not(feature = "portable"))]
+impl Default for DriveClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── Portable constructors and HTTP helpers ────────────────────────────────────
+
+#[cfg(feature = "portable")]
+impl DriveClient {
+    /// Construct a client with custom base URLs and an injected HTTP client.
+    /// Used when the `portable` feature is active and `reqwest` is unavailable.
+    #[must_use]
+    pub fn with_http_client(
+        base_url: String,
+        upload_url: String,
+        http: std::sync::Arc<dyn cascade_engine::portable::HttpClient>,
+    ) -> Self {
+        Self {
+            rate_limiter: RateLimiter::new(10_000),
+            base_url,
+            upload_url,
+            http,
+        }
+    }
+
+    /// Construct a client pointing at the production Google Drive API.
+    #[must_use]
+    pub fn new_with_http_client(
+        http: std::sync::Arc<dyn cascade_engine::portable::HttpClient>,
+    ) -> Self {
+        Self::with_http_client(
+            "https://www.googleapis.com/drive/v3".to_string(),
+            "https://www.googleapis.com/upload/drive/v3".to_string(),
+            http,
+        )
+    }
+
+    /// Issue an authenticated GET, rate-limited. Returns `Err` for 4xx/5xx.
+    pub(crate) async fn authenticated_get(
+        &self,
+        path: &str,
+        token: &str,
+        query: &[(&str, &str)],
+    ) -> anyhow::Result<DriveHttpResponse> {
+        use cascade_engine::portable::HeaderMap;
+
+        self.rate_limiter.acquire().await;
+        let url = build_query_url(&format!("{}/{path}", self.base_url), query);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {token}").as_str());
+
+        let resp = self
+            .http
+            .get(&url, headers)
+            .await
+            .map_err(|e| anyhow::anyhow!("Drive GET failed: {e}"))?;
+
+        if resp.status >= 400 {
+            let body_str = String::from_utf8_lossy(&resp.body).into_owned();
+            return Err(drive_api_error("Drive API error", resp.status, body_str));
+        }
+        Ok(DriveHttpResponse {
+            status: resp.status,
+            body: resp.body,
+        })
+    }
+
+    /// Issue a request with a body (POST, PATCH, PUT), rate-limited.
+    pub(crate) async fn authenticated_write(
+        &self,
+        method: &str,
+        url: &str,
+        extra_query: &[(&str, &str)],
+        token: &str,
+        body: Vec<u8>,
+        content_type: &str,
+    ) -> anyhow::Result<DriveHttpResponse> {
+        use cascade_engine::portable::HeaderMap;
+
+        self.rate_limiter.acquire().await;
+        let full_url = build_query_url(url, extra_query);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {token}").as_str());
+        headers.insert("content-type", content_type);
+
+        let resp = match method {
+            "POST" => self
+                .http
+                .post(&full_url, headers, body)
+                .await
+                .map_err(|e| anyhow::anyhow!("Drive POST failed: {e}"))?,
+            "PATCH" => self
+                .http
+                .patch(&full_url, headers, body)
+                .await
+                .map_err(|e| anyhow::anyhow!("Drive PATCH failed: {e}"))?,
+            "PUT" => self
+                .http
+                .put(&full_url, headers, body)
+                .await
+                .map_err(|e| anyhow::anyhow!("Drive PUT failed: {e}"))?,
+            other => anyhow::bail!("unsupported write method for Drive portable backend: {other}"),
+        };
+
+        if resp.status >= 400 {
+            let body_str = String::from_utf8_lossy(&resp.body).into_owned();
+            return Err(drive_api_error("Drive API error", resp.status, body_str));
+        }
+        Ok(DriveHttpResponse {
+            status: resp.status,
+            body: resp.body,
+        })
+    }
+
+    /// Issue a GET with an HTTP `Range` header, **without** error-checking the
+    /// status (callers handle 416 specially).
+    pub(crate) async fn authenticated_get_range(
+        &self,
+        url: &str,
+        token: &str,
+        range: &str,
+        query: &[(&str, &str)],
+    ) -> anyhow::Result<DriveHttpResponse> {
+        use cascade_engine::portable::HeaderMap;
+
+        self.rate_limiter.acquire().await;
+        let full_url = build_query_url(url, query);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {token}").as_str());
+        headers.insert("range", range);
+
+        let resp = self
+            .http
+            .get(&full_url, headers)
+            .await
+            .map_err(|e| anyhow::anyhow!("Drive range GET failed: {e}"))?;
+
+        Ok(DriveHttpResponse {
+            status: resp.status,
+            body: resp.body,
+        })
+    }
+}
+
+// ── Shared public API (works with either transport) ───────────────────────────
+
+impl DriveClient {
     /// Fetch a single file by ID.
     pub async fn get_file(&self, file_id: &str, token: &str) -> anyhow::Result<DriveFile> {
         let resp = self
@@ -247,22 +470,17 @@ impl DriveClient {
                 ],
             )
             .await?;
-        let file = resp.json::<DriveFile>().await?;
+        let file = serde_json::from_slice::<DriveFile>(&resp.body)?;
         Ok(file)
     }
 
     /// List files using the given query strategy.
-    ///
-    /// `page_token` continues a paged listing. See [`ListQuery`] for the
-    /// three supported listing modes.
     pub async fn list_files(
         &self,
         query: &ListQuery,
         token: &str,
         page_token: Option<&str>,
     ) -> anyhow::Result<FileListResponse> {
-        // Build owned strings before constructing the params slice so that
-        // all references remain valid for the duration of the call.
         let q_str: String;
         let drive_id_str: String;
         let page_token_str: String;
@@ -320,7 +538,7 @@ impl DriveClient {
         }
 
         let resp = self.authenticated_get("files", token, &params).await?;
-        let list = resp.json::<FileListResponse>().await?;
+        let list = serde_json::from_slice::<FileListResponse>(&resp.body)?;
         Ok(list)
     }
 
@@ -340,19 +558,17 @@ impl DriveClient {
             params.push(("pageToken", &page_token_str));
         }
         let resp = self.authenticated_get("drives", token, &params).await?;
-        let list = resp.json::<SharedDriveListResponse>().await?;
+        let list = serde_json::from_slice::<SharedDriveListResponse>(&resp.body)?;
         Ok(list)
     }
 
     /// Search for a file by name within a specific parent directory.
-    /// Returns at most one match (the first found).
     pub async fn find_file_in_parent(
         &self,
         name: &str,
         parent_id: &str,
         token: &str,
     ) -> anyhow::Result<Option<DriveFile>> {
-        self.rate_limiter.acquire().await;
         let query = format!(
             "'{parent_id}' in parents and name = '{}' and trashed = false",
             name.replace('\\', "\\\\").replace('"', "\\\"")
@@ -368,45 +584,37 @@ impl DriveClient {
             ("includeItemsFromAllDrives", "true"),
         ];
         let resp = self.authenticated_get("files", token, &params).await?;
-        let list = resp.json::<FileListResponse>().await?;
+        let list = serde_json::from_slice::<FileListResponse>(&resp.body)?;
         Ok(list.files.into_iter().next())
     }
 
-    /// Download file content.
+    /// Download file content. Returns the full body.
     pub async fn download_content(
         &self,
         file_id: &str,
         token: &str,
-    ) -> anyhow::Result<reqwest::Response> {
-        self.rate_limiter.acquire().await;
+    ) -> anyhow::Result<DriveHttpResponse> {
         let url = format!("{}/files/{file_id}", self.base_url);
-        let resp = Self::http()?
-            .get(&url)
-            .bearer_auth(token)
-            .query(&[("alt", "media"), ("supportsAllDrives", "true")])
-            .send()
-            .await?;
-
-        let status = resp.status();
-        if status.is_client_error() || status.is_server_error() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(drive_api_error("Drive download error", status, body));
-        }
-        Ok(resp)
+        self.authenticated_get_range(
+            &url,
+            token,
+            // No range restriction — download the whole file.
+            // We re-use the range helper so the rate limiter fires once.
+            "",
+            &[("alt", "media"), ("supportsAllDrives", "true")],
+        )
+        .await
+        .and_then(|resp| {
+            if resp.status >= 400 {
+                let body_str = String::from_utf8_lossy(&resp.body).into_owned();
+                Err(drive_api_error("Drive download error", resp.status, body_str))
+            } else {
+                Ok(resp)
+            }
+        })
     }
 
-    /// Download a byte range of a file's content using an HTTP `Range` header.
-    ///
-    /// `offset` is the first byte to fetch; `length` is the maximum number of
-    /// bytes to return. Returns the bytes in `[offset, offset + length)`,
-    /// possibly fewer at end-of-file.
-    ///
-    /// A compliant Drive server replies `206 Partial Content` carrying exactly
-    /// the requested range. A server that ignores the `Range` header replies
-    /// `200 OK` with the full body — in that case the body is sliced to the
-    /// requested window so the contract holds either way. `416 Range Not
-    /// Satisfiable` (the offset lies at or past the end of the file) yields an
-    /// empty result rather than an error.
+    /// Download a byte range of a file's content.
     pub async fn download_range(
         &self,
         file_id: &str,
@@ -414,50 +622,45 @@ impl DriveClient {
         offset: u64,
         length: u32,
     ) -> anyhow::Result<Vec<u8>> {
-        // A zero-length request needs no network round-trip.
         if length == 0 {
             return Ok(Vec::new());
         }
 
-        self.rate_limiter.acquire().await;
         let url = format!("{}/files/{file_id}", self.base_url);
-
-        // RFC 7233 byte ranges are inclusive: bytes=<start>-<end>. With a
-        // non-zero length, `end` is `offset + length - 1`; saturating addition
-        // and subtraction keep the arithmetic within bounds without overflow.
         let end = offset.saturating_add(u64::from(length)).saturating_sub(1);
         let range_header = format!("bytes={offset}-{end}");
 
-        let resp = Self::http()?
-            .get(&url)
-            .bearer_auth(token)
-            .header(reqwest::header::RANGE, range_header)
-            .query(&[("alt", "media"), ("supportsAllDrives", "true")])
-            .send()
+        let resp = self
+            .authenticated_get_range(
+                &url,
+                token,
+                &range_header,
+                &[("alt", "media"), ("supportsAllDrives", "true")],
+            )
             .await?;
 
-        let status = resp.status();
-
-        // Offset at or past EOF — the contract says return empty, not error.
-        if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+        // 416: offset at or past EOF — return empty per the trait contract.
+        if resp.status == 416 {
             return Ok(Vec::new());
         }
 
-        if status.is_client_error() || status.is_server_error() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(drive_api_error("Drive range download error", status, body));
+        if resp.status >= 400 {
+            let body_str = String::from_utf8_lossy(&resp.body).into_owned();
+            return Err(drive_api_error(
+                "Drive range download error",
+                resp.status,
+                body_str,
+            ));
         }
 
-        // 206 means the server honoured the range and the body is already the
-        // requested window. Any other success (notably 200) means the server
-        // ignored the header and sent the whole file, so slice client-side.
-        let honoured_range = status == reqwest::StatusCode::PARTIAL_CONTENT;
-        let bytes = resp.bytes().await?;
+        let honoured_range = resp.status == 206;
+        let bytes = resp.body;
 
         if honoured_range {
-            return Ok(bytes.to_vec());
+            return Ok(bytes);
         }
 
+        // 200: server returned the full file; slice client-side.
         let start = usize::try_from(offset)
             .unwrap_or(usize::MAX)
             .min(bytes.len());
@@ -471,7 +674,7 @@ impl DriveClient {
         let resp = self
             .authenticated_get("about", token, &[("fields", "storageQuota(limit,usage)")])
             .await?;
-        let about = resp.json::<AboutResponse>().await?;
+        let about = serde_json::from_slice::<AboutResponse>(&resp.body)?;
         Ok(about)
     }
 
@@ -490,7 +693,7 @@ impl DriveClient {
                 &[("supportsAllDrives", "true")],
             )
             .await?;
-        let spt = resp.json::<StartPageToken>().await?;
+        let spt = serde_json::from_slice::<StartPageToken>(&resp.body)?;
         Ok(spt.start_page_token)
     }
 
@@ -509,14 +712,13 @@ impl DriveClient {
                 ("includeItemsFromAllDrives", "true"),
             ])
             .await?;
-        let changes = resp.json::<ChangesResponse>().await?;
+        let changes = serde_json::from_slice::<ChangesResponse>(&resp.body)?;
         Ok(changes)
     }
 
     // ── Write operations ──
 
-    /// Upload file content (create or update).
-    /// Uses the multipart upload endpoint for new files.
+    /// Upload file content (create new file via multipart upload).
     pub async fn upload_file(
         &self,
         file_name: &str,
@@ -524,9 +726,6 @@ impl DriveClient {
         data: &[u8],
         token: &str,
     ) -> anyhow::Result<DriveFile> {
-        self.rate_limiter.acquire().await;
-
-        // Multipart upload: metadata + content.
         let metadata = serde_json::json!({
             "name": file_name,
             "parents": [parent_id]
@@ -542,27 +741,26 @@ impl DriveClient {
         body.extend_from_slice(data);
         body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
 
-        let url = format!(
-            "{}/files?uploadType=multipart&supportsAllDrives=true&fields=id,name,mimeType,parents,size,modifiedTime,md5Checksum,trashed",
-            self.upload_url
-        );
-        let resp = Self::http()?
-            .post(&url)
-            .bearer_auth(token)
-            .header(
-                "Content-Type",
-                format!("multipart/related; boundary={boundary}"),
+        let url = format!("{}/files", self.upload_url);
+        let resp = self
+            .authenticated_write(
+                "POST",
+                &url,
+                &[
+                    ("uploadType", "multipart"),
+                    ("supportsAllDrives", "true"),
+                    (
+                        "fields",
+                        "id,name,mimeType,parents,size,modifiedTime,md5Checksum,trashed",
+                    ),
+                ],
+                token,
+                body,
+                &format!("multipart/related; boundary={boundary}"),
             )
-            .body(body)
-            .send()
             .await?;
 
-        let status = resp.status();
-        if status.is_client_error() || status.is_server_error() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(drive_api_error("Drive upload error", status, body));
-        }
-        let file = resp.json::<DriveFile>().await?;
+        let file = serde_json::from_slice::<DriveFile>(&resp.body)?;
         Ok(file)
     }
 
@@ -573,25 +771,26 @@ impl DriveClient {
         data: &[u8],
         token: &str,
     ) -> anyhow::Result<DriveFile> {
-        self.rate_limiter.acquire().await;
-        let url = format!(
-            "{}/files/{file_id}?uploadType=media&supportsAllDrives=true&fields=id,name,mimeType,parents,size,modifiedTime,md5Checksum,trashed",
-            self.upload_url
-        );
-        let resp = Self::http()?
-            .patch(&url)
-            .bearer_auth(token)
-            .header("Content-Type", "application/octet-stream")
-            .body(data.to_vec())
-            .send()
+        let url = format!("{}/files/{file_id}", self.upload_url);
+        let resp = self
+            .authenticated_write(
+                "PATCH",
+                &url,
+                &[
+                    ("uploadType", "media"),
+                    ("supportsAllDrives", "true"),
+                    (
+                        "fields",
+                        "id,name,mimeType,parents,size,modifiedTime,md5Checksum,trashed",
+                    ),
+                ],
+                token,
+                data.to_vec(),
+                "application/octet-stream",
+            )
             .await?;
 
-        let status = resp.status();
-        if status.is_client_error() || status.is_server_error() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(drive_api_error("Drive update error", status, body));
-        }
-        let file = resp.json::<DriveFile>().await?;
+        let file = serde_json::from_slice::<DriveFile>(&resp.body)?;
         Ok(file)
     }
 
@@ -602,82 +801,66 @@ impl DriveClient {
         parent_id: &str,
         token: &str,
     ) -> anyhow::Result<DriveFile> {
-        self.rate_limiter.acquire().await;
-        let url = format!(
-            "{}/files?supportsAllDrives=true&fields=id,name,mimeType,parents,size,modifiedTime,md5Checksum,trashed",
-            self.base_url
-        );
         let body = serde_json::json!({
             "name": name,
             "mimeType": "application/vnd.google-apps.folder",
             "parents": [parent_id]
         });
-        let resp = Self::http()?
-            .post(&url)
-            .bearer_auth(token)
-            .json(&body)
-            .send()
+        let url = format!("{}/files", self.base_url);
+        let resp = self
+            .authenticated_write(
+                "POST",
+                &url,
+                &[
+                    ("supportsAllDrives", "true"),
+                    (
+                        "fields",
+                        "id,name,mimeType,parents,size,modifiedTime,md5Checksum,trashed",
+                    ),
+                ],
+                token,
+                body.to_string().into_bytes(),
+                "application/json",
+            )
             .await?;
 
-        let status = resp.status();
-        if status.is_client_error() || status.is_server_error() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(drive_api_error("Drive create_dir error", status, body));
-        }
-        let file = resp.json::<DriveFile>().await?;
+        let file = serde_json::from_slice::<DriveFile>(&resp.body)?;
         Ok(file)
     }
 
     /// Trash (soft-delete) a file.
     pub async fn trash_file(&self, file_id: &str, token: &str) -> anyhow::Result<()> {
-        self.rate_limiter.acquire().await;
-        let url = format!(
-            "{}/files/{file_id}?supportsAllDrives=true&fields=id",
-            self.base_url
-        );
-        let resp = Self::http()?
-            .patch(&url)
-            .bearer_auth(token)
-            .json(&serde_json::json!({"trashed": true}))
-            .send()
-            .await?;
-
-        let status = resp.status();
-        if status.is_client_error() || status.is_server_error() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(drive_api_error("Drive trash error", status, body));
-        }
+        let url = format!("{}/files/{file_id}", self.base_url);
+        let body = serde_json::json!({"trashed": true}).to_string().into_bytes();
+        self.authenticated_write(
+            "PATCH",
+            &url,
+            &[("supportsAllDrives", "true"), ("fields", "id")],
+            token,
+            body,
+            "application/json",
+        )
+        .await?;
         Ok(())
     }
 
     /// Restore a trashed file by clearing the `trashed` flag.
     pub async fn untrash_file(&self, file_id: &str, token: &str) -> anyhow::Result<()> {
-        self.rate_limiter.acquire().await;
-        let url = format!(
-            "{}/files/{file_id}?supportsAllDrives=true&fields=id",
-            self.base_url
-        );
-        let resp = Self::http()?
-            .patch(&url)
-            .bearer_auth(token)
-            .json(&serde_json::json!({"trashed": false}))
-            .send()
-            .await?;
-
-        let status = resp.status();
-        if status.is_client_error() || status.is_server_error() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(drive_api_error("Drive untrash error", status, body));
-        }
+        let url = format!("{}/files/{file_id}", self.base_url);
+        let body = serde_json::json!({"trashed": false}).to_string().into_bytes();
+        self.authenticated_write(
+            "PATCH",
+            &url,
+            &[("supportsAllDrives", "true"), ("fields", "id")],
+            token,
+            body,
+            "application/json",
+        )
+        .await?;
         Ok(())
     }
 
     /// Move a file to a new parent and/or rename it.
-    ///
-    /// `remove_parents` should list the file's current parent IDs that need
-    /// to be detached. Shared-drive items require exactly one parent, so
-    /// `addParents` alone (without a matching `removeParents`) returns 403
-    /// `teamDrivesParentLimit` on them.
     pub async fn move_file(
         &self,
         file_id: &str,
@@ -686,40 +869,43 @@ impl DriveClient {
         new_name: Option<&str>,
         token: &str,
     ) -> anyhow::Result<DriveFile> {
-        self.rate_limiter.acquire().await;
-        let url = format!(
-            "{}/files/{file_id}?supportsAllDrives=true&fields=id,name,mimeType,parents,size,modifiedTime,md5Checksum,trashed",
-            self.base_url
-        );
-        let mut body = serde_json::Map::new();
+        let url = format!("{}/files/{file_id}", self.base_url);
+
+        let mut metadata = serde_json::Map::new();
         if let Some(name) = new_name {
-            body.insert(
+            metadata.insert(
                 "name".to_string(),
                 serde_json::Value::String(name.to_string()),
             );
         }
-        let body = serde_json::Value::Object(body);
+        let body_json = serde_json::Value::Object(metadata);
         let remove_csv = remove_parents.join(",");
-        let resp = Self::http()?
-            .patch(&url)
-            .bearer_auth(token)
-            .query(&[
-                ("addParents", new_parent_id),
-                ("removeParents", remove_csv.as_str()),
-            ])
-            .json(&body)
-            .send()
+
+        let resp = self
+            .authenticated_write(
+                "PATCH",
+                &url,
+                &[
+                    ("supportsAllDrives", "true"),
+                    (
+                        "fields",
+                        "id,name,mimeType,parents,size,modifiedTime,md5Checksum,trashed",
+                    ),
+                    ("addParents", new_parent_id),
+                    ("removeParents", remove_csv.as_str()),
+                ],
+                token,
+                body_json.to_string().into_bytes(),
+                "application/json",
+            )
             .await?;
 
-        let status = resp.status();
-        if status.is_client_error() || status.is_server_error() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(drive_api_error("Drive move error", status, body));
-        }
-        let file = resp.json::<DriveFile>().await?;
+        let file = serde_json::from_slice::<DriveFile>(&resp.body)?;
         Ok(file)
     }
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -742,11 +928,11 @@ mod tests {
         }
         assert!(!limiter.try_acquire());
         limiter.refill();
-        // refill_rate = 100/100 = 1, so after refill we get 1 token back.
         assert!(limiter.try_acquire());
     }
 
     #[test]
+    #[cfg(not(feature = "portable"))]
     fn client_construction() {
         let _client = DriveClient::new();
     }

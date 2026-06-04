@@ -371,7 +371,8 @@ pub async fn poll_for_token(
 // Token refresh
 // ---------------------------------------------------------------------------
 
-/// Refresh an access token using a refresh token.
+/// Refresh an access token using a refresh token (native path).
+#[cfg(not(feature = "portable"))]
 pub async fn refresh_access_token(
     http: &reqwest::Client,
     config: &OAuthConfig,
@@ -395,6 +396,52 @@ pub async fn refresh_access_token(
     }
 
     let token_resp: TokenResponse = resp.json().await?;
+    let secs = i64::try_from(token_resp.expires_in).unwrap_or(i64::MAX);
+    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(secs);
+
+    Ok(AuthTokens {
+        access_token: token_resp.access_token,
+        refresh_token: token_resp
+            .refresh_token
+            .unwrap_or_else(|| refresh_token.to_string()),
+        expires_at,
+    })
+}
+
+/// Refresh an access token using a refresh token (portable path).
+///
+/// Sends `application/x-www-form-urlencoded` via the portable `HttpClient`
+/// trait instead of `reqwest`, so the backend can run in environments where
+/// `reqwest` is not available.
+#[cfg(feature = "portable")]
+pub async fn refresh_access_token(
+    http: &dyn cascade_engine::portable::HttpClient,
+    config: &OAuthConfig,
+    refresh_token: &str,
+) -> anyhow::Result<AuthTokens> {
+    use cascade_engine::portable::HeaderMap;
+
+    let form_body = format!(
+        "client_id={}&client_secret={}&refresh_token={}&grant_type=refresh_token",
+        urlencoding::encode(&config.client_id),
+        urlencoding::encode(&config.client_secret),
+        urlencoding::encode(refresh_token),
+    );
+
+    let mut headers = HeaderMap::new();
+    headers.insert("content-type", "application/x-www-form-urlencoded");
+
+    let resp = http
+        .post(&config.token_url, headers, form_body.into_bytes())
+        .await
+        .map_err(|e| anyhow::anyhow!("Token refresh request failed: {e}"))?;
+
+    if resp.status < 200 || resp.status >= 300 {
+        let body = String::from_utf8_lossy(&resp.body).into_owned();
+        anyhow::bail!("Token refresh failed (HTTP {}): {body}", resp.status);
+    }
+
+    let token_resp: TokenResponse = serde_json::from_slice(&resp.body)?;
     let secs = i64::try_from(token_resp.expires_in).unwrap_or(i64::MAX);
     let expires_at = chrono::Utc::now() + chrono::Duration::seconds(secs);
 

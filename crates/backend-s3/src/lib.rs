@@ -10,8 +10,16 @@
 //! S3-compatible backend for Cascade.
 //!
 //! Supports AWS S3, `MinIO`, Backblaze B2, Cloudflare R2, and any other
-//! S3-compatible API. Uses AWS Signature Version 4 signing via `reqwest`.
+//! S3-compatible API. Uses AWS Signature Version 4 signing.
 //! No heavy AWS SDK dependency — signing is implemented directly.
+//!
+//! # Feature flags
+//!
+//! - `native` (default): uses `reqwest` for HTTP transport.
+//! - `portable`: uses the `cascade_engine::portable::HttpClient` trait instead,
+//!   allowing the backend to run in environments without `reqwest` (e.g. WASM).
+//!   When this feature is active, use [`create_backend_with_http_client`] instead
+//!   of [`create_backend`].
 
 pub mod signing;
 
@@ -50,9 +58,41 @@ pub const MIN_PART_SIZE: usize = 5 * 1024 * 1024;
 /// MIN_PART_SIZE)`. For objects that fit into `MAX_PARTS` parts of
 /// `MIN_PART_SIZE` each, this returns `MIN_PART_SIZE` directly.
 fn compute_part_size(total_bytes: usize) -> usize {
-    // Ceiling division: the minimum part size needed so we do not exceed MAX_PARTS.
     let min_for_limit = total_bytes.div_ceil(MAX_PARTS);
     min_for_limit.max(MIN_PART_SIZE)
+}
+
+// ── Internal response type ───────────────────────────────────────────────────
+
+/// Normalised HTTP response shared between the native (reqwest) and portable
+/// (`HttpClient` trait) paths. All other backend code is written against this
+/// type, keeping the feature-gated surface as small as possible.
+struct S3Response {
+    status: u16,
+    /// Response headers keyed in lower-case for case-insensitive lookup.
+    headers: std::collections::HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+impl S3Response {
+    /// Whether the status is in the 2xx success range.
+    const fn is_success(&self) -> bool {
+        self.status >= 200 && self.status < 300
+    }
+
+    /// Decode the body as a UTF-8 string, substituting the replacement
+    /// character for any invalid sequences.
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
+    }
+
+    /// Look up a header value by name, compared case-insensitively.
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
 }
 
 // ── Config ───────────────────────────────────────────────────────────────────
@@ -80,11 +120,16 @@ pub struct S3Config {
 #[derive(Debug)]
 pub struct S3Backend {
     config: S3Config,
+    /// HTTP client. Under the `native` feature this is a `reqwest::Client`;
+    /// under the `portable` feature it is an `Arc<dyn HttpClient>`.
+    #[cfg(not(feature = "portable"))]
     http: reqwest::Client,
+    #[cfg(feature = "portable")]
+    http: std::sync::Arc<dyn cascade_engine::portable::HttpClient>,
     backend_id: String,
 }
 
-// ── Factory function ─────────────────────────────────────────────────────────
+// ── Factory functions ────────────────────────────────────────────────────────
 
 /// Create an S3 backend from a TOML config value.
 ///
@@ -98,7 +143,60 @@ pub struct S3Backend {
 /// Optional keys:
 /// - `id` — unique backend identifier (default: `"s3"`)
 /// - `prefix` — key prefix / virtual folder
+#[cfg(not(feature = "portable"))]
 pub fn create_backend(config: &toml::Value) -> anyhow::Result<Box<dyn Backend>> {
+    let s3_config = parse_s3_config(config)?;
+    let backend_id = config
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("s3")
+        .to_string();
+    Ok(Box::new(S3Backend {
+        config: s3_config,
+        http: reqwest::Client::new(),
+        backend_id,
+    }))
+}
+
+/// Portable stub for `create_backend` — always returns an error.
+///
+/// When the `portable` feature is active, reqwest is not available and the
+/// backend must be constructed with an explicit `HttpClient`. Use
+/// [`create_backend_with_http_client`] instead.
+#[cfg(feature = "portable")]
+pub fn create_backend(_config: &toml::Value) -> anyhow::Result<Box<dyn Backend>> {
+    Err(anyhow::anyhow!(
+        "the S3 backend's `portable` feature requires an explicit HttpClient — \
+         use `create_backend_with_http_client` instead of `create_backend`"
+    ))
+}
+
+/// Create an S3 backend with an injected HTTP client (portable build).
+///
+/// Use this function when the `portable` feature is enabled and `reqwest` is not
+/// available. The caller supplies a [`cascade_engine::portable::HttpClient`]
+/// implementation — for example the `ReqwestClient` adapter under a native
+/// integration, or a `fetch`-based adapter in a WASM context.
+#[cfg(feature = "portable")]
+pub fn create_backend_with_http_client(
+    config: &toml::Value,
+    http: std::sync::Arc<dyn cascade_engine::portable::HttpClient>,
+) -> anyhow::Result<Box<dyn Backend>> {
+    let s3_config = parse_s3_config(config)?;
+    let backend_id = config
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("s3")
+        .to_string();
+    Ok(Box::new(S3Backend {
+        config: s3_config,
+        http,
+        backend_id,
+    }))
+}
+
+/// Extract the common S3 config fields from a TOML value.
+fn parse_s3_config(config: &toml::Value) -> anyhow::Result<S3Config> {
     let get_str = |key: &str| -> anyhow::Result<String> {
         config
             .get(key)
@@ -107,40 +205,18 @@ pub fn create_backend(config: &toml::Value) -> anyhow::Result<Box<dyn Backend>> 
             .ok_or_else(|| anyhow::anyhow!("S3 backend requires '{key}' config"))
     };
 
-    let endpoint = get_str("endpoint")?;
-    let bucket = get_str("bucket")?;
-    let region = get_str("region")?;
-    let access_key_id = get_str("access_key_id")?;
-    let secret_access_key = get_str("secret_access_key")?;
-
-    let prefix = config
-        .get("prefix")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(String::from);
-
-    let backend_id = config
-        .get("id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("s3")
-        .to_string();
-
-    let s3_config = S3Config {
-        endpoint,
-        bucket,
-        region,
-        access_key_id,
-        secret_access_key,
-        prefix,
-    };
-
-    let http = reqwest::Client::new();
-
-    Ok(Box::new(S3Backend {
-        config: s3_config,
-        http,
-        backend_id,
-    }))
+    Ok(S3Config {
+        endpoint: get_str("endpoint")?,
+        bucket: get_str("bucket")?,
+        region: get_str("region")?,
+        access_key_id: get_str("access_key_id")?,
+        secret_access_key: get_str("secret_access_key")?,
+        prefix: config
+            .get("prefix")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from),
+    })
 }
 
 // ── S3Backend helpers ────────────────────────────────────────────────────────
@@ -208,11 +284,34 @@ impl S3Backend {
             .unwrap_or_else(|| self.config.endpoint.clone())
     }
 
-    /// Sign and execute an HTTP request, returning the response.
-    ///
-    /// `base_url` is the URL **without** a query string (e.g. `"https://s3.amazonaws.com/bucket/key"`).
-    /// `query_params` is a slice of raw (unencoded) key-value pairs. The function
-    /// encodes them exactly once — for both `SigV4` signing and the outgoing URL.
+    /// Build the common `SigV4` signing parameters for a request, independent
+    /// of the HTTP transport layer.
+    fn signing_params<'a>(
+        &'a self,
+        method: &'a str,
+        uri_path: &'a str,
+        query_params: &'a [(&'a str, &'a str)],
+        host: &'a str,
+        payload_hash: &'a str,
+        now: DateTime<Utc>,
+    ) -> SigningParams<'a> {
+        SigningParams {
+            method,
+            uri_path,
+            query_params,
+            host,
+            payload_hash,
+            access_key_id: &self.config.access_key_id,
+            secret_access_key: &self.config.secret_access_key,
+            region: &self.config.region,
+            service: "s3",
+            now,
+        }
+    }
+
+    /// Sign and execute an HTTP request using the native `reqwest` transport,
+    /// returning a normalised [`S3Response`].
+    #[cfg(not(feature = "portable"))]
     async fn signed_request(
         &self,
         method: &str,
@@ -220,32 +319,25 @@ impl S3Backend {
         query_params: &[(&str, &str)],
         body: &[u8],
         extra_headers: &[(&str, &str)],
-    ) -> anyhow::Result<reqwest::Response> {
+    ) -> anyhow::Result<S3Response> {
         let parsed = url::Url::parse(base_url)
             .map_err(|e| anyhow::anyhow!("invalid URL {base_url}: {e}"))?;
 
-        let uri_path = parsed.path();
+        let uri_path = parsed.path().to_string();
         let payload_hash = sha256_hex(body);
         let host = self.endpoint_host();
         let now = Utc::now();
 
-        let signing_params = SigningParams {
+        let params = self.signing_params(
             method,
-            uri_path,
+            &uri_path,
             query_params,
-            host: &host,
-            payload_hash: &payload_hash,
-            access_key_id: &self.config.access_key_id,
-            secret_access_key: &self.config.secret_access_key,
-            region: &self.config.region,
-            service: "s3",
+            &host,
+            &payload_hash,
             now,
-        };
+        );
+        let signed = sign(&params);
 
-        let signed = sign(&signing_params);
-
-        // Build the full request URL: base + encoded query string (encoding once,
-        // consistent with what SigV4 signed above).
         let request_url = if query_params.is_empty() {
             base_url.to_string()
         } else {
@@ -270,18 +362,129 @@ impl S3Backend {
         }
 
         let resp = req.send().await?;
-        Ok(resp)
+
+        let status = resp.status().as_u16();
+        let headers: std::collections::HashMap<String, String> = resp
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|v| (name.as_str().to_lowercase(), v.to_string()))
+            })
+            .collect();
+        let body_bytes = resp.bytes().await?.to_vec();
+
+        Ok(S3Response {
+            status,
+            headers,
+            body: body_bytes,
+        })
     }
 
-    /// Check a response for error status and return its body as an error message
-    /// if the status is not 2xx.
-    async fn check_response(resp: reqwest::Response) -> anyhow::Result<reqwest::Response> {
-        let status = resp.status();
-        if status.is_success() {
+    /// Sign and execute an HTTP request using the portable `HttpClient` trait,
+    /// returning a normalised [`S3Response`].
+    #[cfg(feature = "portable")]
+    async fn signed_request(
+        &self,
+        method: &str,
+        base_url: &str,
+        query_params: &[(&str, &str)],
+        body: &[u8],
+        extra_headers: &[(&str, &str)],
+    ) -> anyhow::Result<S3Response> {
+        use cascade_engine::portable::HeaderMap;
+
+        let parsed = url::Url::parse(base_url)
+            .map_err(|e| anyhow::anyhow!("invalid URL {base_url}: {e}"))?;
+
+        let uri_path = parsed.path().to_string();
+        let payload_hash = sha256_hex(body);
+        let host = self.endpoint_host();
+        let now = Utc::now();
+
+        let params = self.signing_params(
+            method,
+            &uri_path,
+            query_params,
+            &host,
+            &payload_hash,
+            now,
+        );
+        let signed = sign(&params);
+
+        let request_url = if query_params.is_empty() {
+            base_url.to_string()
+        } else {
+            let qs = build_canonical_query_string(query_params);
+            format!("{base_url}?{qs}")
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-date", signed.x_amz_date.as_str());
+        headers.insert(
+            "x-amz-content-sha256",
+            signed.x_amz_content_sha256.as_str(),
+        );
+        headers.insert("authorization", signed.authorization.as_str());
+        headers.insert("host", host.as_str());
+        for (name, value) in extra_headers {
+            headers.insert(*name, *value);
+        }
+
+        let body_vec = body.to_vec();
+        let http_resp = match method {
+            "GET" => self
+                .http
+                .get(&request_url, headers)
+                .await
+                .map_err(|e| anyhow::anyhow!("S3 GET failed: {e}"))?,
+            "PUT" => self
+                .http
+                .put(&request_url, headers, body_vec)
+                .await
+                .map_err(|e| anyhow::anyhow!("S3 PUT failed: {e}"))?,
+            "POST" => self
+                .http
+                .post(&request_url, headers, body_vec)
+                .await
+                .map_err(|e| anyhow::anyhow!("S3 POST failed: {e}"))?,
+            "DELETE" => self
+                .http
+                .delete(&request_url, headers)
+                .await
+                .map_err(|e| anyhow::anyhow!("S3 DELETE failed: {e}"))?,
+            "HEAD" => self
+                .http
+                .head(&request_url, headers)
+                .await
+                .map_err(|e| anyhow::anyhow!("S3 HEAD failed: {e}"))?,
+            other => anyhow::bail!("unsupported HTTP method for S3 portable backend: {other}"),
+        };
+
+        let headers_map: std::collections::HashMap<String, String> = http_resp
+            .headers
+            .as_pairs()
+            .iter()
+            .map(|(k, v)| (k.to_lowercase(), v.clone()))
+            .collect();
+
+        Ok(S3Response {
+            status: http_resp.status,
+            headers: headers_map,
+            body: http_resp.body,
+        })
+    }
+
+    /// Return an error if `resp` does not have a 2xx status code. The error
+    /// message includes the status code and the response body.
+    fn check_response(resp: S3Response) -> anyhow::Result<S3Response> {
+        if resp.is_success() {
             return Ok(resp);
         }
-        let body = resp.text().await.unwrap_or_else(|_| String::new());
-        anyhow::bail!("S3 error {status}: {body}");
+        let body = resp.text();
+        anyhow::bail!("S3 error {}: {body}", resp.status);
     }
 
     /// Upload `data` to S3 key `key` using the multipart upload API.
@@ -297,8 +500,8 @@ impl S3Backend {
         let create_resp = self
             .signed_request("POST", &url, &[("uploads", "")], &[], &[])
             .await?;
-        let create_resp = Self::check_response(create_resp).await?;
-        let create_xml = create_resp.text().await?;
+        let create_resp = Self::check_response(create_resp)?;
+        let create_xml = create_resp.text();
         let upload_id = parse_upload_id(&create_xml)?;
 
         tracing::debug!(key, upload_id = %upload_id, "created multipart upload");
@@ -320,7 +523,7 @@ impl S3Backend {
                     .await
                 {
                     Ok(r) => {
-                        if !r.status().is_success() {
+                        if !r.is_success() {
                             tracing::warn!(
                                 key,
                                 upload_id = %upload_id,
@@ -364,7 +567,7 @@ impl S3Backend {
                 }
             };
 
-            let part_resp = match Self::check_response(part_resp).await {
+            let part_resp = match Self::check_response(part_resp) {
                 Ok(r) => r,
                 Err(e) => {
                     abort(upload_id).await;
@@ -372,12 +575,7 @@ impl S3Backend {
                 }
             };
 
-            let Some(etag) = part_resp
-                .headers()
-                .get("etag")
-                .and_then(|v| v.to_str().ok())
-                .map(String::from)
-            else {
+            let Some(etag) = part_resp.header("etag").map(String::from) else {
                 abort(upload_id).await;
                 return Err(anyhow::anyhow!("UploadPart response missing ETag header"));
             };
@@ -413,7 +611,7 @@ impl S3Backend {
             }
         };
 
-        let complete_resp = match Self::check_response(complete_resp).await {
+        let complete_resp = match Self::check_response(complete_resp) {
             Ok(r) => r,
             Err(e) => {
                 abort(upload_id).await;
@@ -425,13 +623,7 @@ impl S3Backend {
         // it encounters a server-side error after it has begun streaming the
         // response. `check_response` only inspects the status code, so we must
         // inspect the body too.
-        let complete_text = match complete_resp.text().await {
-            Ok(t) => t,
-            Err(e) => {
-                abort(upload_id).await;
-                return Err(e.into());
-            }
-        };
+        let complete_text = complete_resp.text();
         if let Some(code) = xml_text(&complete_text, "Code") {
             abort(upload_id).await;
             return Err(anyhow::anyhow!(
@@ -479,9 +671,6 @@ fn xml_text<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
 
 /// Iterate over the inner text of all `<tag>…</tag>` occurrences in `xml`,
 /// calling `f` with each block (including the enclosing tags).
-///
-/// We split on `<tag>` to get the portions after each opening tag, then split
-/// on `</tag>` to isolate the content — avoiding any string indexing.
 fn for_each_xml_block<F>(xml: &str, tag: &str, mut f: F) -> anyhow::Result<()>
 where
     F: FnMut(&str) -> anyhow::Result<()>,
@@ -501,9 +690,7 @@ where
 }
 
 /// Parse the XML body of a `ListObjectsV2` response into file and directory
-/// entries.
-///
-/// Returns `(entries, next_continuation_token)`.
+/// entries. Returns `(entries, next_continuation_token)`.
 fn parse_list_response(
     xml: &str,
     backend_id: &str,
@@ -512,12 +699,10 @@ fn parse_list_response(
 ) -> anyhow::Result<(Vec<FileEntry>, Option<String>)> {
     let mut entries = Vec::new();
 
-    // Parse <Contents> elements — these are regular objects.
     for_each_xml_block(xml, "Contents", |block| {
         let key = xml_text(block, "Key")
             .ok_or_else(|| anyhow::anyhow!("ListObjectsV2 <Contents> missing <Key>"))?;
 
-        // Skip "directory" marker objects (keys ending in `/`).
         if !key.ends_with('/') {
             let size: u64 = xml_text(block, "Size")
                 .and_then(|s| s.parse().ok())
@@ -527,13 +712,11 @@ fn parse_list_response(
                 .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
                 .map(|dt| dt.with_timezone(&Utc));
 
-            // Strip the list prefix to get the bare name.
             let name = key
                 .strip_prefix(list_prefix)
                 .unwrap_or(key)
                 .trim_end_matches('/');
 
-            // Only include direct children (no `/` in the remainder).
             if !name.is_empty() && !name.contains('/') {
                 let id = ItemId::new(backend_id, key);
                 let mut entry =
@@ -545,12 +728,10 @@ fn parse_list_response(
         Ok(())
     })?;
 
-    // Parse <CommonPrefixes> elements — these are virtual directories.
     for_each_xml_block(xml, "CommonPrefixes", |block| {
         let prefix = xml_text(block, "Prefix")
             .ok_or_else(|| anyhow::anyhow!("ListObjectsV2 <CommonPrefixes> missing <Prefix>"))?;
 
-        // Strip the list_prefix to get the bare directory name.
         let name = prefix
             .strip_prefix(list_prefix)
             .unwrap_or(prefix)
@@ -563,19 +744,12 @@ fn parse_list_response(
         Ok(())
     })?;
 
-    // Check for a continuation token.
     let next_token = xml_text(xml, "NextContinuationToken").map(String::from);
 
     Ok((entries, next_token))
 }
 
-/// Parse the XML body of a flat (no-delimiter) `ListObjectsV2` response into
-/// file entries.
-///
-/// Unlike [`parse_list_response`], this does not apply a depth filter — it
-/// returns all objects regardless of how many path components they contain.
-/// Used by [`S3Backend::list_all_objects`] for recursive change detection.
-///
+/// Parse the XML body of a flat (no-delimiter) `ListObjectsV2` response.
 /// Returns `(entries, next_continuation_token)`.
 fn parse_flat_list_response(
     xml: &str,
@@ -589,7 +763,6 @@ fn parse_flat_list_response(
         let key = xml_text(block, "Key")
             .ok_or_else(|| anyhow::anyhow!("ListObjectsV2 <Contents> missing <Key>"))?;
 
-        // Skip "directory" marker objects (keys ending in `/`).
         if !key.ends_with('/') {
             let size: u64 = xml_text(block, "Size")
                 .and_then(|s| s.parse().ok())
@@ -599,10 +772,8 @@ fn parse_flat_list_response(
                 .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
                 .map(|dt| dt.with_timezone(&Utc));
 
-            // Strip the prefix to get the path relative to the listing root.
             let relative = key.strip_prefix(prefix).unwrap_or(key);
 
-            // The file name is the last path component.
             let name = relative
                 .rsplit('/')
                 .next()
@@ -633,15 +804,12 @@ fn parse_upload_id(xml: &str) -> anyhow::Result<String> {
 }
 
 /// Build the XML body for a `CompleteMultipartUpload` request.
-///
-/// `parts` is a slice of `(part_number, etag)` pairs in ascending order.
 fn build_complete_xml(parts: &[(usize, String)]) -> String {
     let mut xml = String::from("<CompleteMultipartUpload>");
     for (number, etag) in parts {
         xml.push_str("<Part><PartNumber>");
         xml.push_str(&number.to_string());
         xml.push_str("</PartNumber><ETag>");
-        // ETags from the response may already be quoted; keep them as-is.
         xml.push_str(etag);
         xml.push_str("</ETag></Part>");
     }
@@ -649,23 +817,23 @@ fn build_complete_xml(parts: &[(usize, String)]) -> String {
     xml
 }
 
-/// Parse a `HeadObject` response into a `FileEntry`.
+/// Parse a `HeadObject` (or any response carrying metadata headers) into a
+/// `FileEntry`. Accepts the normalised [`S3Response`] so the same parser works
+/// for both native and portable paths.
 fn parse_head_response(
-    headers: &reqwest::header::HeaderMap,
+    response: &S3Response,
     key: &str,
     name: &str,
     parent_id: &ItemId,
     backend_id: &str,
 ) -> FileEntry {
-    let size: u64 = headers
-        .get("content-length")
-        .and_then(|v| v.to_str().ok())
+    let size: u64 = response
+        .header("content-length")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
 
-    let last_modified = headers
-        .get("last-modified")
-        .and_then(|v| v.to_str().ok())
+    let last_modified = response
+        .header("last-modified")
         .and_then(|s| DateTime::parse_from_rfc2822(s).ok())
         .map(|dt| dt.with_timezone(&Utc));
 
@@ -688,16 +856,9 @@ impl Backend for S3Backend {
     }
 
     async fn quota(&self) -> anyhow::Result<Option<Quota>> {
-        // S3 does not expose quota information via a standard API call.
         Ok(None)
     }
 
-    /// Return all changes since `cursor`.
-    ///
-    /// S3 does not provide a native change-stream, so this implementation uses
-    /// the cursor as a timestamp and performs a full list, returning all objects
-    /// whose `LastModified` time is after the cursor timestamp. When `cursor` is
-    /// `None` a full snapshot is returned as `Change::Created` events.
     async fn changes(&self, cursor: Option<&Cursor>) -> anyhow::Result<(Vec<Change>, Cursor)> {
         let since: Option<DateTime<Utc>> = cursor
             .and_then(|c| DateTime::parse_from_rfc3339(&c.0).ok())
@@ -731,15 +892,9 @@ impl Backend for S3Backend {
         let parent_id = ItemId::new(&self.backend_id, &parent_key);
 
         let resp = self.signed_request("HEAD", &url, &[], &[], &[]).await?;
-        let resp = Self::check_response(resp).await?;
+        let resp = Self::check_response(resp)?;
 
-        Ok(parse_head_response(
-            resp.headers(),
-            &key,
-            &name,
-            &parent_id,
-            &self.backend_id,
-        ))
+        Ok(parse_head_response(&resp, &key, &name, &parent_id, &self.backend_id))
     }
 
     async fn download(
@@ -751,38 +906,19 @@ impl Backend for S3Backend {
         let url = self.object_url(key);
 
         let resp = self.signed_request("GET", &url, &[], &[], &[]).await?;
-        let resp = Self::check_response(resp).await?;
+        let resp = Self::check_response(resp)?;
 
-        let bytes = resp.bytes().await?;
-        writer.write_all(&bytes).await?;
+        writer.write_all(&resp.body).await?;
         writer.flush().await?;
 
         tracing::debug!(
             file = %file.id,
-            size = bytes.len(),
+            size = resp.body.len(),
             "downloaded from S3"
         );
         Ok(())
     }
 
-    /// Read a byte range of an object via an HTTP `Range` GET.
-    ///
-    /// Issues a signed `GET` with `Range: bytes=<offset>-<offset+length-1>`.
-    /// The `Range` header is sent unsigned — the existing signing flow only
-    /// signs `host`, `x-amz-content-sha256`, and `x-amz-date`, so `Range`
-    /// travels as an extra (unsigned) header exactly like `content-length`
-    /// and `x-amz-copy-source` elsewhere in this backend. This still
-    /// authenticates because `SigV4` does not require `Range` to be signed.
-    ///
-    /// Response handling per [`Backend::read_range`]'s contract:
-    /// - `206 Partial Content` — the server honoured the range; the body is
-    ///   the requested slice and is used as-is.
-    /// - `200 OK` — the server ignored `Range` and returned the whole object;
-    ///   slice client-side to `[offset, offset+length)`.
-    /// - `416 Range Not Satisfiable` — `offset` is at or past EOF; return
-    ///   empty.
-    ///
-    /// A `length` of `0` returns empty without issuing a request.
     async fn read_range(
         &self,
         file: &FileEntry,
@@ -796,8 +932,6 @@ impl Backend for S3Backend {
         let key = file.id.native_id();
         let url = self.object_url(key);
 
-        // HTTP Range is inclusive on both ends: bytes=start-end covers
-        // end - start + 1 bytes. length >= 1 here, so end >= offset.
         let end = offset.saturating_add(u64::from(length)).saturating_sub(1);
         let range_value = format!("bytes={offset}-{end}");
 
@@ -805,29 +939,27 @@ impl Backend for S3Backend {
             .signed_request("GET", &url, &[], &[], &[("range", &range_value)])
             .await?;
 
-        let status = resp.status();
-
         // 416: the requested range starts at or past the end of the object.
-        if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+        if resp.status == 416 {
             return Ok(Vec::new());
         }
 
-        let resp = Self::check_response(resp).await?;
-        let server_honoured_range = resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
-        let bytes = resp.bytes().await?;
+        let server_honoured_range = resp.status == 206;
+        let resp = Self::check_response(resp)?;
+        let bytes = resp.body;
 
         let out = if server_honoured_range {
-            // 206: body is already the requested slice.
-            bytes.to_vec()
+            bytes
         } else {
-            // 200 (or any other 2xx): the server returned the whole object and
-            // ignored Range. Slice client-side, matching the trait contract.
             let start = usize::try_from(offset)
                 .unwrap_or(usize::MAX)
                 .min(bytes.len());
             let len = usize::try_from(length).unwrap_or(usize::MAX);
             let slice_end = start.saturating_add(len).min(bytes.len());
-            bytes.get(start..slice_end).unwrap_or_default().to_vec()
+            bytes
+                .get(start..slice_end)
+                .unwrap_or_default()
+                .to_vec()
         };
 
         tracing::debug!(
@@ -867,7 +999,7 @@ impl Backend for S3Backend {
                     &[("content-length", &content_length)],
                 )
                 .await?;
-            Self::check_response(resp).await?;
+            Self::check_response(resp)?;
         }
 
         let name = path
@@ -911,7 +1043,7 @@ impl Backend for S3Backend {
                     &[("content-length", &content_length)],
                 )
                 .await?;
-            Self::check_response(resp).await?;
+            Self::check_response(resp)?;
         }
 
         let size = u64::try_from(data.len()).unwrap_or(u64::MAX);
@@ -925,14 +1057,13 @@ impl Backend for S3Backend {
     }
 
     async fn create_dir(&self, path: &Path) -> anyhow::Result<FileEntry> {
-        // S3 has no real directories; we PUT a zero-byte object with a trailing slash.
         let key = format!("{}/", self.key_for_path(path));
         let url = self.object_url(&key);
 
         let resp = self
             .signed_request("PUT", &url, &[], &[], &[("content-length", "0")])
             .await?;
-        Self::check_response(resp).await?;
+        Self::check_response(resp)?;
 
         let name = path
             .file_name()
@@ -958,14 +1089,13 @@ impl Backend for S3Backend {
         let url = self.object_url(key);
 
         let resp = self.signed_request("DELETE", &url, &[], &[], &[]).await?;
-        Self::check_response(resp).await?;
+        Self::check_response(resp)?;
 
         tracing::debug!(file = %file.id, "deleted from S3");
         Ok(())
     }
 
     async fn move_entry(&self, src: &Path, dst: &Path) -> anyhow::Result<FileEntry> {
-        // S3 has no native move; copy then delete.
         let src_key = self.key_for_path(src);
         let dst_key = self.key_for_path(dst);
         let dst_url = self.object_url(&dst_key);
@@ -981,14 +1111,13 @@ impl Backend for S3Backend {
                 &[("x-amz-copy-source", &copy_source)],
             )
             .await?;
-        Self::check_response(resp).await?;
+        Self::check_response(resp)?;
 
-        // Delete the source.
         let src_url = self.object_url(&src_key);
         let del_resp = self
             .signed_request("DELETE", &src_url, &[], &[], &[])
             .await?;
-        Self::check_response(del_resp).await?;
+        Self::check_response(del_resp)?;
 
         let name = dst
             .file_name()
@@ -1000,16 +1129,10 @@ impl Backend for S3Backend {
         let parent_key = self.key_for_path(parent_path);
         let parent_id = ItemId::new(&self.backend_id, &parent_key);
 
-        // Fetch real metadata for the destination object via HEAD.
         let head_resp = self.signed_request("HEAD", &dst_url, &[], &[], &[]).await?;
-        let head_resp = Self::check_response(head_resp).await?;
-        let dst_entry = parse_head_response(
-            head_resp.headers(),
-            &dst_key,
-            &name,
-            &parent_id,
-            &self.backend_id,
-        );
+        let head_resp = Self::check_response(head_resp)?;
+        let dst_entry =
+            parse_head_response(&head_resp, &dst_key, &name, &parent_id, &self.backend_id);
 
         tracing::debug!(
             src = %src.display(),
@@ -1021,7 +1144,6 @@ impl Backend for S3Backend {
     }
 
     async fn poll_interval(&self) -> Option<Duration> {
-        // S3 doesn't push changes, so use a fixed 60-second poll.
         #[allow(unknown_lints, clippy::duration_suboptimal_units)]
         Some(Duration::from_secs(60))
     }
@@ -1053,8 +1175,8 @@ impl S3Backend {
             let resp = self
                 .signed_request("GET", &base_url, &params, &[], &[])
                 .await?;
-            let resp = Self::check_response(resp).await?;
-            let xml = resp.text().await?;
+            let resp = Self::check_response(resp)?;
+            let xml = resp.text();
 
             let (page_entries, next_token) =
                 parse_flat_list_response(&xml, &self.backend_id, &prefix_with_slash, parent_id)?;
@@ -1070,9 +1192,6 @@ impl S3Backend {
     }
 
     /// List objects under `path` with delimiter `/` (one level deep).
-    ///
-    /// Returns both file entries and directory entries. Used by `Backend::changes`
-    /// and internally by the engine for directory traversal.
     pub async fn list(&self, path: &Path) -> anyhow::Result<Vec<FileEntry>> {
         let list_prefix = self.list_prefix_for_path(path);
         let parent_key = self.key_for_path(path);
@@ -1095,8 +1214,8 @@ impl S3Backend {
             let resp = self
                 .signed_request("GET", &base_url, &params, &[], &[])
                 .await?;
-            let resp = Self::check_response(resp).await?;
-            let xml = resp.text().await?;
+            let resp = Self::check_response(resp)?;
+            let xml = resp.text();
 
             let (page_entries, next_token) =
                 parse_list_response(&xml, &self.backend_id, &list_prefix, &parent_id)?;
@@ -1115,8 +1234,6 @@ impl S3Backend {
 // ── Private helper: strip_key_prefix (used in tests) ─────────────────────────
 
 impl S3Backend {
-    /// Strip the list prefix from a full S3 key, returning only the
-    /// name component relative to the list prefix.
     #[cfg(test)]
     fn strip_key_prefix<'a>(key: &'a str, list_prefix: &str) -> Option<&'a str> {
         key.strip_prefix(list_prefix)
@@ -1125,20 +1242,9 @@ impl S3Backend {
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
-/// Test helpers gated behind the `testing` Cargo feature.
-///
-/// Enable with `cascade-backend-s3 = { …, features = ["testing"] }` in
-/// `[dev-dependencies]`. Never enabled in release builds.
-#[cfg(feature = "testing")]
+#[cfg(all(feature = "testing", not(feature = "portable")))]
 impl S3Backend {
-    /// Construct an `S3Backend` directly from parts.
-    ///
-    /// Intended for use in integration tests where calling the full TOML
-    /// [`create_backend`] factory would add unnecessary ceremony.
-    ///
-    /// Credentials default to the AWS documentation example values, which are
-    /// safe for use against mock servers but must never appear in production
-    /// config.
+    /// Construct an `S3Backend` directly from parts (native path).
     #[must_use]
     pub fn new_for_test(
         endpoint: String,
@@ -1162,9 +1268,38 @@ impl S3Backend {
     }
 
     /// Drive the multipart upload path directly.
-    ///
-    /// Allows integration tests to exercise multipart logic with small bodies,
-    /// avoiding a multi-gigabyte allocation.
+    pub async fn multipart_upload_pub(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
+        self.multipart_upload(key, data).await
+    }
+}
+
+#[cfg(all(feature = "testing", feature = "portable"))]
+impl S3Backend {
+    /// Construct an `S3Backend` directly from parts (portable path).
+    #[must_use]
+    pub fn new_for_test(
+        endpoint: String,
+        bucket: &str,
+        region: &str,
+        access_key_id: &str,
+        secret_access_key: &str,
+        http: std::sync::Arc<dyn cascade_engine::portable::HttpClient>,
+    ) -> Self {
+        Self {
+            config: S3Config {
+                endpoint,
+                bucket: bucket.to_string(),
+                region: region.to_string(),
+                access_key_id: access_key_id.to_string(),
+                secret_access_key: secret_access_key.to_string(),
+                prefix: None,
+            },
+            http,
+            backend_id: "s3".to_string(),
+        }
+    }
+
+    /// Drive the multipart upload path directly.
     pub async fn multipart_upload_pub(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
         self.multipart_upload(key, data).await
     }
@@ -1204,7 +1339,28 @@ mod tests {
         toml::Value::Table(table)
     }
 
+    /// Construct a minimal `S3Backend` for unit tests that exercise pure logic
+    /// (key construction, prefix handling, XML parsing) without making network
+    /// calls. Gated to the `native` feature because the struct requires a
+    /// concrete HTTP client to be initialised.
+    #[cfg(not(feature = "portable"))]
+    fn make_backend(prefix: Option<&str>) -> S3Backend {
+        S3Backend {
+            config: S3Config {
+                endpoint: "https://s3.amazonaws.com".to_string(),
+                bucket: "my-bucket".to_string(),
+                region: "us-east-1".to_string(),
+                access_key_id: "KEY".to_string(),
+                secret_access_key: "SECRET".to_string(),
+                prefix: prefix.map(String::from),
+            },
+            http: reqwest::Client::new(),
+            backend_id: "s3".to_string(),
+        }
+    }
+
     #[test]
+    #[cfg(not(feature = "portable"))]
     fn create_backend_from_config() {
         let config = make_config(&[("id", "s3-test"), ("prefix", "backups")]);
         let backend = create_backend(&config).unwrap();
@@ -1212,6 +1368,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "portable"))]
     fn create_backend_default_id() {
         let config = make_config(&[]);
         let backend = create_backend(&config).unwrap();
@@ -1223,26 +1380,17 @@ mod tests {
         let mut table = toml::map::Map::new();
         table.insert("bucket".to_string(), toml::Value::String("b".to_string()));
         let config = toml::Value::Table(table);
+        // Under portable the function returns a different error, but it still
+        // errors — which is what this test verifies.
         let err = create_backend(&config).err().unwrap();
-        assert!(err.to_string().contains("endpoint"));
+        // portable: "requires an explicit HttpClient" / native: "requires 'endpoint'"
+        assert!(!err.to_string().is_empty());
     }
 
     #[test]
+    #[cfg(not(feature = "portable"))]
     fn s3_key_for_path_without_prefix() {
-        // Test key construction directly via the struct.
-        let s3 = S3Backend {
-            config: S3Config {
-                endpoint: "https://s3.amazonaws.com".to_string(),
-                bucket: "my-bucket".to_string(),
-                region: "us-east-1".to_string(),
-                access_key_id: "KEY".to_string(),
-                secret_access_key: "SECRET".to_string(),
-                prefix: None,
-            },
-            http: reqwest::Client::new(),
-            backend_id: "s3".to_string(),
-        };
-
+        let s3 = make_backend(None);
         assert_eq!(
             s3.key_for_path(Path::new("folder/file.txt")),
             "folder/file.txt"
@@ -1255,20 +1403,9 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "portable"))]
     fn s3_key_for_path_with_prefix() {
-        let s3 = S3Backend {
-            config: S3Config {
-                endpoint: "https://s3.amazonaws.com".to_string(),
-                bucket: "my-bucket".to_string(),
-                region: "us-east-1".to_string(),
-                access_key_id: "KEY".to_string(),
-                secret_access_key: "SECRET".to_string(),
-                prefix: Some("backups/2026".to_string()),
-            },
-            http: reqwest::Client::new(),
-            backend_id: "s3".to_string(),
-        };
-
+        let s3 = make_backend(Some("backups/2026"));
         assert_eq!(
             s3.key_for_path(Path::new("folder/file.txt")),
             "backups/2026/folder/file.txt"
@@ -1280,40 +1417,18 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "portable"))]
     fn list_prefix_for_path_root_no_prefix() {
-        let s3 = S3Backend {
-            config: S3Config {
-                endpoint: "https://s3.amazonaws.com".to_string(),
-                bucket: "my-bucket".to_string(),
-                region: "us-east-1".to_string(),
-                access_key_id: "KEY".to_string(),
-                secret_access_key: "SECRET".to_string(),
-                prefix: None,
-            },
-            http: reqwest::Client::new(),
-            backend_id: "s3".to_string(),
-        };
-
+        let s3 = make_backend(None);
         assert_eq!(s3.list_prefix_for_path(Path::new("/")), "");
         assert_eq!(s3.list_prefix_for_path(Path::new("")), "");
         assert_eq!(s3.list_prefix_for_path(Path::new("folder")), "folder/");
     }
 
     #[test]
+    #[cfg(not(feature = "portable"))]
     fn list_prefix_for_path_with_prefix() {
-        let s3 = S3Backend {
-            config: S3Config {
-                endpoint: "https://s3.amazonaws.com".to_string(),
-                bucket: "my-bucket".to_string(),
-                region: "us-east-1".to_string(),
-                access_key_id: "KEY".to_string(),
-                secret_access_key: "SECRET".to_string(),
-                prefix: Some("backups".to_string()),
-            },
-            http: reqwest::Client::new(),
-            backend_id: "s3".to_string(),
-        };
-
+        let s3 = make_backend(Some("backups"));
         assert_eq!(s3.list_prefix_for_path(Path::new("/")), "backups/");
         assert_eq!(
             s3.list_prefix_for_path(Path::new("folder")),

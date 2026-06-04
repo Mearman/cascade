@@ -496,7 +496,7 @@ impl HttpResponse {
 /// Abstraction over an HTTP client (replaces reqwest). Each method buffers the
 /// full response; streaming bodies are out of scope for this contract.
 #[async_trait]
-pub trait HttpClient: Send + Sync {
+pub trait HttpClient: Send + Sync + std::fmt::Debug {
     /// Issue a GET request.
     async fn get(&self, url: &str, headers: HeaderMap) -> Result<HttpResponse, HttpError>;
 
@@ -518,6 +518,17 @@ pub trait HttpClient: Send + Sync {
 
     /// Issue a DELETE request.
     async fn delete(&self, url: &str, headers: HeaderMap) -> Result<HttpResponse, HttpError>;
+
+    /// Issue a PATCH request with a body.
+    async fn patch(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+        body: Vec<u8>,
+    ) -> Result<HttpResponse, HttpError>;
+
+    /// Issue a HEAD request. Returns status and headers; the body is always empty.
+    async fn head(&self, url: &str, headers: HeaderMap) -> Result<HttpResponse, HttpError>;
 }
 
 // ─────────────────────────── Filesystem ───────────────────────────
