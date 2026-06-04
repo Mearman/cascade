@@ -658,6 +658,25 @@ impl HttpClient for ReqwestClient {
             .headers(to_reqwest_headers(&headers)?);
         execute(request).await
     }
+
+    async fn head(&self, url: &str, headers: HeaderMap) -> Result<HttpResponse, HttpError> {
+        let request = self.inner.head(url).headers(to_reqwest_headers(&headers)?);
+        execute(request).await
+    }
+
+    async fn patch(
+        &self,
+        url: &str,
+        headers: HeaderMap,
+        body: Vec<u8>,
+    ) -> Result<HttpResponse, HttpError> {
+        let request = self
+            .inner
+            .patch(url)
+            .headers(to_reqwest_headers(&headers)?)
+            .body(body);
+        execute(request).await
+    }
 }
 
 // ─────────────────────────── Filesystem ───────────────────────────
