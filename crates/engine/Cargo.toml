@@ -15,18 +15,20 @@ thiserror.workspace = true
 tracing.workspace = true
 chrono.workspace = true
 rusqlite = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
 cascade-p2p = { path = "../p2p" }
 data-encoding.workspace = true
 sha2 = { workspace = true }
 
 [features]
-# `native` carries the host-only runtime and storage backends — tokio and
-# rusqlite neither compile to wasm32. It is on by default so an ordinary
-# `cargo build` is unaffected. A wasm build drops it
-# (`--no-default-features --features portable`) and supplies its own adapters
-# behind the `portable` trait contracts.
+# `native` carries the host-only runtime and storage backends — tokio,
+# rusqlite, and reqwest none of which compile to wasm32. It is on by default so
+# an ordinary `cargo build` is unaffected, and it supplies the native adapters
+# in `portable::native` that bind the trait contracts to those crates. A wasm
+# build drops it (`--no-default-features --features portable`) and supplies its
+# own adapters behind the same contracts.
 default = ["native"]
-native = ["dep:tokio", "dep:rusqlite"]
+native = ["dep:tokio", "dep:rusqlite", "dep:reqwest"]
 # `portable` compiles the runtime/storage/HTTP/filesystem trait contracts in
 # `portable`, which the core logic depends on instead of tokio/rusqlite/reqwest
 # /std::fs directly. The traits carry no host-only types, so the module builds

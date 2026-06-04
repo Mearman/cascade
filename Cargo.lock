@@ -444,6 +444,7 @@ dependencies = [
  "cascade-p2p",
  "chrono",
  "data-encoding",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",

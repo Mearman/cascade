@@ -31,6 +31,13 @@
 //! friends) are plain serialisable structs that carry no rusqlite types, so
 //! referencing them here keeps the boundary clean.
 
+// Native adapters bind the contracts below to tokio/rusqlite/reqwest/`std::fs`.
+// They compile only for the native build: a `--features portable` build (wasm
+// or otherwise) drops them and supplies its own adapters over the browser's
+// equivalents instead.
+#[cfg(all(feature = "native", not(feature = "portable")))]
+pub mod native;
+
 use std::collections::HashSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
