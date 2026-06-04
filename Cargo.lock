@@ -333,6 +333,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cascade-backend-fsaccess"
+version = "0.1.74"
+dependencies = [
+ "js-sys",
+ "serde",
+ "thiserror",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+]
+
+[[package]]
 name = "cascade-backend-gdrive"
 version = "0.1.74"
 dependencies = [
@@ -498,6 +509,16 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "x509-parser",
+]
+
+[[package]]
+name = "cascade-p2p-webrtc"
+version = "0.1.74"
+dependencies = [
+ "js-sys",
+ "serde",
+ "thiserror",
+ "wasm-bindgen",
 ]
 
 [[package]]

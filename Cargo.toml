@@ -24,6 +24,14 @@ members = [
     # all deps are target-specific. Verify with:
     #   cargo check -p cascade-wasm --target wasm32-unknown-unknown
     "crates/cascade-wasm",
+    # cascade-backend-fsaccess and cascade-p2p-webrtc compile to
+    # wasm32-unknown-unknown only. On native targets they build as empty libs —
+    # every module and public item is cfg-gated on wasm32 and all deps are
+    # target-specific. Verify with:
+    #   cargo check -p cascade-backend-fsaccess --target wasm32-unknown-unknown
+    #   cargo check -p cascade-p2p-webrtc --target wasm32-unknown-unknown
+    "crates/cascade-backend-fsaccess",
+    "crates/cascade-p2p-webrtc",
 ]
 # The announce Worker (workers/announce) compiles only to
 # wasm32-unknown-unknown — it links the `worker` crate's JS glue — so it is
