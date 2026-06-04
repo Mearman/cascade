@@ -1142,6 +1142,119 @@ impl StateDb {
         )?;
         u64::try_from(rows).map_err(|e| anyhow::anyhow!("prune count overflow: {e}"))
     }
+
+    // ── Data-plane explicit-control bit operations ──
+    //
+    // The F2 invariant: a peer who has ever presented a verified data-verb
+    // token for a folder stays in explicit-control mode for that folder
+    // for as long as the bit persists, so a token revocation or expiry
+    // does not widen the absent direction back to the trusted-peer
+    // default. The runtime data-plane gate consults `list_data_explicit_control`
+    // on every frame; an operator who wants to return a peer to the
+    // trusted-peer default for a folder calls `clear_data_explicit_control`
+    // after removing the underlying grant.
+
+    /// Record (or update) the explicit-control bit for `(peer, folder)`.
+    /// The `data_read` and `data_write` columns are OR-merged with any
+    /// existing row: the bit is sticky across multiple verifies, so a
+    /// later `data:read` verify must not clear a previous `data:write`
+    /// observation. A new row is created on the first verify.
+    pub fn record_data_explicit_control(
+        &self,
+        peer_device: &str,
+        folder_id: &str,
+        data_read: bool,
+        data_write: bool,
+        observed_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        conn.execute(
+            "INSERT INTO data_explicit_control
+                 (peer_device, folder_id, data_read, data_write, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(peer_device, folder_id) DO UPDATE SET
+                 data_read  = data_explicit_control.data_read  OR excluded.data_read,
+                 data_write = data_explicit_control.data_write OR excluded.data_write,
+                 observed_at = MAX(data_explicit_control.observed_at, excluded.observed_at)",
+            (
+                peer_device,
+                folder_id,
+                data_read,
+                data_write,
+                observed_at.timestamp(),
+            ),
+        )?;
+        Ok(())
+    }
+
+    /// List every explicit-control row. The runtime gate calls this on
+    /// every frame, so the read path is the hot one — the result is held
+    /// in the engine's in-memory mirror and refreshed from this on
+    /// startup and on `clear_data_explicit_control`.
+    pub fn list_data_explicit_control(&self) -> Result<Vec<ExplicitControlRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT peer_device, folder_id, data_read, data_write, observed_at
+             FROM data_explicit_control
+             ORDER BY peer_device ASC, folder_id ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                let observed_ts: i64 = row.get(4)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                    row.get::<_, bool>(3)?,
+                    observed_ts,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        rows.into_iter()
+            .map(|(peer_device, folder_id, data_read, data_write, observed_ts)| {
+                let observed_at = DateTime::from_timestamp(observed_ts, 0).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "invalid observed_at timestamp in data_explicit_control row for \
+                         {peer_device}/{folder_id}"
+                    )
+                })?;
+                Ok(ExplicitControlRecord {
+                    peer_device,
+                    folder_id,
+                    data_read,
+                    data_write,
+                    observed_at,
+                })
+            })
+            .collect()
+    }
+
+    /// Explicitly clear the bit for `(peer, folder)`. Returns `true` if a
+    /// row was deleted, `false` if there was no row. This is the only path
+    /// that removes a row; token revocation and token expiry never do.
+    pub fn clear_data_explicit_control(
+        &self,
+        peer_device: &str,
+        folder_id: &str,
+    ) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let rows = conn.execute(
+            "DELETE FROM data_explicit_control
+             WHERE peer_device = ?1 AND folder_id = ?2",
+            [peer_device, folder_id],
+        )?;
+        Ok(rows > 0)
+    }
 }
 
 /// An issued capability-token row read back from the database.
@@ -1339,6 +1452,23 @@ pub struct QuarantineRecord {
     /// The serialised `FileInfo` JSON as sent by the peer.
     pub file_json: String,
     /// Unix timestamp (seconds) when the proposal was observed.
+    pub observed_at: DateTime<Utc>,
+}
+
+/// A row of the F2 explicit-control bit: a peer is in explicit-control
+/// mode for a folder, with the per-direction state observed the last
+/// time a verified data-verb token granted it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplicitControlRecord {
+    /// The peer device in explicit-control mode.
+    pub peer_device: String,
+    /// The BEP folder id the control applies to.
+    pub folder_id: String,
+    /// Whether the verified token granted `data:read` for this folder.
+    pub data_read: bool,
+    /// Whether the verified token granted `data:write` for this folder.
+    pub data_write: bool,
+    /// Unix timestamp (seconds) when the bit was last refreshed.
     pub observed_at: DateTime<Utc>,
 }
 

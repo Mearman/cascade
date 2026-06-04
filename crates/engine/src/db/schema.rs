@@ -9,7 +9,7 @@ impl SchemaVersion {
     /// Current schema version.
     #[must_use]
     pub const fn current() -> Self {
-        Self(4)
+        Self(5)
     }
 }
 
@@ -26,6 +26,9 @@ pub fn migrate(conn: &Connection, from: SchemaVersion, _to: SchemaVersion) -> Re
     }
     if from < SchemaVersion(4) {
         v4_data_receive_quarantine(conn)?;
+    }
+    if from < SchemaVersion(5) {
+        v5_data_explicit_control(conn)?;
     }
 
     Ok(())
@@ -236,6 +239,39 @@ fn v4_data_receive_quarantine(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_quarantine_folder_peer
             ON data_receive_quarantine(folder_id, peer_device);
+        ",
+    )?;
+
+    Ok(())
+}
+
+/// Schema v5 — explicit-control bit for directional data sharing.
+///
+/// `data_explicit_control` is the durable backing for the F2 invariant: a
+/// peer who has *ever* presented a verified data-verb token for a folder is
+/// in explicit-control mode for that folder, even after the token has been
+/// revoked or has expired. The runtime data-plane gate consults the bit so
+/// the absent direction stays denied; a token-only restriction cannot be
+/// widened back to the trusted-peer default by revoking or letting the
+/// token lapse.
+///
+/// The bit is set on the first successful token verify (folded in by the
+/// `DataAuthority` impl) and persists across restarts, so a stale
+/// restart cannot re-introduce the F2 widening. An explicit
+/// `clear_data_explicit_control` row operation — the only path that
+/// removes a row — exists for the operator to return the peer to the
+/// trusted-peer default after they have removed the underlying grant.
+fn v5_data_explicit_control(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS data_explicit_control (
+            peer_device   TEXT NOT NULL,
+            folder_id     TEXT NOT NULL,
+            data_read     BOOLEAN NOT NULL,
+            data_write    BOOLEAN NOT NULL,
+            observed_at   INTEGER NOT NULL,
+            PRIMARY KEY (peer_device, folder_id)
+        );
         ",
     )?;
 

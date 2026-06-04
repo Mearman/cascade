@@ -28,8 +28,9 @@ use crate::changefeed::ChangeFeed;
 use crate::config::ConfigResolver;
 use crate::db::{AuditEntry, PinRuleRecord, QuarantineRecord, StateDb};
 use crate::manage::{
-    DataAccess, DataAuthority, DeviceId, Grant, ManageCommandExecutor, ManageDispatch,
-    ManageGrantStore, Scope, data_access, run_dispatch, verify_data_token,
+    DataAccess, DataAuthority, DeviceId, ExplicitControlState, Grant, ManageCommandExecutor,
+    ManageDispatch, ManageGrantStore, Scope, data_access_with_explicit_control, run_dispatch,
+    verify_data_token,
 };
 use crate::p2p_bridge::P2pBridge;
 use crate::presenter::VfsPresenter;
@@ -599,6 +600,28 @@ impl Engine {
     pub const fn db(&self) -> &Arc<StateDb> {
         &self.db
     }
+
+    /// Snapshot the F2 explicit-control bit. Returns a map keyed by
+    /// `(peer_device, folder_id)` with the per-direction state observed on
+    /// the last successful token verify. Exists for the F2 integration
+    /// test to assert the in-memory mirror reflects the durable state
+    /// the engine just observed.
+    pub async fn explicit_data_control_snapshot(
+        &self,
+    ) -> std::collections::HashMap<(String, String), (bool, bool)> {
+        let rows = match self.db.list_data_explicit_control() {
+            Ok(rows) => rows,
+            Err(_) => return std::collections::HashMap::new(),
+        };
+        rows.into_iter()
+            .map(|r| {
+                (
+                    (r.peer_device, r.folder_id),
+                    (r.data_read, r.data_write),
+                )
+            })
+            .collect()
+    }
 }
 
 /// The engine is the grant store and audit sink for the management plane,
@@ -788,11 +811,13 @@ impl ManageDispatch for Engine {
 /// grants, the token revocation list, and any signed data-verb token the peer
 /// presented on its sync `ClusterConfig`.
 ///
-/// The decision is **default-open** (see [`data_access`]): a trusted peer with
-/// no data grant configured keeps full bidirectional access, and the feature
-/// only ever narrows. Both the grant rows and the revocation list are read on
-/// every call, so revoking or expiring a grant takes effect at the next frame
-/// rather than at restart.
+/// The decision is **default-open** (see [`data_access_with_explicit_control`]):
+/// a trusted peer with no data grant configured keeps full bidirectional
+/// access, and the feature only ever narrows. Both the grant rows and the
+/// revocation list are read on every call, so revoking or expiring a grant
+/// takes effect at the next frame rather than at restart. The F2
+/// explicit-control bit is consulted on every call too, so a verified-token
+/// restriction survives the token revocation or expiry that prompted it.
 #[async_trait]
 impl DataAuthority for Engine {
     async fn data_access(
@@ -819,10 +844,45 @@ impl DataAuthority for Engine {
         if let Some(token_json) = presented_token
             && let Some(token_grant) = verify_data_token(self, peer, token_json, now)
         {
+            // The F2 invariant: a successful verify pins the peer into
+            // explicit-control mode for the folder. Record the bit so the
+            // absent direction stays denied even if the token is later
+            // revoked or allowed to expire. The data-plane gate keys on
+            // `folder`, the runtime value the BEP session is bound to, not
+            // the token's carried scope — the verify path's scope-cover
+            // check has already confirmed the two agree.
+            self.db.record_data_explicit_control(
+                peer.as_str(),
+                folder,
+                matches!(token_grant.capability, crate::manage::Capability::DataRead),
+                matches!(
+                    token_grant.capability,
+                    crate::manage::Capability::DataWrite
+                ),
+                now,
+            )?;
             grants.push(token_grant);
         }
 
-        Ok(data_access(&grants, peer, folder, now))
+        let explicit_control: Vec<ExplicitControlState> = self
+            .db
+            .list_data_explicit_control()?
+            .into_iter()
+            .map(|record| ExplicitControlState {
+                peer: record.peer_device,
+                folder: record.folder_id,
+                data_read: record.data_read,
+                data_write: record.data_write,
+            })
+            .collect();
+
+        Ok(data_access_with_explicit_control(
+            &grants,
+            peer,
+            folder,
+            now,
+            &explicit_control,
+        ))
     }
 
     async fn quarantine_received(

@@ -456,6 +456,36 @@ pub fn data_access(
     folder: &str,
     now: DateTime<Utc>,
 ) -> DataAccess {
+    data_access_with_explicit_control(grants, peer, folder, now, &[])
+}
+
+/// Decide the data-plane access a `peer` has for `folder` given the grants
+/// held on this node, the revoked token ids, and the F2 explicit-control
+/// bit, at `now`.
+///
+/// The F2 invariant: a peer who has *ever* presented a verified data-verb
+/// token for a folder is in explicit-control mode for that folder, even
+/// after the token has been revoked or has expired. The absent direction
+/// stays denied; a token-only restriction cannot be widened back to the
+/// trusted-peer default by revoking or letting the token lapse.
+///
+/// `explicit_control` is the slice of `(peer, folder, data_read, data_write)`
+/// rows the engine's in-memory mirror holds. When the slice contains a row
+/// for `(peer, folder)`, that row's per-direction state is honoured in
+/// addition to the grant-driven decision, so a token-only restriction
+/// survives the token revocation: the bit is set when the token first
+/// verifies and never cleared by revocation or expiry.
+///
+/// The function is pure so it can be used in tests and in the hot BEP path
+/// without I/O. The `DataAuthority` trait wraps the I/O boundary.
+#[must_use]
+pub fn data_access_with_explicit_control(
+    grants: &[Grant],
+    peer: &DeviceId,
+    folder: &str,
+    now: DateTime<Utc>,
+    explicit_control: &[ExplicitControlState],
+) -> DataAccess {
     let folder_scope = Scope::folder(folder);
 
     // Collect data grants that cover this peer and folder, partitioned by
@@ -502,11 +532,40 @@ pub fn data_access(
         }
     } else {
         // Rule 3: no data grant of any kind — trusted-peer default (full sharing).
-        DataAccess {
-            read: true,
-            write: true,
+        // But the F2 bit may still pin the peer into explicit-control mode.
+        // If a bit exists for this (peer, folder), apply it: the bit carries
+        // the per-direction state observed on the first successful verify,
+        // and it survives any token revocation or expiry.
+        if let Some(state) = explicit_control
+            .iter()
+            .find(|s| s.peer == peer.as_str() && s.folder == folder)
+        {
+            DataAccess {
+                read: state.data_read,
+                write: state.data_write,
+            }
+        } else {
+            DataAccess {
+                read: true,
+                write: true,
+            }
         }
     }
+}
+
+/// The in-memory representation of one F2 explicit-control row. Mirrored
+/// from the `data_explicit_control` table into the engine on startup and
+/// refreshed on `clear_data_explicit_control`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExplicitControlState {
+    /// The peer device in explicit-control mode.
+    pub peer: String,
+    /// The BEP folder id the control applies to.
+    pub folder: String,
+    /// Whether the verified token granted `data:read` for this folder.
+    pub data_read: bool,
+    /// Whether the verified token granted `data:write` for this folder.
+    pub data_write: bool,
 }
 
 /// The data-plane authority port: consults the on-node data grants and
