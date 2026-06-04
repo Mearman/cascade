@@ -38,8 +38,7 @@ use wasm_bindgen::prelude::*;
 pub fn parse_config(toml_str: &str) -> Result<JsValue, JsValue> {
     let config = cascade_config::parse::toml::parse(toml_str)
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let json = serde_json::to_string(&config)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let json = serde_json::to_string(&config).map_err(|e| JsValue::from_str(&e.to_string()))?;
     js_sys::JSON::parse(&json)
         .map_err(|_| JsValue::from_str("serialised config was not valid JSON"))
 }
@@ -71,9 +70,8 @@ pub fn parse_config(toml_str: &str) -> Result<JsValue, JsValue> {
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub fn eval_expression(expr: &str, context_json: &str) -> Result<bool, JsValue> {
-    let ast = cascade_expr::eval::parse_expr(expr)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let ctx = context::from_json(context_json)
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let ast =
+        cascade_expr::eval::parse_expr(expr).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let ctx = context::from_json(context_json).map_err(|e| JsValue::from_str(&e.to_string()))?;
     Ok(cascade_expr::eval::evaluate(&ast, &ctx))
 }

@@ -166,11 +166,7 @@ pub trait StateStorage: Send + Sync {
     async fn delete_subtree(&self, root_id: &ItemId) -> Result<(), StorageError>;
 
     /// Update the cache state of a file.
-    async fn update_cache_state(
-        &self,
-        id: &ItemId,
-        state: CacheState,
-    ) -> Result<(), StorageError>;
+    async fn update_cache_state(&self, id: &ItemId, state: CacheState) -> Result<(), StorageError>;
 
     /// Read the cache state of a file, or `None` if the file is unknown.
     async fn get_cache_state(&self, id: &ItemId) -> Result<Option<CacheState>, StorageError>;
@@ -230,9 +226,7 @@ pub trait StateStorage: Send + Sync {
     ) -> Result<(), StorageError>;
 
     /// List lifecycle policies, ordered by priority descending.
-    async fn list_lifecycle_policies(
-        &self,
-    ) -> Result<Vec<LifecyclePolicyRecord>, StorageError>;
+    async fn list_lifecycle_policies(&self) -> Result<Vec<LifecyclePolicyRecord>, StorageError>;
 
     /// Remove a lifecycle policy by id. Returns `true` if a row was removed.
     async fn remove_lifecycle_policy(&self, id: i64) -> Result<bool, StorageError>;
@@ -278,10 +272,7 @@ pub trait StateStorage: Send + Sync {
 
     /// Eviction candidates: cached, non-pinned files ordered least-recently
     /// accessed first.
-    async fn eviction_candidates(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<FileEntry>, StorageError>;
+    async fn eviction_candidates(&self, limit: usize) -> Result<Vec<FileEntry>, StorageError>;
 
     // ── P2P operations ──
 
@@ -401,9 +392,7 @@ pub trait StateStorage: Send + Sync {
     ) -> Result<(), StorageError>;
 
     /// List every explicit-control row.
-    async fn list_data_explicit_control(
-        &self,
-    ) -> Result<Vec<ExplicitControlRecord>, StorageError>;
+    async fn list_data_explicit_control(&self) -> Result<Vec<ExplicitControlRecord>, StorageError>;
 
     /// Clear the explicit-control bit for a `(peer, folder)` pair. Returns
     /// `true` if a row was removed.
