@@ -1,7 +1,9 @@
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useState, useContext } from 'preact/hooks';
 import { api } from '@/api/client';
 import type { HealthResponse, SessionResponse } from '@/api/types';
 import { ErrorBanner, Spinner } from '@/components';
+import { AppContext } from '@/context';
+import { RuntimeMode } from '@/wasm';
 
 function formatBytes(bytes: number): string {
   if (bytes === 0) return '0 B';
@@ -13,7 +15,9 @@ function formatBytes(bytes: number): string {
   return `${(bytes / Math.pow(k, i)).toFixed(1)} ${unit}`;
 }
 
-export function DashboardPage() {
+// ─── Connected mode dashboard ─────────────────────────────────────────────────
+
+function ConnectedDashboard() {
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [session, setSession] = useState<SessionResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -30,8 +34,8 @@ export function DashboardPage() {
   }, []);
 
   if (loading) return <Spinner />;
-  if (error) return <ErrorBanner message={error} />;
-  if (!health || !session) return null;
+  if (error !== null) return <ErrorBanner message={error} />;
+  if (health === null || session === null) return null;
 
   const { abilities } = session;
 
@@ -47,7 +51,11 @@ export function DashboardPage() {
           <dt>Device ID</dt>
           <dd><code>{health.node_device_id}</code></dd>
           <dt>Session class</dt>
-          <dd><span class={`badge badge-class badge-${session.session.class}`}>{session.session.class}</span></dd>
+          <dd>
+            <span class={`badge badge-class badge-${session.session.class}`}>
+              {session.session.class}
+            </span>
+          </dd>
         </dl>
       </section>
 
@@ -90,4 +98,65 @@ export function DashboardPage() {
       </section>
     </div>
   );
+}
+
+// ─── WASM mode dashboard ──────────────────────────────────────────────────────
+
+function WasmDashboard({ mode }: { mode: RuntimeMode }) {
+  const [ready, setReady] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    api.wasmReady()
+      .then((r) => setReady(r))
+      .catch(() => setReady(false));
+  }, []);
+
+  return (
+    <div class="dashboard">
+      <h2>Dashboard</h2>
+
+      <section class="dashboard-section">
+        <h3>WASM Engine</h3>
+        <dl class="info-list">
+          <dt>Status</dt>
+          <dd>
+            {ready === null
+              ? <Spinner />
+              : <span class={`badge ${ready ? 'ok' : 'danger'}`}>{ready ? 'Ready' : 'Error'}</span>
+            }
+          </dd>
+          <dt>Mode</dt>
+          <dd>
+            {mode === RuntimeMode.Standalone
+              ? 'Standalone (local filesystem + cloud)'
+              : 'Browse-only (cloud access)'}
+          </dd>
+        </dl>
+      </section>
+
+      <section class="dashboard-section">
+        <h3>Backends</h3>
+        <p class="muted">
+          No backends connected yet. Sign in with Google on the{' '}
+          <a href="/login">login page</a> to add Google Drive.
+        </p>
+      </section>
+
+      <section class="dashboard-section">
+        <h3>Sync</h3>
+        <p class="muted">Sync state will appear here once a backend is connected.</p>
+      </section>
+    </div>
+  );
+}
+
+// ─── Public export ────────────────────────────────────────────────────────────
+
+export function DashboardPage() {
+  const { mode } = useContext(AppContext);
+
+  if (mode !== RuntimeMode.Connected) {
+    return <WasmDashboard mode={mode} />;
+  }
+  return <ConnectedDashboard />;
 }

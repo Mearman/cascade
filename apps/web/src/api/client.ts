@@ -33,6 +33,7 @@ import type {
   ErrorCode,
 } from './types';
 import { ApiError } from './types';
+import { createClient as createBridgeClient, type ApiClient as BridgeApiClient, RuntimeMode } from '@/wasm';
 
 export const API_BASE_KEY = 'cascade-api-base';
 export const TOKEN_KEY = 'cascade-token';
@@ -63,6 +64,10 @@ function isCapabilityToken(value: unknown): value is CapabilityToken {
   if (!('expires' in value) || typeof value.expires !== 'string') return false;
   if (!('issued_at' in value) || typeof value.issued_at !== 'string') return false;
   return true;
+}
+
+function isBridgeMethod(m: string): m is 'GET' | 'POST' | 'PUT' | 'DELETE' {
+  return m === 'GET' || m === 'POST' || m === 'PUT' || m === 'DELETE';
 }
 
 function isApiErrorResponse(body: unknown): body is ApiErrorResponse {
@@ -103,6 +108,28 @@ function parseApiError(body: unknown): ApiErrorDetail {
 export class ApiClient {
   private token: CapabilityToken | null = null;
   private on401: (() => void) | null = null;
+  private bridgeClient: BridgeApiClient | null = null;
+  private currentMode: RuntimeMode = RuntimeMode.Connected;
+
+  setMode(mode: RuntimeMode): void {
+    if (mode === this.currentMode) return;
+    this.currentMode = mode;
+    if (mode === RuntimeMode.Connected) {
+      this.bridgeClient = null;
+    } else {
+      this.bridgeClient = createBridgeClient(mode);
+    }
+  }
+
+  getMode(): RuntimeMode {
+    return this.currentMode;
+  }
+
+  // Resolves to true once the WASM worker has initialised. Always false in Connected mode.
+  wasmReady(): Promise<boolean> {
+    if (this.bridgeClient === null) return Promise.resolve(false);
+    return this.bridgeClient.ready();
+  }
 
   setToken(token: CapabilityToken | null): void {
     this.token = token;
@@ -121,6 +148,24 @@ export class ApiClient {
     path: string,
     body?: unknown,
   ): Promise<T> {
+    // WASM modes route through the bridge worker instead of direct fetch.
+    if (this.bridgeClient !== null) {
+      if (!isBridgeMethod(method)) {
+        throw new Error(`WASM bridge does not support HTTP method: ${method}`);
+      }
+      const result = await this.bridgeClient.request(method, path, body);
+      if (result.status === 204) return undefined as T;
+      if (result.status === 401) {
+        this.token = null;
+        this.on401?.();
+        throw new ApiError(parseApiError(result.body));
+      }
+      if (result.status < 200 || result.status >= 300) {
+        throw new ApiError(parseApiError(result.body));
+      }
+      return result.body as T;
+    }
+
     const token = this.getToken();
     const headers: Record<string, string> = {};
 
@@ -170,7 +215,11 @@ export class ApiClient {
 
   // ─── Health / Readiness ────────────────────────────────────────────────────
 
-  health(): Promise<HealthResponse> {
+  async health(): Promise<HealthResponse> {
+    if (this.bridgeClient !== null) {
+      const result = await this.bridgeClient.request('GET', '/health');
+      return result.body as HealthResponse;
+    }
     return fetch(`${getBase()}/v1/health`).then((r) => r.json() as Promise<HealthResponse>);
   }
 

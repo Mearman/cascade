@@ -1,8 +1,27 @@
 import { api, API_BASE_KEY, TOKEN_KEY } from '@/api/client';
 import { ApiError } from '@/api/types';
 import type { CapabilityToken, SessionResponse } from '@/api/types';
+import { RuntimeMode } from '@/wasm';
 
 export { API_BASE_KEY };
+
+export const MODE_STORAGE_KEY = 'cascade-runtime-mode';
+
+export function getStoredMode(): RuntimeMode | null {
+  const stored = localStorage.getItem(MODE_STORAGE_KEY);
+  if (stored === RuntimeMode.Standalone) return RuntimeMode.Standalone;
+  if (stored === RuntimeMode.Connected) return RuntimeMode.Connected;
+  if (stored === RuntimeMode.BrowseOnly) return RuntimeMode.BrowseOnly;
+  return null;
+}
+
+export function saveMode(mode: RuntimeMode): void {
+  localStorage.setItem(MODE_STORAGE_KEY, mode);
+}
+
+export function clearMode(): void {
+  localStorage.removeItem(MODE_STORAGE_KEY);
+}
 
 export function isCapabilityToken(value: unknown): value is CapabilityToken {
   if (typeof value !== 'object' || value === null) return false;
