@@ -87,8 +87,8 @@ export function App() {
   }
 
   return (
-    <AppShell>
-      <Router base={ROUTER_BASE}>
+    <Router base={ROUTER_BASE}>
+      <AppShell>
         <Switch>
           <Route path="/login" component={LoginPage} />
           <Route path="/settings" component={() => <SettingsPage />} />
@@ -111,7 +111,7 @@ export function App() {
             <p class="muted">Page not found.</p>
           </Route>
         </Switch>
-      </Router>
-    </AppShell>
+      </AppShell>
+    </Router>
   );
 }
