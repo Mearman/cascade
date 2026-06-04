@@ -17,6 +17,8 @@ pub mod db;
 pub mod engine;
 pub mod manage;
 pub mod p2p_bridge;
+#[cfg(feature = "portable")]
+pub mod portable;
 pub mod presenter;
 pub mod protocol;
 pub mod sync;

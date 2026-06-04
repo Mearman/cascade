@@ -9,15 +9,29 @@ cascade-expr = { path = "../expr" }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, optional = true }
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 chrono.workspace = true
-rusqlite.workspace = true
+rusqlite = { workspace = true, optional = true }
 cascade-p2p = { path = "../p2p" }
 data-encoding.workspace = true
 sha2 = { workspace = true }
+
+[features]
+# `native` carries the host-only runtime and storage backends — tokio and
+# rusqlite neither compile to wasm32. It is on by default so an ordinary
+# `cargo build` is unaffected. A wasm build drops it
+# (`--no-default-features --features portable`) and supplies its own adapters
+# behind the `portable` trait contracts.
+default = ["native"]
+native = ["dep:tokio", "dep:rusqlite"]
+# `portable` compiles the runtime/storage/HTTP/filesystem trait contracts in
+# `portable`, which the core logic depends on instead of tokio/rusqlite/reqwest
+# /std::fs directly. The traits carry no host-only types, so the module builds
+# on any target.
+portable = []
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
