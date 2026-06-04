@@ -33,7 +33,7 @@ jobs:
             target: aarch64-unknown-linux-gnu
           - os: macos-latest
             target: aarch64-apple-darwin
-          - os: windows-latest
+          - os: windows-2025-vs2026
             target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     # sccache wraps rustc so individual compilation units survive release-plz's
@@ -103,6 +103,10 @@ jobs:
         # Mirror rust-cache's save-if policy: only main writes the cache so
         # feature-branch churn can't evict the warm main-line entry.
         if: github.ref == 'refs/heads/main'
+        # sccache is a build-time accelerator; an empty or failed cache save
+        # is a noisy warning, not a real failure. Continue on error so the
+        # post-build upload doesn't pollute the run summary.
+        continue-on-error: true
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ runner.temp }}/sccache
@@ -121,7 +125,7 @@ jobs:
             target: aarch64-unknown-linux-gnu
           - os: macos-latest
             target: aarch64-apple-darwin
-          - os: windows-latest
+          - os: windows-2025-vs2026
             target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     env:
@@ -158,6 +162,10 @@ jobs:
         run: sccache --show-stats
       - name: Save sccache
         if: github.ref == 'refs/heads/main'
+        # sccache is a build-time accelerator; an empty or failed cache save
+        # is a noisy warning, not a real failure. Continue on error so the
+        # post-build upload doesn't pollute the run summary.
+        continue-on-error: true
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ runner.temp }}/sccache
@@ -238,6 +246,10 @@ jobs:
         run: sccache --show-stats
       - name: Save sccache
         if: github.ref == 'refs/heads/main'
+        # sccache is a build-time accelerator; an empty or failed cache save
+        # is a noisy warning, not a real failure. Continue on error so the
+        # post-build upload doesn't pollute the run summary.
+        continue-on-error: true
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ runner.temp }}/sccache
@@ -306,6 +318,10 @@ jobs:
         run: sccache --show-stats
       - name: Save sccache
         if: github.ref == 'refs/heads/main'
+        # sccache is a build-time accelerator; an empty or failed cache save
+        # is a noisy warning, not a real failure. Continue on error so the
+        # post-build upload doesn't pollute the run summary.
+        continue-on-error: true
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ runner.temp }}/sccache
@@ -315,7 +331,7 @@ jobs:
     name: ProjFS availability probe (Windows)
     needs: [check, test]
     timeout-minutes: 20
-    runs-on: windows-latest
+    runs-on: windows-2025-vs2026
     steps:
       # Diagnostic only: confirms whether the Windows Projected File System
       # (Client-ProjFS) optional feature is enabled on the hosted runner and
@@ -372,7 +388,7 @@ jobs:
     name: ProjFS live integration (Windows)
     needs: [check, test]
     timeout-minutes: 20
-    runs-on: windows-latest
+    runs-on: windows-2025-vs2026
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -540,6 +556,10 @@ jobs:
         run: sccache --show-stats
       - name: Save sccache
         if: github.ref == 'refs/heads/main'
+        # sccache is a build-time accelerator; an empty or failed cache save
+        # is a noisy warning, not a real failure. Continue on error so the
+        # post-build upload doesn't pollute the run summary.
+        continue-on-error: true
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ runner.temp }}/sccache
@@ -595,6 +615,10 @@ jobs:
         run: sccache --show-stats
       - name: Save sccache
         if: github.ref == 'refs/heads/main'
+        # sccache is a build-time accelerator; an empty or failed cache save
+        # is a noisy warning, not a real failure. Continue on error so the
+        # post-build upload doesn't pollute the run summary.
+        continue-on-error: true
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ runner.temp }}/sccache
@@ -665,6 +689,10 @@ jobs:
         run: sccache --show-stats
       - name: Save sccache
         if: github.ref == 'refs/heads/main'
+        # sccache is a build-time accelerator; an empty or failed cache save
+        # is a noisy warning, not a real failure. Continue on error so the
+        # post-build upload doesn't pollute the run summary.
+        continue-on-error: true
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ runner.temp }}/sccache
@@ -734,6 +762,10 @@ jobs:
         run: sccache --show-stats
       - name: Save sccache
         if: github.ref == 'refs/heads/main'
+        # sccache is a build-time accelerator; an empty or failed cache save
+        # is a noisy warning, not a real failure. Continue on error so the
+        # post-build upload doesn't pollute the run summary.
+        continue-on-error: true
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ runner.temp }}/sccache
@@ -809,6 +841,10 @@ jobs:
         run: sccache --show-stats
       - name: Save sccache
         if: github.ref == 'refs/heads/main'
+        # sccache is a build-time accelerator; an empty or failed cache save
+        # is a noisy warning, not a real failure. Continue on error so the
+        # post-build upload doesn't pollute the run summary.
+        continue-on-error: true
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ runner.temp }}/sccache
@@ -837,7 +873,7 @@ jobs:
     # dependency graph, and Windows linking is the slowest of the matrix.
     # 60 minutes covers the cold path; warm builds finish well inside it.
     timeout-minutes: 60
-    runs-on: windows-latest
+    runs-on: windows-2025-vs2026
     permissions:
       contents: write
     env:
@@ -878,6 +914,10 @@ jobs:
         run: sccache --show-stats
       - name: Save sccache
         if: github.ref == 'refs/heads/main'
+        # sccache is a build-time accelerator; an empty or failed cache save
+        # is a noisy warning, not a real failure. Continue on error so the
+        # post-build upload doesn't pollute the run summary.
+        continue-on-error: true
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ runner.temp }}/sccache
@@ -1145,7 +1185,7 @@ jobs:
     needs: [release, update-scoop]
     if: needs.release.outputs.released == 'true'
     timeout-minutes: 15
-    runs-on: windows-latest
+    runs-on: windows-2025-vs2026
     steps:
       - name: Cache Scoop downloads
         # Caching the full ~/scoop dir restores an older cascade across
@@ -1344,7 +1384,7 @@ jobs:
     needs: [release, update-scoop]
     if: needs.release.outputs.released == 'true'
     timeout-minutes: 20
-    runs-on: windows-latest
+    runs-on: windows-2025-vs2026
     steps:
       - name: Cache Scoop downloads
         # Caching the full ~/scoop dir restores an older cascade across
@@ -1790,6 +1830,10 @@ jobs:
         run: sccache --show-stats
       - name: Save sccache
         if: github.ref == 'refs/heads/main'
+        # sccache is a build-time accelerator; an empty or failed cache save
+        # is a noisy warning, not a real failure. Continue on error so the
+        # post-build upload doesn't pollute the run summary.
+        continue-on-error: true
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ runner.temp }}/sccache
@@ -1859,6 +1903,10 @@ jobs:
         run: sccache --show-stats
       - name: Save sccache
         if: github.ref == 'refs/heads/main'
+        # sccache is a build-time accelerator; an empty or failed cache save
+        # is a noisy warning, not a real failure. Continue on error so the
+        # post-build upload doesn't pollute the run summary.
+        continue-on-error: true
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ runner.temp }}/sccache
@@ -1929,6 +1977,10 @@ jobs:
         run: sccache --show-stats
       - name: Save sccache
         if: github.ref == 'refs/heads/main'
+        # sccache is a build-time accelerator; an empty or failed cache save
+        # is a noisy warning, not a real failure. Continue on error so the
+        # post-build upload doesn't pollute the run summary.
+        continue-on-error: true
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ runner.temp }}/sccache
@@ -2004,6 +2056,10 @@ jobs:
         run: sccache --show-stats
       - name: Save sccache
         if: github.ref == 'refs/heads/main'
+        # sccache is a build-time accelerator; an empty or failed cache save
+        # is a noisy warning, not a real failure. Continue on error so the
+        # post-build upload doesn't pollute the run summary.
+        continue-on-error: true
         uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: ${{ runner.temp }}/sccache
