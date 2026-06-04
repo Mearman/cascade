@@ -10,3 +10,5 @@
 # Local-only build cache config (sccache wiring); never committed — CI sets its
 # own sccache env explicitly.
 /.cargo/config.toml
+
+.playwright-mcp/
