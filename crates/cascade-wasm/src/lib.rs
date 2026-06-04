@@ -16,7 +16,7 @@
 //!
 //! ## API surface
 //!
-//! - [`handle_request`] — the unified entry point the PWA worker drives. It
+//! - `handle_request` — the unified entry point the PWA worker drives. It
 //!   takes a JSON `WorkerRequest` (method + path), routes it, and returns a JSON
 //!   `WorkerResponse`. `GET /v1/health` and `GET /v1/capabilities` are answered
 //!   fully; `GET /v1/session` and `GET /v1/backends` project in-memory state;
@@ -26,7 +26,7 @@
 //!   `remove_peer_connection`) — the worker calls these after it has driven the
 //!   browser-side async work (OAuth, the directory picker, WebRTC signalling) to
 //!   record the resulting handles in the engine's session state.
-//! - [`parse_config`] / [`eval_expression`] — standalone helpers for the config
+//! - `parse_config` / `eval_expression` — standalone helpers for the config
 //!   and expression languages.
 //!
 //! Verify the WASM build with:
