@@ -601,6 +601,18 @@ impl Engine {
         &self.db
     }
 
+    /// This node's full device identity — certificate and private key — when a
+    /// P2P backend is configured.
+    ///
+    /// The management plane (and the HTTP API that reuses its auth machinery)
+    /// signs capability tokens with this identity, the same key a token's
+    /// delegation chain roots in. `None` when no P2P backend is configured, in
+    /// which case the node has no device identity to sign or verify against.
+    #[must_use]
+    pub fn device_identity(&self) -> Option<&cascade_p2p::identity::DeviceIdentity> {
+        self.p2p.as_ref().map(|bridge| bridge.engine().identity())
+    }
+
     /// Snapshot the F2 explicit-control bit. Returns a map keyed by
     /// `(peer_device, folder_id)` with the per-direction state observed on
     /// the last successful token verify. Exists for the F2 integration

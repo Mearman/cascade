@@ -7,6 +7,11 @@ edition.workspace = true
 name = "cascade"
 path = "src/main.rs"
 
+[features]
+# Serve the typed HTTP JSON API for the PWA. Off by default so `axum` does not
+# build when the operator never passes `--web`.
+web = ["dep:cascade-web-api"]
+
 [dependencies]
 cascade-engine = { path = "../engine" }
 cascade-config = { path = "../cascade-config" }
@@ -21,6 +26,7 @@ cascade-presenter-webdav = { path = "../presenter-webdav" }
 cascade-presenter-fskit = { path = "../presenter-fskit" }
 cascade-presenter-fuse = { path = "../presenter-fuse" }
 cascade-presenter-projfs = { path = "../presenter-projfs" }
+cascade-web-api = { path = "../cascade-web-api", optional = true }
 clap.workspace = true
 tokio.workspace = true
 anyhow.workspace = true

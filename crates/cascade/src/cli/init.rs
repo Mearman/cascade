@@ -54,6 +54,37 @@ pub struct CascadeConfig {
     pub mount: MountConfig,
     #[serde(default)]
     pub p2p: P2pConfig,
+    #[serde(default)]
+    pub web: WebConfig,
+}
+
+/// HTTP JSON API configuration — the front door the PWA drives.
+///
+/// Off by default; the daemon serves the API only when `[web].enabled = true`
+/// or `cascade start --web` is passed. Mirrors the CLI flags so an operator can
+/// configure the bind, the advertised bundle URL, and the CORS allowlist from
+/// `config.toml` without repeating them on every start.
+#[derive(Debug, Serialize, Deserialize, Default)]
+pub struct WebConfig {
+    /// Whether to serve the HTTP API. Overridden on by `--web`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// The socket to bind. Absent means the loopback default `127.0.0.1:7842`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind: Option<String>,
+    /// The hosted PWA bundle URL the daemon advertises in `/v1/bundle`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_url: Option<String>,
+    /// Operator-configured CORS origins, in addition to loopback (always
+    /// allowed). A wildcard `*` is refused at startup.
+    #[serde(default)]
+    pub cors_origins: Vec<String>,
+    /// Server-side request timeout in seconds. Absent means the default 3600.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout_secs: Option<u64>,
+    /// Maximum request body size in bytes. Absent means the default 1 GiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_body_bytes: Option<usize>,
 }
 
 /// Mount configuration.

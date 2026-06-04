@@ -9,8 +9,200 @@ use cascade_engine::presenter::VfsPresenter;
 use cascade_presenter_nfs::nfs::server::{NfsCacheMode, NfsServer, NfsServerConfig};
 use cascade_presenter_webdav::WebDavPresenter;
 
-use super::init::{BackendConfig, CascadeConfig, P2pConfig};
+use super::init::{BackendConfig, CascadeConfig, P2pConfig, WebConfig};
 use super::{CliContext, is_process_alive};
+
+// ---------------------------------------------------------------------------
+// HTTP API (PWA) wiring
+// ---------------------------------------------------------------------------
+
+/// Default HTTP API bind — loopback only.
+const WEB_DEFAULT_BIND: &str = "127.0.0.1:7842";
+/// Default HTTP API request timeout in seconds (one hour).
+const WEB_DEFAULT_TIMEOUT_SECS: u64 = 3600;
+/// Default HTTP API maximum request body size in bytes (1 GiB).
+const WEB_DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024 * 1024;
+
+/// The HTTP API flags supplied on the `cascade start` command line.
+#[derive(Debug, Clone, Default)]
+pub struct WebFlags {
+    /// `--web`: serve the HTTP API (overrides `[web].enabled`).
+    pub enable: bool,
+    /// `--web-bind`: bind address override.
+    pub bind: Option<String>,
+    /// `--web-bundle-url`: advertised PWA bundle URL.
+    pub bundle_url: Option<String>,
+    /// `--web-cors-origin`: additional CORS origins (repeatable).
+    pub cors_origins: Vec<String>,
+}
+
+/// The resolved HTTP API configuration, merging `config.toml` `[web]` with the
+/// CLI flags. Always present so the `web` parameter is used in both feature
+/// builds; the actual server is feature-gated.
+///
+/// All fields but `enabled` are read only by the `web`-feature server; without
+/// the feature the struct still carries them (so `resolve_web_options` and the
+/// CLI surface are identical across builds), hence the feature-conditional
+/// dead-code allowance.
+#[derive(Debug, Clone)]
+#[cfg_attr(not(feature = "web"), allow(dead_code))]
+struct WebOptions {
+    enabled: bool,
+    bind: String,
+    bundle_url: Option<String>,
+    cors_origins: Vec<String>,
+    request_timeout_secs: u64,
+    max_body_bytes: usize,
+}
+
+/// Merge the `[web]` config table with the CLI flags. A flag overrides the
+/// config value; `--web` and `[web].enabled` are OR-ed; CORS origins from both
+/// sources accumulate.
+fn resolve_web_options(cfg: &WebConfig, flags: &WebFlags) -> WebOptions {
+    let mut cors_origins = cfg.cors_origins.clone();
+    cors_origins.extend(flags.cors_origins.iter().cloned());
+    WebOptions {
+        enabled: flags.enable || cfg.enabled,
+        bind: flags
+            .bind
+            .clone()
+            .or_else(|| cfg.bind.clone())
+            .unwrap_or_else(|| WEB_DEFAULT_BIND.to_owned()),
+        bundle_url: flags.bundle_url.clone().or_else(|| cfg.bundle_url.clone()),
+        cors_origins,
+        request_timeout_secs: cfg.request_timeout_secs.unwrap_or(WEB_DEFAULT_TIMEOUT_SECS),
+        max_body_bytes: cfg.max_body_bytes.unwrap_or(WEB_DEFAULT_MAX_BODY_BYTES),
+    }
+}
+
+/// A running HTTP API server plus the readiness handle the daemon flips once the
+/// data plane is up.
+#[cfg(feature = "web")]
+struct WebRuntime {
+    handle: cascade_web_api::RouterHandle,
+    readiness: cascade_web_api::Readiness,
+}
+
+/// What [`start_web`] returns: a running server (or `None` when disabled) in the
+/// `web` build, or a unit placeholder otherwise. The alias keeps the presenter
+/// call sites identical across feature builds.
+#[cfg(feature = "web")]
+type WebRuntimeOpt = Option<WebRuntime>;
+/// See [`WebRuntimeOpt`] — the placeholder form when the `web` feature is off.
+#[cfg(not(feature = "web"))]
+type WebRuntimeOpt = Option<()>;
+
+/// Validate the resolved web options and build the bind configuration without
+/// touching the network, so a misconfigured `[web]` fails fast at startup —
+/// before any mount is attempted — rather than after a presenter has come up.
+///
+/// Catches an unparseable bind address, the `0.0.0.0`-without-`bundle_url`
+/// footgun, and a wildcard CORS origin (refused by `BindConfig::new`).
+#[cfg(feature = "web")]
+fn validated_web_config(
+    web: &WebOptions,
+) -> Result<(std::net::SocketAddr, cascade_web_api::state::BindConfig)> {
+    let bind: std::net::SocketAddr = web
+        .bind
+        .parse()
+        .with_context(|| format!("[web] bind `{}` is not a valid socket address", web.bind))?;
+    if bind.ip().is_unspecified() && web.bundle_url.is_none() {
+        anyhow::bail!(
+            "[web] bind {bind} exposes the API on all interfaces but no bundle_url is set; \
+             refusing to start. A bearer-auth API on a public interface without TLS leaks \
+             credentials — put a TLS-terminating reverse proxy in front and set bundle_url."
+        );
+    }
+    let bind_config = cascade_web_api::state::BindConfig::new(
+        bind,
+        web.bundle_url.clone(),
+        web.cors_origins.clone(),
+        web.request_timeout_secs,
+        web.max_body_bytes,
+        env!("CARGO_PKG_VERSION").to_owned(),
+        option_env!("CASCADE_BUILD_SHA").map(ToOwned::to_owned),
+    )
+    .context("invalid [web] configuration")?;
+    Ok((bind, bind_config))
+}
+
+/// Build the HTTP API state from a live engine and spawn the server, when the
+/// `web` feature is compiled in and the operator enabled it.
+#[cfg(feature = "web")]
+async fn start_web(engine: &Arc<Engine>, web: &WebOptions) -> Result<WebRuntimeOpt> {
+    use cascade_web_api::state::{AppState, NodeIdentity, Readiness};
+
+    if !web.enabled {
+        return Ok(None);
+    }
+
+    let identity = engine.device_identity().cloned().context(
+        "the HTTP API requires a device identity; configure a P2P backend or omit --web",
+    )?;
+    let (bind, bind_config) = validated_web_config(web)?;
+    if bind.ip().is_unspecified() {
+        tracing::warn!(
+            %bind,
+            "serving the HTTP API on a public interface — ensure a TLS-terminating reverse \
+             proxy fronts it; bearer tokens must never cross the wire in clear"
+        );
+    }
+
+    let readiness = Readiness::new(chrono::Utc::now());
+    let state = AppState::new(
+        engine.clone(),
+        NodeIdentity::new(identity),
+        bind_config,
+        readiness.clone(),
+    );
+    let handle = cascade_web_api::serve(state)
+        .await
+        .context("could not bind the HTTP API socket")?;
+    tracing::info!(addr = %handle.local_addr(), "HTTP API serving");
+    println!("  HTTP API: http://{}", handle.local_addr());
+    Ok(Some(WebRuntime { handle, readiness }))
+}
+
+/// Stub form when the `web` feature is off: refuse loudly if the operator asked
+/// for the API, otherwise do nothing.
+#[cfg(not(feature = "web"))]
+#[allow(clippy::unused_async)]
+async fn start_web(_engine: &Arc<Engine>, web: &WebOptions) -> Result<WebRuntimeOpt> {
+    if web.enabled {
+        anyhow::bail!(
+            "the HTTP API was requested (--web or [web].enabled) but this binary was built \
+             without the `web` feature; rebuild with `cargo build --features web`"
+        );
+    }
+    Ok(None)
+}
+
+/// Flip the data-plane readiness bit once the presenter is up, so the F3-gated
+/// data routes begin serving. A no-op without the `web` feature.
+#[cfg(feature = "web")]
+fn mark_web_ready(runtime: &WebRuntimeOpt) {
+    if let Some(runtime) = runtime {
+        runtime.readiness.set_data_plane_ready(true);
+    }
+}
+
+/// See [`mark_web_ready`] — the no-op form when the `web` feature is off.
+#[cfg(not(feature = "web"))]
+const fn mark_web_ready(_runtime: &WebRuntimeOpt) {}
+
+/// Gracefully stop the HTTP API server on daemon shutdown, draining in-flight
+/// requests. A no-op without the `web` feature.
+#[cfg(feature = "web")]
+async fn stop_web(runtime: WebRuntimeOpt) {
+    if let Some(runtime) = runtime {
+        runtime.handle.stop().await;
+    }
+}
+
+/// See [`stop_web`] — the no-op form when the `web` feature is off.
+#[cfg(not(feature = "web"))]
+#[allow(clippy::unused_async)]
+async fn stop_web(_runtime: WebRuntimeOpt) {}
 
 /// Resolved optimisation-layer P2P configuration threaded into every
 /// `EngineConfig` at daemon startup.
@@ -237,6 +429,7 @@ pub async fn start(
     no_mount: bool,
     p2p_override: Option<bool>,
     file_provider: bool,
+    web_flags: WebFlags,
 ) -> Result<()> {
     tracing::info!("Starting Cascade daemon");
 
@@ -270,6 +463,23 @@ pub async fn start(
 
     if p2p_config.enable_p2p {
         tracing::info!("P2P optimisation layer enabled");
+    }
+
+    // Resolve the HTTP API config from the [web] table and the CLI flags. The
+    // server is spawned inside whichever presenter strategy succeeds.
+    let web_options = resolve_web_options(&main_config.web, &web_flags);
+    if web_options.enabled {
+        tracing::info!("HTTP API (PWA) enabled");
+        // Fail fast on a misconfigured API before mounting anything, so a bad
+        // bind address or a missing `web` feature never tears down a working
+        // mount during the presenter-fallback chain.
+        #[cfg(feature = "web")]
+        validated_web_config(&web_options).context("[web] configuration is invalid")?;
+        #[cfg(not(feature = "web"))]
+        anyhow::bail!(
+            "the HTTP API was requested (--web or [web].enabled) but this binary was built \
+             without the `web` feature; rebuild with `cargo build --features web`"
+        );
     }
 
     // Create backends from config.
@@ -317,7 +527,7 @@ pub async fn start(
             strategy = "webdav-forced",
             "honouring CASCADE_PRESENTER=webdav"
         );
-        return try_webdav(ctx, &mount_path, backends, no_mount, &p2p_config).await;
+        return try_webdav(ctx, &mount_path, backends, no_mount, &p2p_config, &web_options).await;
     }
 
     // `--file-provider` is an explicit opt-in to the macOS File Provider
@@ -333,7 +543,7 @@ pub async fn start(
     if file_provider {
         let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
         tracing::info!(strategy = "fileprovider", "attempting File Provider mount");
-        return try_fileprovider(ctx, &mount_path, backends, no_mount, &p2p_config).await;
+        return try_fileprovider(ctx, &mount_path, backends, no_mount, &p2p_config, &web_options).await;
     }
 
     // On macOS: FSKit first (native, kext-free, POSIX), then WebDAV (no
@@ -348,7 +558,7 @@ pub async fn start(
         if !no_mount {
             let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
             tracing::info!(strategy = "fskit", "attempting FSKit mount");
-            match try_fskit(ctx, &mount_path, backends, &p2p_config).await {
+            match try_fskit(ctx, &mount_path, backends, &p2p_config, &web_options).await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     tracing::warn!(error = %e, "FSKit mount failed, falling back to WebDAV");
@@ -360,7 +570,7 @@ pub async fn start(
         // Attempt 2: WebDAV.
         let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
         tracing::info!(strategy = "webdav", "attempting WebDAV mount");
-        match try_webdav(ctx, &mount_path, backends, no_mount, &p2p_config).await {
+        match try_webdav(ctx, &mount_path, backends, no_mount, &p2p_config, &web_options).await {
             Ok(()) => return Ok(()),
             Err(e) => {
                 tracing::warn!(error = %e, "WebDAV mount failed, falling back to NFS");
@@ -370,7 +580,7 @@ pub async fn start(
 
         // Attempt 3: NFS (v4 → v3 escalation inside mount_nfs).
         let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
-        try_nfs(ctx, &mount_path, backends, no_mount, &p2p_config).await
+        try_nfs(ctx, &mount_path, backends, no_mount, &p2p_config, &web_options).await
     }
 
     #[cfg(target_os = "linux")]
@@ -389,11 +599,11 @@ pub async fn start(
                 strategy = "webdav-seed",
                 "--no-mount set on Linux; starting WebDAV server in seed mode"
             );
-            try_webdav(ctx, &mount_path, backends, no_mount, &p2p_config).await
+            try_webdav(ctx, &mount_path, backends, no_mount, &p2p_config, &web_options).await
         } else {
             let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
             tracing::info!(strategy = "fuse", "attempting FUSE mount");
-            match try_fuse(ctx, &mount_path, backends, &p2p_config).await {
+            match try_fuse(ctx, &mount_path, backends, &p2p_config, &web_options).await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     tracing::warn!(error = %e, "FUSE mount failed, falling back to NFS");
@@ -402,7 +612,7 @@ pub async fn start(
             }
 
             let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
-            try_nfs(ctx, &mount_path, backends, no_mount, &p2p_config).await
+            try_nfs(ctx, &mount_path, backends, no_mount, &p2p_config, &web_options).await
         }
     }
 
@@ -418,7 +628,7 @@ pub async fn start(
         if !no_mount {
             let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
             tracing::info!(strategy = "projfs", "attempting ProjFS mount");
-            match try_projfs(ctx, &mount_path, backends, &p2p_config).await {
+            match try_projfs(ctx, &mount_path, backends, &p2p_config, &web_options).await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     tracing::warn!(error = %e, "ProjFS mount failed, falling back to WebDAV");
@@ -430,13 +640,13 @@ pub async fn start(
         // Attempt 2: WebDAV via the built-in WebClient service.
         let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
         tracing::info!(strategy = "webdav", "attempting WebDAV mount");
-        try_webdav(ctx, &mount_path, backends, no_mount, &p2p_config).await
+        try_webdav(ctx, &mount_path, backends, no_mount, &p2p_config, &web_options).await
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
-        try_nfs(ctx, &mount_path, backends, no_mount, &p2p_config).await
+        try_nfs(ctx, &mount_path, backends, no_mount, &p2p_config, &web_options).await
     }
 }
 
@@ -456,6 +666,7 @@ async fn try_fskit(
     mount_path: &Path,
     backends: Vec<Arc<dyn cascade_engine::backend::Backend>>,
     p2p: &ResolvedP2pConfig,
+    web: &WebOptions,
 ) -> Result<()> {
     let engine_config = EngineConfig {
         db_path: ctx.db_path.clone(),
@@ -474,6 +685,11 @@ async fn try_fskit(
     // remote management (the P2P backend). Done before the presenter starts so
     // an inbound ManageRequest is authorised and executed rather than refused.
     engine.wire_manage_dispatch().await;
+
+    // Clone the engine handle for the HTTP API before the engine is moved into
+    // the presenter resources; the API server is started only once the winning
+    // presenter is confirmed up, so a failed attempt never binds the port.
+    let engine_for_web = engine.clone();
 
     let presenter = Arc::new(
         cascade_presenter_fskit::FSKitPresenter::from_default_socket()?
@@ -519,7 +735,15 @@ async fn try_fskit(
     println!();
     println!("Press Ctrl+C to stop.");
 
+    // The presenter is up: spawn the HTTP API (feature-gated, when enabled) and
+    // flip the F3 data-plane readiness bit so its data routes begin serving.
+    let web_runtime = start_web(&engine_for_web, web).await?;
+    mark_web_ready(&web_runtime);
+
     wait_for_shutdown_signal().await?;
+
+    // Stop the HTTP API before tearing the rest down.
+    stop_web(web_runtime).await;
 
     tracing::info!("Shutting down...");
 
@@ -608,6 +832,7 @@ async fn try_fileprovider(
     backends: Vec<Arc<dyn cascade_engine::backend::Backend>>,
     _no_mount: bool,
     p2p: &ResolvedP2pConfig,
+    web: &WebOptions,
 ) -> Result<()> {
     use cascade_presenter_fileprovider::engine_handlers::EngineHandlers;
     use cascade_presenter_fileprovider::server::FileProviderServer;
@@ -629,6 +854,11 @@ async fn try_fileprovider(
     // remote management (the P2P backend). Done before the presenter starts so
     // an inbound ManageRequest is authorised and executed rather than refused.
     engine.wire_manage_dispatch().await;
+
+    // Clone the engine handle for the HTTP API before the engine is moved into
+    // the presenter resources; the API server is started only once the winning
+    // presenter is confirmed up, so a failed attempt never binds the port.
+    let engine_for_web = engine.clone();
 
     // The File Provider RPC server answers inbound queries from the Swift
     // extension against the engine's live VFS, state DB, cache directory,
@@ -693,7 +923,15 @@ async fn try_fileprovider(
     println!();
     println!("Press Ctrl+C to stop.");
 
+    // The presenter is up: spawn the HTTP API (feature-gated, when enabled) and
+    // flip the F3 data-plane readiness bit so its data routes begin serving.
+    let web_runtime = start_web(&engine_for_web, web).await?;
+    mark_web_ready(&web_runtime);
+
     wait_for_shutdown_signal().await?;
+
+    // Stop the HTTP API before tearing the rest down.
+    stop_web(web_runtime).await;
 
     tracing::info!("Shutting down...");
 
@@ -732,6 +970,7 @@ async fn try_projfs(
     mount_path: &Path,
     backends: Vec<Arc<dyn cascade_engine::backend::Backend>>,
     p2p: &ResolvedP2pConfig,
+    web: &WebOptions,
 ) -> Result<()> {
     // The backend list is consumed by EngineConfig, so clone it for the
     // content provider first. Cloning a `Vec<Arc<dyn Backend>>` is cheap —
@@ -755,6 +994,11 @@ async fn try_projfs(
     // remote management (the P2P backend). Done before the presenter starts so
     // an inbound ManageRequest is authorised and executed rather than refused.
     engine.wire_manage_dispatch().await;
+
+    // Clone the engine handle for the HTTP API before the engine is moved into
+    // the presenter resources; the API server is started only once the winning
+    // presenter is confirmed up, so a failed attempt never binds the port.
+    let engine_for_web = engine.clone();
 
     // Capture the daemon's runtime handle while still on it. The ProjFS
     // GetFileData callback runs on a kernel thread outside any runtime; the
@@ -840,7 +1084,15 @@ async fn try_projfs(
     println!();
     println!("Press Ctrl+C to stop.");
 
+    // The presenter is up: spawn the HTTP API (feature-gated, when enabled) and
+    // flip the F3 data-plane readiness bit so its data routes begin serving.
+    let web_runtime = start_web(&engine_for_web, web).await?;
+    mark_web_ready(&web_runtime);
+
     wait_for_shutdown_signal().await?;
+
+    // Stop the HTTP API before tearing the rest down.
+    stop_web(web_runtime).await;
 
     tracing::info!("Shutting down...");
 
@@ -868,6 +1120,7 @@ async fn try_webdav(
     backends: Vec<Arc<dyn cascade_engine::backend::Backend>>,
     no_mount: bool,
     p2p: &ResolvedP2pConfig,
+    web: &WebOptions,
 ) -> Result<()> {
     let engine_config = EngineConfig {
         db_path: ctx.db_path.clone(),
@@ -886,6 +1139,11 @@ async fn try_webdav(
     // remote management (the P2P backend). Done before the presenter starts so
     // an inbound ManageRequest is authorised and executed rather than refused.
     engine.wire_manage_dispatch().await;
+
+    // Clone the engine handle for the HTTP API before the engine is moved into
+    // the presenter resources; the API server is started only once the winning
+    // presenter is confirmed up, so a failed attempt never binds the port.
+    let engine_for_web = engine.clone();
 
     let mut presenter = WebDavPresenter::new(mount_path);
     if let Ok(bind) = std::env::var("CASCADE_WEBDAV_BIND") {
@@ -965,7 +1223,15 @@ async fn try_webdav(
     println!();
     println!("Press Ctrl+C to stop.");
 
+    // The presenter is up: spawn the HTTP API (feature-gated, when enabled) and
+    // flip the F3 data-plane readiness bit so its data routes begin serving.
+    let web_runtime = start_web(&engine_for_web, web).await?;
+    mark_web_ready(&web_runtime);
+
     wait_for_shutdown_signal().await?;
+
+    // Stop the HTTP API before tearing the rest down.
+    stop_web(web_runtime).await;
 
     tracing::info!("Shutting down...");
 
@@ -997,6 +1263,7 @@ async fn try_fuse(
     mount_path: &Path,
     backends: Vec<Arc<dyn cascade_engine::backend::Backend>>,
     p2p: &ResolvedP2pConfig,
+    web: &WebOptions,
 ) -> Result<()> {
     let engine_config = EngineConfig {
         db_path: ctx.db_path.clone(),
@@ -1015,6 +1282,11 @@ async fn try_fuse(
     // remote management (the P2P backend). Done before the presenter starts so
     // an inbound ManageRequest is authorised and executed rather than refused.
     engine.wire_manage_dispatch().await;
+
+    // Clone the engine handle for the HTTP API before the engine is moved into
+    // the presenter resources; the API server is started only once the winning
+    // presenter is confirmed up, so a failed attempt never binds the port.
+    let engine_for_web = engine.clone();
 
     let root_id = cascade_engine::types::ItemId::new("vfs", "root");
     let presenter = Arc::new(
@@ -1054,7 +1326,15 @@ async fn try_fuse(
     println!();
     println!("Press Ctrl+C to stop.");
 
+    // The presenter is up: spawn the HTTP API (feature-gated, when enabled) and
+    // flip the F3 data-plane readiness bit so its data routes begin serving.
+    let web_runtime = start_web(&engine_for_web, web).await?;
+    mark_web_ready(&web_runtime);
+
     wait_for_shutdown_signal().await?;
+
+    // Stop the HTTP API before tearing the rest down.
+    stop_web(web_runtime).await;
 
     tracing::info!("Shutting down...");
 
@@ -1080,6 +1360,7 @@ async fn try_nfs(
     backends: Vec<Arc<dyn cascade_engine::backend::Backend>>,
     no_mount: bool,
     p2p: &ResolvedP2pConfig,
+    web: &WebOptions,
 ) -> Result<()> {
     let engine_config = EngineConfig {
         db_path: ctx.db_path.clone(),
@@ -1098,6 +1379,11 @@ async fn try_nfs(
     // remote management (the P2P backend). Done before the presenter starts so
     // an inbound ManageRequest is authorised and executed rather than refused.
     engine.wire_manage_dispatch().await;
+
+    // Clone the engine handle for the HTTP API before the engine is moved into
+    // the presenter resources; the API server is started only once the winning
+    // presenter is confirmed up, so a failed attempt never binds the port.
+    let engine_for_web = engine.clone();
 
     let presenter = Arc::new(cascade_presenter_nfs::NfsPresenter::with_vfs(
         mount_path,
@@ -1158,7 +1444,15 @@ async fn try_nfs(
     println!();
     println!("Press Ctrl+C to stop.");
 
+    // The presenter is up: spawn the HTTP API (feature-gated, when enabled) and
+    // flip the F3 data-plane readiness bit so its data routes begin serving.
+    let web_runtime = start_web(&engine_for_web, web).await?;
+    mark_web_ready(&web_runtime);
+
     wait_for_shutdown_signal().await?;
+
+    // Stop the HTTP API before tearing the rest down.
+    stop_web(web_runtime).await;
 
     tracing::info!("Shutting down...");
 

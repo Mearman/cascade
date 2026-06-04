@@ -233,6 +233,24 @@ pub enum Commands {
         /// `docs/fileprovider-smoke-test.md`. No effect on Linux or Windows.
         #[arg(long)]
         file_provider: bool,
+
+        /// Serve the typed HTTP JSON API for the PWA alongside the mount.
+        /// Overrides `[web].enabled` in config.toml.
+        #[arg(long)]
+        web: bool,
+
+        /// Bind address for the HTTP API (default 127.0.0.1:7842, loopback only).
+        #[arg(long)]
+        web_bind: Option<String>,
+
+        /// PWA bundle URL the daemon advertises in /v1/bundle.
+        #[arg(long)]
+        web_bundle_url: Option<String>,
+
+        /// Additional CORS origin to allow for the HTTP API (repeatable).
+        /// Loopback origins are always allowed; a wildcard `*` is refused.
+        #[arg(long)]
+        web_cors_origin: Vec<String>,
     },
 
     /// Stop the daemon and unmount
@@ -849,6 +867,10 @@ impl Cli {
                 p2p,
                 no_p2p,
                 file_provider,
+                web,
+                web_bind,
+                web_bundle_url,
+                web_cors_origin,
             } => {
                 // Tri-state override: --p2p forces on, --no-p2p forces off,
                 // neither falls through to the config-file default.
@@ -859,19 +881,26 @@ impl Cli {
                 } else {
                     None
                 };
+                let web_flags = mount::WebFlags {
+                    enable: web,
+                    bind: web_bind,
+                    bundle_url: web_bundle_url,
+                    cors_origins: web_cors_origin,
+                };
                 mount::start(
                     ctx,
                     mount_point.as_deref(),
                     no_mount,
                     p2p_override,
                     file_provider,
+                    web_flags,
                 )
                 .await
             }
             Commands::Stop => mount::stop(ctx),
             Commands::Restart => {
                 mount::stop(ctx)?;
-                mount::start(ctx, None, false, None, false).await
+                mount::start(ctx, None, false, None, false, mount::WebFlags::default()).await
             }
             Commands::Status => status::show(ctx),
             Commands::Pin { path } => cache::pin(ctx, &path),

@@ -18,6 +18,7 @@ members = [
     "crates/presenter-projfs",
     "crates/relay-server",
     "crates/cascade-announce-wire",
+    "crates/cascade-web-api",
 ]
 # The announce Worker (workers/announce) compiles only to
 # wasm32-unknown-unknown — it links the `worker` crate's JS glue — so it is
