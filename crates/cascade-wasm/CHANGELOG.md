@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.77](https://github.com/Mearman/cascade/compare/cascade-wasm-v0.1.76...cascade-wasm-v0.1.77) - 2026-06-04
+
+### Added
+
+- *(wasm)* wire unified handle_request API and session state
+- *(wasm)* add cascade-wasm crate proving wasm32-unknown-unknown toolchain
+
+### Other
+
+- *(wasm)* fix unresolved doc links in cascade-wasm crate root
+- release v0.1.76 [skip ci]
+- release v0.1.75 [skip ci]
+- apply cargo fmt to portable traits and cascade-wasm
+
 ## [0.1.76](https://github.com/Mearman/cascade/compare/cascade-wasm-v0.1.75...cascade-wasm-v0.1.76) - 2026-06-04
 
 ### Added
