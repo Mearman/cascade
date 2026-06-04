@@ -188,7 +188,7 @@ fn mark_web_ready(runtime: &WebRuntimeOpt) {
 
 /// See [`mark_web_ready`] — the no-op form when the `web` feature is off.
 #[cfg(not(feature = "web"))]
-const fn mark_web_ready(_runtime: &WebRuntimeOpt) {}
+const fn mark_web_ready(_runtime: WebRuntimeOpt) {}
 
 /// Gracefully stop the HTTP API server on daemon shutdown, draining in-flight
 /// requests. A no-op without the `web` feature.
@@ -527,7 +527,15 @@ pub async fn start(
             strategy = "webdav-forced",
             "honouring CASCADE_PRESENTER=webdav"
         );
-        return try_webdav(ctx, &mount_path, backends, no_mount, &p2p_config, &web_options).await;
+        return try_webdav(
+            ctx,
+            &mount_path,
+            backends,
+            no_mount,
+            &p2p_config,
+            &web_options,
+        )
+        .await;
     }
 
     // `--file-provider` is an explicit opt-in to the macOS File Provider
@@ -543,7 +551,15 @@ pub async fn start(
     if file_provider {
         let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
         tracing::info!(strategy = "fileprovider", "attempting File Provider mount");
-        return try_fileprovider(ctx, &mount_path, backends, no_mount, &p2p_config, &web_options).await;
+        return try_fileprovider(
+            ctx,
+            &mount_path,
+            backends,
+            no_mount,
+            &p2p_config,
+            &web_options,
+        )
+        .await;
     }
 
     // On macOS: FSKit first (native, kext-free, POSIX), then WebDAV (no
@@ -570,7 +586,16 @@ pub async fn start(
         // Attempt 2: WebDAV.
         let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
         tracing::info!(strategy = "webdav", "attempting WebDAV mount");
-        match try_webdav(ctx, &mount_path, backends, no_mount, &p2p_config, &web_options).await {
+        match try_webdav(
+            ctx,
+            &mount_path,
+            backends,
+            no_mount,
+            &p2p_config,
+            &web_options,
+        )
+        .await
+        {
             Ok(()) => return Ok(()),
             Err(e) => {
                 tracing::warn!(error = %e, "WebDAV mount failed, falling back to NFS");
@@ -580,7 +605,15 @@ pub async fn start(
 
         // Attempt 3: NFS (v4 → v3 escalation inside mount_nfs).
         let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
-        try_nfs(ctx, &mount_path, backends, no_mount, &p2p_config, &web_options).await
+        try_nfs(
+            ctx,
+            &mount_path,
+            backends,
+            no_mount,
+            &p2p_config,
+            &web_options,
+        )
+        .await
     }
 
     #[cfg(target_os = "linux")]
@@ -599,7 +632,15 @@ pub async fn start(
                 strategy = "webdav-seed",
                 "--no-mount set on Linux; starting WebDAV server in seed mode"
             );
-            try_webdav(ctx, &mount_path, backends, no_mount, &p2p_config, &web_options).await
+            try_webdav(
+                ctx,
+                &mount_path,
+                backends,
+                no_mount,
+                &p2p_config,
+                &web_options,
+            )
+            .await
         } else {
             let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
             tracing::info!(strategy = "fuse", "attempting FUSE mount");
@@ -612,7 +653,15 @@ pub async fn start(
             }
 
             let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
-            try_nfs(ctx, &mount_path, backends, no_mount, &p2p_config, &web_options).await
+            try_nfs(
+                ctx,
+                &mount_path,
+                backends,
+                no_mount,
+                &p2p_config,
+                &web_options,
+            )
+            .await
         }
     }
 
@@ -640,13 +689,29 @@ pub async fn start(
         // Attempt 2: WebDAV via the built-in WebClient service.
         let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
         tracing::info!(strategy = "webdav", "attempting WebDAV mount");
-        try_webdav(ctx, &mount_path, backends, no_mount, &p2p_config, &web_options).await
+        try_webdav(
+            ctx,
+            &mount_path,
+            backends,
+            no_mount,
+            &p2p_config,
+            &web_options,
+        )
+        .await
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
-        try_nfs(ctx, &mount_path, backends, no_mount, &p2p_config, &web_options).await
+        try_nfs(
+            ctx,
+            &mount_path,
+            backends,
+            no_mount,
+            &p2p_config,
+            &web_options,
+        )
+        .await
     }
 }
 
@@ -738,7 +803,7 @@ async fn try_fskit(
     // The presenter is up: spawn the HTTP API (feature-gated, when enabled) and
     // flip the F3 data-plane readiness bit so its data routes begin serving.
     let web_runtime = start_web(&engine_for_web, web).await?;
-    mark_web_ready(&web_runtime);
+    mark_web_ready(web_runtime);
 
     wait_for_shutdown_signal().await?;
 
@@ -926,7 +991,7 @@ async fn try_fileprovider(
     // The presenter is up: spawn the HTTP API (feature-gated, when enabled) and
     // flip the F3 data-plane readiness bit so its data routes begin serving.
     let web_runtime = start_web(&engine_for_web, web).await?;
-    mark_web_ready(&web_runtime);
+    mark_web_ready(web_runtime);
 
     wait_for_shutdown_signal().await?;
 
@@ -1087,7 +1152,7 @@ async fn try_projfs(
     // The presenter is up: spawn the HTTP API (feature-gated, when enabled) and
     // flip the F3 data-plane readiness bit so its data routes begin serving.
     let web_runtime = start_web(&engine_for_web, web).await?;
-    mark_web_ready(&web_runtime);
+    mark_web_ready(web_runtime);
 
     wait_for_shutdown_signal().await?;
 
@@ -1226,7 +1291,7 @@ async fn try_webdav(
     // The presenter is up: spawn the HTTP API (feature-gated, when enabled) and
     // flip the F3 data-plane readiness bit so its data routes begin serving.
     let web_runtime = start_web(&engine_for_web, web).await?;
-    mark_web_ready(&web_runtime);
+    mark_web_ready(web_runtime);
 
     wait_for_shutdown_signal().await?;
 
@@ -1329,7 +1394,7 @@ async fn try_fuse(
     // The presenter is up: spawn the HTTP API (feature-gated, when enabled) and
     // flip the F3 data-plane readiness bit so its data routes begin serving.
     let web_runtime = start_web(&engine_for_web, web).await?;
-    mark_web_ready(&web_runtime);
+    mark_web_ready(web_runtime);
 
     wait_for_shutdown_signal().await?;
 
@@ -1447,7 +1512,7 @@ async fn try_nfs(
     // The presenter is up: spawn the HTTP API (feature-gated, when enabled) and
     // flip the F3 data-plane readiness bit so its data routes begin serving.
     let web_runtime = start_web(&engine_for_web, web).await?;
-    mark_web_ready(&web_runtime);
+    mark_web_ready(web_runtime);
 
     wait_for_shutdown_signal().await?;
 
