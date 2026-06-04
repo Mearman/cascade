@@ -58,7 +58,7 @@ jobs:
       - name: Build
         run: pnpm --dir apps/web run build
       - name: Upload dist artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pwa-dist
           path: apps/web/dist/
