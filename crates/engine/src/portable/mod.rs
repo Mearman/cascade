@@ -38,6 +38,7 @@
 #[cfg(all(feature = "native", not(feature = "portable")))]
 pub mod native;
 
+#[cfg(feature = "p2p")]
 use std::collections::HashSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
