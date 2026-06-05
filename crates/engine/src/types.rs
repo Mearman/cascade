@@ -340,6 +340,21 @@ impl DirEntry {
     }
 }
 
+/// A max file length rule: files matching `path_glob` must not exceed
+/// `max_bytes` in size. Rules are evaluated with child-overrides-parent
+/// precedence and first-match-wins ordering by `priority` (descending).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MaxFileLengthRule {
+    /// Glob pattern matched against file paths relative to the mount root.
+    pub path_glob: String,
+    /// Maximum allowed file size in bytes.
+    pub max_bytes: u64,
+    /// Higher-priority rules take precedence when multiple rules match.
+    pub priority: i32,
+    /// Optional conditional expression evaluated against [`EvalContext`].
+    pub conditions: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

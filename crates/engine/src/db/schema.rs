@@ -9,7 +9,7 @@ impl SchemaVersion {
     /// Current schema version.
     #[must_use]
     pub const fn current() -> Self {
-        Self(6)
+        Self(7)
     }
 }
 
@@ -32,6 +32,9 @@ pub fn migrate(conn: &Connection, from: SchemaVersion, _to: SchemaVersion) -> Re
     }
     if from < SchemaVersion(6) {
         v6_auth_codes(conn)?;
+    }
+    if from < SchemaVersion(7) {
+        v7_max_file_length_rules(conn)?;
     }
 
     Ok(())
@@ -311,6 +314,31 @@ fn v6_auth_codes(conn: &Connection) -> Result<()> {
             secret      TEXT NOT NULL,
             created_at  TEXT NOT NULL
         );
+        ",
+    )?;
+
+    Ok(())
+}
+
+/// Schema v7 -- max file length rules.
+///
+/// `max_file_length_rules` holds per-path-glob constraints on the maximum
+/// allowed file size. Rules are matched by priority (higher wins) and
+/// optionally gated by a conditional expression string evaluated against
+/// the engine's `EvalContext`.
+fn v7_max_file_length_rules(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS max_file_length_rules (
+            id            INTEGER PRIMARY KEY,
+            path_glob     TEXT NOT NULL,
+            max_bytes     INTEGER NOT NULL,
+            priority      INTEGER NOT NULL DEFAULT 0,
+            conditions    TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_max_file_length_priority
+            ON max_file_length_rules(priority DESC);
         ",
     )?;
 
