@@ -22,7 +22,7 @@ use std::sync::Mutex;
 // ───────────── Native-only: StateDb (rusqlite-backed) ─────────────
 
 #[cfg(feature = "native")]
-/// Cap a logical `u64` size into the `i64` range SQLite stores integers in,
+/// Cap a logical `u64` size into the `i64` range `SQLite` stores integers in,
 /// for binding via `Option::map`. A real file never exceeds `i64::MAX` bytes
 /// (8 EiB), so the saturation point is unreachable; this exists only because
 /// rusqlite 0.40 dropped the `u64` `ToSql` impl to prevent silent truncation.
@@ -42,7 +42,7 @@ fn size_from_row(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<Option
 }
 
 #[cfg(feature = "native")]
-/// SQLite state database. Stores file metadata, backend config,
+/// `SQLite` state database. Stores file metadata, backend config,
 /// pin rules, lifecycle policies, config cache, sync cursors, and P2P state.
 pub struct StateDb {
     conn: Mutex<Connection>,
