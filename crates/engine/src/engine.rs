@@ -1114,7 +1114,7 @@ mod tests {
     fn make_test_engine() -> Engine {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("state.db");
-        let mut config = EngineConfig {
+        let config = EngineConfig {
             db_path,
             mount_point: PathBuf::from("/tmp/test-mount"),
             backends: vec![Arc::new(NullBackend::new("test"))],

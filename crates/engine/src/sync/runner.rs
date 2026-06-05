@@ -368,15 +368,14 @@ impl SyncRunner {
                 continue;
             }
 
-            let file = tokio::fs::File::open(&local_path).await;
-            let mut file = match file {
-                Ok(f) => f,
+            let data = match tokio::fs::read(&local_path).await {
+                Ok(d) => d,
                 Err(e) => {
                     tracing::error!(
                         file = %record.id,
                         path = %local_path.display(),
                         error = %e,
-                        "failed to open dirty file — skipping"
+                        "failed to read dirty file — skipping"
                     );
                     continue;
                 }
@@ -385,10 +384,7 @@ impl SyncRunner {
             let upload_path = std::path::Path::new(&record.path);
             let parent_file_id = FileId(record.parent_id.native_id().to_string());
 
-            match backend
-                .upload(upload_path, &mut file, &parent_file_id)
-                .await
-            {
+            match backend.upload(upload_path, &data, &parent_file_id).await {
                 Ok(_updated_entry) => {
                     if let Err(e) = self.db.clear_dirty(&record.id) {
                         tracing::error!(
@@ -576,18 +572,14 @@ mod tests {
             anyhow::bail!("not implemented")
         }
 
-        async fn download(
-            &self,
-            _file: &crate::types::FileEntry,
-            _writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
-        ) -> anyhow::Result<()> {
+        async fn download(&self, _file: &crate::types::FileEntry) -> anyhow::Result<Vec<u8>> {
             anyhow::bail!("not implemented")
         }
 
         async fn upload(
             &self,
             path: &std::path::Path,
-            _reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+            _data: &[u8],
             parent_id: &crate::types::FileId,
         ) -> anyhow::Result<crate::types::FileEntry> {
             self.uploads
@@ -604,7 +596,7 @@ mod tests {
         async fn update(
             &self,
             _file_id: &crate::types::FileId,
-            _reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+            _data: &[u8],
         ) -> anyhow::Result<crate::types::FileEntry> {
             anyhow::bail!("not implemented")
         }

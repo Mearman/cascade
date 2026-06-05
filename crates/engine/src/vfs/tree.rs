@@ -104,12 +104,9 @@ impl VfsTree {
         } else {
             // Cross-backend — download, upload, delete original
             let entry = src_backend.metadata(&src_path).await?;
-            let mut data = Vec::new();
-            src_backend.download(&entry, &mut data).await?;
+            let data = src_backend.download(&entry).await?;
             let parent_id = FileId(entry.parent_id.0.clone());
-            dst_backend
-                .upload(&dst_path, &mut &data[..], &parent_id)
-                .await?;
+            dst_backend.upload(&dst_path, &data, &parent_id).await?;
             src_backend.delete(&entry).await?;
         }
         Ok(())
@@ -279,28 +276,20 @@ mod tests {
             anyhow::bail!("metadata not implemented")
         }
 
-        async fn download(
-            &self,
-            _file: &FileEntry,
-            _writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
-        ) -> anyhow::Result<()> {
+        async fn download(&self, _file: &FileEntry) -> anyhow::Result<Vec<u8>> {
             anyhow::bail!("download not implemented")
         }
 
         async fn upload(
             &self,
             _path: &Path,
-            _reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+            _data: &[u8],
             _parent_id: &FileId,
         ) -> anyhow::Result<FileEntry> {
             anyhow::bail!("upload not implemented")
         }
 
-        async fn update(
-            &self,
-            _file_id: &FileId,
-            _reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
-        ) -> anyhow::Result<FileEntry> {
+        async fn update(&self, _file_id: &FileId, _data: &[u8]) -> anyhow::Result<FileEntry> {
             anyhow::bail!("update not implemented")
         }
 

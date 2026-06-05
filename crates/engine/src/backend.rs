@@ -82,12 +82,8 @@ pub trait Backend: Send + Sync {
     /// Fetch metadata for a single file or directory by path.
     async fn metadata(&self, path: &Path) -> anyhow::Result<FileEntry>;
 
-    /// Download file content. The backend writes to the provided writer.
-    async fn download(
-        &self,
-        file: &FileEntry,
-        writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
-    ) -> anyhow::Result<()>;
+    /// Download file content, returning the full byte body.
+    async fn download(&self, file: &FileEntry) -> anyhow::Result<Vec<u8>>;
 
     /// Read a byte range of a file's content.
     ///
@@ -107,8 +103,7 @@ pub trait Backend: Send + Sync {
         offset: u64,
         length: u32,
     ) -> anyhow::Result<Vec<u8>> {
-        let mut buf = Vec::new();
-        self.download(file, &mut buf).await?;
+        let buf = self.download(file).await?;
         let start = usize::try_from(offset).unwrap_or(usize::MAX).min(buf.len());
         let len = usize::try_from(length).unwrap_or(usize::MAX);
         let end = start.saturating_add(len).min(buf.len());
@@ -120,16 +115,12 @@ pub trait Backend: Send + Sync {
     async fn upload(
         &self,
         path: &Path,
-        reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+        data: &[u8],
         parent_id: &FileId,
     ) -> anyhow::Result<FileEntry>;
 
     /// Overwrite the content of an existing file.
-    async fn update(
-        &self,
-        file_id: &FileId,
-        reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
-    ) -> anyhow::Result<FileEntry>;
+    async fn update(&self, file_id: &FileId, data: &[u8]) -> anyhow::Result<FileEntry>;
 
     /// Create a directory.
     async fn create_dir(&self, path: &Path) -> anyhow::Result<FileEntry>;
@@ -253,28 +244,20 @@ impl Backend for NullBackend {
         anyhow::bail!("null backend has no files")
     }
 
-    async fn download(
-        &self,
-        _file: &FileEntry,
-        _writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
-    ) -> anyhow::Result<()> {
+    async fn download(&self, _file: &FileEntry) -> anyhow::Result<Vec<u8>> {
         anyhow::bail!("null backend has no files")
     }
 
     async fn upload(
         &self,
         _path: &Path,
-        _reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+        _data: &[u8],
         _parent_id: &FileId,
     ) -> anyhow::Result<FileEntry> {
         anyhow::bail!("null backend cannot upload")
     }
 
-    async fn update(
-        &self,
-        _file_id: &FileId,
-        _reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
-    ) -> anyhow::Result<FileEntry> {
+    async fn update(&self, _file_id: &FileId, _data: &[u8]) -> anyhow::Result<FileEntry> {
         anyhow::bail!("null backend cannot update")
     }
 
@@ -316,9 +299,7 @@ impl Backend for NullBackend {
 mod tests {
     use super::*;
     use crate::types::ItemId;
-    use tokio::io::AsyncWriteExt as _;
-
-    /// Backend whose `download` writes a fixed buffer; every other method
+    /// Backend whose `download` returns a fixed buffer; every other method
     /// is unused. Exercises the default `read_range` (download-and-slice).
     #[derive(Debug)]
     struct FixedBackend {
@@ -342,28 +323,18 @@ mod tests {
         async fn metadata(&self, _path: &Path) -> anyhow::Result<FileEntry> {
             anyhow::bail!("unused")
         }
-        async fn download(
-            &self,
-            _file: &FileEntry,
-            writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
-        ) -> anyhow::Result<()> {
-            writer.write_all(&self.content).await?;
-            writer.flush().await?;
-            Ok(())
+        async fn download(&self, _file: &FileEntry) -> anyhow::Result<Vec<u8>> {
+            Ok(self.content.clone())
         }
         async fn upload(
             &self,
             _path: &Path,
-            _reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+            _data: &[u8],
             _parent_id: &FileId,
         ) -> anyhow::Result<FileEntry> {
             anyhow::bail!("unused")
         }
-        async fn update(
-            &self,
-            _file_id: &FileId,
-            _reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
-        ) -> anyhow::Result<FileEntry> {
+        async fn update(&self, _file_id: &FileId, _data: &[u8]) -> anyhow::Result<FileEntry> {
             anyhow::bail!("unused")
         }
         async fn create_dir(&self, _path: &Path) -> anyhow::Result<FileEntry> {
