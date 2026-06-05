@@ -9,6 +9,7 @@
 use crate::cache::lifecycle::{EvictionDecision, LifecycleEvaluator};
 use crate::cache::pin::PinMatcher;
 use crate::db::StateDb;
+#[cfg(feature = "p2p")]
 use crate::p2p_bridge::P2pBridge;
 use crate::types::CacheState;
 use anyhow::Result;
@@ -42,15 +43,19 @@ impl Default for CacheManagerConfig {
 pub struct CacheManager {
     db: Arc<StateDb>,
     config: CacheManagerConfig,
+    #[cfg(feature = "p2p")]
     p2p: Option<Arc<P2pBridge>>,
 }
 
 impl std::fmt::Debug for CacheManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CacheManager")
-            .field("config", &self.config)
-            .field("p2p_enabled", &self.p2p.is_some())
-            .finish_non_exhaustive()
+        let mut binding = f.debug_struct("CacheManager");
+        let s = binding.field("config", &self.config);
+        #[cfg(feature = "p2p")]
+        {
+            s.field("p2p_enabled", &self.p2p.is_some());
+        }
+        s.finish_non_exhaustive()
     }
 }
 
@@ -60,12 +65,14 @@ impl CacheManager {
         Self {
             db,
             config,
+            #[cfg(feature = "p2p")]
             p2p: None,
         }
     }
 
     /// Attach a P2P bridge for content fetching.
     #[must_use]
+    #[cfg(feature = "p2p")]
     pub fn with_p2p(mut self, p2p: Arc<P2pBridge>) -> Self {
         self.p2p = Some(p2p);
         self
@@ -73,6 +80,7 @@ impl CacheManager {
 
     /// Try to fetch file contents from P2P peers before falling back to
     /// cloud. Returns the file data if P2P has it, None otherwise.
+    #[cfg(feature = "p2p")]
     pub async fn fetch_from_p2p(&self, file: &crate::types::FileEntry) -> Result<Option<Vec<u8>>> {
         let Some(bridge) = &self.p2p else {
             return Ok(None);
@@ -81,6 +89,7 @@ impl CacheManager {
     }
 
     /// Index downloaded file data into the P2P block store for sharing.
+    #[cfg(feature = "p2p")]
     pub async fn index_for_p2p(&self, file_id: &crate::types::ItemId, data: &[u8]) -> Result<()> {
         let Some(bridge) = &self.p2p else {
             return Ok(());

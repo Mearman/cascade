@@ -20,13 +20,17 @@ use cascade_config::{GrantConfig, ScopeConfig};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "p2p")]
 pub mod dispatch;
+#[cfg(feature = "p2p")]
 pub mod token;
 
+#[cfg(feature = "p2p")]
 pub use dispatch::{
     ManageCommandExecutor, ManageDispatch, ManageGrantStore, required_capability, run_dispatch,
     scope_from_wire, verify_data_token,
 };
+#[cfg(feature = "p2p")]
 pub use token::{
     CapabilityToken, DelegateError, MAX_DELEGATION_DEPTH, TokenClaims, TokenVerifyError,
     derive_token_id,

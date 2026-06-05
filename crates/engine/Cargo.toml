@@ -16,7 +16,7 @@ tracing.workspace = true
 chrono.workspace = true
 rusqlite = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
-cascade-p2p = { path = "../p2p" }
+cascade-p2p = { path = "../p2p", optional = true }
 data-encoding.workspace = true
 sha2 = { workspace = true }
 
@@ -27,8 +27,13 @@ sha2 = { workspace = true }
 # in `portable::native` that bind the trait contracts to those crates. A wasm
 # build drops it (`--no-default-features --features portable`) and supplies its
 # own adapters behind the same contracts.
-default = ["native"]
+default = ["native", "p2p"]
 native = ["dep:tokio", "dep:rusqlite", "dep:reqwest"]
+# `p2p` pulls in the P2P block-sharing engine (cascade-p2p), the management-plane
+# dispatch and signed capability tokens, and the p2p_bridge module. The ring C
+# crate inside cascade-p2p does not compile to wasm32, so a WASM build drops this
+# feature and loses remote management, token signing, and peer sync.
+p2p = ["dep:cascade-p2p"]
 # `portable` compiles the runtime/storage/HTTP/filesystem trait contracts in
 # `portable`, which the core logic depends on instead of tokio/rusqlite/reqwest
 # /std::fs directly. The traits carry no host-only types, so the module builds

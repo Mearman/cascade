@@ -50,8 +50,11 @@ use chrono::{DateTime, Utc};
 
 use crate::db::{
     AuditEntry, AuditRecord, BackendRecord, DirtyFileRecord, ExplicitControlRecord, GrantRecord,
-    LifecyclePolicyRecord, PeerRecord, PinRuleRecord, QuarantineRecord, TokenRecord,
+    LifecyclePolicyRecord, PeerRecord, PinRuleRecord, QuarantineRecord,
 };
+#[cfg(feature = "p2p")]
+use crate::db::TokenRecord;
+#[cfg(feature = "p2p")]
 use crate::manage::token::CapabilityToken;
 use crate::manage::{Grant, Scope};
 use crate::types::{CacheState, Cursor, FileEntry, ItemId};
@@ -335,6 +338,7 @@ pub trait StateStorage: Send + Sync {
 
     /// Record an issued capability token. Re-issuing an existing token id is a
     /// constraint violation, never a silent overwrite.
+    #[cfg(feature = "p2p")]
     async fn insert_token(
         &self,
         token: &CapabilityToken,
@@ -342,10 +346,12 @@ pub trait StateStorage: Send + Sync {
     ) -> Result<(), StorageError>;
 
     /// List every issued token in issuance order.
+    #[cfg(feature = "p2p")]
     async fn list_tokens(&self) -> Result<Vec<TokenRecord>, StorageError>;
 
     /// Add a token id to the append-only revocation list. Returns `true` if the
     /// id was newly revoked, `false` if it was already present.
+    #[cfg(feature = "p2p")]
     async fn revoke_token(
         &self,
         token_id: &str,
@@ -353,9 +359,11 @@ pub trait StateStorage: Send + Sync {
     ) -> Result<bool, StorageError>;
 
     /// Whether a token id is on the revocation list.
+    #[cfg(feature = "p2p")]
     async fn is_token_revoked(&self, token_id: &str) -> Result<bool, StorageError>;
 
     /// The full set of revoked token ids, for building an in-memory predicate.
+    #[cfg(feature = "p2p")]
     async fn revoked_token_ids(&self) -> Result<HashSet<String>, StorageError>;
 
     // ── Data-receive quarantine operations ──

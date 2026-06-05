@@ -10,6 +10,7 @@ use crate::cache::pin::PinMatcher;
 use crate::changefeed::ChangeFeed;
 use crate::config::ConfigResolver;
 use crate::db::StateDb;
+#[cfg(feature = "p2p")]
 use crate::p2p_bridge::P2pBridge;
 use crate::presenter::VfsPresenter;
 use crate::sync::conflict::{ConflictCheck, check_conflict, conflict_name};
@@ -28,6 +29,7 @@ pub struct SyncRunner {
     backends: Vec<Arc<dyn Backend>>,
     presenter: Arc<dyn VfsPresenter>,
     config: Arc<ConfigResolver>,
+    #[cfg(feature = "p2p")]
     p2p: Option<P2pBridge>,
     /// Optional engine-side change index. When present, every applied
     /// batch is also filed here so presenters can serve per-parent
@@ -43,10 +45,14 @@ pub struct SyncRunner {
 
 impl std::fmt::Debug for SyncRunner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SyncRunner")
-            .field("backend_count", &self.backends.len())
-            .field("p2p_enabled", &self.p2p.is_some())
-            .finish_non_exhaustive()
+        let backend_count = self.backends.len();
+        let mut binding = f.debug_struct("SyncRunner");
+        let s = binding.field("backend_count", &backend_count);
+        #[cfg(feature = "p2p")]
+        {
+            s.field("p2p_enabled", &self.p2p.is_some());
+        }
+        s.finish_non_exhaustive()
     }
 }
 
@@ -70,6 +76,7 @@ impl SyncRunner {
             backends,
             presenter,
             config,
+            #[cfg(feature = "p2p")]
             p2p: None,
             change_feed: None,
             cancel_rx,
@@ -78,6 +85,7 @@ impl SyncRunner {
 
     /// Attach a P2P bridge for block-level file sharing.
     #[must_use]
+    #[cfg(feature = "p2p")]
     pub fn with_p2p(mut self, p2p: P2pBridge) -> Self {
         self.p2p = Some(p2p);
         self
@@ -210,6 +218,7 @@ impl SyncRunner {
                         self.db.update_cache_state(&entry.id, CacheState::Pinned)?;
                     }
                     // Index cached files for P2P sharing.
+                    #[cfg(feature = "p2p")]
                     if let Some(bridge) = &self.p2p
                         && entry.size.is_some_and(|s| s > 0)
                         && let Err(e) = bridge.index_file(&entry.name, &Vec::new()).await

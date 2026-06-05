@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+#[cfg(feature = "p2p")]
 use crate::manage::{DataAuthority, ManageDispatch};
 use crate::types::{Change, Cursor, FileEntry, FileId, Quota};
 
@@ -193,6 +194,7 @@ pub trait Backend: Send + Sync {
     /// have nothing to wire. Overriding backends take `&self` and store the port
     /// behind their own interior mutability so the already-running listener and
     /// session loops observe it.
+    #[cfg(feature = "p2p")]
     async fn set_manage_dispatch(&self, dispatch: Arc<dyn ManageDispatch>) {
         let _ = dispatch;
     }
@@ -211,6 +213,7 @@ pub trait Backend: Send + Sync {
     /// already-running session loops observe it. When the port is never wired,
     /// the BEP path is default-open — every trusted peer keeps full
     /// bidirectional access — preserving the pre-feature behaviour.
+    #[cfg(feature = "p2p")]
     async fn set_data_authority(&self, authority: Arc<dyn DataAuthority>) {
         let _ = authority;
     }

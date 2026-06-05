@@ -1,6 +1,7 @@
 pub mod schema;
 
 use crate::db::schema::SchemaVersion;
+#[cfg(feature = "p2p")]
 use crate::manage::token::CapabilityToken;
 use crate::manage::{Capability, DeviceId, Grant, Scope};
 use crate::types::{CacheState, Cursor, FileEntry, ItemId};
@@ -907,6 +908,7 @@ impl StateDb {
     /// it; the indexed columns mirror the claims for querying. `issued_at` is the
     /// wall clock at issuance. A token id is unique, so re-issuing the same id is
     /// a hard error rather than a silent overwrite.
+    #[cfg(feature = "p2p")]
     pub fn insert_token(&self, token: &CapabilityToken, issued_at: DateTime<Utc>) -> Result<()> {
         let conn = self
             .conn
@@ -937,6 +939,7 @@ impl StateDb {
 
     /// List every token this node has issued, in issuance order, validating the
     /// stored JSON back into a typed [`CapabilityToken`].
+    #[cfg(feature = "p2p")]
     pub fn list_tokens(&self) -> Result<Vec<TokenRecord>> {
         let conn = self
             .conn
@@ -969,6 +972,7 @@ impl StateDb {
     /// Add a token id to the append-only revocation list. Returns `true` if the
     /// id was newly revoked, `false` if it was already on the list. `revoked_at`
     /// is the wall clock at revocation.
+    #[cfg(feature = "p2p")]
     pub fn revoke_token(&self, token_id: &str, revoked_at: DateTime<Utc>) -> Result<bool> {
         let conn = self
             .conn
@@ -984,6 +988,7 @@ impl StateDb {
 
     /// Whether `token_id` is on the revocation list. Consulted by the verify
     /// path for every token in a presented chain.
+    #[cfg(feature = "p2p")]
     pub fn is_token_revoked(&self, token_id: &str) -> Result<bool> {
         let conn = self
             .conn
@@ -999,6 +1004,7 @@ impl StateDb {
 
     /// The full set of revoked token ids, for building an in-memory predicate
     /// that does not touch the database per token in a chain.
+    #[cfg(feature = "p2p")]
     pub fn revoked_token_ids(&self) -> Result<std::collections::HashSet<String>> {
         let conn = self
             .conn
@@ -1361,6 +1367,7 @@ impl StateDb {
 }
 
 /// An issued capability-token row read back from the database.
+#[cfg(feature = "p2p")]
 #[derive(Debug, Clone)]
 pub struct TokenRecord {
     /// When the token was issued.
@@ -1831,6 +1838,7 @@ mod tests {
 
     // ── Capability-token store tests ──
 
+    #[cfg(feature = "p2p")]
     fn sample_token() -> CapabilityToken {
         // The store only persists and reloads token JSON, so any validly-signed
         // token serves. Sign with a freshly generated node identity.
@@ -1846,6 +1854,7 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(feature = "p2p")]
     #[test]
     fn token_insert_and_list_round_trip() {
         let db = StateDb::open_in_memory().unwrap();
@@ -1861,6 +1870,7 @@ mod tests {
         assert_eq!(listed[0].issued_at, issued_at);
     }
 
+    #[cfg(feature = "p2p")]
     #[test]
     fn token_revocation_is_recorded_and_queryable() {
         let db = StateDb::open_in_memory().unwrap();
@@ -1875,6 +1885,7 @@ mod tests {
         assert!(db.revoked_token_ids().unwrap().contains("tok-store-1"));
     }
 
+    #[cfg(feature = "p2p")]
     #[test]
     fn duplicate_token_id_is_rejected() {
         let db = StateDb::open_in_memory().unwrap();

@@ -31,8 +31,11 @@ use super::{
 };
 use crate::db::{
     AuditEntry, AuditRecord, BackendRecord, DirtyFileRecord, ExplicitControlRecord, GrantRecord,
-    LifecyclePolicyRecord, PeerRecord, PinRuleRecord, QuarantineRecord, StateDb, TokenRecord,
+    LifecyclePolicyRecord, PeerRecord, PinRuleRecord, QuarantineRecord, StateDb,
 };
+#[cfg(feature = "p2p")]
+use crate::db::TokenRecord;
+#[cfg(feature = "p2p")]
 use crate::manage::token::CapabilityToken;
 use crate::manage::{Grant, Scope};
 use crate::types::{CacheState, Cursor, FileEntry, ItemId};
@@ -420,6 +423,7 @@ impl<R: RuntimeHandle> StateStorage for SqliteStorage<R> {
 
     // ── Capability-token operations ──
 
+    #[cfg(feature = "p2p")]
     async fn insert_token(
         &self,
         token: &CapabilityToken,
@@ -429,10 +433,12 @@ impl<R: RuntimeHandle> StateStorage for SqliteStorage<R> {
         self.run(move |db| db.insert_token(&token, issued_at)).await
     }
 
+    #[cfg(feature = "p2p")]
     async fn list_tokens(&self) -> Result<Vec<TokenRecord>, StorageError> {
         self.run(StateDb::list_tokens).await
     }
 
+    #[cfg(feature = "p2p")]
     async fn revoke_token(
         &self,
         token_id: &str,
@@ -443,11 +449,13 @@ impl<R: RuntimeHandle> StateStorage for SqliteStorage<R> {
             .await
     }
 
+    #[cfg(feature = "p2p")]
     async fn is_token_revoked(&self, token_id: &str) -> Result<bool, StorageError> {
         let token_id = token_id.to_owned();
         self.run(move |db| db.is_token_revoked(&token_id)).await
     }
 
+    #[cfg(feature = "p2p")]
     async fn revoked_token_ids(&self) -> Result<HashSet<String>, StorageError> {
         self.run(StateDb::revoked_token_ids).await
     }

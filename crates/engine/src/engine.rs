@@ -16,7 +16,9 @@ use anyhow::Result;
 use tokio::sync::watch;
 use tracing::info;
 
+#[cfg(feature = "p2p")]
 use async_trait::async_trait;
+#[cfg(feature = "p2p")]
 use cascade_p2p::protocol::{
     ManageCommand, ManageConfigFormat, ManageResult, ManageScope as WireScope,
 };
@@ -27,11 +29,14 @@ use crate::cache::manager::{CacheManager, CacheManagerConfig};
 use crate::changefeed::ChangeFeed;
 use crate::config::ConfigResolver;
 use crate::db::{AuditEntry, PinRuleRecord, QuarantineRecord, StateDb};
+use crate::manage::{DeviceId, Grant, Scope};
+#[cfg(feature = "p2p")]
 use crate::manage::{
-    DataAccess, DataAuthority, DeviceId, ExplicitControlState, Grant, ManageCommandExecutor,
-    ManageDispatch, ManageGrantStore, Scope, data_access_with_explicit_control, run_dispatch,
+    DataAccess, DataAuthority, ExplicitControlState, ManageCommandExecutor,
+    ManageDispatch, ManageGrantStore, data_access_with_explicit_control, run_dispatch,
     verify_data_token,
 };
+#[cfg(feature = "p2p")]
 use crate::p2p_bridge::P2pBridge;
 use crate::presenter::VfsPresenter;
 use crate::sync::runner::SyncRunner;
@@ -49,8 +54,10 @@ pub struct EngineConfig {
     /// Cache directory override. `None` uses the default.
     pub cache_dir: Option<PathBuf>,
     /// Whether to enable P2P block sharing.
+    #[cfg(feature = "p2p")]
     pub enable_p2p: bool,
     /// P2P data directory override. `None` uses `db_path` parent + `/p2p`.
+    #[cfg(feature = "p2p")]
     pub p2p_data_dir: Option<PathBuf>,
     /// Discovery reach for the engine's optimisation-layer P2P bridge.
     ///
@@ -60,18 +67,21 @@ pub struct EngineConfig {
     /// carries its own posture in its per-backend TOML; this field is for the
     /// case where a cloud-backed node also wants block sharing with a specific
     /// reach.
+    #[cfg(feature = "p2p")]
     pub p2p_posture: Option<cascade_p2p::DiscoveryReach>,
     /// Relay endpoint addresses for WAN NAT traversal of the optimisation-layer P2P.
     ///
     /// Each entry is a resolved `host:port` of a `cascade-relay` server. Empty
     /// means no relay strategy is provisioned for the optimisation layer. Only
     /// meaningful when `enable_p2p` is `true` and `p2p_posture` permits relay.
+    #[cfg(feature = "p2p")]
     pub p2p_relay_endpoints: Vec<std::net::SocketAddr>,
     /// 32-byte HMAC shared secret for authenticating this node to the relay server.
     ///
     /// `None` means no authentication secret is configured; the relay strategy
     /// will be provisioned but the dial will be skipped. Only meaningful when
     /// `p2p_relay_endpoints` is non-empty.
+    #[cfg(feature = "p2p")]
     pub p2p_relay_shared_secret: Option<[u8; 32]>,
     /// Factory used to construct backends at runtime — for example when an
     /// authorised manager pushes a `BackendAdd` command. `None` leaves the
@@ -82,23 +92,26 @@ pub struct EngineConfig {
 
 impl fmt::Debug for EngineConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("EngineConfig")
+        let backends_count = format!("[{} backend(s)]", self.backends.len());
+        let mut binding = f.debug_struct("EngineConfig");
+        let s = binding
             .field("db_path", &self.db_path)
             .field("mount_point", &self.mount_point)
-            .field("backends", &format!("[{} backend(s)]", self.backends.len()))
-            .field("cache_dir", &self.cache_dir)
-            .field("enable_p2p", &self.enable_p2p)
-            .field("p2p_data_dir", &self.p2p_data_dir)
-            .field("p2p_posture", &self.p2p_posture)
-            .field(
-                "p2p_relay_endpoints",
-                &format!("[{} endpoint(s)]", self.p2p_relay_endpoints.len()),
-            )
-            .field(
-                "p2p_relay_shared_secret",
-                &self.p2p_relay_shared_secret.is_some(),
-            )
-            .field("backend_factory", &self.backend_factory.is_some())
+            .field("backends", &backends_count)
+            .field("cache_dir", &self.cache_dir);
+        #[cfg(feature = "p2p")]
+        {
+            let relay_count = format!("[{} endpoint(s)]", self.p2p_relay_endpoints.len());
+            s.field("enable_p2p", &self.enable_p2p)
+                .field("p2p_data_dir", &self.p2p_data_dir)
+                .field("p2p_posture", &self.p2p_posture)
+                .field("p2p_relay_endpoints", &relay_count)
+                .field(
+                    "p2p_relay_shared_secret",
+                    &self.p2p_relay_shared_secret.is_some(),
+                );
+        }
+        s.field("backend_factory", &self.backend_factory.is_some())
             .finish()
     }
 }
@@ -109,6 +122,7 @@ pub struct Engine {
     vfs: Arc<RwLock<VfsTree>>,
     cache: CacheManager,
     config: Arc<ConfigResolver>,
+    #[cfg(feature = "p2p")]
     p2p: Option<P2pBridge>,
     /// Engine-side per-parent change index. Fed by the sync runner and
     /// read by presenters that serve `enumerateChanges`-style deltas.
@@ -122,9 +136,12 @@ pub struct Engine {
 
 impl fmt::Debug for Engine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Engine")
-            .field("p2p_enabled", &self.p2p.is_some())
-            .finish_non_exhaustive()
+        let mut binding = f.debug_struct("Engine");
+        #[cfg(feature = "p2p")]
+        {
+            binding.field("p2p_enabled", &self.p2p.is_some());
+        }
+        binding.finish_non_exhaustive()
     }
 }
 
@@ -168,6 +185,7 @@ impl Engine {
         let cache = CacheManager::new(db.clone(), CacheManagerConfig::default());
 
         // P2P bridge (optional).
+        #[cfg(feature = "p2p")]
         let p2p = if config.enable_p2p {
             let p2p_dir = config.p2p_data_dir.unwrap_or_else(|| {
                 config
@@ -202,6 +220,7 @@ impl Engine {
             vfs,
             cache,
             config: config_resolver,
+            #[cfg(feature = "p2p")]
             p2p,
             change_feed: Arc::new(ChangeFeed::new()),
             backend_factory,
@@ -255,6 +274,7 @@ impl Engine {
     /// its presenter begins accepting connections. Takes `self: &Arc<Self>` so
     /// the engine can hand a clone of itself, as an `Arc<dyn ManageDispatch>` and
     /// an `Arc<dyn DataAuthority>`, to each backend.
+    #[cfg(feature = "p2p")]
     pub async fn wire_manage_dispatch(self: &Arc<Self>) {
         let dispatch: Arc<dyn ManageDispatch> = self.clone();
         let authority: Arc<dyn DataAuthority> = self.clone();
@@ -578,13 +598,19 @@ impl Engine {
             })
             .unwrap_or_default();
 
-        let p2p_device_id = self.p2p.as_ref().map(|b| b.device_id().to_string());
+        #[cfg(feature = "p2p")]
+        let (p2p_enabled, p2p_device_id) = {
+            let id = self.p2p.as_ref().map(|b| b.device_id().to_string());
+            (id.is_some(), id)
+        };
+        #[cfg(not(feature = "p2p"))]
+        let (p2p_enabled, p2p_device_id) = (false, None);
 
         EngineStatus {
             running: !*self.cancel_rx.borrow(),
             backends,
             cache_stats,
-            p2p_enabled: self.p2p.is_some(),
+            p2p_enabled,
             p2p_device_id,
         }
     }
@@ -609,6 +635,7 @@ impl Engine {
     /// delegation chain roots in. `None` when no P2P backend is configured, in
     /// which case the node has no device identity to sign or verify against.
     #[must_use]
+    #[cfg(feature = "p2p")]
     pub fn device_identity(&self) -> Option<&cascade_p2p::identity::DeviceIdentity> {
         self.p2p.as_ref().map(|bridge| bridge.engine().identity())
     }
@@ -631,6 +658,7 @@ impl Engine {
     }
 }
 
+#[cfg(feature = "p2p")]
 /// The engine is the grant store and audit sink for the management plane,
 /// reading and writing the two `state.db` tables the prior phase added.
 impl ManageGrantStore for Engine {
@@ -674,6 +702,7 @@ impl ManageGrantStore for Engine {
     }
 }
 
+#[cfg(feature = "p2p")]
 /// The engine is the command executor for the management plane. Each method is
 /// the *same* operation the local CLI drives — `pin`, `unpin`, `status`, and a
 /// cache eviction sweep — so a manager can never do more than the daemon could
@@ -781,6 +810,7 @@ impl ManageCommandExecutor for Engine {
     }
 }
 
+#[cfg(feature = "p2p")]
 /// Parse a pushed `.cascade` config fragment in `format` into a
 /// [`CascadeConfig`](cascade_config::CascadeConfig).
 ///
@@ -799,6 +829,7 @@ fn parse_config_fragment(
     }
 }
 
+#[cfg(feature = "p2p")]
 #[async_trait]
 impl ManageDispatch for Engine {
     async fn dispatch(
@@ -813,6 +844,7 @@ impl ManageDispatch for Engine {
     }
 }
 
+#[cfg(feature = "p2p")]
 /// The engine is the data-plane authority for the BEP sync path: it resolves a
 /// peer's directional read/write access to a folder from the on-node data
 /// grants, the token revocation list, and any signed data-verb token the peer
@@ -1083,19 +1115,25 @@ mod tests {
     fn make_test_engine() -> Engine {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("state.db");
-        Engine::new(EngineConfig {
+        let mut config = EngineConfig {
             db_path,
             mount_point: PathBuf::from("/tmp/test-mount"),
             backends: vec![Arc::new(NullBackend::new("test"))],
             cache_dir: None,
-            enable_p2p: false,
-            p2p_data_dir: None,
-            p2p_posture: None,
-            p2p_relay_endpoints: Vec::new(),
-            p2p_relay_shared_secret: None,
             backend_factory: None,
-        })
-        .unwrap()
+            #[cfg(feature = "p2p")]
+            enable_p2p: false,
+            #[cfg(feature = "p2p")]
+            p2p_data_dir: None,
+            #[cfg(feature = "p2p")]
+            p2p_posture: None,
+            #[cfg(feature = "p2p")]
+            p2p_relay_endpoints: Vec::new(),
+            #[cfg(feature = "p2p")]
+            p2p_relay_shared_secret: None,
+        };
+        let _ = config;
+        Engine::new(config).unwrap()
     }
 
     #[tokio::test]
@@ -1181,12 +1219,17 @@ mod tests {
             mount_point: PathBuf::from("/tmp/test-mount"),
             backends: vec![],
             cache_dir: None,
-            enable_p2p: false,
-            p2p_data_dir: None,
-            p2p_posture: None,
-            p2p_relay_endpoints: Vec::new(),
-            p2p_relay_shared_secret: None,
             backend_factory: None,
+            #[cfg(feature = "p2p")]
+            enable_p2p: false,
+            #[cfg(feature = "p2p")]
+            p2p_data_dir: None,
+            #[cfg(feature = "p2p")]
+            p2p_posture: None,
+            #[cfg(feature = "p2p")]
+            p2p_relay_endpoints: Vec::new(),
+            #[cfg(feature = "p2p")]
+            p2p_relay_shared_secret: None,
         });
 
         assert!(result.is_err());
@@ -1203,12 +1246,17 @@ mod tests {
                 Arc::new(NullBackend::new("work")),
             ],
             cache_dir: None,
-            enable_p2p: false,
-            p2p_data_dir: None,
-            p2p_posture: None,
-            p2p_relay_endpoints: Vec::new(),
-            p2p_relay_shared_secret: None,
             backend_factory: None,
+            #[cfg(feature = "p2p")]
+            enable_p2p: false,
+            #[cfg(feature = "p2p")]
+            p2p_data_dir: None,
+            #[cfg(feature = "p2p")]
+            p2p_posture: None,
+            #[cfg(feature = "p2p")]
+            p2p_relay_endpoints: Vec::new(),
+            #[cfg(feature = "p2p")]
+            p2p_relay_shared_secret: None,
         })
         .unwrap();
 
@@ -1221,6 +1269,8 @@ mod tests {
     }
 
     // ── Management-plane dispatch against the real engine + DB ──
+
+    #[cfg(feature = "p2p")]
 
     use crate::manage::{Capability, Scope};
     use chrono::Utc;

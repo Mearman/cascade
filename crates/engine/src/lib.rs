@@ -16,6 +16,7 @@ pub mod config;
 pub mod db;
 pub mod engine;
 pub mod manage;
+#[cfg(feature = "p2p")]
 pub mod p2p_bridge;
 #[cfg(any(feature = "native", feature = "portable"))]
 pub mod portable;
