@@ -1,10 +1,14 @@
 import { RuntimeMode } from './capabilities';
-import type { WorkerRequest, WorkerResponse, WorkerEvent } from './messages';
+import type { WorkerRequest, WorkerResponse, WorkerEvent, WorkerMutator, MutatorAck } from './messages';
 
 export interface ApiClient {
   request(method: string, path: string, body?: unknown): Promise<{ status: number; body: unknown }>;
   ready(): Promise<boolean>;
   mode: RuntimeMode;
+  registerBackend(id: string, type: string, handle?: unknown): Promise<void>;
+  deregisterBackend(id: string): Promise<boolean>;
+  storeAuthToken(provider: string, token: { scope: string; expiry: number }): Promise<void>;
+  clearAuthToken(provider: string): Promise<boolean>;
 }
 
 function isHttpMethod(m: string): m is WorkerRequest['method'] {
@@ -23,10 +27,18 @@ function isWorkerEvent(value: unknown): value is WorkerEvent {
   return 'type' in value && typeof value.type === 'string';
 }
 
+function isMutatorAck(value: unknown): value is MutatorAck {
+  if (typeof value !== 'object' || value === null) return false;
+  if (!('id' in value) || typeof value.id !== 'string') return false;
+  if (!('result' in value)) return false;
+  return true;
+}
+
 class WasmApiClient implements ApiClient {
   readonly mode: RuntimeMode;
   private readonly worker: Worker;
   private readonly pending = new Map<string, (response: { status: number; body: unknown }) => void>();
+  private readonly mutatorPending = new Map<string, { resolve: (result: unknown) => void; reject: (err: Error) => void }>();
   private readonly readyPromise: Promise<boolean>;
   // Assigned synchronously by the Promise executor; declared as definite assignment
   // because TypeScript cannot see that the executor runs before the constructor returns.
@@ -48,6 +60,16 @@ class WasmApiClient implements ApiClient {
         if (handler !== undefined) {
           this.pending.delete(data.id);
           handler({ status: data.status, body: data.body });
+        }
+      } else if (isMutatorAck(data)) {
+        const entry = this.mutatorPending.get(data.id);
+        if (entry !== undefined) {
+          this.mutatorPending.delete(data.id);
+          if (data.error !== undefined) {
+            entry.reject(new Error(data.error));
+          } else {
+            entry.resolve(data.result);
+          }
         }
       } else if (isWorkerEvent(data)) {
         if (data.type === 'ready') {
@@ -81,6 +103,31 @@ class WasmApiClient implements ApiClient {
       this.worker.postMessage(msg);
     });
   }
+
+  private sendMutator(mutator: WorkerMutator['mutator'], args: unknown[]): Promise<unknown> {
+    const id = crypto.randomUUID();
+    const msg: WorkerMutator = { id, mutator, args };
+    return new Promise<unknown>((resolve, reject) => {
+      this.mutatorPending.set(id, { resolve, reject });
+      this.worker.postMessage(msg);
+    });
+  }
+
+  registerBackend(id: string, type: string, handle?: unknown): Promise<void> {
+    return this.sendMutator('register_backend', [id, type, handle]).then(() => undefined);
+  }
+
+  deregisterBackend(id: string): Promise<boolean> {
+    return this.sendMutator('deregister_backend', [id]).then((result) => result === true);
+  }
+
+  storeAuthToken(provider: string, token: { scope: string; expiry: number }): Promise<void> {
+    return this.sendMutator('store_auth_token', [provider, JSON.stringify(token)]).then(() => undefined);
+  }
+
+  clearAuthToken(provider: string): Promise<boolean> {
+    return this.sendMutator('clear_auth_token', [provider]).then((result) => result === true);
+  }
 }
 
 class HttpApiClient implements ApiClient {
@@ -106,6 +153,44 @@ class HttpApiClient implements ApiClient {
     const res = await fetch(`${this.baseUrl}/v1${path}`, init);
     const responseBody: unknown = await res.json().catch(() => null);
     return { status: res.status, body: responseBody };
+  }
+
+  async registerBackend(id: string, type: string, _handle?: unknown): Promise<void> {
+    const res = await fetch(`${this.baseUrl}/v1/backends`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, type }),
+    });
+    if (!res.ok) {
+      const body: unknown = await res.json().catch(() => null);
+      throw new Error(`register_backend failed: ${res.status} ${JSON.stringify(body)}`);
+    }
+  }
+
+  async deregisterBackend(id: string): Promise<boolean> {
+    const res = await fetch(`${this.baseUrl}/v1/backends/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    });
+    return res.ok;
+  }
+
+  async storeAuthToken(provider: string, token: { scope: string; expiry: number }): Promise<void> {
+    const res = await fetch(`${this.baseUrl}/v1/auth/tokens/${encodeURIComponent(provider)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(token),
+    });
+    if (!res.ok) {
+      const body: unknown = await res.json().catch(() => null);
+      throw new Error(`store_auth_token failed: ${res.status} ${JSON.stringify(body)}`);
+    }
+  }
+
+  async clearAuthToken(provider: string): Promise<boolean> {
+    const res = await fetch(`${this.baseUrl}/v1/auth/tokens/${encodeURIComponent(provider)}`, {
+      method: 'DELETE',
+    });
+    return res.ok;
   }
 }
 

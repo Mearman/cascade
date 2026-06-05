@@ -102,18 +102,63 @@ function ConnectedDashboard() {
 
 // ─── WASM mode dashboard ──────────────────────────────────────────────────────
 
+interface WasmHealth { version: string; status: string }
+interface WasmBackend { id: string; type: string; status: string }
+interface WasmCapabilities { backends: boolean; config: boolean; files: boolean; sync: boolean }
+
 function WasmDashboard({ mode }: { mode: RuntimeMode }) {
   const [ready, setReady] = useState<boolean | null>(null);
+  const [health, setHealth] = useState<WasmHealth | null>(null);
+  const [backends, setBackends] = useState<WasmBackend[]>([]);
+  const [capabilities, setCapabilities] = useState<WasmCapabilities | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    api.wasmReady()
-      .then((r) => setReady(r))
-      .catch(() => setReady(false));
+    let cancelled = false;
+
+    async function load() {
+      try {
+        const isReady = await api.wasmReady();
+        if (cancelled) return;
+        setReady(isReady);
+        if (!isReady) return;
+
+        // Query the WASM engine for health, backends, and capabilities.
+        const [healthRes, backendsRes, capsRes] = await Promise.allSettled([
+          api.health(),
+          api.backends(),
+          api.rawRequest('GET', '/capabilities'),
+        ]);
+
+        if (cancelled) return;
+
+        if (healthRes.status === 'fulfilled') {
+          setHealth(healthRes.value as unknown as WasmHealth);
+        }
+        if (backendsRes.status === 'fulfilled') {
+          const body = (backendsRes.value as unknown as { backends?: WasmBackend[] });
+          setBackends(body.backends ?? []);
+        }
+        if (capsRes.status === 'fulfilled') {
+          const capsBody = capsRes.value as { status: number; body: unknown };
+          if (capsBody.status === 200 && typeof capsBody.body === 'object' && capsBody.body !== null) {
+            setCapabilities(capsBody.body as WasmCapabilities);
+          }
+        }
+      } catch (err) {
+        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+      }
+    }
+
+    load();
+    return () => { cancelled = true; };
   }, []);
 
   return (
     <div class="dashboard">
       <h2>Dashboard</h2>
+
+      {error !== null && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
 
       <section class="dashboard-section">
         <h3>WASM Engine</h3>
@@ -131,15 +176,54 @@ function WasmDashboard({ mode }: { mode: RuntimeMode }) {
               ? 'Standalone (local filesystem + cloud)'
               : 'Browse-only (cloud access)'}
           </dd>
+          {health !== null && (
+            <>
+              <dt>Version</dt>
+              <dd>{health.version}</dd>
+              <dt>Engine status</dt>
+              <dd><span class={`badge ${health.status === 'ok' ? 'ok' : 'danger'}`}>{health.status}</span></dd>
+            </>
+          )}
         </dl>
       </section>
 
+      {capabilities !== null && (
+        <section class="dashboard-section">
+          <h3>Capabilities</h3>
+          <ul class="abilities-list">
+            {capabilities.backends && <li><span class="badge ok">Backends</span></li>}
+            {capabilities.config && <li><span class="badge ok">Config parsing</span></li>}
+            {capabilities.files && <li><span class="badge ok">File browsing</span></li>}
+            {capabilities.sync && <li><span class="badge ok">Sync</span></li>}
+          </ul>
+          {!capabilities.files && (
+            <p class="muted">File browsing returns 501 from the WASM engine in this build.</p>
+          )}
+        </section>
+      )}
+
       <section class="dashboard-section">
         <h3>Backends</h3>
-        <p class="muted">
-          No backends connected yet. Sign in with Google on the{' '}
-          <a href="/login">login page</a> to add Google Drive.
-        </p>
+        {backends.length > 0
+          ? (
+            <ul class="abilities-list">
+              {backends.map((b) => (
+                <li key={b.id}>
+                  <code>{b.id}</code> ({b.type})
+                  <span class={`badge ${b.status === 'ok' ? 'ok' : 'danger'}`}>{b.status}</span>
+                </li>
+              ))}
+            </ul>
+          )
+          : (
+            <p class="muted">
+              No backends connected yet.{' '}
+              {mode === RuntimeMode.Standalone
+                ? 'Choose a local folder or sign in with a cloud provider to add a backend.'
+                : 'Sign in with a cloud provider on the login page to add a backend.'}
+            </p>
+          )
+        }
       </section>
 
       <section class="dashboard-section">

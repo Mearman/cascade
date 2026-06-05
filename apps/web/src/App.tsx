@@ -32,6 +32,11 @@ function ConnectionSetup({ onConnected }: {
   const [pickingDir, setPickingDir] = useState(false);
   const [dirName, setDirName] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [starting, setStarting] = useState(false);
+  // Holds the FileSystemDirectoryHandle chosen by the user. Kept outside
+  // dirName (which is just the display name) so we can pass it to
+  // registerBackend on continue.
+  const [directoryHandle, setDirectoryHandle] = useState<FileSystemDirectoryHandle | null>(null);
 
   const standaloneAvailable = capabilities.wasm && capabilities.fileSystemAccess;
   const browseOnlyAvailable = capabilities.wasm;
@@ -43,6 +48,7 @@ function ConnectionSetup({ onConnected }: {
       const handle = await requestDirectory();
       await persistHandle('cascade-root', handle);
       setDirName(handle.name);
+      setDirectoryHandle(handle);
     } catch (err) {
       if (err instanceof Error && err.name !== 'AbortError') {
         setError(err.message);
@@ -74,11 +80,28 @@ function ConnectionSetup({ onConnected }: {
     onConnected(RuntimeMode.Connected);
   }
 
-  function handleContinue() {
-    if (selectedMode === RuntimeMode.BrowseOnly) {
-      onConnected(RuntimeMode.BrowseOnly);
-    } else if (selectedMode === RuntimeMode.Standalone) {
-      onConnected(RuntimeMode.Standalone, dirName ?? undefined);
+  async function handleContinue() {
+    setError(null);
+    setStarting(true);
+    try {
+      if (selectedMode === RuntimeMode.BrowseOnly) {
+        onConnected(RuntimeMode.BrowseOnly);
+      } else if (selectedMode === RuntimeMode.Standalone) {
+        // Set mode first so the bridge client is created and the worker starts.
+        api.setMode(RuntimeMode.Standalone);
+        const ready = await api.wasmReady();
+        if (!ready) {
+          throw new Error('WASM engine failed to initialise');
+        }
+        if (directoryHandle !== null) {
+          await api.registerBackend('local', 'local-fs', directoryHandle);
+        }
+        onConnected(RuntimeMode.Standalone, dirName ?? undefined);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setStarting(false);
     }
   }
 
@@ -168,8 +191,8 @@ function ConnectionSetup({ onConnected }: {
             <button type="button" class="secondary" onClick={handleChooseFolder} disabled={pickingDir}>
               {pickingDir ? 'Choosing…' : dirName !== null ? 'Choose a different folder' : 'Choose folder'}
             </button>
-            <button type="button" onClick={handleContinue}>
-              {dirName !== null ? 'Continue' : 'Continue without folder'}
+            <button type="button" onClick={handleContinue} disabled={starting}>
+              {starting ? 'Starting…' : dirName !== null ? 'Continue' : 'Continue without folder'}
             </button>
           </div>
         </div>
@@ -178,7 +201,9 @@ function ConnectionSetup({ onConnected }: {
       {selectedMode === RuntimeMode.BrowseOnly && (
         <div class="setup-actions setup-actions-top">
           {error !== null && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
-          <button type="button" onClick={handleContinue}>Continue</button>
+          <button type="button" onClick={handleContinue} disabled={starting}>
+            {starting ? 'Starting…' : 'Continue'}
+          </button>
         </div>
       )}
     </div>

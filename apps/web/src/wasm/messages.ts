@@ -17,8 +17,30 @@ export interface WorkerResponse {
   error?: string;
 }
 
+/** Mutator command sent from the main thread to the worker. */
+export type MutatorMethod =
+  | 'register_backend'
+  | 'deregister_backend'
+  | 'store_auth_token'
+  | 'clear_auth_token'
+  | 'set_peer_connection'
+  | 'remove_peer_connection';
+
+export interface WorkerMutator {
+  id: string;
+  mutator: MutatorMethod;
+  args: unknown[];
+}
+
 /** Sent from the worker to the main thread as a lifecycle notification. */
 export interface WorkerEvent {
   type: 'ready' | 'error' | 'state-change';
   data?: unknown;
+}
+
+/** Sent from the worker to acknowledge a mutator command. */
+export interface MutatorAck {
+  id: string;
+  result: unknown;
+  error?: string;
 }

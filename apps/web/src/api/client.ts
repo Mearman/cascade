@@ -432,6 +432,53 @@ export class ApiClient {
     return this.request('GET', '/backends');
   }
 
+  /** Register a backend via the WASM mutator channel (or POST in Connected mode). */
+  registerBackend(id: string, type: string, handle?: unknown): Promise<void> {
+    if (this.bridgeClient !== null) {
+      return this.bridgeClient.registerBackend(id, type, handle);
+    }
+    return this.request('POST', '/backends', { id, type });
+  }
+
+  /** Deregister a backend via the WASM mutator channel (or DELETE in Connected mode). */
+  deregisterBackend(id: string): Promise<boolean> {
+    if (this.bridgeClient !== null) {
+      return this.bridgeClient.deregisterBackend(id);
+    }
+    return this.request('DELETE', `/backends/${encodeURIComponent(id)}`).then(() => true).catch(() => false);
+  }
+
+  /** Store an auth token for a provider via the WASM mutator channel (or POST in Connected mode). */
+  storeAuthToken(provider: string, token: { scope: string; expiry: number }): Promise<void> {
+    if (this.bridgeClient !== null) {
+      return this.bridgeClient.storeAuthToken(provider, token);
+    }
+    return this.request('POST', `/auth/tokens/${encodeURIComponent(provider)}`, token);
+  }
+
+  /** Clear an auth token for a provider via the WASM mutator channel (or DELETE in Connected mode). */
+  clearAuthToken(provider: string): Promise<boolean> {
+    if (this.bridgeClient !== null) {
+      return this.bridgeClient.clearAuthToken(provider);
+    }
+    return this.request('DELETE', `/auth/tokens/${encodeURIComponent(provider)}`).then(() => true).catch(() => false);
+  }
+
+  /** Make a raw request through the bridge (WASM modes) or fetch (Connected mode). */
+  rawRequest(method: 'GET' | 'POST' | 'PUT' | 'DELETE', path: string, body?: unknown): Promise<{ status: number; body: unknown }> {
+    if (this.bridgeClient !== null) {
+      return this.bridgeClient.request(method, path, body);
+    }
+    return this.request<{ status: number; body: unknown }>(method as 'GET' | 'POST' | 'PUT' | 'DELETE', path, body)
+      .then((result) => ({ status: 200, body: result as unknown }))
+      .catch((err) => {
+        if (err instanceof ApiError) {
+          return { status: 500, body: { error: err } };
+        }
+        return { status: 500, body: { error: String(err) } };
+      });
+  }
+
   // ─── Cache ────────────────────────────────────────────────────────────────
 
   cacheEvict(): Promise<CacheActionResponse> {
