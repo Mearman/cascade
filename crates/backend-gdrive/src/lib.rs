@@ -108,7 +108,7 @@ pub fn create_backend_with_store_and_http(
     http: Arc<dyn cascade_engine::portable::HttpClient>,
 ) -> anyhow::Result<Box<dyn Backend>> {
     let (oauth, drive_native, initial_tokens, instance_id) =
-        parse_gdrive_config_portable(config, Arc::clone(&http))?;
+        parse_gdrive_config_portable(config, Arc::clone(&http));
 
     Ok(Box::new(GdriveBackend {
         drive: drive_native,
@@ -193,12 +193,12 @@ fn parse_gdrive_config(
 fn parse_gdrive_config_portable(
     config: &toml::Value,
     http: Arc<dyn cascade_engine::portable::HttpClient>,
-) -> anyhow::Result<(
+) -> (
     auth::OAuthConfig,
     DriveClient,
     Option<auth::AuthTokens>,
     String,
-)> {
+) {
     const DEFAULT_TOKEN_LIFETIME_HOURS: i64 = 24;
 
     let client_id = config
@@ -243,7 +243,7 @@ fn parse_gdrive_config_portable(
         token_url,
     };
 
-    Ok((oauth, drive, initial_tokens, instance_id))
+    (oauth, drive, initial_tokens, instance_id)
 }
 
 /// Build optional pre-populated tokens from test-harness config keys.
