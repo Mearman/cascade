@@ -77,8 +77,8 @@ function ConnectionSetup({ onConnected }: {
   function handleContinue() {
     if (selectedMode === RuntimeMode.BrowseOnly) {
       onConnected(RuntimeMode.BrowseOnly);
-    } else if (selectedMode === RuntimeMode.Standalone && dirName !== null) {
-      onConnected(RuntimeMode.Standalone, dirName);
+    } else if (selectedMode === RuntimeMode.Standalone) {
+      onConnected(RuntimeMode.Standalone, dirName ?? undefined);
     }
   }
 
@@ -161,16 +161,16 @@ function ConnectionSetup({ onConnected }: {
         <div class="setup-dir">
           {dirName !== null
             ? <p>Selected folder: <strong>{dirName}</strong></p>
-            : <p class="muted">No folder selected — choose one to continue.</p>
+            : <p class="muted">Optionally choose a local folder to sync files to your computer.</p>
           }
           {error !== null && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
           <div class="setup-actions">
             <button type="button" class="secondary" onClick={handleChooseFolder} disabled={pickingDir}>
               {pickingDir ? 'Choosing…' : dirName !== null ? 'Choose a different folder' : 'Choose folder'}
             </button>
-            {dirName !== null && (
-              <button type="button" onClick={handleContinue}>Continue</button>
-            )}
+            <button type="button" onClick={handleContinue}>
+              {dirName !== null ? 'Continue' : 'Continue without folder'}
+            </button>
           </div>
         </div>
       )}
