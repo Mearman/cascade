@@ -5,17 +5,21 @@
 //! 2. Evicts LRU non-pinned files when cache exceeds limits
 //! 3. Applies lifecycle policies
 //! 4. Reports cache statistics
+//!
+//! The manager uses portable traits ([`StateStorage`], [`RuntimeHandle`])
+//! instead of concrete tokio/rusqlite types so it compiles to both native
+//! and WASM targets. The cancel mechanism is runtime-specific: a tokio
+//! `watch` channel on native, an `AtomicBool` flag on portable.
 
 use crate::cache::lifecycle::{EvictionDecision, LifecycleEvaluator};
-use crate::cache::pin::PinMatcher;
-use crate::db::StateDb;
+use crate::cache::pin::{self, PinMatcher};
 #[cfg(feature = "p2p")]
 use crate::p2p_bridge::P2pBridge;
+use crate::portable::{RuntimeHandle, StateStorage};
 use crate::types::CacheState;
 use anyhow::Result;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::watch;
 use tracing::info;
 
 /// Configuration for the cache manager.
@@ -40,14 +44,15 @@ impl Default for CacheManagerConfig {
 }
 
 /// Manages file caching, pinning, and eviction.
-pub struct CacheManager {
-    db: Arc<StateDb>,
+pub struct CacheManager<R: RuntimeHandle> {
+    storage: Arc<dyn StateStorage>,
+    runtime: R,
     config: CacheManagerConfig,
     #[cfg(feature = "p2p")]
     p2p: Option<Arc<P2pBridge>>,
 }
 
-impl std::fmt::Debug for CacheManager {
+impl<R: RuntimeHandle> std::fmt::Debug for CacheManager<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut binding = f.debug_struct("CacheManager");
         let s = binding.field("config", &self.config);
@@ -59,11 +64,12 @@ impl std::fmt::Debug for CacheManager {
     }
 }
 
-impl CacheManager {
-    /// Create a new cache manager.
-    pub const fn new(db: Arc<StateDb>, config: CacheManagerConfig) -> Self {
+impl<R: RuntimeHandle> CacheManager<R> {
+    /// Create a new cache manager backed by portable traits.
+    pub fn new(storage: Arc<dyn StateStorage>, runtime: R, config: CacheManagerConfig) -> Self {
         Self {
-            db,
+            storage,
+            runtime,
             config,
             #[cfg(feature = "p2p")]
             p2p: None,
@@ -99,9 +105,8 @@ impl CacheManager {
     }
 
     /// Pin a path — all files matching the glob will be kept offline.
-    pub fn pin(&self, path_glob: &str, recursive: bool) -> Result<()> {
-        let mut matcher = PinMatcher::load(&self.db)?;
-        matcher.add_rule(path_glob, recursive)?;
+    pub async fn pin(&self, path_glob: &str, recursive: bool) -> Result<()> {
+        let _matcher = pin::add_pin_rule(&*self.storage, path_glob, recursive).await?;
 
         // Transition matching files to Pinned state.
         // For now, we just record the rule. Actual file download is deferred
@@ -112,9 +117,8 @@ impl CacheManager {
     }
 
     /// Unpin a path — removes the pin rule.
-    pub fn unpin(&self, path_glob: &str) -> Result<bool> {
-        let mut matcher = PinMatcher::load(&self.db)?;
-        let removed = matcher.remove_rule(path_glob)?;
+    pub async fn unpin(&self, path_glob: &str) -> Result<bool> {
+        let removed = pin::remove_pin_rule(&*self.storage, path_glob).await?;
         if removed {
             info!("pin rule removed: {}", path_glob);
         }
@@ -122,8 +126,8 @@ impl CacheManager {
     }
 
     /// List all pin rules.
-    pub fn list_pins(&self) -> Result<Vec<crate::db::PinRuleRecord>> {
-        let matcher = PinMatcher::load(&self.db)?;
+    pub async fn list_pins(&self) -> Result<Vec<crate::db::PinRuleRecord>> {
+        let matcher = PinMatcher::load(&*self.storage).await?;
         Ok(matcher.rules().to_vec())
     }
 
@@ -131,33 +135,53 @@ impl CacheManager {
     /// subject to lifecycle policies.
     ///
     /// Returns the number of files evicted.
-    pub fn evict(&self) -> Result<EvictionReport> {
+    pub async fn evict(&self) -> Result<EvictionReport> {
         let mut report = EvictionReport::default();
 
         // 1. Evict files matching lifecycle policies.
-        let lifecycle = LifecycleEvaluator::load(&self.db)?;
-        let cached_files = self.db.list_files_by_cache_state(CacheState::Cached)?;
+        let lifecycle = LifecycleEvaluator::load(&*self.storage).await?;
+        let cached_files = self
+            .storage
+            .list_files_by_cache_state(CacheState::Cached)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         for file in &cached_files {
             let path = Path::new(&file.name);
             if lifecycle.should_evict(file, path) != EvictionDecision::Keep {
-                self.db.update_cache_state(&file.id, CacheState::Online)?;
+                self.storage
+                    .update_cache_state(&file.id, CacheState::Online)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
                 report.lifecycle_evicted += 1;
             }
         }
 
         // 2. Evict LRU files if cache exceeds max_size.
         if let Some(max_size) = self.config.max_size {
-            let current_size = u64::try_from(self.db.cache_size()?).unwrap_or(0);
+            let current_size = u64::try_from(
+                self.storage
+                    .cache_size()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+            )
+            .unwrap_or(0);
             if current_size > max_size {
                 // Evict in LRU order until under limit.
-                let candidates = self.db.eviction_candidates(100)?;
+                let candidates = self
+                    .storage
+                    .eviction_candidates(100)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
                 let mut freed: u64 = 0;
                 for file in &candidates {
                     if current_size - freed <= max_size {
                         break;
                     }
                     freed += file.size.unwrap_or(0);
-                    self.db.update_cache_state(&file.id, CacheState::Online)?;
+                    self.storage
+                        .update_cache_state(&file.id, CacheState::Online)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
                     report.size_evicted += 1;
                 }
                 report.bytes_freed = freed;
@@ -175,11 +199,27 @@ impl CacheManager {
     }
 
     /// Get cache statistics.
-    pub fn stats(&self) -> Result<CacheStats> {
-        let online = self.db.list_files_by_cache_state(CacheState::Online)?;
-        let cached = self.db.list_files_by_cache_state(CacheState::Cached)?;
-        let pinned = self.db.list_files_by_cache_state(CacheState::Pinned)?;
-        let total_size = self.db.cache_size()?;
+    pub async fn stats(&self) -> Result<CacheStats> {
+        let online = self
+            .storage
+            .list_files_by_cache_state(CacheState::Online)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let cached = self
+            .storage
+            .list_files_by_cache_state(CacheState::Cached)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let pinned = self
+            .storage
+            .list_files_by_cache_state(CacheState::Pinned)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let total_size = self
+            .storage
+            .cache_size()
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         Ok(CacheStats {
             online_count: online.len(),
@@ -190,15 +230,17 @@ impl CacheManager {
         })
     }
 
-    /// Run the background eviction loop. Blocks until cancelled.
-    pub async fn run(&self, mut cancel: watch::Receiver<bool>) {
-        let interval = tokio::time::Duration::from_secs(self.config.sweep_interval_secs);
+    /// Run the background eviction loop using a tokio watch channel for
+    /// cancellation.
+    #[cfg(feature = "native")]
+    pub async fn run(&self, mut cancel: tokio::sync::watch::Receiver<bool>) {
+        let interval = std::time::Duration::from_secs(self.config.sweep_interval_secs);
         let mut ticker = tokio::time::interval(interval);
 
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    if let Err(e) = self.evict() {
+                    if let Err(e) = self.evict().await {
                         tracing::error!("eviction sweep failed: {e}");
                     }
                 }
@@ -206,6 +248,31 @@ impl CacheManager {
                     info!("cache manager shutting down");
                     return;
                 }
+            }
+        }
+    }
+
+    /// Run the background eviction loop using an atomic flag for cancellation.
+    ///
+    /// Polls the flag each sweep interval. Suitable for runtimes without tokio
+    /// watch channels (e.g. WASM).
+    pub async fn run_with_flag(&self, cancel: Arc<std::sync::atomic::AtomicBool>) {
+        use std::sync::atomic::Ordering;
+
+        let interval = std::time::Duration::from_secs(self.config.sweep_interval_secs);
+
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                info!("cache manager shutting down");
+                return;
+            }
+            let () = self.runtime.sleep(interval).await;
+            if cancel.load(Ordering::Relaxed) {
+                info!("cache manager shutting down");
+                return;
+            }
+            if let Err(e) = self.evict().await {
+                tracing::error!("eviction sweep failed: {e}");
             }
         }
     }

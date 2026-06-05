@@ -10,7 +10,7 @@
 //! Cascade engine — core types, backend trait, VFS tree, state database.
 
 pub mod backend;
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "portable"))]
 pub mod cache;
 #[cfg(feature = "native")]
 pub mod changefeed;
@@ -25,7 +25,7 @@ pub mod p2p_bridge;
 pub mod portable;
 pub mod presenter;
 pub mod protocol;
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "portable"))]
 pub mod sync;
 pub mod types;
 #[cfg(feature = "native")]

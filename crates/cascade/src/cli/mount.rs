@@ -762,8 +762,9 @@ async fn try_fskit(
     );
 
     let sync_runner = engine.create_sync_runner(presenter.clone());
+    let cancel = engine.cancel_flag();
     let sync_handle = tokio::spawn(async move {
-        if let Err(e) = sync_runner.run().await {
+        if let Err(e) = sync_runner.run(cancel).await {
             tracing::error!(error = %e, "sync runner exited with error");
         }
     });
@@ -956,8 +957,9 @@ async fn try_fileprovider(
     // direction has no consumer in the pull-based File Provider model, so
     // it pushes to a no-op presenter.
     let sync_runner = engine.create_sync_runner(Arc::new(NoopPresenter));
+    let cancel = engine.cancel_flag();
     let sync_handle = tokio::spawn(async move {
-        if let Err(e) = sync_runner.run().await {
+        if let Err(e) = sync_runner.run(cancel).await {
             tracing::error!(error = %e, "sync runner exited with error");
         }
     });
@@ -1111,8 +1113,9 @@ async fn try_projfs(
     );
 
     let sync_runner = engine.create_sync_runner(presenter.clone());
+    let cancel = engine.cancel_flag();
     let sync_handle = tokio::spawn(async move {
-        if let Err(e) = sync_runner.run().await {
+        if let Err(e) = sync_runner.run(cancel).await {
             tracing::error!(error = %e, "sync runner exited with error");
         }
     });
@@ -1234,8 +1237,9 @@ async fn try_webdav(
     let items = presenter.items().clone();
 
     let sync_runner = engine.create_sync_runner(presenter.clone());
+    let cancel = engine.cancel_flag();
     let sync_handle = tokio::spawn(async move {
-        if let Err(e) = sync_runner.run().await {
+        if let Err(e) = sync_runner.run(cancel).await {
             tracing::error!(error = %e, "sync runner exited with error");
         }
     });
@@ -1360,8 +1364,9 @@ async fn try_fuse(
     );
 
     let sync_runner = engine.create_sync_runner(presenter.clone());
+    let cancel = engine.cancel_flag();
     let sync_handle = tokio::spawn(async move {
-        if let Err(e) = sync_runner.run().await {
+        if let Err(e) = sync_runner.run(cancel).await {
             tracing::error!(error = %e, "sync runner exited with error");
         }
     });
@@ -1457,8 +1462,9 @@ async fn try_nfs(
     let nfs_ctx = presenter.context().clone();
 
     let sync_runner = engine.create_sync_runner(presenter);
+    let cancel = engine.cancel_flag();
     let sync_handle = tokio::spawn(async move {
-        if let Err(e) = sync_runner.run().await {
+        if let Err(e) = sync_runner.run(cancel).await {
             tracing::error!(error = %e, "sync runner exited with error");
         }
     });

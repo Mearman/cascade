@@ -88,12 +88,12 @@ impl crate::manage::ManageCommandExecutor for Engine {
     }
 
     async fn manage_pin(&self, path_glob: &str, recursive: bool) -> Result<String> {
-        self.pin(path_glob, recursive)?;
+        self.pin(path_glob, recursive).await?;
         Ok(format!("pinned {path_glob} (recursive={recursive})"))
     }
 
     async fn manage_unpin(&self, path_glob: &str) -> Result<String> {
-        let removed = self.unpin(path_glob)?;
+        let removed = self.unpin(path_glob).await?;
         Ok(if removed {
             format!("unpinned {path_glob}")
         } else {
@@ -102,7 +102,7 @@ impl crate::manage::ManageCommandExecutor for Engine {
     }
 
     async fn manage_cache_evict(&self) -> Result<String> {
-        let report = self.cache.evict()?;
+        let report = self.cache.evict().await?;
         Ok(format!(
             "evicted {} files ({} lifecycle, {} size), freed {} bytes",
             report.total_evicted(),
@@ -113,7 +113,7 @@ impl crate::manage::ManageCommandExecutor for Engine {
     }
 
     async fn manage_cache_warm(&self, path_glob: &str) -> Result<String> {
-        self.warm(path_glob)?;
+        self.warm(path_glob).await?;
         Ok(format!("warmed {path_glob}"))
     }
 

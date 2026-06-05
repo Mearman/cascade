@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use super::*;
 use crate::backend::NullBackend;
-use crate::manage::{DeviceId, Grant, Scope};
 #[cfg(feature = "p2p")]
 use crate::manage::Capability;
+use crate::manage::{DeviceId, Grant, Scope};
 #[cfg(feature = "p2p")]
 use cascade_p2p::protocol::{ManageCommand, ManageResult, ManageScope as WireScope};
 
@@ -66,16 +66,16 @@ async fn engine_mount_unmount_backend() {
 async fn engine_pin_unpin_list() {
     let engine = make_test_engine();
 
-    engine.pin("Documents/**", true).unwrap();
+    engine.pin("Documents/**", true).await.unwrap();
 
-    let pins = engine.list_pins().unwrap();
+    let pins = engine.list_pins().await.unwrap();
     assert_eq!(pins.len(), 1);
     assert_eq!(pins[0].path_glob, "Documents/**");
 
-    let removed = engine.unpin("Documents/**").unwrap();
+    let removed = engine.unpin("Documents/**").await.unwrap();
     assert!(removed);
 
-    let pins = engine.list_pins().unwrap();
+    let pins = engine.list_pins().await.unwrap();
     assert!(pins.is_empty());
 }
 
@@ -210,7 +210,7 @@ async fn dispatch_authorised_pin_mutates_state_and_audits() {
         "authorised pin should succeed, got {result:?}",
     );
     // The side effect ran: the pin rule is now present.
-    let pins = engine.list_pins().unwrap();
+    let pins = engine.list_pins().await.unwrap();
     assert!(
         pins.iter().any(|p| p.path_glob == "/work/reports"),
         "pin rule must have been recorded",
@@ -268,7 +268,7 @@ async fn dispatch_pin_outside_granted_scope_is_refused_against_real_engine() {
         "a pin escaping the granted scope must be refused, got {result:?}",
     );
     assert!(
-        engine.list_pins().unwrap().is_empty(),
+        engine.list_pins().await.unwrap().is_empty(),
         "no pin rule may be created for a path outside the granted scope",
     );
     let audit = engine.db().list_audit().unwrap();
@@ -321,7 +321,7 @@ async fn dispatch_unauthorised_pin_makes_no_change_and_audits_denial() {
     );
     // No pin rule was created.
     assert!(
-        engine.list_pins().unwrap().is_empty(),
+        engine.list_pins().await.unwrap().is_empty(),
         "an unauthorised request must not mutate state",
     );
     // The denial was still audited.
@@ -390,8 +390,14 @@ fn parse_size_bytes_units() {
     assert_eq!(operations::parse_size_bytes("512").unwrap(), 512);
     assert_eq!(operations::parse_size_bytes("512B").unwrap(), 512);
     assert_eq!(operations::parse_size_bytes("1KB").unwrap(), 1024);
-    assert_eq!(operations::parse_size_bytes("2MB").unwrap(), 2 * 1024 * 1024);
-    assert_eq!(operations::parse_size_bytes("1gb").unwrap(), 1024 * 1024 * 1024);
+    assert_eq!(
+        operations::parse_size_bytes("2MB").unwrap(),
+        2 * 1024 * 1024
+    );
+    assert_eq!(
+        operations::parse_size_bytes("1gb").unwrap(),
+        1024 * 1024 * 1024
+    );
     assert_eq!(
         operations::parse_size_bytes("1TB").unwrap(),
         1024_i64 * 1024 * 1024 * 1024
@@ -447,8 +453,8 @@ fn confine_rule_path_rejects_parent_traversal_escape() {
 
 // ── Engine-level command entry points against the real state DB ──
 
-#[test]
-fn config_push_applies_pins_and_policies_into_db() {
+#[tokio::test]
+async fn config_push_applies_pins_and_policies_into_db() {
     let engine = make_test_engine();
     let body = r#"
         [[pin]]
@@ -479,8 +485,8 @@ fn config_push_applies_pins_and_policies_into_db() {
     assert_eq!(policy.priority, 3);
 }
 
-#[test]
-fn config_push_roots_absolute_rule_paths_under_the_folder() {
+#[tokio::test]
+async fn config_push_roots_absolute_rule_paths_under_the_folder() {
     // Scope-escape blocker, end to end: a fragment authorised over /work
     // carries an absolute pin path `/personal` and an absolute lifecycle
     // path `/`. Both must be rooted UNDER /work — no `/personal` or bare
@@ -515,8 +521,8 @@ fn config_push_roots_absolute_rule_paths_under_the_folder() {
     );
 }
 
-#[test]
-fn config_push_with_traversal_escape_applies_nothing() {
+#[tokio::test]
+async fn config_push_with_traversal_escape_applies_nothing() {
     // A fragment whose rule path climbs out of the authorised folder via
     // `..` must reject the whole push and apply nothing — not even the
     // earlier, well-behaved rules in the same fragment.
@@ -542,8 +548,8 @@ fn config_push_with_traversal_escape_applies_nothing() {
     );
 }
 
-#[test]
-fn policy_set_inserts_a_lifecycle_policy() {
+#[tokio::test]
+async fn policy_set_inserts_a_lifecycle_policy() {
     let engine = make_test_engine();
     engine
         .policy_set("/work/*.tmp", Some(3600), None, 1)
@@ -557,8 +563,8 @@ fn policy_set_inserts_a_lifecycle_policy() {
     assert_eq!(policy.max_file_size, None);
 }
 
-#[test]
-fn grant_add_and_revoke_round_trip_through_db() {
+#[tokio::test]
+async fn grant_add_and_revoke_round_trip_through_db() {
     use crate::manage::{Capability, Scope};
     let engine = make_test_engine();
     let g = Grant {

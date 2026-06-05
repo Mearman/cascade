@@ -33,7 +33,8 @@ use super::{
 use crate::db::TokenRecord;
 use crate::db::{
     AuditEntry, AuditRecord, BackendRecord, DirtyFileRecord, ExplicitControlRecord, GrantRecord,
-    LifecyclePolicyRecord, MaxFileLengthRecord, PeerRecord, PinRuleRecord, QuarantineRecord, StateDb,
+    LifecyclePolicyRecord, MaxFileLengthRecord, PeerRecord, PinRuleRecord, QuarantineRecord,
+    StateDb,
 };
 #[cfg(feature = "p2p")]
 use crate::manage::token::CapabilityToken;
@@ -304,12 +305,7 @@ impl<R: RuntimeHandle> StateStorage for SqliteStorage<R> {
         let path_glob = path_glob.to_owned();
         let conditions = conditions.map(ToOwned::to_owned);
         self.run(move |db| {
-            db.add_max_file_length_rule(
-                &path_glob,
-                max_bytes,
-                priority,
-                conditions.as_deref(),
-            )
+            db.add_max_file_length_rule(&path_glob, max_bytes, priority, conditions.as_deref())
         })
         .await
     }

@@ -1,17 +1,19 @@
 //! Lifecycle policy evaluation — determines if a file should be evicted.
 
-use crate::db::{LifecyclePolicyRecord, StateDb};
+use crate::db::LifecyclePolicyRecord;
 use crate::types::FileEntry;
-use anyhow::Result;
 use std::path::Path;
 
 /// Evaluates lifecycle policies to determine eviction candidates.
-pub struct LifecycleEvaluator<'a> {
-    db: &'a StateDb,
+///
+/// Owns a snapshot of the policies loaded at construction time. The evaluation
+/// logic is pure; state mutations are done through the storage layer and a
+/// fresh evaluator is created from the updated policies.
+pub struct LifecycleEvaluator {
     policies: Vec<LifecyclePolicyRecord>,
 }
 
-impl std::fmt::Debug for LifecycleEvaluator<'_> {
+impl std::fmt::Debug for LifecycleEvaluator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LifecycleEvaluator")
             .field("policy_count", &self.policies.len())
@@ -19,11 +21,26 @@ impl std::fmt::Debug for LifecycleEvaluator<'_> {
     }
 }
 
-impl<'a> LifecycleEvaluator<'a> {
-    /// Load all lifecycle policies from the database.
-    pub fn load(db: &'a StateDb) -> Result<Self> {
+impl LifecycleEvaluator {
+    /// Build an evaluator from a pre-loaded policy set.
+    #[must_use]
+    pub const fn from_policies(policies: Vec<LifecyclePolicyRecord>) -> Self {
+        Self { policies }
+    }
+
+    /// Load all lifecycle policies from the native state database.
+    #[cfg(feature = "native")]
+    pub fn load_native(db: &crate::db::StateDb) -> anyhow::Result<Self> {
         let policies = db.list_lifecycle_policies()?;
-        Ok(Self { db, policies })
+        Ok(Self { policies })
+    }
+
+    /// Load all lifecycle policies from the portable state storage.
+    pub async fn load(
+        storage: &dyn crate::portable::StateStorage,
+    ) -> Result<Self, crate::portable::StorageError> {
+        let policies = storage.list_lifecycle_policies().await?;
+        Ok(Self { policies })
     }
 
     /// Evaluate whether a file should be evicted based on lifecycle policies.
@@ -67,29 +84,6 @@ impl<'a> LifecycleEvaluator<'a> {
         }
 
         EvictionDecision::Keep
-    }
-
-    /// Add a new lifecycle policy and reload.
-    pub fn add_policy(
-        &mut self,
-        path_glob: &str,
-        max_age: Option<i64>,
-        max_file_size: Option<i64>,
-        priority: i32,
-    ) -> Result<()> {
-        self.db
-            .add_lifecycle_policy(path_glob, max_age, max_file_size, priority, None)?;
-        self.policies = self.db.list_lifecycle_policies()?;
-        Ok(())
-    }
-
-    /// Remove a lifecycle policy and reload.
-    pub fn remove_policy(&mut self, id: i64) -> Result<bool> {
-        let removed = self.db.remove_lifecycle_policy(id)?;
-        if removed {
-            self.policies = self.db.list_lifecycle_policies()?;
-        }
-        Ok(removed)
     }
 
     /// Return the current list of policies.
@@ -158,6 +152,7 @@ fn simple_star_match(pattern: &str, path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::LifecyclePolicyRecord;
     use crate::types::ItemId;
 
     fn make_file(name: &str, size: Option<u64>) -> FileEntry {
@@ -169,10 +164,28 @@ mod tests {
         .with_size(size)
     }
 
+    fn make_policies(
+        entries: &[(&str, Option<i64>, Option<i64>, i32)],
+    ) -> Vec<LifecyclePolicyRecord> {
+        entries
+            .iter()
+            .enumerate()
+            .map(
+                |(idx, (path, max_age, max_file_size, priority))| LifecyclePolicyRecord {
+                    id: idx as i64,
+                    path_glob: (*path).to_string(),
+                    max_age: *max_age,
+                    max_file_size: *max_file_size,
+                    priority: *priority,
+                    conditions: None,
+                },
+            )
+            .collect()
+    }
+
     #[test]
     fn no_policies_means_keep() {
-        let db = StateDb::open_in_memory().unwrap();
-        let evaluator = LifecycleEvaluator::load(&db).unwrap();
+        let evaluator = LifecycleEvaluator::from_policies(vec![]);
         let file = make_file("report.pdf", Some(1024));
         assert_eq!(
             evaluator.should_evict(&file, Path::new("report.pdf")),
@@ -182,11 +195,12 @@ mod tests {
 
     #[test]
     fn max_size_policy_evicts_large_files() {
-        let db = StateDb::open_in_memory().unwrap();
-        db.add_lifecycle_policy("Documents/**", None, Some(1024), 0, None)
-            .unwrap();
-
-        let evaluator = LifecycleEvaluator::load(&db).unwrap();
+        let evaluator = LifecycleEvaluator::from_policies(make_policies(&[(
+            "Documents/**",
+            None,
+            Some(1024),
+            0,
+        )]));
 
         let small = make_file("small.txt", Some(512));
         assert_eq!(
@@ -206,15 +220,10 @@ mod tests {
 
     #[test]
     fn higher_priority_wins() {
-        let db = StateDb::open_in_memory().unwrap();
-        // High priority: evict anything in Temp/.
-        db.add_lifecycle_policy("Temp/**", None, Some(0), 10, None)
-            .unwrap();
-        // Lower priority: keep everything.
-        db.add_lifecycle_policy("**", Some(i64::MAX), None, 0, None)
-            .unwrap();
-
-        let evaluator = LifecycleEvaluator::load(&db).unwrap();
+        let evaluator = LifecycleEvaluator::from_policies(make_policies(&[
+            ("Temp/**", None, Some(0), 10),
+            ("**", Some(i64::MAX), None, 0),
+        ]));
         let file = make_file("cache.tmp", Some(100));
         let decision = evaluator.should_evict(&file, Path::new("Temp/cache.tmp"));
         assert!(matches!(

@@ -924,14 +924,14 @@ impl Cli {
                 mount::start(ctx, None, false, None, false, mount::WebFlags::default()).await
             }
             Commands::Status => status::show(ctx),
-            Commands::Pin { path } => cache::pin(ctx, &path),
-            Commands::Unpin { path } => cache::unpin(ctx, &path),
-            Commands::PinList => cache::pin_list(ctx),
+            Commands::Pin { path } => cache::pin(ctx, &path).await,
+            Commands::Unpin { path } => cache::unpin(ctx, &path).await,
+            Commands::PinList => cache::pin_list(ctx).await,
             Commands::Cache { command } => match command {
-                CacheCommands::Status => cache::cache_status(ctx),
-                CacheCommands::Evict { all } => cache::evict(ctx, all),
-                CacheCommands::Warm { path } => cache::warm(ctx, &path),
-                CacheCommands::Clear { path } => cache::clear(ctx, &path),
+                CacheCommands::Status => cache::cache_status(ctx).await,
+                CacheCommands::Evict { all } => cache::evict(ctx, all).await,
+                CacheCommands::Warm { path } => cache::warm(ctx, &path).await,
+                CacheCommands::Clear { path } => cache::clear(ctx, &path).await,
             },
             Commands::ConfigShow { path } => config::show(&path),
             Commands::ConfigValidate => config::validate(),

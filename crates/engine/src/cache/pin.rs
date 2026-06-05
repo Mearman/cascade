@@ -1,16 +1,19 @@
 //! Pin matching — determines if a path is covered by any pin rule.
 
-use crate::db::{PinRuleRecord, StateDb};
+use crate::db::PinRuleRecord;
 use anyhow::Result;
 use std::path::Path;
 
-/// Matches file paths against pin rules stored in the state DB.
-pub struct PinMatcher<'a> {
-    db: &'a StateDb,
+/// Matches file paths against pin rules.
+///
+/// Owns a snapshot of the rules loaded at construction time. The matching logic
+/// is pure; state mutations are done through the storage layer and a fresh
+/// matcher is created from the updated rules.
+pub struct PinMatcher {
     rules: Vec<PinRuleRecord>,
 }
 
-impl std::fmt::Debug for PinMatcher<'_> {
+impl std::fmt::Debug for PinMatcher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PinMatcher")
             .field("rule_count", &self.rules.len())
@@ -18,11 +21,26 @@ impl std::fmt::Debug for PinMatcher<'_> {
     }
 }
 
-impl<'a> PinMatcher<'a> {
-    /// Load all pin rules from the database.
-    pub fn load(db: &'a StateDb) -> Result<Self> {
+impl PinMatcher {
+    /// Build a matcher from a pre-loaded rule set.
+    #[must_use]
+    pub const fn from_rules(rules: Vec<PinRuleRecord>) -> Self {
+        Self { rules }
+    }
+
+    /// Load all pin rules from the native state database.
+    #[cfg(feature = "native")]
+    pub fn load_native(db: &crate::db::StateDb) -> Result<Self> {
         let rules = db.list_pin_rules()?;
-        Ok(Self { db, rules })
+        Ok(Self { rules })
+    }
+
+    /// Load all pin rules from the portable state storage.
+    pub async fn load(
+        storage: &dyn crate::portable::StateStorage,
+    ) -> Result<Self, crate::portable::StorageError> {
+        let rules = storage.list_pin_rules().await?;
+        Ok(Self { rules })
     }
 
     /// Check if a path matches any pin rule.
@@ -42,27 +60,30 @@ impl<'a> PinMatcher<'a> {
         })
     }
 
-    /// Add a new pin rule and reload.
-    pub fn add_rule(&mut self, path_glob: &str, recursive: bool) -> Result<()> {
-        self.db.add_pin_rule(path_glob, recursive, None)?;
-        self.rules = self.db.list_pin_rules()?;
-        Ok(())
-    }
-
-    /// Remove a pin rule and reload.
-    pub fn remove_rule(&mut self, path_glob: &str) -> Result<bool> {
-        let removed = self.db.remove_pin_rule(path_glob)?;
-        if removed {
-            self.rules = self.db.list_pin_rules()?;
-        }
-        Ok(removed)
-    }
-
     /// Return the current list of rules.
     #[must_use]
     pub fn rules(&self) -> &[PinRuleRecord] {
         &self.rules
     }
+}
+
+/// Add a pin rule through the portable state storage and return a fresh matcher.
+pub async fn add_pin_rule(
+    storage: &dyn crate::portable::StateStorage,
+    path_glob: &str,
+    recursive: bool,
+) -> Result<PinMatcher, crate::portable::StorageError> {
+    storage.add_pin_rule(path_glob, recursive, None).await?;
+    PinMatcher::load(storage).await
+}
+
+/// Remove a pin rule through the portable state storage and return a fresh matcher.
+pub async fn remove_pin_rule(
+    storage: &dyn crate::portable::StateStorage,
+    path_glob: &str,
+) -> Result<bool, crate::portable::StorageError> {
+    let removed = storage.remove_pin_rule(path_glob).await?;
+    Ok(removed)
 }
 
 /// Simple glob matching for path patterns.
@@ -165,21 +186,30 @@ fn star_match_path(pattern: &str, path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::PinRuleRecord;
+
+    fn make_rules(entries: &[(&str, bool)]) -> Vec<PinRuleRecord> {
+        entries
+            .iter()
+            .map(|(path, recursive)| PinRuleRecord {
+                id: 0,
+                path_glob: (*path).to_string(),
+                recursive: *recursive,
+                conditions: None,
+            })
+            .collect()
+    }
 
     #[test]
     fn exact_match_is_pinned() {
-        let db = StateDb::open_in_memory().unwrap();
-        db.add_pin_rule("Documents/report.pdf", true, None).unwrap();
-        let matcher = PinMatcher::load(&db).unwrap();
+        let matcher = PinMatcher::from_rules(make_rules(&[("Documents/report.pdf", true)]));
         assert!(matcher.is_pinned(Path::new("Documents/report.pdf")));
         assert!(!matcher.is_pinned(Path::new("Documents/other.pdf")));
     }
 
     #[test]
     fn recursive_match_covers_children() {
-        let db = StateDb::open_in_memory().unwrap();
-        db.add_pin_rule("Documents", true, None).unwrap();
-        let matcher = PinMatcher::load(&db).unwrap();
+        let matcher = PinMatcher::from_rules(make_rules(&[("Documents", true)]));
         assert!(matcher.is_pinned(Path::new("Documents")));
         assert!(matcher.is_pinned(Path::new("Documents/report.pdf")));
         assert!(matcher.is_pinned(Path::new("Documents/Projects/code.rs")));
@@ -188,18 +218,14 @@ mod tests {
 
     #[test]
     fn non_recursive_does_not_cover_children() {
-        let db = StateDb::open_in_memory().unwrap();
-        db.add_pin_rule("Documents", false, None).unwrap();
-        let matcher = PinMatcher::load(&db).unwrap();
+        let matcher = PinMatcher::from_rules(make_rules(&[("Documents", false)]));
         assert!(matcher.is_pinned(Path::new("Documents")));
         assert!(!matcher.is_pinned(Path::new("Documents/report.pdf")));
     }
 
     #[test]
     fn glob_pattern_match() {
-        let db = StateDb::open_in_memory().unwrap();
-        db.add_pin_rule("Documents/**/*.pdf", true, None).unwrap();
-        let matcher = PinMatcher::load(&db).unwrap();
+        let matcher = PinMatcher::from_rules(make_rules(&[("Documents/**/*.pdf", true)]));
         assert!(matcher.is_pinned(Path::new("Documents/report.pdf")));
         assert!(matcher.is_pinned(Path::new("Documents/Projects/plan.pdf")));
         assert!(!matcher.is_pinned(Path::new("Documents/report.txt")));

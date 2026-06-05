@@ -22,10 +22,11 @@ pub fn routes() -> Router<AppState> {
 }
 
 /// Read the current pin rules as views.
-fn pin_views(state: &AppState) -> Result<Vec<PinView>, ApiError> {
+async fn pin_views(state: &AppState) -> Result<Vec<PinView>, ApiError> {
     Ok(state
         .engine
         .list_pins()
+        .await
         .map_err(|e| ApiError::internal(format!("could not list pins: {e}")))?
         .into_iter()
         .map(|record| PinView {
@@ -43,7 +44,7 @@ async fn list(
 ) -> Result<Json<PinsResponse>, ApiError> {
     session.require(&state, Capability::StatusRead, &Scope::Node)?;
     Ok(Json(PinsResponse {
-        pins: pin_views(&state)?,
+        pins: pin_views(&state).await?,
     }))
 }
 
@@ -57,11 +58,13 @@ async fn create(
     state
         .engine
         .pin(&body.path_glob, body.recursive)
+        .await
         .map_err(|e| ApiError::internal(format!("could not create pin: {e}")))?;
 
     // Return the created rule by finding the highest-id row matching the glob,
     // since `pin` does not return the inserted id.
-    let created = pin_views(&state)?
+    let created = pin_views(&state)
+        .await?
         .into_iter()
         .filter(|view| view.path_glob == body.path_glob)
         .max_by_key(|view| view.id)
@@ -78,7 +81,10 @@ async fn remove(
     session.require(&state, Capability::PinWrite, &Scope::Node)?;
 
     // The engine removes a pin by its glob, so resolve the id to its glob first.
-    let target = pin_views(&state)?.into_iter().find(|view| view.id == id);
+    let target = pin_views(&state)
+        .await?
+        .into_iter()
+        .find(|view| view.id == id);
     let Some(view) = target else {
         return Err(ApiError::not_found(format!("no pin rule with id {id}")));
     };

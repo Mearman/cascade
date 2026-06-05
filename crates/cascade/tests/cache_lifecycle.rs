@@ -10,6 +10,7 @@ use cascade_engine::cache::lifecycle::{EvictionDecision, EvictionReason, Lifecyc
 use cascade_engine::cache::manager::{CacheManager, CacheManagerConfig};
 use cascade_engine::cache::pin::PinMatcher;
 use cascade_engine::db::StateDb;
+use cascade_engine::portable::native::{SqliteStorage, TokioRuntimeHandle};
 use cascade_engine::types::{CacheState, FileEntry, ItemId};
 use std::path::Path;
 use std::sync::Arc;
@@ -21,6 +22,21 @@ fn setup_db() -> Arc<StateDb> {
     Arc::new(db)
 }
 
+fn make_manager(db: Arc<StateDb>) -> CacheManager<TokioRuntimeHandle> {
+    let runtime = TokioRuntimeHandle::current();
+    let storage = SqliteStorage::new(db, runtime.clone());
+    CacheManager::new(Arc::new(storage), runtime, CacheManagerConfig::default())
+}
+
+fn make_manager_with_config(
+    db: Arc<StateDb>,
+    config: CacheManagerConfig,
+) -> CacheManager<TokioRuntimeHandle> {
+    let runtime = TokioRuntimeHandle::current();
+    let storage = SqliteStorage::new(db, runtime.clone());
+    CacheManager::new(Arc::new(storage), runtime, config)
+}
+
 fn make_file(name: &str, id: &str, size: Option<u64>) -> FileEntry {
     FileEntry::file(
         ItemId::new("test", id),
@@ -30,29 +46,29 @@ fn make_file(name: &str, id: &str, size: Option<u64>) -> FileEntry {
     .with_size(size)
 }
 
-#[test]
-fn pin_rule_adds_to_database() {
+#[tokio::test]
+async fn pin_rule_adds_to_database() {
     let db = setup_db();
-    let manager = CacheManager::new(db, CacheManagerConfig::default());
+    let manager = make_manager(db);
 
-    manager.pin("Documents", true).unwrap();
+    manager.pin("Documents", true).await.unwrap();
 
-    let rules = manager.list_pins().unwrap();
+    let rules = manager.list_pins().await.unwrap();
     assert_eq!(rules.len(), 1);
     assert_eq!(rules[0].path_glob, "Documents");
     assert!(rules[0].recursive);
 }
 
-#[test]
-fn unpin_removes_rule() {
+#[tokio::test]
+async fn unpin_removes_rule() {
     let db = setup_db();
-    let manager = CacheManager::new(db, CacheManagerConfig::default());
+    let manager = make_manager(db);
 
-    manager.pin("Documents", true).unwrap();
-    assert!(manager.unpin("Documents").unwrap());
-    assert!(!manager.unpin("Documents").unwrap()); // Already removed.
+    manager.pin("Documents", true).await.unwrap();
+    assert!(manager.unpin("Documents").await.unwrap());
+    assert!(!manager.unpin("Documents").await.unwrap()); // Already removed.
 
-    let rules = manager.list_pins().unwrap();
+    let rules = manager.list_pins().await.unwrap();
     assert!(rules.is_empty());
 }
 
@@ -62,7 +78,7 @@ fn pin_matcher_matches_paths() {
     db.add_pin_rule("Documents", true, None).unwrap();
     db.add_pin_rule("Photos/img.jpg", false, None).unwrap();
 
-    let matcher = PinMatcher::load(&db).unwrap();
+    let matcher = PinMatcher::load_native(&db).unwrap();
 
     // Recursive rule.
     assert!(matcher.is_pinned(Path::new("Documents")));
@@ -83,7 +99,7 @@ fn lifecycle_max_size_evicts_large_files() {
     db.add_lifecycle_policy("Documents/**", None, Some(1024), 0, None)
         .unwrap();
 
-    let evaluator = LifecycleEvaluator::load(&db).unwrap();
+    let evaluator = LifecycleEvaluator::load_native(&db).unwrap();
 
     // Small file: keep.
     let small = make_file("tiny.txt", "f1", Some(512));
@@ -109,7 +125,7 @@ fn lifecycle_no_matching_policy_means_keep() {
     db.add_lifecycle_policy("Temp/**", None, Some(0), 0, None)
         .unwrap();
 
-    let evaluator = LifecycleEvaluator::load(&db).unwrap();
+    let evaluator = LifecycleEvaluator::load_native(&db).unwrap();
     let file = make_file("report.pdf", "f1", Some(2048));
     assert_eq!(
         evaluator.should_evict(&file, Path::new("Documents/report.pdf")),
@@ -117,8 +133,8 @@ fn lifecycle_no_matching_policy_means_keep() {
     );
 }
 
-#[test]
-fn cache_eviction_sweep_removes_cached_files() {
+#[tokio::test]
+async fn cache_eviction_sweep_removes_cached_files() {
     let db = setup_db();
 
     // Insert files.
@@ -133,8 +149,8 @@ fn cache_eviction_sweep_removes_cached_files() {
     db.add_lifecycle_policy("old.*", None, Some(0), 0, None)
         .unwrap();
 
-    let manager = CacheManager::new(db.clone(), CacheManagerConfig::default());
-    let report = manager.evict().unwrap();
+    let manager = make_manager(db.clone());
+    let report = manager.evict().await.unwrap();
 
     assert_eq!(report.lifecycle_evicted, 1);
     assert_eq!(report.total_evicted(), 1);
@@ -150,8 +166,8 @@ fn cache_eviction_sweep_removes_cached_files() {
     );
 }
 
-#[test]
-fn cache_stats_count_by_state() {
+#[tokio::test]
+async fn cache_stats_count_by_state() {
     let db = setup_db();
 
     let f1 = make_file("a.txt", "f1", Some(100));
@@ -164,8 +180,8 @@ fn cache_stats_count_by_state() {
     db.update_cache_state(&f2.id, CacheState::Cached).unwrap();
     db.update_cache_state(&f3.id, CacheState::Pinned).unwrap();
 
-    let manager = CacheManager::new(db, CacheManagerConfig::default());
-    let stats = manager.stats().unwrap();
+    let manager = make_manager(db);
+    let stats = manager.stats().await.unwrap();
 
     assert_eq!(stats.online_count, 1);
     assert_eq!(stats.cached_count, 1);
@@ -173,8 +189,8 @@ fn cache_stats_count_by_state() {
     assert_eq!(stats.total_bytes, 500); // cached (200) + pinned (300)
 }
 
-#[test]
-fn size_based_eviction_frees_space() {
+#[tokio::test]
+async fn size_based_eviction_frees_space() {
     let db = setup_db();
 
     let f1 = make_file("big.bin", "f1", Some(2000));
@@ -189,8 +205,8 @@ fn size_based_eviction_frees_space() {
         max_size: Some(500),
         ..CacheManagerConfig::default()
     };
-    let manager = CacheManager::new(db, config);
-    let report = manager.evict().unwrap();
+    let manager = make_manager_with_config(db, config);
+    let report = manager.evict().await.unwrap();
 
     // Should evict LRU files until under 500 bytes.
     assert!(report.size_evicted > 0);

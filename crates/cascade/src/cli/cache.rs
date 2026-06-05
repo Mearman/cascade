@@ -4,6 +4,7 @@ use anyhow::Result;
 use cascade_engine::cache::manager::CacheManager;
 use cascade_engine::cache::manager::CacheManagerConfig;
 use cascade_engine::db::StateDb;
+use cascade_engine::portable::native::{SqliteStorage, TokioRuntimeHandle};
 use std::sync::Arc;
 
 use super::CliContext;
@@ -14,25 +15,42 @@ fn open_db(ctx: &CliContext) -> Result<StateDb> {
     StateDb::open(&ctx.db_path)
 }
 
+/// Build a `CacheManager` over a freshly opened state database.
+fn make_manager(db: Arc<StateDb>) -> CacheManager<TokioRuntimeHandle> {
+    let runtime = TokioRuntimeHandle::current();
+    let storage = SqliteStorage::new(db, runtime.clone());
+    CacheManager::new(Arc::new(storage), runtime, CacheManagerConfig::default())
+}
+
+/// Build a `CacheManager` with custom config.
+fn make_manager_with_config(
+    db: Arc<StateDb>,
+    config: CacheManagerConfig,
+) -> CacheManager<TokioRuntimeHandle> {
+    let runtime = TokioRuntimeHandle::current();
+    let storage = SqliteStorage::new(db, runtime.clone());
+    CacheManager::new(Arc::new(storage), runtime, config)
+}
+
 /// Pin a path.
-pub fn pin(ctx: &CliContext, path: &str) -> Result<()> {
+pub async fn pin(ctx: &CliContext, path: &str) -> Result<()> {
     let db = open_db(ctx)?;
     let db = Arc::new(db);
-    let manager = CacheManager::new(db, CacheManagerConfig::default());
+    let manager = make_manager(db);
 
     let recursive = true; // Default to recursive pin.
-    manager.pin(path, recursive)?;
+    manager.pin(path, recursive).await?;
     println!("Pinned: {path}");
     Ok(())
 }
 
 /// Unpin a path.
-pub fn unpin(ctx: &CliContext, path: &str) -> Result<()> {
+pub async fn unpin(ctx: &CliContext, path: &str) -> Result<()> {
     let db = open_db(ctx)?;
     let db = Arc::new(db);
-    let manager = CacheManager::new(db, CacheManagerConfig::default());
+    let manager = make_manager(db);
 
-    if manager.unpin(path)? {
+    if manager.unpin(path).await? {
         println!("Unpinned: {path}");
     } else {
         println!("Not pinned: {path}");
@@ -41,12 +59,12 @@ pub fn unpin(ctx: &CliContext, path: &str) -> Result<()> {
 }
 
 /// List all pinned paths.
-pub fn pin_list(ctx: &CliContext) -> Result<()> {
+pub async fn pin_list(ctx: &CliContext) -> Result<()> {
     let db = open_db(ctx)?;
     let db = Arc::new(db);
-    let manager = CacheManager::new(db, CacheManagerConfig::default());
+    let manager = make_manager(db);
 
-    let rules = manager.list_pins()?;
+    let rules = manager.list_pins().await?;
     if rules.is_empty() {
         println!("No pinned paths.");
     } else {
@@ -60,12 +78,12 @@ pub fn pin_list(ctx: &CliContext) -> Result<()> {
 }
 
 /// Pre-warm a path by pinning it so files are downloaded on the next sync.
-pub fn warm(ctx: &CliContext, path: &str) -> Result<()> {
+pub async fn warm(ctx: &CliContext, path: &str) -> Result<()> {
     let db = open_db(ctx)?;
     let db = Arc::new(db);
-    let manager = CacheManager::new(db, CacheManagerConfig::default());
+    let manager = make_manager(db);
 
-    manager.pin(path, true)?;
+    manager.pin(path, true).await?;
     println!("Warmed: {path}");
     println!("Files will be downloaded on next sync.");
     Ok(())
@@ -78,15 +96,15 @@ pub fn warm(ctx: &CliContext, path: &str) -> Result<()> {
 /// transitions every cached file whose path matches `path` as a prefix to the
 /// `Online` state. The background worker will then skip those files until they
 /// are accessed or re-pinned.
-pub fn clear(ctx: &CliContext, path: &str) -> Result<()> {
+pub async fn clear(ctx: &CliContext, path: &str) -> Result<()> {
     use cascade_engine::types::CacheState;
 
     let db = open_db(ctx)?;
     let db = Arc::new(db);
-    let manager = CacheManager::new(Arc::clone(&db), CacheManagerConfig::default());
+    let manager = make_manager(Arc::clone(&db));
 
     // Remove the pin rule if one exists — ignore "not pinned" case.
-    let _ = manager.unpin(path)?;
+    let _ = manager.unpin(path).await?;
 
     // Normalise the prefix for matching: "foo/bar" should match "foo/bar" and
     // "foo/bar/baz" but not "foo/barbaz".
@@ -113,12 +131,12 @@ pub fn clear(ctx: &CliContext, path: &str) -> Result<()> {
 
 /// Show cache status.
 #[allow(clippy::cast_precision_loss)]
-pub fn cache_status(ctx: &CliContext) -> Result<()> {
+pub async fn cache_status(ctx: &CliContext) -> Result<()> {
     let db = open_db(ctx)?;
     let db = Arc::new(db);
-    let manager = CacheManager::new(db, CacheManagerConfig::default());
+    let manager = make_manager(db);
 
-    let stats = manager.stats()?;
+    let stats = manager.stats().await?;
     println!("Cache Status:");
     println!("  Online:  {} files", stats.online_count);
     println!("  Cached:  {} files", stats.cached_count);
@@ -137,7 +155,7 @@ pub fn cache_status(ctx: &CliContext) -> Result<()> {
 }
 
 /// Run eviction.
-pub fn evict(ctx: &CliContext, all: bool) -> Result<()> {
+pub async fn evict(ctx: &CliContext, all: bool) -> Result<()> {
     let db = open_db(ctx)?;
     let db = Arc::new(db);
     let config = if all {
@@ -148,9 +166,9 @@ pub fn evict(ctx: &CliContext, all: bool) -> Result<()> {
     } else {
         CacheManagerConfig::default()
     };
-    let manager = CacheManager::new(db, config);
+    let manager = make_manager_with_config(db, config);
 
-    let report = manager.evict()?;
+    let report = manager.evict().await?;
     if report.total_evicted() == 0 {
         println!("No files to evict.");
     } else {
@@ -602,13 +620,13 @@ mod tests {
 
     // ── pin / unpin / pin_list ──
 
-    #[test]
-    fn pin_adds_rule_to_db() {
+    #[tokio::test]
+    async fn pin_adds_rule_to_db() {
         let dir = TempDir::new().unwrap();
         let ctx = make_ctx(&dir);
         seed_backend(&ctx);
 
-        pin(&ctx, "Documents/Accounts").unwrap();
+        pin(&ctx, "Documents/Accounts").await.unwrap();
 
         let db = StateDb::open(&ctx.db_path).unwrap();
         let rules = db.list_pin_rules().unwrap();
@@ -617,64 +635,64 @@ mod tests {
         assert!(rules[0].recursive);
     }
 
-    #[test]
-    fn unpin_removes_existing_rule() {
+    #[tokio::test]
+    async fn unpin_removes_existing_rule() {
         let dir = TempDir::new().unwrap();
         let ctx = make_ctx(&dir);
         seed_backend(&ctx);
 
-        pin(&ctx, "Photos").unwrap();
-        unpin(&ctx, "Photos").unwrap();
+        pin(&ctx, "Photos").await.unwrap();
+        unpin(&ctx, "Photos").await.unwrap();
 
         let db = StateDb::open(&ctx.db_path).unwrap();
         assert!(db.list_pin_rules().unwrap().is_empty());
     }
 
-    #[test]
-    fn unpin_nonexistent_path_succeeds() {
+    #[tokio::test]
+    async fn unpin_nonexistent_path_succeeds() {
         let dir = TempDir::new().unwrap();
         let ctx = make_ctx(&dir);
         seed_backend(&ctx);
 
         // Unpinning a path that was never pinned should succeed (prints
         // "Not pinned: ...").
-        unpin(&ctx, "no/such/path").unwrap();
+        unpin(&ctx, "no/such/path").await.unwrap();
     }
 
-    #[test]
-    fn pin_list_empty() {
+    #[tokio::test]
+    async fn pin_list_empty() {
         let dir = TempDir::new().unwrap();
         let ctx = make_ctx(&dir);
         seed_backend(&ctx);
 
-        pin_list(&ctx).unwrap();
+        pin_list(&ctx).await.unwrap();
     }
 
-    #[test]
-    fn pin_list_shows_rules() {
+    #[tokio::test]
+    async fn pin_list_shows_rules() {
         let dir = TempDir::new().unwrap();
         let ctx = make_ctx(&dir);
         seed_backend(&ctx);
 
-        pin(&ctx, "Docs").unwrap();
-        pin(&ctx, "Photos").unwrap();
+        pin(&ctx, "Docs").await.unwrap();
+        pin(&ctx, "Photos").await.unwrap();
 
-        pin_list(&ctx).unwrap();
+        pin_list(&ctx).await.unwrap();
     }
 
     // ── cache_status ──
 
-    #[test]
-    fn cache_status_empty_db() {
+    #[tokio::test]
+    async fn cache_status_empty_db() {
         let dir = TempDir::new().unwrap();
         let ctx = make_ctx(&dir);
         seed_backend(&ctx);
 
-        cache_status(&ctx).unwrap();
+        cache_status(&ctx).await.unwrap();
     }
 
-    #[test]
-    fn cache_status_with_files() {
+    #[tokio::test]
+    async fn cache_status_with_files() {
         let dir = TempDir::new().unwrap();
         let ctx = make_ctx(&dir);
         let db = seed_backend(&ctx);
@@ -683,22 +701,22 @@ mod tests {
         seed_file(&db, "file2.txt", CacheState::Cached);
         seed_file(&db, "file3.txt", CacheState::Pinned);
 
-        cache_status(&ctx).unwrap();
+        cache_status(&ctx).await.unwrap();
     }
 
     // ── evict ──
 
-    #[test]
-    fn evict_with_no_files() {
+    #[tokio::test]
+    async fn evict_with_no_files() {
         let dir = TempDir::new().unwrap();
         let ctx = make_ctx(&dir);
         seed_backend(&ctx);
 
-        evict(&ctx, false).unwrap();
+        evict(&ctx, false).await.unwrap();
     }
 
-    #[test]
-    fn evict_all_with_cached_files() {
+    #[tokio::test]
+    async fn evict_all_with_cached_files() {
         let dir = TempDir::new().unwrap();
         let ctx = make_ctx(&dir);
         let db = seed_backend(&ctx);
@@ -707,13 +725,13 @@ mod tests {
         seed_file(&db, "cached2.txt", CacheState::Cached);
         seed_file(&db, "pinned.txt", CacheState::Pinned);
 
-        evict(&ctx, true).unwrap();
+        evict(&ctx, true).await.unwrap();
     }
 
     // ── clear ──
 
-    #[test]
-    fn clear_reverts_cached_files_to_online() {
+    #[tokio::test]
+    async fn clear_reverts_cached_files_to_online() {
         let dir = TempDir::new().unwrap();
         let ctx = make_ctx(&dir);
         let db = seed_backend(&ctx);
@@ -723,7 +741,7 @@ mod tests {
         seed_file(&db, "other.txt", CacheState::Cached);
 
         drop(db);
-        clear(&ctx, "dir").unwrap();
+        clear(&ctx, "dir").await.unwrap();
 
         let db = StateDb::open(&ctx.db_path).unwrap();
         let file1_id = ItemId::new("test", "dir/file1.txt");
@@ -745,8 +763,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn clear_with_no_matching_files() {
+    #[tokio::test]
+    async fn clear_with_no_matching_files() {
         let dir = TempDir::new().unwrap();
         let ctx = make_ctx(&dir);
         let db = seed_backend(&ctx);
@@ -754,7 +772,7 @@ mod tests {
         seed_file(&db, "unrelated.txt", CacheState::Cached);
 
         drop(db);
-        clear(&ctx, "no/match").unwrap();
+        clear(&ctx, "no/match").await.unwrap();
     }
 
     // ── backend_remove ──

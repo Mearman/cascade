@@ -107,11 +107,7 @@ pub(super) fn backend_add(
 }
 
 /// Unmount and deregister a backend by name.
-pub(super) fn backend_remove(
-    engine: &Engine,
-    name: &str,
-    mount_path: &str,
-) -> Result<String> {
+pub(super) fn backend_remove(engine: &Engine, name: &str, mount_path: &str) -> Result<String> {
     engine.unmount_backend(std::path::Path::new(mount_path));
     let removed = engine.db.remove_backend(name)?;
     Ok(if removed {
@@ -181,7 +177,11 @@ pub(crate) fn root_under(folder: &str, rule_path: &str) -> String {
 /// containment test reuses [`Scope::covers`], which normalises `.`/`..`/empty
 /// segments and matches on path components, so the same defence the authz layer
 /// applies to scopes is applied to every rule path.
-pub(crate) fn confine_rule_path(folder: &str, rule_path: &str, folder_scope: &Scope) -> Result<String> {
+pub(crate) fn confine_rule_path(
+    folder: &str,
+    rule_path: &str,
+    folder_scope: &Scope,
+) -> Result<String> {
     let rooted = root_under(folder, rule_path);
     if folder_scope.covers(&Scope::folder(rooted.clone())) {
         Ok(rooted)

@@ -11,6 +11,7 @@ use cascade_engine::backend::NullBackend;
 use cascade_engine::cache::manager::{CacheManager, CacheManagerConfig};
 use cascade_engine::db::StateDb;
 use cascade_engine::p2p_bridge::P2pBridge;
+use cascade_engine::portable::native::{SqliteStorage, StdFileSystem, TokioRuntimeHandle};
 use cascade_engine::sync::runner::SyncRunner;
 use cascade_engine::types::{CacheState, FileEntry, ItemId};
 use cascade_p2p::P2pEngine;
@@ -107,10 +108,19 @@ async fn sync_runner_with_p2p_bridge() {
         std::path::PathBuf::from("/tmp/test"),
     ));
 
-    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-    let runner = SyncRunner::new(db, vec![backend], presenter, config, cancel_rx).with_p2p(bridge);
-    let _ = cancel_tx.send(true);
-    let result = runner.run().await;
+    let runtime = TokioRuntimeHandle::current();
+    let storage = SqliteStorage::new(db.clone(), runtime.clone());
+    let runner = SyncRunner::new(
+        Arc::new(storage),
+        Arc::new(StdFileSystem),
+        runtime,
+        vec![backend],
+        presenter,
+        config,
+    )
+    .with_p2p(bridge);
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let result = runner.run(cancel).await;
     assert!(result.is_ok());
 }
 
@@ -126,7 +136,10 @@ async fn cache_manager_with_p2p() {
     let p2p_engine = P2pEngine::new(p2p_dir.path()).unwrap();
     let bridge = Arc::new(P2pBridge::new(p2p_engine, db.clone()));
 
-    let cache = CacheManager::new(db.clone(), CacheManagerConfig::default()).with_p2p(bridge);
+    let runtime = TokioRuntimeHandle::current();
+    let storage: Arc<dyn cascade_engine::portable::StateStorage> =
+        Arc::new(SqliteStorage::new(db.clone(), runtime.clone()));
+    let cache = CacheManager::new(storage, runtime, CacheManagerConfig::default()).with_p2p(bridge);
 
     let file_id = ItemId::new("p2p", "cached.bin");
     let data = vec![0xDD; BLOCK_128KB + 256];
@@ -147,7 +160,10 @@ async fn cache_manager_with_p2p() {
 #[tokio::test]
 async fn cache_manager_without_p2p_returns_none() {
     let db = Arc::new(StateDb::open_in_memory().unwrap());
-    let cache = CacheManager::new(db, CacheManagerConfig::default());
+    let runtime = TokioRuntimeHandle::current();
+    let storage: Arc<dyn cascade_engine::portable::StateStorage> =
+        Arc::new(SqliteStorage::new(db, runtime.clone()));
+    let cache = CacheManager::new(storage, runtime, CacheManagerConfig::default());
 
     let file = FileEntry::file(
         ItemId::new("gdrive", "file1"),

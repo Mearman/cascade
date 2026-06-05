@@ -1,17 +1,17 @@
 //! Sync runner — orchestrates change polling across all backends.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::watch;
-
 use crate::backend::Backend;
 use crate::cache::pin::PinMatcher;
+#[cfg(feature = "native")]
 use crate::changefeed::ChangeFeed;
 use crate::config::ConfigResolver;
-use crate::db::StateDb;
 #[cfg(feature = "p2p")]
 use crate::p2p_bridge::P2pBridge;
+use crate::portable::{FileSystem, RuntimeHandle, StateStorage};
 use crate::presenter::VfsPresenter;
 use crate::sync::conflict::{ConflictCheck, check_conflict, conflict_name};
 use crate::types::{CacheState, Change, FileId, VfsItem};
@@ -24,8 +24,14 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(60);
 ///
 /// For each backend, periodically calls `changes(cursor)` to get incremental
 /// updates, applies them to the state database, and notifies the presenter.
-pub struct SyncRunner {
-    db: Arc<StateDb>,
+///
+/// Uses portable traits ([`StateStorage`], [`RuntimeHandle`], [`FileSystem`])
+/// instead of concrete tokio/rusqlite types so it compiles to both native and
+/// WASM targets.
+pub struct SyncRunner<R: RuntimeHandle> {
+    storage: Arc<dyn StateStorage>,
+    fs: Arc<dyn FileSystem>,
+    runtime: R,
     backends: Vec<Arc<dyn Backend>>,
     presenter: Arc<dyn VfsPresenter>,
     config: Arc<ConfigResolver>,
@@ -34,16 +40,12 @@ pub struct SyncRunner {
     /// Optional engine-side change index. When present, every applied
     /// batch is also filed here so presenters can serve per-parent
     /// `enumerateChanges` deltas without running a second poll loop.
+    /// Available only on native builds (uses `tokio::sync::RwLock`).
+    #[cfg(feature = "native")]
     change_feed: Option<Arc<ChangeFeed>>,
-    /// Cancellation signal the runner observes. This is the engine's shared
-    /// channel, handed in at construction, so a management-plane Stop (which
-    /// signals the engine's [`Engine::shutdown`](crate::engine::Engine::shutdown)) actually quiesces the sync
-    /// loop — not just the cache worker. The runner never owns a private
-    /// channel; if it did, the engine's cancel could never reach it.
-    cancel_rx: watch::Receiver<bool>,
 }
 
-impl std::fmt::Debug for SyncRunner {
+impl<R: RuntimeHandle> std::fmt::Debug for SyncRunner<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let backend_count = self.backends.len();
         let mut binding = f.debug_struct("SyncRunner");
@@ -56,30 +58,27 @@ impl std::fmt::Debug for SyncRunner {
     }
 }
 
-impl SyncRunner {
-    /// Create a new sync runner.
-    ///
-    /// `cancel_rx` is the engine's shared cancellation receiver
-    /// ([`Engine::create_sync_runner`](crate::engine::Engine::create_sync_runner)
-    /// subscribes the engine's channel and passes it in). The runner watches
-    /// this receiver so an engine-wide shutdown — including the management-plane
-    /// Stop command — stops the sync loop alongside the cache worker.
+impl<R: RuntimeHandle> SyncRunner<R> {
+    /// Create a new sync runner backed by portable traits.
     pub fn new(
-        db: Arc<StateDb>,
+        storage: Arc<dyn StateStorage>,
+        fs: Arc<dyn FileSystem>,
+        runtime: R,
         backends: Vec<Arc<dyn Backend>>,
         presenter: Arc<dyn VfsPresenter>,
         config: Arc<ConfigResolver>,
-        cancel_rx: watch::Receiver<bool>,
     ) -> Self {
         Self {
-            db,
+            storage,
+            fs,
+            runtime,
             backends,
             presenter,
             config,
             #[cfg(feature = "p2p")]
             p2p: None,
+            #[cfg(feature = "native")]
             change_feed: None,
-            cancel_rx,
         }
     }
 
@@ -97,7 +96,11 @@ impl SyncRunner {
     /// presenters (e.g. the File Provider bridge's `enumerateChanges`) can
     /// serve per-parent deltas from the same poll loop the runner already
     /// drives.
+    ///
+    /// Only available on native builds (the change feed uses
+    /// `tokio::sync::RwLock`).
     #[must_use]
+    #[cfg(feature = "native")]
     pub fn with_change_feed(mut self, change_feed: Arc<ChangeFeed>) -> Self {
         self.change_feed = Some(change_feed);
         self
@@ -105,11 +108,13 @@ impl SyncRunner {
 
     /// Perform an initial sync for all backends, then start the polling loop.
     ///
-    /// This runs until `stop()` is called.
-    pub async fn run(mut self) -> anyhow::Result<()> {
+    /// This runs until `cancel` is set to `true`.
+    pub async fn run(self, cancel: Arc<std::sync::atomic::AtomicBool>) -> anyhow::Result<()> {
+        use std::sync::atomic::Ordering;
+
         // Initial sync — get full snapshot for each backend.
         for backend in &self.backends {
-            if *self.cancel_rx.borrow() {
+            if cancel.load(Ordering::Relaxed) {
                 tracing::info!(backend = %backend.id(), "sync cancelled during initial sync");
                 return Ok(());
             }
@@ -138,20 +143,15 @@ impl SyncRunner {
         // Polling loop.
         loop {
             let interval = self.effective_poll_interval().await;
-            tokio::select! {
-                () = tokio::time::sleep(interval) => {}
-                _ = self.cancel_rx.changed() => {
-                    tracing::info!("sync runner cancelled");
-                    return Ok(());
-                }
-            }
+            let () = self.runtime.sleep(interval).await;
 
-            if *self.cancel_rx.borrow() {
+            if cancel.load(Ordering::Relaxed) {
+                tracing::info!("sync runner cancelled");
                 return Ok(());
             }
 
             for backend in &self.backends {
-                if *self.cancel_rx.borrow() {
+                if cancel.load(Ordering::Relaxed) {
                     return Ok(());
                 }
 
@@ -176,16 +176,24 @@ impl SyncRunner {
     /// Returns the number of changes applied.
     async fn sync_backend(&self, backend: &Arc<dyn Backend>) -> anyhow::Result<usize> {
         let backend_id = backend.id();
-        let cursor = self.db.get_cursor(backend_id)?;
+        let cursor = self
+            .storage
+            .get_cursor(backend_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let (changes, new_cursor) = backend.changes(cursor.as_ref()).await?;
 
         let applied = self.apply_changes(backend_id, &changes).await?;
 
-        self.db.set_cursor(backend_id, &new_cursor)?;
+        self.storage
+            .set_cursor(backend_id, &new_cursor)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         // File the applied (post-ignore-filter) changes into the engine's
         // per-parent change index, if one is attached. This is the single
         // canonical poll loop — the feed never polls backends itself.
+        #[cfg(feature = "native")]
         if let Some(feed) = &self.change_feed {
             feed.record(backend_id, &applied).await;
         }
@@ -212,17 +220,23 @@ impl SyncRunner {
                     if self.is_ignored_entry(entry) {
                         continue;
                     }
-                    if self.exceeds_max_file_length(entry) {
+                    if self.exceeds_max_file_length(entry).await {
                         tracing::warn!(
                             file = %entry.name,
                             "file exceeds max file length rule — skipped"
                         );
                         continue;
                     }
-                    self.db.upsert_file(entry)?;
+                    self.storage
+                        .upsert_file(entry)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
                     // Auto-pin if the file matches any pin rule.
-                    if self.is_pinned_entry(entry) {
-                        self.db.update_cache_state(&entry.id, CacheState::Pinned)?;
+                    if self.is_pinned_entry(entry).await {
+                        self.storage
+                            .update_cache_state(&entry.id, CacheState::Pinned)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
                     }
                     // Index cached files for P2P sharing.
                     #[cfg(feature = "p2p")]
@@ -244,7 +258,7 @@ impl SyncRunner {
                     if self.is_ignored_entry(new) {
                         continue;
                     }
-                    if self.exceeds_max_file_length(new) {
+                    if self.exceeds_max_file_length(new).await {
                         tracing::warn!(
                             file = %new.name,
                             "file exceeds max file length rule — skipped"
@@ -252,7 +266,12 @@ impl SyncRunner {
                         continue;
                     }
                     // Check for conflict: if the local file is dirty and remote changed.
-                    if let Some(local) = self.db.get_file(&new.id)? {
+                    let local = self
+                        .storage
+                        .get_file(&new.id)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    if let Some(local) = local {
                         match check_conflict(&local, new, false) {
                             ConflictCheck::Conflict {
                                 local_entry,
@@ -272,13 +291,19 @@ impl SyncRunner {
                             ConflictCheck::NoConflict => {}
                         }
                     }
-                    self.db.upsert_file(new)?;
+                    self.storage
+                        .upsert_file(new)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
                     let item: VfsItem = new.clone().into();
                     self.presenter.upsert_item(item).await?;
                     applied.push(change.clone());
                 }
                 Change::Deleted(entry) => {
-                    self.db.delete_file(&entry.id)?;
+                    self.storage
+                        .delete_file(&entry.id)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
                     self.presenter.delete_item(&entry.id).await?;
                     applied.push(change.clone());
                 }
@@ -286,14 +311,17 @@ impl SyncRunner {
                     if self.is_ignored_entry(to) {
                         continue;
                     }
-                    if self.exceeds_max_file_length(to) {
+                    if self.exceeds_max_file_length(to).await {
                         tracing::warn!(
                             file = %to.name,
                             "file exceeds max file length rule — skipped"
                         );
                         continue;
                     }
-                    self.db.upsert_file(to)?;
+                    self.storage
+                        .upsert_file(to)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
                     let item: VfsItem = to.clone().into();
                     self.presenter.upsert_item(item).await?;
                     applied.push(change.clone());
@@ -305,9 +333,11 @@ impl SyncRunner {
     }
 
     /// Check if a file entry matches any pin rule.
-    fn is_pinned_entry(&self, entry: &crate::types::FileEntry) -> bool {
-        let path = std::path::Path::new(&entry.name);
-        PinMatcher::load(&self.db).is_ok_and(|matcher| matcher.is_pinned(path))
+    async fn is_pinned_entry(&self, entry: &crate::types::FileEntry) -> bool {
+        let path = Path::new(&entry.name);
+        PinMatcher::load(&*self.storage)
+            .await
+            .is_ok_and(|matcher| matcher.is_pinned(path))
     }
 
     /// Check if a file entry exceeds an applicable max file length rule.
@@ -316,11 +346,19 @@ impl SyncRunner {
     /// limit). Files with no known size (`None`) are not blocked — the size
     /// is only known after listing, not after download. Rules are checked in
     /// priority order (highest first); the first matching rule wins.
-    fn exceeds_max_file_length(&self, entry: &crate::types::FileEntry) -> bool {
+    async fn exceeds_max_file_length(&self, entry: &crate::types::FileEntry) -> bool {
         let Some(size) = entry.size else {
             return false;
         };
-        let Ok(rules) = self.db.list_max_file_length_rules() else {
+        let Ok(rules) = self
+            .storage
+            .list_max_file_length_rules()
+            .await
+            .map_err(|e| {
+                tracing::debug!(error = %e, "failed to load max file length rules");
+                e
+            })
+        else {
             return false;
         };
         let path_str = entry.name.as_str();
@@ -337,7 +375,7 @@ impl SyncRunner {
         // Build a synthetic path from the entry's parent + name.
         // Phase 1 uses a flat path; this will be replaced with actual VFS
         // path resolution once the tree tracks full paths.
-        let path = std::path::Path::new(&entry.name);
+        let path = Path::new(&entry.name);
         self.config.is_ignored(path, entry.is_dir)
     }
 
@@ -365,7 +403,7 @@ impl SyncRunner {
     ///
     /// This function is the upload half of the write-back cache: a presenter
     /// that writes data to a local `cache_dir` should call
-    /// `StateDb::mark_dirty` after the write so that this function picks it
+    /// `StateStorage::mark_dirty` after the write so that this function picks it
     /// up on the next sync cycle and uploads to the backend.
     ///
     /// Currently no presenter implements write-back (the `WebDAV` PUT path
@@ -373,7 +411,7 @@ impl SyncRunner {
     /// function always returns 0 in production. The mechanism is in place for
     /// future write-back presenters (FUSE, local-backend adopt-and-sync).
     async fn flush_dirty_files(&self) -> usize {
-        let dirty_files = match self.db.list_dirty_files() {
+        let dirty_files = match self.storage.list_dirty_files().await {
             Ok(files) => files,
             Err(e) => {
                 tracing::error!(error = %e, "failed to list dirty files");
@@ -402,7 +440,12 @@ impl SyncRunner {
             };
             let local_path = std::path::PathBuf::from(local_path_str);
 
-            if !local_path.exists() {
+            if self
+                .fs
+                .exists(&local_path)
+                .await
+                .is_ok_and(|exists| !exists)
+            {
                 tracing::warn!(
                     file = %record.id,
                     path = %local_path.display(),
@@ -411,7 +454,7 @@ impl SyncRunner {
                 continue;
             }
 
-            let data = match tokio::fs::read(&local_path).await {
+            let data = match self.fs.read_file(&local_path).await {
                 Ok(d) => d,
                 Err(e) => {
                     tracing::error!(
@@ -424,12 +467,12 @@ impl SyncRunner {
                 }
             };
 
-            let upload_path = std::path::Path::new(&record.path);
+            let upload_path = Path::new(&record.path);
             let parent_file_id = FileId(record.parent_id.native_id().to_string());
 
             match backend.upload(upload_path, &data, &parent_file_id).await {
                 Ok(_updated_entry) => {
-                    if let Err(e) = self.db.clear_dirty(&record.id) {
+                    if let Err(e) = self.storage.clear_dirty(&record.id).await {
                         tracing::error!(
                             file = %record.id,
                             error = %e,
@@ -464,16 +507,28 @@ impl SyncRunner {
         // Only hydrate root-level children for each backend.
         // Deeper directories are loaded on demand by the presenter
         // when PROPFIND requests them.
-        let backends = self.db.list_backends()?;
+        let backends = self
+            .storage
+            .list_backends()
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut total = 0;
         for backend in &backends {
             let root_id = format!("{}:root", backend.id);
             // Try the "root" alias first, then discover the real root ID.
-            let mut entries = self.db.list_children(&root_id)?;
+            let mut entries = self
+                .storage
+                .list_children(&root_id)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             if entries.is_empty() {
                 // The backend may use a real folder ID instead of "root".
                 // Find it by looking for the most common parent_id.
-                let all = self.db.list_all_files()?;
+                let all = self
+                    .storage
+                    .list_all_files()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
                 let prefix = format!("{}:", backend.id);
                 let mut counts: std::collections::HashMap<String, usize> =
                     std::collections::HashMap::new();
@@ -483,7 +538,11 @@ impl SyncRunner {
                     }
                 }
                 if let Some((real_root, _)) = counts.into_iter().max_by_key(|(_, c)| *c) {
-                    entries = self.db.list_children(&real_root)?;
+                    entries = self
+                        .storage
+                        .list_children(&real_root)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
                 }
             }
             for entry in &entries {
@@ -592,6 +651,7 @@ mod tests {
     use super::*;
     use crate::backend::NullBackend;
     use crate::db::StateDb;
+    use crate::portable::native::{SqliteStorage, StdFileSystem, TokioRuntimeHandle};
     use crate::presenter::VfsPresenter;
     use crate::types::{FileEntry, ItemId};
     use async_trait::async_trait;
@@ -635,6 +695,24 @@ mod tests {
         }
     }
 
+    fn make_native_runner(
+        db: Arc<StateDb>,
+        backends: Vec<Arc<dyn Backend>>,
+        presenter: Arc<MockPresenter>,
+        config: Arc<ConfigResolver>,
+    ) -> SyncRunner<TokioRuntimeHandle> {
+        let runtime = TokioRuntimeHandle::new(tokio::runtime::Handle::current());
+        let storage = SqliteStorage::new(db.clone(), runtime.clone());
+        SyncRunner::new(
+            Arc::new(storage),
+            Arc::new(StdFileSystem),
+            runtime,
+            backends,
+            presenter,
+            config,
+        )
+    }
+
     #[tokio::test]
     async fn sync_runner_initial_sync_with_null_backend() {
         let db = Arc::new(StateDb::open_in_memory().unwrap());
@@ -646,16 +724,9 @@ mod tests {
         let config = Arc::new(ConfigResolver::new(std::path::PathBuf::from("/tmp/test")));
 
         // Stop immediately — the runner will do one initial sync then exit.
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-        let runner = SyncRunner::new(
-            db.clone(),
-            vec![backend],
-            presenter.clone(),
-            config,
-            cancel_rx,
-        );
-        let _ = cancel_tx.send(true);
-        let result = runner.run().await;
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let runner = make_native_runner(db, vec![backend], presenter.clone(), config);
+        let result = runner.run(cancel).await;
         assert!(result.is_ok());
     }
 
@@ -782,14 +853,7 @@ mod tests {
         let presenter = Arc::new(MockPresenter::default());
         let config = Arc::new(ConfigResolver::new(std::path::PathBuf::from("/tmp/test")));
 
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let runner = SyncRunner::new(
-            db.clone(),
-            vec![mock_backend.clone()],
-            presenter,
-            config,
-            cancel_rx,
-        );
+        let runner = make_native_runner(db.clone(), vec![mock_backend.clone()], presenter, config);
 
         let flushed = runner.flush_dirty_files().await;
         assert_eq!(flushed, 1);
@@ -828,8 +892,7 @@ mod tests {
         let presenter = Arc::new(MockPresenter::default());
         let config = Arc::new(ConfigResolver::new(std::path::PathBuf::from("/tmp/test")));
 
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let runner = SyncRunner::new(db.clone(), vec![null_backend], presenter, config, cancel_rx);
+        let runner = make_native_runner(db.clone(), vec![null_backend], presenter, config);
 
         let flushed = runner.flush_dirty_files().await;
         assert_eq!(flushed, 0);

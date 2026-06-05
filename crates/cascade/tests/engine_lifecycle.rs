@@ -42,8 +42,8 @@ async fn full_engine_lifecycle() {
     let handle = engine.start().unwrap();
 
     // Pin a path.
-    engine.pin("Documents/**", true).unwrap();
-    let pins = engine.list_pins().unwrap();
+    engine.pin("Documents/**", true).await.unwrap();
+    let pins = engine.list_pins().await.unwrap();
     assert_eq!(pins.len(), 1);
 
     // Shut down.
@@ -85,17 +85,17 @@ async fn engine_start_stop_idempotent() {
 async fn engine_pin_unpin_affects_status() {
     let engine = make_engine_with_backends(vec![Arc::new(NullBackend::new("test"))]);
 
-    engine.pin("Photos/**", true).unwrap();
-    engine.pin("Documents/report.pdf", false).unwrap();
+    engine.pin("Photos/**", true).await.unwrap();
+    engine.pin("Documents/report.pdf", false).await.unwrap();
 
-    let pins = engine.list_pins().unwrap();
+    let pins = engine.list_pins().await.unwrap();
     assert_eq!(pins.len(), 2);
 
     // Unpin one.
-    let removed = engine.unpin("Photos/**").unwrap();
+    let removed = engine.unpin("Photos/**").await.unwrap();
     assert!(removed);
 
-    let pins = engine.list_pins().unwrap();
+    let pins = engine.list_pins().await.unwrap();
     assert_eq!(pins.len(), 1);
     assert_eq!(pins[0].path_glob, "Documents/report.pdf");
 }

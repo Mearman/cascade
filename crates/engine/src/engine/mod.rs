@@ -19,10 +19,10 @@ mod tests;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
-use tokio::sync::watch;
 use tracing::info;
 
 use crate::backend::{Backend, BackendFactory};
@@ -35,6 +35,8 @@ use crate::manage::Grant;
 use crate::manage::{DataAuthority, ManageDispatch};
 #[cfg(feature = "p2p")]
 use crate::p2p_bridge::P2pBridge;
+use crate::portable::native::{SqliteStorage, StdFileSystem, TokioRuntimeHandle};
+use crate::portable::{FileSystem, StateStorage};
 use crate::presenter::VfsPresenter;
 use crate::sync::runner::SyncRunner;
 use crate::vfs::VfsTree;
@@ -114,10 +116,24 @@ impl fmt::Debug for EngineConfig {
 }
 
 /// Unified Cascade engine that owns and coordinates all components.
+///
+/// The engine holds both the native [`StateDb`] (for direct synchronous access
+/// by external crates and the management plane) and a portable [`StateStorage`]
+/// trait object (for use by the cache manager and sync runner, which are
+/// portable). Cancellation uses an `AtomicBool` flag — runtime-agnostic and
+/// observable by both native and portable workers.
 pub struct Engine {
+    /// Native state database — used directly by operations, management plane,
+    /// and external crates via [`Engine::db`].
     db: Arc<StateDb>,
+    /// Portable state storage — wraps the same `StateDb` behind the trait.
+    storage: Arc<dyn StateStorage>,
+    /// Portable filesystem adapter.
+    fs: Arc<dyn FileSystem>,
+    /// Runtime handle for spawning and timers.
+    runtime: TokioRuntimeHandle,
     vfs: Arc<RwLock<VfsTree>>,
-    cache: CacheManager,
+    cache: CacheManager<TokioRuntimeHandle>,
     config: Arc<ConfigResolver>,
     #[cfg(feature = "p2p")]
     p2p: Option<P2pBridge>,
@@ -127,8 +143,9 @@ pub struct Engine {
     /// Factory for constructing backends at runtime (the `BackendAdd` path).
     /// `None` when the host did not inject one.
     backend_factory: Option<Arc<dyn BackendFactory>>,
-    cancel: watch::Sender<bool>,
-    cancel_rx: watch::Receiver<bool>,
+    /// Shared cancellation flag. Workers poll this; setting it to `true`
+    /// quiesces the cache manager, sync runner, and any other subscriber.
+    cancel: Arc<AtomicBool>,
 }
 
 impl fmt::Debug for Engine {
@@ -178,8 +195,18 @@ impl Engine {
         // Config resolver for .cascade file filtering.
         let config_resolver = Arc::new(ConfigResolver::new(config.mount_point.clone()));
 
-        // Cache manager.
-        let cache = CacheManager::new(db.clone(), CacheManagerConfig::default());
+        // Portable adapters wrapping the native StateDb.
+        let runtime = TokioRuntimeHandle::current();
+        let storage: Arc<dyn StateStorage> =
+            Arc::new(SqliteStorage::new(db.clone(), runtime.clone()));
+        let fs: Arc<dyn FileSystem> = Arc::new(StdFileSystem);
+
+        // Cache manager backed by portable storage.
+        let cache = CacheManager::new(
+            storage.clone(),
+            runtime.clone(),
+            CacheManagerConfig::default(),
+        );
 
         // P2P bridge (optional).
         #[cfg(feature = "p2p")]
@@ -210,10 +237,13 @@ impl Engine {
             None
         };
 
-        let (cancel, cancel_rx) = watch::channel(false);
+        let cancel = Arc::new(AtomicBool::new(false));
 
         Ok(Self {
             db,
+            storage,
+            fs,
+            runtime,
             vfs,
             cache,
             config: config_resolver,
@@ -222,7 +252,6 @@ impl Engine {
             change_feed: Arc::new(ChangeFeed::new()),
             backend_factory,
             cancel,
-            cancel_rx,
         })
     }
 
@@ -298,13 +327,13 @@ impl Engine {
     /// NFS, FUSE, etc.) and is responsible for spawning the runner as a
     /// background task.
     ///
-    /// The runner subscribes to the engine's cancellation channel, so
+    /// The runner receives a clone of the engine's cancellation flag, so
     /// [`Engine::shutdown`] / [`Engine::stop`] stop the sync loop along with the
-    /// cache worker. The runner observes a `false → true` edge on this channel,
-    /// so it must be created while the channel reads `false` (running) — which it
-    /// always does immediately after [`Engine::new`] and after a
-    /// [`Engine::restart`] re-arm.
-    pub fn create_sync_runner(&self, presenter: Arc<dyn VfsPresenter>) -> SyncRunner {
+    /// cache worker.
+    pub fn create_sync_runner(
+        &self,
+        presenter: Arc<dyn VfsPresenter>,
+    ) -> SyncRunner<TokioRuntimeHandle> {
         // Collect all backends from the VFS tree.
         let tree = self
             .vfs
@@ -317,13 +346,23 @@ impl Engine {
         drop(tree);
 
         SyncRunner::new(
-            self.db.clone(),
+            self.storage.clone(),
+            self.fs.clone(),
+            self.runtime.clone(),
             backends,
             presenter,
             self.config.clone(),
-            self.cancel.subscribe(),
         )
         .with_change_feed(self.change_feed.clone())
+    }
+
+    /// The engine's shared cancellation flag.
+    ///
+    /// Callers that spawn the sync runner (or any other background worker)
+    /// should clone this flag and pass it to the worker's run method.
+    #[must_use]
+    pub fn cancel_flag(&self) -> Arc<AtomicBool> {
+        self.cancel.clone()
     }
 
     /// Start the engine's background tasks (cache manager).
@@ -331,13 +370,14 @@ impl Engine {
     /// The sync runner is not started here — use [`Engine::create_sync_runner`]
     /// to build one with the real presenter, then spawn it yourself.
     pub fn start(&self) -> Result<EngineHandle> {
-        // Start cache manager background worker.
-        let cancel_rx = self.cancel.subscribe();
-        let cache_db = self.db.clone();
-        let cache_config = CacheManagerConfig::default();
-        let cache_worker = CacheManager::new(cache_db, cache_config);
+        let cancel = self.cancel.clone();
+        let cache = CacheManager::new(
+            self.storage.clone(),
+            self.runtime.clone(),
+            CacheManagerConfig::default(),
+        );
         let cache_handle = tokio::spawn(async move {
-            cache_worker.run(cancel_rx).await;
+            cache.run_with_flag(cancel).await;
         });
 
         info!("engine started");
@@ -347,29 +387,29 @@ impl Engine {
 
     /// Graceful shutdown — signals all background workers to stop.
     ///
-    /// Sends the cancellation edge every worker subscribed to the engine's
-    /// channel observes: the cache-manager task spawned by [`Engine::start`] and
-    /// the sync runner created by [`Engine::create_sync_runner`] (which
-    /// subscribes this same channel). Both quiesce on the next loop iteration.
+    /// Sets the shared cancellation flag that the cache-manager task spawned
+    /// by [`Engine::start`] and the sync runner created by
+    /// [`Engine::create_sync_runner`] both observe. Both quiesce on the next
+    /// loop iteration.
     pub fn shutdown(&self) {
         info!("engine shutting down");
-        let _ = self.cancel.send(true);
+        self.cancel.store(true, Ordering::SeqCst);
         info!("engine shutdown complete");
     }
 
     /// Pin a path pattern. All files matching the glob will be kept offline.
-    pub fn pin(&self, pattern: &str, recursive: bool) -> Result<()> {
-        self.cache.pin(pattern, recursive)
+    pub async fn pin(&self, pattern: &str, recursive: bool) -> Result<()> {
+        self.cache.pin(pattern, recursive).await
     }
 
     /// Unpin a path pattern. Returns `true` if a rule was removed.
-    pub fn unpin(&self, pattern: &str) -> Result<bool> {
-        self.cache.unpin(pattern)
+    pub async fn unpin(&self, pattern: &str) -> Result<bool> {
+        self.cache.unpin(pattern).await
     }
 
     /// List active pin rules.
-    pub fn list_pins(&self) -> Result<Vec<PinRuleRecord>> {
-        self.cache.list_pins()
+    pub async fn list_pins(&self) -> Result<Vec<PinRuleRecord>> {
+        self.cache.list_pins().await
     }
 
     /// Pre-warm a path glob so matching files are fetched on the next sync.
@@ -378,8 +418,8 @@ impl Engine {
     /// warm` command performs. There is deliberately no separate warm path in
     /// the cache manager — warming *is* pinning, and the background worker
     /// materialises the pinned files.
-    pub fn warm(&self, pattern: &str) -> Result<()> {
-        self.cache.pin(pattern, true)
+    pub async fn warm(&self, pattern: &str) -> Result<()> {
+        self.cache.pin(pattern, true).await
     }
 
     /// Add a max file length rule.
@@ -476,21 +516,21 @@ impl Engine {
 
     /// Restart the engine's cache-manager worker.
     ///
-    /// Signals the current workers to stop, re-arms the cancellation channel,
+    /// Signals the current workers to stop, re-arms the cancellation flag,
     /// and spawns a fresh cache-manager task; the returned handle owns it.
     ///
     /// The sync runner is **not** revived here. It is created and spawned by the
     /// daemon (it needs the platform presenter, which the engine does not own),
-    /// and once its `run()` future observes the stop edge it returns and cannot
+    /// and once its `run()` future observes the stop flag it returns and cannot
     /// be respawned from inside the engine. Reviving the full worker set requires
     /// a daemon-level process restart. The re-arm therefore un-cancels the
-    /// channel so the freshly spawned cache worker does not see a stale shutdown
+    /// flag so the freshly spawned cache worker does not see a stale shutdown
     /// signal, but a sync runner that already returned stays stopped.
     pub fn restart(&self) -> Result<EngineHandle> {
-        let _ = self.cancel.send(true);
-        // Re-arm: a freshly subscribed receiver reads `false` (running) so the
-        // new cache worker does not see a stale shutdown signal.
-        let _ = self.cancel.send(false);
+        self.cancel.store(true, Ordering::SeqCst);
+        // Re-arm: the freshly spawned worker reads `false` (running) so it
+        // does not see a stale shutdown signal.
+        self.cancel.store(false, Ordering::SeqCst);
         self.start()
     }
 
@@ -498,7 +538,7 @@ impl Engine {
     /// returning a summary for the management plane.
     ///
     /// This signals both the cache-manager task and the sync runner (both
-    /// subscribe the engine's cancellation channel) to quiesce.
+    /// observe the engine's cancellation flag) to quiesce.
     #[must_use]
     pub fn stop(&self) -> String {
         self.shutdown();
@@ -544,16 +584,28 @@ impl Engine {
             })
             .unwrap_or_default();
 
-        let cache_stats = self
-            .cache
-            .stats()
-            .map(|s| CacheStatsSnapshot {
-                online_count: s.online_count,
-                cached_count: s.cached_count,
-                pinned_count: s.pinned_count,
-                total_bytes: s.total_bytes,
-            })
-            .unwrap_or_default();
+        // Cache stats are async on the portable path. For the synchronous
+        // status snapshot, read directly from the native DB.
+        let online = self
+            .db
+            .list_files_by_cache_state(crate::types::CacheState::Online);
+        let cached = self
+            .db
+            .list_files_by_cache_state(crate::types::CacheState::Cached);
+        let pinned = self
+            .db
+            .list_files_by_cache_state(crate::types::CacheState::Pinned);
+        let total_size = self.db.cache_size();
+
+        let cache_stats = match (online, cached, pinned, total_size) {
+            (Ok(o), Ok(c), Ok(p), Ok(t)) => CacheStatsSnapshot {
+                online_count: o.len(),
+                cached_count: c.len(),
+                pinned_count: p.len(),
+                total_bytes: u64::try_from(t).unwrap_or(0),
+            },
+            _ => CacheStatsSnapshot::default(),
+        };
 
         #[cfg(feature = "p2p")]
         let (p2p_enabled, p2p_device_id) = {
@@ -564,7 +616,7 @@ impl Engine {
         let (p2p_enabled, p2p_device_id) = (false, None);
 
         EngineStatus {
-            running: !*self.cancel_rx.borrow(),
+            running: !self.cancel.load(Ordering::SeqCst),
             backends,
             cache_stats,
             p2p_enabled,

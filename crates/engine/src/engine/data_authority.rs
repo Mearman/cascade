@@ -11,8 +11,8 @@ use chrono::{DateTime, Utc};
 use super::Engine;
 use crate::db::QuarantineRecord;
 use crate::manage::{
-    DataAccess, DataAuthority, DeviceId, ExplicitControlState,
-    data_access_with_explicit_control, verify_data_token,
+    DataAccess, DataAuthority, DeviceId, ExplicitControlState, data_access_with_explicit_control,
+    verify_data_token,
 };
 
 /// The engine is the data-plane authority for the BEP sync path: it resolves a
