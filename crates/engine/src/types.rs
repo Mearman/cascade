@@ -353,7 +353,7 @@ pub struct MaxFileLengthRule {
     pub max_bytes: u64,
     /// Higher-priority rules take precedence when multiple rules match.
     pub priority: i32,
-    /// Optional conditional expression evaluated against [`EvalContext`].
+    /// Optional conditional expression evaluated against [`cascade_expr::context::EvalContext`].
     pub conditions: Option<String>,
 }
 

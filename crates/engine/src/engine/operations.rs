@@ -177,11 +177,7 @@ pub fn root_under(folder: &str, rule_path: &str) -> String {
 /// containment test reuses [`Scope::covers`], which normalises `.`/`..`/empty
 /// segments and matches on path components, so the same defence the authz layer
 /// applies to scopes is applied to every rule path.
-pub fn confine_rule_path(
-    folder: &str,
-    rule_path: &str,
-    folder_scope: &Scope,
-) -> Result<String> {
+pub fn confine_rule_path(folder: &str, rule_path: &str, folder_scope: &Scope) -> Result<String> {
     let rooted = root_under(folder, rule_path);
     if folder_scope.covers(&Scope::folder(rooted.clone())) {
         Ok(rooted)
