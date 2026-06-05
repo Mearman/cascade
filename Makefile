@@ -1,4 +1,4 @@
-.PHONY: start stop build dev debug release fileprovider-smoke
+.PHONY: start stop build dev debug release fileprovider-smoke wasm
 
 BINARY := ./target/release/cascade
 
@@ -45,3 +45,8 @@ fileprovider-smoke:
 		-showBuildSettings \
 		2>/dev/null \
 		| awk '/BUILT_PRODUCTS_DIR/{print $$3}')/CascadeFileProviderHost.app"
+
+# Build the cascade-wasm crate to wasm32-unknown-unknown and run wasm-bindgen
+# to generate the JS glue in crates/cascade-wasm/pkg/.
+wasm:
+	bash scripts/build-wasm.sh

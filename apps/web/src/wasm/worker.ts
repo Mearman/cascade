@@ -1,14 +1,21 @@
 import type { WorkerRequest, WorkerResponse, WorkerEvent } from './messages';
 
-// The WASM module will live at a path relative to the built worker chunk.
-// Uncomment and adjust once the cascade_wasm crate is compiled to WASM:
-// import init from '../wasm/cascade_wasm.js';
+// The WASM glue is served from public/wasm/ which Vite exposes at the base
+// path.  In a module worker import.meta.env.BASE_URL gives "/cascade/" so the
+// full URL resolves to /cascade/wasm/cascade_wasm.js.
+const WASM_GLUE_URL = `${import.meta.env.BASE_URL}wasm/cascade_wasm.js`;
 
 let wasmReady = false;
 
+// Dynamically imported at runtime; the WASM glue is not bundled by Vite.
+type WasmInit = () => Promise<unknown>;
+let wasmInit: WasmInit | undefined;
+
 async function initWasm(): Promise<void> {
   try {
-    // await init();
+    const mod: { default: WasmInit } = await import(/* @vite-ignore */ WASM_GLUE_URL);
+    await mod.default();
+    wasmInit = mod.default;
     wasmReady = true;
   } catch (err) {
     const event: WorkerEvent = { type: 'error', data: String(err) };

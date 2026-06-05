@@ -12,3 +12,6 @@
 /.cargo/config.toml
 
 .playwright-mcp/
+
+# WASM build artefacts
+crates/cascade-wasm/pkg/
