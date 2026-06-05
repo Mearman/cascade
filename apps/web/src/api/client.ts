@@ -223,6 +223,61 @@ export class ApiClient {
     return fetch(`${getBase()}/v1/health`).then((r) => r.json() as Promise<HealthResponse>);
   }
 
+  // ─── Auth (no session required) ──────────────────────────────────────────────
+
+  /** Pairing code: submit a code from `cascade auth pair`. */
+  authPair(code: string): Promise<CapabilityToken> {
+    const base = getBase();
+    return fetch(`${base}/v1/auth/pair`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code }),
+    }).then(async (r) => {
+      const raw: unknown = await r.json().catch(() => null);
+      if (!r.ok) throw new ApiError(parseApiError(raw));
+      if (!isCapabilityToken(raw)) throw new Error('invalid token response');
+      return raw;
+    });
+  }
+
+  /** Shared secret: submit the daemon secret. */
+  authSecret(secret: string): Promise<CapabilityToken> {
+    const base = getBase();
+    return fetch(`${base}/v1/auth/secret`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ secret }),
+    }).then(async (r) => {
+      const raw: unknown = await r.json().catch(() => null);
+      if (!r.ok) throw new ApiError(parseApiError(raw));
+      if (!isCapabilityToken(raw)) throw new Error('invalid token response');
+      return raw;
+    });
+  }
+
+  /** Device code: request a new code. */
+  authDeviceRequest(): Promise<{ code: string; expires_in: number }> {
+    const base = getBase();
+    return fetch(`${base}/v1/auth/device`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    }).then(async (r) => {
+      const raw: unknown = await r.json().catch(() => null);
+      if (!r.ok) throw new ApiError(parseApiError(raw));
+      return raw as { code: string; expires_in: number };
+    });
+  }
+
+  /** Device code: poll for authorisation. */
+  authDevicePoll(code: string): Promise<{ status: string; token?: CapabilityToken }> {
+    const base = getBase();
+    return fetch(`${base}/v1/auth/device/${encodeURIComponent(code)}`).then(async (r) => {
+      const raw: unknown = await r.json().catch(() => null);
+      if (!r.ok) throw new ApiError(parseApiError(raw));
+      return raw as { status: string; token?: CapabilityToken };
+    });
+  }
+
   ready(): Promise<ReadyResponse> {
     return this.request('GET', '/ready');
   }

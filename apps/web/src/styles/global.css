@@ -562,3 +562,55 @@ button.link:disabled {
   align-items: center;
   gap: 0.75rem;
 }
+
+/* ─── Auth tabs ────────────────────────────────────────────────────────────── */
+
+.auth-tabs {
+  display: flex;
+  gap: 0;
+  margin-bottom: 1.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.auth-tab {
+  padding: 0.5rem 1rem;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+.auth-tab:hover {
+  color: var(--text);
+}
+
+.auth-tab.active {
+  color: var(--text);
+  border-bottom-color: var(--primary);
+  font-weight: 600;
+}
+
+/* ─── Device code display ──────────────────────────────────────────────────── */
+
+.device-code-display {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 1.75rem;
+  letter-spacing: 0.25em;
+  text-align: center;
+  padding: 1rem;
+  margin: 1rem 0;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 0.375rem;
+  user-select: all;
+}
+
+/* ─── Advanced section ─────────────────────────────────────────────────────── */
+
+.advanced-section {
+  margin-top: 2rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+}

@@ -30,6 +30,7 @@ pub fn build_router(state: AppState) -> Router {
     let cors = build_cors(&state);
 
     Router::new()
+        .merge(routes::auth::routes())
         .merge(routes::health::routes())
         .merge(routes::session::routes())
         .merge(routes::files::routes())

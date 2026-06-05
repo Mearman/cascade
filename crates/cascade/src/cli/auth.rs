@@ -3,11 +3,19 @@
 //! For Google Drive, uses the localhost redirect `OAuth2` flow by default
 //! (full Drive scope). Pass `--device-code` to use the device code flow
 //! directly (headless environments, limited to `drive.file` scope).
+//!
+//! Also contains `cascade auth pair/authorize/secret` — PWA authentication
+//! commands that generate pairing codes, authorise device codes, and manage
+//! the daemon's shared secret.
 
-use anyhow::Context as _;
+use anyhow::{Context as _, Result};
 use cascade_backend_gdrive::auth::{
     poll_for_token, resolve_credentials, save_tokens, start_device_code, start_local_redirect,
 };
+use cascade_engine::db::StateDb;
+use chrono::{Duration, Utc};
+use data_encoding::{BASE32_NOPAD, HEXLOWER};
+use sha2::{Digest, Sha256};
 
 use super::CliContext;
 
@@ -77,6 +85,93 @@ pub async fn authenticate(
             );
             eprintln!("Note: device code flow only grants per-file access (drive.file scope).");
             Err(anyhow::anyhow!("authentication failed"))
+        }
+    }
+}
+
+// ── PWA authentication commands ──
+
+use super::AuthCommands;
+
+/// Generate a short code derived from SHA-256 of timestamp + counter.
+fn generate_pairing_code() -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = Utc::now();
+    let counter = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut hasher = Sha256::new();
+    hasher.update(b"cascade-pair-code-v1");
+    hasher.update(now.timestamp_nanos_opt().map_or([0u8; 8], i64::to_be_bytes));
+    hasher.update(counter.to_be_bytes());
+    let digest = hasher.finalize();
+    let prefix: [u8; 5] = digest
+        .get(..5)
+        .and_then(|s| s.try_into().ok())
+        .unwrap_or([0u8; 5]);
+    BASE32_NOPAD.encode(&prefix)
+}
+
+/// Generate 16 random bytes from SHA-256 and return them as hex (32 chars).
+fn generate_secret() -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"cascade-daemon-secret-v1");
+    hasher.update(
+        Utc::now()
+            .timestamp_nanos_opt()
+            .map_or([0u8; 8], i64::to_be_bytes),
+    );
+    let digest = hasher.finalize();
+    HEXLOWER.encode(digest.get(..16).unwrap_or(&[0u8; 16]))
+}
+
+/// Handle `cascade auth pair/authorize/secret`.
+pub async fn pwa_auth(ctx: &super::CliContext, command: AuthCommands) -> Result<()> {
+    let db = StateDb::open(&ctx.db_path).context("could not open state database")?;
+
+    match command {
+        AuthCommands::Pair => {
+            let code = generate_pairing_code();
+            let expires_at = Utc::now() + Duration::minutes(5);
+            db.insert_auth_code(&code, "pairing", expires_at)
+                .context("could not store pairing code")?;
+            println!("Pairing code: {code}");
+            println!("Enter this code in the Cascade web UI within 5 minutes.");
+            Ok(())
+        }
+        AuthCommands::Authorize { code } => {
+            // The daemon must be running for this to work — the PWA is polling
+            // it. Call the daemon's authorize endpoint via HTTP.
+            let client = reqwest::Client::new();
+            let url = format!("http://127.0.0.1:7842/v1/auth/device/{code}/authorize");
+            let resp = client
+                .post(&url)
+                .send()
+                .await
+                .context("could not reach the daemon — is it running?")?;
+
+            if resp.status().is_success() {
+                println!("Authorised. The web UI will connect automatically.");
+                Ok(())
+            } else {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                anyhow::bail!("daemon returned {status}: {body}");
+            }
+        }
+        AuthCommands::Secret => {
+            let existing = db
+                .get_daemon_secret()
+                .context("could not read daemon secret")?;
+            let secret = if let Some(s) = existing {
+                s
+            } else {
+                let generated = generate_secret();
+                db.set_daemon_secret(&generated)
+                    .context("could not store daemon secret")?;
+                generated
+            };
+            println!("Daemon secret: {secret}");
+            println!("Use this secret in the Cascade web UI to authenticate.");
+            Ok(())
         }
     }
 }

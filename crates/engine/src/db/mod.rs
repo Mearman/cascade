@@ -6,7 +6,7 @@ use crate::manage::{Capability, DeviceId, Grant, Scope};
 use crate::types::{CacheState, Cursor, FileEntry, ItemId};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -1036,7 +1036,111 @@ impl StateDb {
         rows.into_iter().map(GrantRecord::try_from_raw).collect()
     }
 
-    // ── Data-receive quarantine operations ──
+    // ── Auth code operations (pairing + device flow) ──
+
+    /// Insert a new pending auth code.
+    pub fn insert_auth_code(
+        &self,
+        code: &str,
+        kind: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        conn.execute(
+            "INSERT INTO auth_codes (code, kind, status, created_at, expires_at)
+             VALUES (?1, ?2, 'pending', ?3, ?4)",
+            (code, kind, Utc::now().to_rfc3339(), expires_at.to_rfc3339()),
+        )?;
+        Ok(())
+    }
+
+    /// Look up an auth code by its code string.
+    pub fn get_auth_code(&self, code: &str) -> Result<Option<AuthCodeRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT code, kind, status, token_id, token_json, created_at, expires_at
+             FROM auth_codes WHERE code = ?1",
+        )?;
+        let row = stmt
+            .query_row([code], |row| {
+                Ok(AuthCodeRecord {
+                    code: row.get("code")?,
+                    kind: row.get("kind")?,
+                    status: row.get("status")?,
+                    token_id: row.get("token_id")?,
+                    token_json: row.get("token_json")?,
+                    created_at: row.get("created_at")?,
+                    expires_at: row.get("expires_at")?,
+                })
+            })
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Update an auth code's status, optionally attaching the issued token.
+    pub fn update_auth_code(
+        &self,
+        code: &str,
+        status: &str,
+        token_id: Option<&str>,
+        token_json: Option<&str>,
+    ) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let rows = conn.execute(
+            "UPDATE auth_codes SET status = ?2, token_id = ?3, token_json = ?4
+             WHERE code = ?1",
+            (code, status, token_id, token_json),
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Delete expired auth codes. Returns the number of rows removed.
+    pub fn delete_expired_auth_codes(&self) -> Result<u64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let now = Utc::now().to_rfc3339();
+        let rows = conn.execute("DELETE FROM auth_codes WHERE expires_at < ?1", [&now])?;
+        Ok(u64::try_from(rows).unwrap_or(0))
+    }
+
+    // ── Daemon shared secret ──
+
+    /// Get the daemon shared secret, if one has been generated.
+    pub fn get_daemon_secret(&self) -> Result<Option<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let mut stmt = conn.prepare("SELECT secret FROM daemon_secret WHERE id = 1")?;
+        let row = stmt
+            .query_row([], |row| row.get::<_, String>(0))
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Set (or replace) the daemon shared secret.
+    pub fn set_daemon_secret(&self, secret: &str) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO daemon_secret (id, secret, created_at) VALUES (1, ?1, ?2)",
+            (secret, Utc::now().to_rfc3339()),
+        )?;
+        Ok(())
+    }
 
     /// Insert or replace a quarantine record. A newer proposal for the same
     /// `(folder_id, peer_device, path)` primary key silently replaces the
@@ -1469,6 +1573,25 @@ pub struct ExplicitControlRecord {
     pub data_write: bool,
     /// Unix timestamp (seconds) when the bit was last refreshed.
     pub observed_at: DateTime<Utc>,
+}
+
+/// An auth code record from the `auth_codes` table.
+#[derive(Debug, Clone)]
+pub struct AuthCodeRecord {
+    /// The short code the user enters or is shown.
+    pub code: String,
+    /// Either `pairing` or `device`.
+    pub kind: String,
+    /// `pending`, `authorised`, or `consumed`.
+    pub status: String,
+    /// The token id set when the code is authorised.
+    pub token_id: Option<String>,
+    /// The full `CapabilityToken` JSON set when authorised.
+    pub token_json: Option<String>,
+    /// When the code was created (RFC 3339).
+    pub created_at: String,
+    /// When the code expires (RFC 3339).
+    pub expires_at: String,
 }
 
 #[cfg(test)]

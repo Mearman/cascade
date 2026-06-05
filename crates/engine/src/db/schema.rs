@@ -9,7 +9,7 @@ impl SchemaVersion {
     /// Current schema version.
     #[must_use]
     pub const fn current() -> Self {
-        Self(5)
+        Self(6)
     }
 }
 
@@ -29,6 +29,9 @@ pub fn migrate(conn: &Connection, from: SchemaVersion, _to: SchemaVersion) -> Re
     }
     if from < SchemaVersion(5) {
         v5_data_explicit_control(conn)?;
+    }
+    if from < SchemaVersion(6) {
+        v6_auth_codes(conn)?;
     }
 
     Ok(())
@@ -271,6 +274,42 @@ fn v5_data_explicit_control(conn: &Connection) -> Result<()> {
             data_write    BOOLEAN NOT NULL,
             observed_at   INTEGER NOT NULL,
             PRIMARY KEY (peer_device, folder_id)
+        );
+        ",
+    )?;
+
+    Ok(())
+}
+
+/// Schema v6 — PWA authentication codes and daemon shared secret.
+///
+/// `auth_codes` holds short-lived pending codes for two flows:
+/// - *pairing*: the CLI generates a code, the PWA submits it to get a token.
+/// - *device*: the PWA requests a code, the CLI authorises it, the PWA polls
+///   until the token appears.
+///
+/// `daemon_secret` is a single-row table holding a hex-encoded secret the
+/// operator shares with the PWA for password-style authentication.
+fn v6_auth_codes(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS auth_codes (
+            code        TEXT PRIMARY KEY,
+            kind        TEXT NOT NULL,
+            status      TEXT NOT NULL DEFAULT 'pending',
+            token_id    TEXT,
+            token_json  TEXT,
+            created_at  TEXT NOT NULL,
+            expires_at  TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_auth_codes_status
+            ON auth_codes(status);
+
+        CREATE TABLE IF NOT EXISTS daemon_secret (
+            id          INTEGER PRIMARY KEY CHECK (id = 1),
+            secret      TEXT NOT NULL,
+            created_at  TEXT NOT NULL
         );
         ",
     )?;

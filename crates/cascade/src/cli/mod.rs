@@ -408,6 +408,12 @@ pub enum Commands {
         #[arg(long, global = true)]
         system: bool,
     },
+
+    /// PWA authentication: pairing codes, device codes, and shared secrets
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -441,6 +447,21 @@ impl ServiceCommands {
             Self::Status => service::ServiceAction::Status,
         }
     }
+}
+
+#[derive(Subcommand)]
+pub enum AuthCommands {
+    /// Generate a pairing code for the web UI
+    Pair,
+
+    /// Authorise a device code from the web UI
+    Authorize {
+        /// The device code shown in the web UI
+        code: String,
+    },
+
+    /// Show or generate the daemon shared secret
+    Secret,
 }
 
 #[derive(Subcommand)]
@@ -1005,6 +1026,7 @@ impl Cli {
                 let request = service::ScopeRequest::from_flags(user, system);
                 service::run(ctx, command.into_action(), request).await
             }
+            Commands::Auth { command } => auth::pwa_auth(ctx, command).await,
         }
     }
 }

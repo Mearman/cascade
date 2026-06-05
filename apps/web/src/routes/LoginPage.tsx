@@ -1,6 +1,7 @@
-import { useState, useEffect, useContext } from 'preact/hooks';
-import { validateToken, isCapabilityToken } from '@/auth';
+import { useState, useEffect, useRef, useContext } from 'preact/hooks';
+import { validateToken, isCapabilityToken, saveToken } from '@/auth';
 import { ApiError } from '@/api/types';
+import { api } from '@/api/client';
 import { AppContext } from '@/context';
 import { RuntimeMode } from '@/wasm';
 import { initiateAuth, handleCallback, GDRIVE_SCOPES } from '@/wasm/oauth';
@@ -8,9 +9,220 @@ import { Spinner } from '@/components';
 
 const OAUTH_CLIENT_ID_KEY = 'cascade-oauth-client-id';
 
-// ─── Connected mode login (capability token paste) ────────────────────────────
+type AuthTab = 'pair' | 'secret' | 'device';
+
+// ─── Connected mode login (tabbed auth) ───────────────────────────────────────
 
 function ConnectedLoginPage() {
+  const [tab, setTab] = useState<AuthTab>('pair');
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  // Pairing code state
+  const [pairCode, setPairCode] = useState('');
+
+  // Shared secret state
+  const [secret, setSecret] = useState('');
+
+  // Device code state
+  const [deviceCode, setDeviceCode] = useState<string | null>(null);
+  const [expiresIn, setExpiresIn] = useState(0);
+  const [polling, setPolling] = useState(false);
+  const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const countdownTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [countdown, setCountdown] = useState(0);
+
+  // Clean up timers on unmount or tab switch.
+  useEffect(() => {
+    return () => {
+      if (pollTimer.current !== null) clearInterval(pollTimer.current);
+      if (countdownTimer.current !== null) clearInterval(countdownTimer.current);
+    };
+  }, []);
+
+  // Stop polling when switching tabs.
+  useEffect(() => {
+    if (pollTimer.current !== null) clearInterval(pollTimer.current);
+    if (countdownTimer.current !== null) clearInterval(countdownTimer.current);
+    setDeviceCode(null);
+    setPolling(false);
+    setError(null);
+  }, [tab]);
+
+  async function handlePair(ev: Event) {
+    ev.preventDefault();
+    setError(null);
+    setLoading(true);
+    try {
+      const token = await api.authPair(pairCode.trim());
+      saveToken(token);
+      window.location.reload();
+    } catch (err) {
+      setError(err instanceof ApiError ? `${err.code}: ${err.message}` : err instanceof Error ? err.message : 'Invalid code');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleSecret(ev: Event) {
+    ev.preventDefault();
+    setError(null);
+    setLoading(true);
+    try {
+      const token = await api.authSecret(secret.trim());
+      saveToken(token);
+      window.location.reload();
+    } catch (err) {
+      setError(err instanceof ApiError ? `${err.code}: ${err.message}` : err instanceof Error ? err.message : 'Invalid secret');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleDeviceRequest() {
+    setError(null);
+    setLoading(true);
+    try {
+      const result = await api.authDeviceRequest();
+      setDeviceCode(result.code);
+      setExpiresIn(result.expires_in);
+      setCountdown(result.expires_in);
+      setPolling(true);
+
+      // Start polling every 3 seconds.
+      pollTimer.current = setInterval(async () => {
+        try {
+          const poll = await api.authDevicePoll(result.code);
+          if (poll.status === 'authorised' && poll.token) {
+            if (pollTimer.current !== null) clearInterval(pollTimer.current);
+            if (countdownTimer.current !== null) clearInterval(countdownTimer.current);
+            setPolling(false);
+            saveToken(poll.token);
+            window.location.reload();
+          }
+        } catch {
+          // Poll errors are transient — keep trying.
+        }
+      }, 3000);
+
+      // Countdown timer.
+      countdownTimer.current = setInterval(() => {
+        setCountdown((prev) => {
+          if (prev <= 1) {
+            if (pollTimer.current !== null) clearInterval(pollTimer.current);
+            if (countdownTimer.current !== null) clearInterval(countdownTimer.current);
+            setPolling(false);
+            setError('Code expired — generate a new one.');
+            return 0;
+          }
+          return prev - 1;
+        });
+      }, 1000);
+    } catch (err) {
+      setError(err instanceof ApiError ? `${err.code}: ${err.message}` : err instanceof Error ? err.message : 'Could not request device code');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const tabs: { id: AuthTab; label: string }[] = [
+    { id: 'pair', label: 'Pairing code' },
+    { id: 'secret', label: 'Shared secret' },
+    { id: 'device', label: 'Device code' },
+  ];
+
+  return (
+    <div class="login-page">
+      <h1>Cascade</h1>
+      <p>Authenticate with the daemon to continue.</p>
+
+      <div class="auth-tabs">
+        {tabs.map(({ id, label }) => (
+          <button
+            key={id}
+            type="button"
+            class={`auth-tab${tab === id ? ' active' : ''}`}
+            onClick={() => setTab(id)}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {tab === 'pair' && (
+        <form onSubmit={handlePair}>
+          <p class="muted">Run <code>cascade auth pair</code> on the daemon host, then enter the code below.</p>
+          <input
+            type="text"
+            value={pairCode}
+            placeholder="ABC12345"
+            onInput={(e) => setPairCode((e.target as HTMLInputElement).value)}
+            disabled={loading}
+            autocomplete="off"
+          />
+          {error !== null && <p class="error">{error}</p>}
+          <button type="submit" disabled={loading || pairCode.trim() === ''}>
+            {loading ? 'Connecting…' : 'Connect'}
+          </button>
+        </form>
+      )}
+
+      {tab === 'secret' && (
+        <form onSubmit={handleSecret}>
+          <p class="muted">Run <code>cascade auth secret</code> on the daemon host to get the secret.</p>
+          <input
+            type="password"
+            value={secret}
+            placeholder="Daemon secret"
+            onInput={(e) => setSecret((e.target as HTMLInputElement).value)}
+            disabled={loading}
+            autocomplete="off"
+          />
+          {error !== null && <p class="error">{error}</p>}
+          <button type="submit" disabled={loading || secret.trim() === ''}>
+            {loading ? 'Connecting…' : 'Connect'}
+          </button>
+        </form>
+      )}
+
+      {tab === 'device' && (
+        <div>
+          {deviceCode === null ? (
+            <>
+              <p class="muted">Generate a code and enter it on the daemon host.</p>
+              {error !== null && <p class="error">{error}</p>}
+              <button type="button" onClick={handleDeviceRequest} disabled={loading}>
+                {loading ? 'Generating…' : 'Generate code'}
+              </button>
+            </>
+          ) : (
+            <>
+              <p class="muted">Run <code>{`cascade auth authorize ${deviceCode}`}</code> on the daemon host.</p>
+              <div class="device-code-display">{deviceCode}</div>
+              <p class="muted">
+                {polling
+                  ? `Waiting for authorisation… ${Math.floor(countdown / 60)}:${String(countdown % 60).padStart(2, '0')} remaining`
+                  : error !== null ? error : 'Connecting…'}
+              </p>
+              {!polling && (
+                <button type="button" onClick={handleDeviceRequest}>
+                  Generate new code
+                </button>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
+      <AdvancedTokenPaste />
+    </div>
+  );
+}
+
+// ─── Advanced: raw JSON paste fallback ─────────────────────────────────────────
+
+function AdvancedTokenPaste() {
+  const [open, setOpen] = useState(false);
   const [tokenJson, setTokenJson] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -19,13 +231,10 @@ function ConnectedLoginPage() {
     ev.preventDefault();
     setError(null);
     setLoading(true);
-
     try {
       const parsed: unknown = JSON.parse(tokenJson);
       if (!isCapabilityToken(parsed)) {
-        throw new Error(
-          'Token must be a CapabilityToken JSON object with token_id, issuer, bearer, capability, scope, expires, and issued_at fields.',
-        );
+        throw new Error('Token must be a CapabilityToken JSON object.');
       }
       await validateToken(parsed);
       window.location.reload();
@@ -41,22 +250,25 @@ function ConnectedLoginPage() {
   }
 
   return (
-    <div class="login-page">
-      <h1>Cascade</h1>
-      <p>Paste your CapabilityToken JSON to continue.</p>
-      <form onSubmit={handleSubmit}>
-        <textarea
-          rows={10}
-          placeholder={'{\n  "token_id": "…",\n  "bearer": "…",\n  "capability": "status:read",\n  …\n}'}
-          value={tokenJson}
-          onInput={(e) => setTokenJson((e.target as HTMLTextAreaElement).value)}
-          disabled={loading}
-        />
-        {error !== null && <p class="error">{error}</p>}
-        <button type="submit" disabled={loading}>
-          {loading ? 'Verifying…' : 'Connect'}
-        </button>
-      </form>
+    <div class="advanced-section">
+      <button type="button" class="link" onClick={() => setOpen(!open)}>
+        {open ? 'Hide' : 'Paste capability token'}
+      </button>
+      {open && (
+        <form onSubmit={handleSubmit}>
+          <textarea
+            rows={6}
+            placeholder={'{\n  "token_id": "…",\n  "bearer": "…",\n  …\n}'}
+            value={tokenJson}
+            onInput={(e) => setTokenJson((e.target as HTMLTextAreaElement).value)}
+            disabled={loading}
+          />
+          {error !== null && <p class="error">{error}</p>}
+          <button type="submit" disabled={loading || tokenJson.trim() === ''}>
+            {loading ? 'Verifying…' : 'Connect'}
+          </button>
+        </form>
+      )}
     </div>
   );
 }

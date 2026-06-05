@@ -2,6 +2,7 @@
 //! the F1/F3/F4 rules share.
 
 pub mod audit;
+pub mod auth;
 pub mod backends;
 pub mod cache;
 pub mod config;
