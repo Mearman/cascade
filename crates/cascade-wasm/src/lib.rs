@@ -97,6 +97,7 @@ struct TokenInput {
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub fn handle_request(request_json: &str) -> Result<JsValue, JsValue> {
+    state::ensure_engine();
     let response = match serde_json::from_str::<router::WorkerRequest>(request_json) {
         Ok(request) => router::route(&request),
         Err(error) => router::bad_request(&format!("malformed request JSON: {error}")),

@@ -660,6 +660,7 @@ version = "0.1.80"
 dependencies = [
  "anyhow",
  "cascade-config",
+ "cascade-engine",
  "cascade-expr",
  "chrono",
  "js-sys",

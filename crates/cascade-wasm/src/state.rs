@@ -13,15 +13,52 @@
 //! `Send + Sync` requirements do not apply on this target, and the opaque JS
 //! handles (`FileSystemDirectoryHandle`, `RTCPeerConnection`) are `!Send`
 //! anyway.
+//!
+//! # Engine state
+//!
+//! Alongside the in-memory session state, this module holds a lazily-initialised
+//! [`EngineState`] containing the four portable WASM adapters
+//! ([`WasmRuntimeHandle`], [`WasmStateStorage`], [`WasmHttpClient`],
+//! [`WasmFileSystem`]). These satisfy the engine's portable trait contracts and
+//! are available for future engine methods that need them. The in-memory session
+//! state remains the source of truth for the router handlers for now.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use cascade_engine::portable::wasm::{WasmRuntimeHandle, WasmStateStorage};
+use cascade_engine::portable::wasm_io::{WasmFileSystem, WasmHttpClient};
 use serde_json::{Value, json};
 use wasm_bindgen::JsValue;
 
 thread_local! {
     static STATE: RefCell<WasmState> = RefCell::new(WasmState::new());
+    static ENGINE_STATE: RefCell<Option<EngineState>> = RefCell::new(None);
+}
+
+/// The portable WASM adapters that satisfy the engine's four trait contracts.
+/// Initialised once on first access and reused for the session lifetime.
+struct EngineState {
+    storage: Arc<WasmStateStorage>,
+    http: WasmHttpClient,
+    fs: WasmFileSystem,
+    runtime: WasmRuntimeHandle,
+}
+
+/// Ensure the engine state has been initialised. Idempotent — subsequent calls
+/// are a no-op.
+pub fn ensure_engine() {
+    ENGINE_STATE.with(|state| {
+        if state.borrow().is_none() {
+            *state.borrow_mut() = Some(EngineState {
+                storage: Arc::new(WasmStateStorage::new()),
+                http: WasmHttpClient,
+                fs: WasmFileSystem,
+                runtime: WasmRuntimeHandle,
+            });
+        }
+    });
 }
 
 /// The engine's live browser-session state.
