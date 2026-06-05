@@ -33,7 +33,7 @@ use super::{
 use crate::db::TokenRecord;
 use crate::db::{
     AuditEntry, AuditRecord, BackendRecord, DirtyFileRecord, ExplicitControlRecord, GrantRecord,
-    LifecyclePolicyRecord, PeerRecord, PinRuleRecord, QuarantineRecord, StateDb,
+    LifecyclePolicyRecord, MaxFileLengthRecord, PeerRecord, PinRuleRecord, QuarantineRecord, StateDb,
 };
 #[cfg(feature = "p2p")]
 use crate::manage::token::CapabilityToken;
@@ -290,6 +290,36 @@ impl<R: RuntimeHandle> StateStorage for SqliteStorage<R> {
 
     async fn remove_lifecycle_policy(&self, id: i64) -> Result<bool, StorageError> {
         self.run(move |db| db.remove_lifecycle_policy(id)).await
+    }
+
+    // ── Max file length rule operations ──
+
+    async fn add_max_file_length_rule(
+        &self,
+        path_glob: &str,
+        max_bytes: u64,
+        priority: i32,
+        conditions: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let path_glob = path_glob.to_owned();
+        let conditions = conditions.map(ToOwned::to_owned);
+        self.run(move |db| {
+            db.add_max_file_length_rule(
+                &path_glob,
+                max_bytes,
+                priority,
+                conditions.as_deref(),
+            )
+        })
+        .await
+    }
+
+    async fn list_max_file_length_rules(&self) -> Result<Vec<MaxFileLengthRecord>, StorageError> {
+        self.run(StateDb::list_max_file_length_rules).await
+    }
+
+    async fn remove_max_file_length_rule(&self, id: i64) -> Result<bool, StorageError> {
+        self.run(move |db| db.remove_max_file_length_rule(id)).await
     }
 
     // ── Cache queries ──

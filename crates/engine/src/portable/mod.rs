@@ -53,7 +53,7 @@ use chrono::{DateTime, Utc};
 use crate::db::TokenRecord;
 use crate::db::{
     AuditEntry, AuditRecord, BackendRecord, DirtyFileRecord, ExplicitControlRecord, GrantRecord,
-    LifecyclePolicyRecord, PeerRecord, PinRuleRecord, QuarantineRecord,
+    LifecyclePolicyRecord, MaxFileLengthRecord, PeerRecord, PinRuleRecord, QuarantineRecord,
 };
 #[cfg(feature = "p2p")]
 use crate::manage::token::CapabilityToken;
@@ -241,6 +241,23 @@ pub trait StateStorage: Send + Sync {
 
     /// Remove a lifecycle policy by id. Returns `true` if a row was removed.
     async fn remove_lifecycle_policy(&self, id: i64) -> Result<bool, StorageError>;
+
+    // ── Max file length rule operations ──
+
+    /// Add a max file length rule.
+    async fn add_max_file_length_rule(
+        &self,
+        path_glob: &str,
+        max_bytes: u64,
+        priority: i32,
+        conditions: Option<&str>,
+    ) -> Result<(), StorageError>;
+
+    /// List max file length rules, ordered by priority descending.
+    async fn list_max_file_length_rules(&self) -> Result<Vec<MaxFileLengthRecord>, StorageError>;
+
+    /// Remove a max file length rule by id. Returns `true` if a row was removed.
+    async fn remove_max_file_length_rule(&self, id: i64) -> Result<bool, StorageError>;
 
     // ── Cache queries ──
 

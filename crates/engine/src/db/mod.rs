@@ -1056,6 +1056,62 @@ impl StateDb {
         rows.into_iter().map(GrantRecord::try_from_raw).collect()
     }
 
+    // ── Max file length rule operations ──
+
+    /// Add a max file length rule.
+    pub fn add_max_file_length_rule(
+        &self,
+        path_glob: &str,
+        max_bytes: u64,
+        priority: i32,
+        conditions: Option<&str>,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        conn.execute(
+            "INSERT INTO max_file_length_rules (path_glob, max_bytes, priority, conditions)
+             VALUES (?1, ?2, ?3, ?4)",
+            (path_glob, size_to_sql(max_bytes), priority, conditions),
+        )?;
+        Ok(())
+    }
+
+    /// List all max file length rules ordered by priority descending.
+    pub fn list_max_file_length_rules(&self) -> Result<Vec<MaxFileLengthRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, path_glob, max_bytes, priority, conditions
+             FROM max_file_length_rules ORDER BY priority DESC",
+        )?;
+        let rules = stmt
+            .query_map([], |row| {
+                Ok(MaxFileLengthRecord {
+                    id: row.get(0)?,
+                    path_glob: row.get(1)?,
+                    max_bytes: size_from_row(row, 2)?.unwrap_or(0),
+                    priority: row.get(3)?,
+                    conditions: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rules)
+    }
+
+    /// Remove a max file length rule by ID. Returns `true` if a row was removed.
+    pub fn remove_max_file_length_rule(&self, id: i64) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let rows = conn.execute("DELETE FROM max_file_length_rules WHERE id = ?1", [id])?;
+        Ok(rows > 0)
+    }
+
     // ── Auth code operations (pairing + device flow) ──
 
     /// Insert a new pending auth code.
@@ -1617,6 +1673,21 @@ pub struct AuthCodeRecord {
     pub created_at: String,
     /// When the code expires (RFC 3339).
     pub expires_at: String,
+}
+
+/// A max file length rule row from the database.
+#[derive(Debug, Clone)]
+pub struct MaxFileLengthRecord {
+    /// The row id.
+    pub id: i64,
+    /// Glob pattern matched against file paths.
+    pub path_glob: String,
+    /// Maximum allowed file size in bytes.
+    pub max_bytes: u64,
+    /// Higher-priority rules take precedence.
+    pub priority: i32,
+    /// Optional conditional expression.
+    pub conditions: Option<String>,
 }
 
 #[cfg(all(test, feature = "native"))]

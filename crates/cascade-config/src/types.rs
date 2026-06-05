@@ -23,6 +23,9 @@ pub struct CascadeConfig {
     pub unpin: Vec<PinRule>,
 
     #[serde(default)]
+    pub max_file_length: Vec<MaxFileLengthRule>,
+
+    #[serde(default)]
     pub cache: Option<CacheConfig>,
 
     #[serde(default)]
@@ -45,6 +48,7 @@ impl CascadeConfig {
         self.lifecycle.extend(other.lifecycle);
         self.pin.extend(other.pin);
         self.unpin.extend(other.unpin);
+        self.max_file_length.extend(other.max_file_length);
         // Nearest-wins for scalar configs
         if other.cache.is_some() {
             self.cache = other.cache;
@@ -86,6 +90,26 @@ pub struct LifecyclePolicy {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PinRule {
     pub path: String,
+    #[serde(default)]
+    pub conditions: Vec<String>,
+}
+
+/// A max file length rule: files matching `path` must not exceed the given
+/// byte limit. Rules are evaluated with child-overrides-parent precedence
+/// and first-match-wins ordering by `priority` (descending).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaxFileLengthRule {
+    /// Glob pattern matched against file paths relative to the mount root.
+    pub path: String,
+    /// Maximum allowed file size, as a human-readable byte string (for example
+    /// `5GB`, `512MiB`).
+    pub max_bytes: MaxSize,
+    /// Higher-priority rules take precedence when multiple rules match.
+    #[serde(default)]
+    pub priority: i32,
+    /// Optional conditional expressions evaluated against the engine's
+    /// `EvalContext`. All conditions must evaluate to true for the rule to
+    /// apply.
     #[serde(default)]
     pub conditions: Vec<String>,
 }
@@ -306,6 +330,7 @@ pub struct ResolvedConfig {
     pub lifecycle: Vec<LifecyclePolicy>,
     pub pins: Vec<PinRule>,
     pub unpins: Vec<PinRule>,
+    pub max_file_length: Vec<MaxFileLengthRule>,
     pub cache: Option<CacheConfig>,
     pub p2p: Option<P2PConfig>,
 }

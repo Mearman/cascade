@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.80](https://github.com/Mearman/cascade/compare/cascade-backend-fsaccess-v0.1.79...cascade-backend-fsaccess-v0.1.80) - 2026-06-05
+
+### Added
+
+- *(wasm)* add browser File System Access and WebRTC transport crates
+
+### Other
+
+- release v0.1.79 [skip ci]
+- release v0.1.78 [skip ci]
+- release v0.1.77 [skip ci]
+- release v0.1.76 [skip ci]
+
 ## [0.1.79](https://github.com/Mearman/cascade/compare/cascade-backend-fsaccess-v0.1.78...cascade-backend-fsaccess-v0.1.79) - 2026-06-05
 
 ### Added

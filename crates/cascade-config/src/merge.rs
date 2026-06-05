@@ -74,6 +74,9 @@ impl ResolvedConfigBuilder {
         self.config.pins.extend(layer.pin);
         self.config.unpins.extend(layer.unpin);
 
+        // Max file length rules accumulate
+        self.config.max_file_length.extend(layer.max_file_length);
+
         // Cache settings: nearest-wins (child overrides parent)
         if layer.cache.is_some() {
             self.config.cache = layer.cache;
