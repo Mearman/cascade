@@ -29,12 +29,12 @@ use super::{
     BoxFuture, FileSystem, FsDirEntry, FsError, HeaderMap, HttpClient, HttpError, HttpResponse,
     JoinError, JoinHandle, RuntimeHandle, StateStorage, StorageError,
 };
+#[cfg(feature = "p2p")]
+use crate::db::TokenRecord;
 use crate::db::{
     AuditEntry, AuditRecord, BackendRecord, DirtyFileRecord, ExplicitControlRecord, GrantRecord,
     LifecyclePolicyRecord, PeerRecord, PinRuleRecord, QuarantineRecord, StateDb,
 };
-#[cfg(feature = "p2p")]
-use crate::db::TokenRecord;
 #[cfg(feature = "p2p")]
 use crate::manage::token::CapabilityToken;
 use crate::manage::{Grant, Scope};

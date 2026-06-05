@@ -49,12 +49,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
+#[cfg(feature = "p2p")]
+use crate::db::TokenRecord;
 use crate::db::{
     AuditEntry, AuditRecord, BackendRecord, DirtyFileRecord, ExplicitControlRecord, GrantRecord,
     LifecyclePolicyRecord, PeerRecord, PinRuleRecord, QuarantineRecord,
 };
-#[cfg(feature = "p2p")]
-use crate::db::TokenRecord;
 #[cfg(feature = "p2p")]
 use crate::manage::token::CapabilityToken;
 use crate::manage::{Grant, Scope};

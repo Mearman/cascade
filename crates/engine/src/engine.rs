@@ -29,13 +29,12 @@ use crate::cache::manager::{CacheManager, CacheManagerConfig};
 use crate::changefeed::ChangeFeed;
 use crate::config::ConfigResolver;
 use crate::db::{AuditEntry, PinRuleRecord, QuarantineRecord, StateDb};
-use crate::manage::{DeviceId, Grant, Scope};
 #[cfg(feature = "p2p")]
 use crate::manage::{
-    DataAccess, DataAuthority, ExplicitControlState, ManageCommandExecutor,
-    ManageDispatch, ManageGrantStore, data_access_with_explicit_control, run_dispatch,
-    verify_data_token,
+    DataAccess, DataAuthority, ExplicitControlState, ManageCommandExecutor, ManageDispatch,
+    ManageGrantStore, data_access_with_explicit_control, run_dispatch, verify_data_token,
 };
+use crate::manage::{DeviceId, Grant, Scope};
 #[cfg(feature = "p2p")]
 use crate::p2p_bridge::P2pBridge;
 use crate::presenter::VfsPresenter;
@@ -1271,7 +1270,6 @@ mod tests {
     // ── Management-plane dispatch against the real engine + DB ──
 
     #[cfg(feature = "p2p")]
-
     use crate::manage::{Capability, Scope};
     use chrono::Utc;
 
