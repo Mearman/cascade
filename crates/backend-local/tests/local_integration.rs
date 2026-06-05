@@ -71,9 +71,7 @@ async fn full_lifecycle_create_detect_download_delete() {
     assert!(entry.hash.is_some());
 
     // download() reads content.
-    let mut buf = Vec::new();
-    let mut writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send) = &mut buf;
-    backend.download(&entry, &mut writer).await.unwrap();
+    let buf = backend.download(&entry).await.unwrap();
     assert_eq!(buf, b"hello world");
 
     // delete() removes it.
@@ -96,10 +94,9 @@ async fn changes_detects_external_deletion() {
 
     // Create and upload a file through the backend.
     let data = b"to be deleted";
-    let mut cursor = std::io::Cursor::new(data);
     let parent_id = FileId("/".to_string());
     let _entry = backend
-        .upload(Path::new("doomed.txt"), &mut cursor, &parent_id)
+        .upload(Path::new("doomed.txt"), data, &parent_id)
         .await
         .unwrap();
 
@@ -164,10 +161,9 @@ async fn move_rename_file() {
 
     // Upload a file.
     let data = b"move me";
-    let mut cursor = std::io::Cursor::new(data);
     let parent_id = FileId("/".to_string());
     let entry = backend
-        .upload(Path::new("alpha.txt"), &mut cursor, &parent_id)
+        .upload(Path::new("alpha.txt"), data, &parent_id)
         .await
         .unwrap();
     assert_eq!(entry.name, "alpha.txt");
@@ -225,10 +221,9 @@ async fn hash_based_change_detection() {
 
     // Upload a file via the backend so it's in the manifest.
     let data = b"original content";
-    let mut cursor = std::io::Cursor::new(data);
     let parent_id = FileId("/".to_string());
     let _entry = backend
-        .upload(Path::new("doc.txt"), &mut cursor, &parent_id)
+        .upload(Path::new("doc.txt"), data, &parent_id)
         .await
         .unwrap();
 
@@ -315,18 +310,13 @@ async fn upload_only_mode_blocks_writes_allows_reads() {
     let meta = backend.metadata(Path::new("existing.txt")).await.unwrap();
     assert_eq!(meta.name, "existing.txt");
 
-    let mut buf = Vec::new();
-    let mut writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send) = &mut buf;
-    backend.download(&meta, &mut writer).await.unwrap();
+    let buf = backend.download(&meta).await.unwrap();
     assert_eq!(buf, b"data");
 
     // Upload fails.
     let data = b"new";
-    let mut cursor = std::io::Cursor::new(data);
     let parent_id = FileId("/".to_string());
-    let result = backend
-        .upload(Path::new("new.txt"), &mut cursor, &parent_id)
-        .await;
+    let result = backend.upload(Path::new("new.txt"), data, &parent_id).await;
     assert!(result.is_err());
 
     // Create dir fails.
@@ -367,16 +357,13 @@ mod proptests {
                 let dir = tempfile::tempdir().unwrap();
                 let backend = make_backend(dir.path(), "prop-roundtrip");
 
-                let mut cursor = std::io::Cursor::new(content.clone());
                 let parent_id = FileId("/".to_string());
                             let entry = backend
-                    .upload(Path::new("prop-file.bin"), &mut cursor, &parent_id)
+                    .upload(Path::new("prop-file.bin"), &content, &parent_id)
                     .await
                     .unwrap();
 
-                let mut buf = Vec::new();
-                let mut writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send) = &mut buf;
-                backend.download(&entry, &mut writer).await.unwrap();
+                let buf = backend.download(&entry).await.unwrap();
 
                 prop_assert_eq!(buf, content);
                 Ok(())
@@ -391,10 +378,9 @@ mod proptests {
                 let backend = make_backend(dir.path(), "prop-name");
 
                 let data = b"content";
-                let mut cursor = std::io::Cursor::new(data);
                 let parent_id = FileId("/".to_string());
                             let _entry = backend
-                    .upload(Path::new(&filename), &mut cursor, &parent_id)
+                    .upload(Path::new(&filename), data, &parent_id)
                     .await
                     .unwrap();
 

@@ -12,7 +12,6 @@
 //! Docker. The Docker compose tests in `test/e2e/p2p/` cover the same
 //! scenarios against multiple real OS network stacks.
 
-use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -141,11 +140,10 @@ async fn three_peer_index_propagation() {
 
     // Upload on A.
     let payload = b"three-peer test".repeat(20);
-    let mut reader = Cursor::new(payload.clone());
     a.backend
         .upload(
             Path::new("hub.txt"),
-            &mut reader,
+            &payload,
             &FileId(format!("{}:root", a.backend.id())),
         )
         .await
@@ -165,13 +163,11 @@ async fn three_peer_index_propagation() {
 
     // Both B and C should be able to download by pulling blocks from A.
     let entry_b = b.backend.metadata(Path::new("hub.txt")).await.unwrap();
-    let mut out_b = Vec::new();
-    b.backend.download(&entry_b, &mut out_b).await.unwrap();
+    let out_b = b.backend.download(&entry_b).await.unwrap();
     assert_eq!(out_b, payload);
 
     let entry_c = c.backend.metadata(Path::new("hub.txt")).await.unwrap();
-    let mut out_c = Vec::new();
-    c.backend.download(&entry_c, &mut out_c).await.unwrap();
+    let out_c = c.backend.download(&entry_c).await.unwrap();
     assert_eq!(out_c, payload);
 }
 
@@ -187,11 +183,10 @@ async fn last_write_wins_conflict() {
 
     // A uploads first.
     let early = b"early".to_vec();
-    let mut r = Cursor::new(early.clone());
     a.backend
         .upload(
             Path::new("doc.txt"),
-            &mut r,
+            &early,
             &FileId(format!("{}:root", a.backend.id())),
         )
         .await
@@ -206,11 +201,10 @@ async fn last_write_wins_conflict() {
     tokio::time::sleep(Duration::from_millis(1100)).await;
 
     let late = b"late and longer".to_vec();
-    let mut r = Cursor::new(late.clone());
     b.backend
         .upload(
             Path::new("doc.txt"),
-            &mut r,
+            &late,
             &FileId(format!("{}:root", b.backend.id())),
         )
         .await
@@ -242,12 +236,11 @@ async fn deletes_propagate_to_peers() {
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     let payload = b"to be deleted".to_vec();
-    let mut r = Cursor::new(payload.clone());
     let entry = a
         .backend
         .upload(
             Path::new("ephemeral.txt"),
-            &mut r,
+            &payload,
             &FileId(format!("{}:root", a.backend.id())),
         )
         .await
@@ -300,20 +293,18 @@ async fn version_vectors_resolve_concurrent_upload() {
     // Disconnected uploads — each node bumps its own short_id only.
     let payload_a = b"alpha payload".repeat(8);
     let payload_b = b"beta payload longer than alpha".repeat(4);
-    let mut ra = Cursor::new(payload_a.clone());
     a.backend
         .upload(
             Path::new("doc.txt"),
-            &mut ra,
+            &payload_a,
             &FileId(format!("{}:root", a.backend.id())),
         )
         .await
         .unwrap();
-    let mut rb = Cursor::new(payload_b.clone());
     b.backend
         .upload(
             Path::new("doc.txt"),
-            &mut rb,
+            &payload_b,
             &FileId(format!("{}:root", b.backend.id())),
         )
         .await
@@ -354,20 +345,18 @@ async fn concurrent_edit_preserves_loser_as_conflict_copy() {
     // Disconnected uploads — each node bumps its own short_id only.
     let payload_a = b"alpha payload".repeat(8);
     let payload_b = b"beta payload longer than alpha".repeat(4);
-    let mut ra = Cursor::new(payload_a.clone());
     a.backend
         .upload(
             Path::new("doc.txt"),
-            &mut ra,
+            &payload_a,
             &FileId(format!("{}:root", a.backend.id())),
         )
         .await
         .unwrap();
-    let mut rb = Cursor::new(payload_b.clone());
     b.backend
         .upload(
             Path::new("doc.txt"),
-            &mut rb,
+            &payload_b,
             &FileId(format!("{}:root", b.backend.id())),
         )
         .await
@@ -459,11 +448,10 @@ async fn concurrent_downloads_do_not_serialise() {
     let p3 = vec![0x33u8; 200 * 1024];
 
     for (name, payload) in [("one.bin", &p1), ("two.bin", &p2), ("three.bin", &p3)] {
-        let mut r = Cursor::new(payload.clone());
         a.backend
             .upload(
                 Path::new(name),
-                &mut r,
+                payload,
                 &FileId(format!("{}:root", a.backend.id())),
             )
             .await
@@ -488,21 +476,9 @@ async fn concurrent_downloads_do_not_serialise() {
     let b_3 = b.backend.clone();
 
     let job = async move {
-        let f1 = tokio::spawn(async move {
-            let mut out = Vec::new();
-            b_1.download(&entry_1, &mut out).await.unwrap();
-            out
-        });
-        let f2 = tokio::spawn(async move {
-            let mut out = Vec::new();
-            b_2.download(&entry_2, &mut out).await.unwrap();
-            out
-        });
-        let f3 = tokio::spawn(async move {
-            let mut out = Vec::new();
-            b_3.download(&entry_3, &mut out).await.unwrap();
-            out
-        });
+        let f1 = tokio::spawn(async move { b_1.download(&entry_1).await.unwrap() });
+        let f2 = tokio::spawn(async move { b_2.download(&entry_2).await.unwrap() });
+        let f3 = tokio::spawn(async move { b_3.download(&entry_3).await.unwrap() });
         (f1.await.unwrap(), f2.await.unwrap(), f3.await.unwrap())
     };
 
@@ -608,11 +584,10 @@ async fn download_pulls_missing_blocks_from_peer() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let payload = vec![0xCDu8; 200 * 1024]; // > one 128KB block
-    let mut r = Cursor::new(payload.clone());
     a.backend
         .upload(
             Path::new("big.bin"),
-            &mut r,
+            &payload,
             &FileId(format!("{}:root", a.backend.id())),
         )
         .await
@@ -627,7 +602,6 @@ async fn download_pulls_missing_blocks_from_peer() {
     // B has the index entry but no blocks. Download must pull them
     // from A.
     let entry = b.backend.metadata(Path::new("big.bin")).await.unwrap();
-    let mut out = Vec::new();
-    b.backend.download(&entry, &mut out).await.unwrap();
+    let out = b.backend.download(&entry).await.unwrap();
     assert_eq!(out, payload);
 }

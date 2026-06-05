@@ -47,6 +47,8 @@ pub mod sync;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::index::{FolderIndex, IndexEntry};
+use crate::sync::SyncEngine;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use cascade_engine::backend::Backend;
@@ -57,10 +59,6 @@ use cascade_p2p::discovery::{Discovery, DiscoveryService, GossipDiscovery, LanDi
 use cascade_p2p::identity::DeviceIdentity;
 use cascade_p2p::protocol::{ManageCommand, ManageResult, ManageScope, Version};
 use cascade_p2p::store::BlockStore;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-use crate::index::{FolderIndex, IndexEntry};
-use crate::sync::SyncEngine;
 
 /// Poll interval reported to the engine.
 ///
@@ -983,17 +981,14 @@ impl Backend for P2pBackend {
         Ok(self.entry_to_file(&entry))
     }
 
-    async fn download(
-        &self,
-        file: &FileEntry,
-        writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
-    ) -> Result<()> {
+    async fn download(&self, file: &FileEntry) -> Result<Vec<u8>> {
         let native = file.id.native_id();
         let entry = self
             .index
             .get(native)?
             .ok_or_else(|| anyhow::anyhow!("not in index: {native}"))?;
         let block_size = cascade_p2p::block::block_size_for_file(entry.size);
+        let mut buf = Vec::new();
         // Block hashes are stored as concatenated 32-byte values.
         for (idx, chunk) in entry.block_hashes.chunks(32).enumerate() {
             let mut h = [0u8; 32];
@@ -1012,10 +1007,9 @@ impl Backend for P2pBackend {
                 self.blocks.store_block(&hash, &fetched).await?;
                 fetched
             };
-            writer.write_all(&data).await?;
+            buf.extend_from_slice(&data);
         }
-        writer.flush().await?;
-        Ok(())
+        Ok(buf)
     }
 
     /// Range read that fetches only the content-addressed blocks
@@ -1128,12 +1122,7 @@ impl Backend for P2pBackend {
             .to_vec())
     }
 
-    async fn upload(
-        &self,
-        path: &Path,
-        reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
-        parent_id: &FileId,
-    ) -> Result<FileEntry> {
+    async fn upload(&self, path: &Path, data: &[u8], parent_id: &FileId) -> Result<FileEntry> {
         let name = path
             .file_name()
             .and_then(|s| s.to_str())
@@ -1145,11 +1134,9 @@ impl Backend for P2pBackend {
             format!("{parent_native}/{name}")
         };
 
-        let mut data = Vec::new();
-        reader.read_to_end(&mut data).await?;
         let size = data.len() as u64;
 
-        let blocks_info = split_data(&data);
+        let blocks_info = split_data(data);
         let block_size = blocks_info.block_size as usize;
         let mut hash_blob = Vec::with_capacity(blocks_info.blocks.len() * 32);
         for (idx, hash) in blocks_info.blocks.iter().enumerate() {
@@ -1188,11 +1175,7 @@ impl Backend for P2pBackend {
         Ok(self.entry_to_file(&entry))
     }
 
-    async fn update(
-        &self,
-        file_id: &FileId,
-        reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
-    ) -> Result<FileEntry> {
+    async fn update(&self, file_id: &FileId, data: &[u8]) -> Result<FileEntry> {
         let native = file_id.native_id();
         let existing = self
             .index
@@ -1203,7 +1186,7 @@ impl Backend for P2pBackend {
             None => format!("{}:root", self.cfg.instance_id),
         };
         // Re-upload using the same path.
-        self.upload(Path::new(&existing.path), reader, &FileId(parent))
+        self.upload(Path::new(&existing.path), data, &FileId(parent))
             .await
     }
 
@@ -2238,7 +2221,6 @@ fn default_data_dir(name: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor as IoCursor;
     use tempfile::tempdir;
 
     fn make_backend() -> (tempfile::TempDir, P2pBackend) {
@@ -2260,11 +2242,10 @@ mod tests {
     async fn upload_then_download_round_trips() {
         let (_dir, backend) = make_backend();
         let data = b"hello world".repeat(1000);
-        let mut reader: IoCursor<Vec<u8>> = IoCursor::new(data.clone());
         let entry = backend
             .upload(
                 Path::new("hello.txt"),
-                &mut reader,
+                &data.clone(),
                 &FileId("p2p-test:root".to_string()),
             )
             .await
@@ -2272,28 +2253,25 @@ mod tests {
         assert_eq!(entry.name, "hello.txt");
         assert_eq!(entry.size, Some(data.len() as u64));
 
-        let mut out: Vec<u8> = Vec::new();
-        backend.download(&entry, &mut out).await.unwrap();
+        let out = backend.download(&entry).await.unwrap();
         assert_eq!(out, data);
     }
 
     #[tokio::test]
     async fn list_children_after_uploads() {
         let (_dir, backend) = make_backend();
-        let mut reader = IoCursor::new(b"a".to_vec());
         backend
             .upload(
                 Path::new("a.txt"),
-                &mut reader,
+                &b"a".to_vec(),
                 &FileId("p2p-test:root".to_string()),
             )
             .await
             .unwrap();
-        let mut reader2 = IoCursor::new(b"b".to_vec());
         backend
             .upload(
                 Path::new("b.txt"),
-                &mut reader2,
+                &b"b".to_vec(),
                 &FileId("p2p-test:root".to_string()),
             )
             .await
@@ -2310,11 +2288,10 @@ mod tests {
         let (initial, c0) = backend.changes(None).await.unwrap();
         assert!(initial.is_empty());
 
-        let mut reader = IoCursor::new(b"data".to_vec());
         backend
             .upload(
                 Path::new("x.txt"),
-                &mut reader,
+                &b"data".to_vec(),
                 &FileId("p2p-test:root".to_string()),
             )
             .await
@@ -2328,11 +2305,10 @@ mod tests {
     #[tokio::test]
     async fn delete_marks_tombstone_excluded_from_listing() {
         let (_dir, backend) = make_backend();
-        let mut reader = IoCursor::new(b"x".to_vec());
         let entry = backend
             .upload(
                 Path::new("x.txt"),
-                &mut reader,
+                &b"x".to_vec(),
                 &FileId("p2p-test:root".to_string()),
             )
             .await
@@ -2389,11 +2365,10 @@ mod tests {
             .unwrap();
 
         let payload = b"peer-to-peer round trip".repeat(50);
-        let mut reader = IoCursor::new(payload.clone());
         let entry_a = backend_a
             .upload(
                 Path::new("shared.bin"),
-                &mut reader,
+                &payload.clone(),
                 &FileId(format!("{}:root", backend_a.id())),
             )
             .await
@@ -2425,8 +2400,7 @@ mod tests {
         }
 
         let entry_b = backend_b.metadata(Path::new("shared.bin")).await.unwrap();
-        let mut out: Vec<u8> = Vec::new();
-        backend_b.download(&entry_b, &mut out).await.unwrap();
+        let out = backend_b.download(&entry_b).await.unwrap();
         assert_eq!(out, payload);
     }
 
@@ -2444,11 +2418,10 @@ mod tests {
         // 3.5 blocks worth of data → four 128 KB blocks, last short.
         let block = 128 * 1024;
         let payload = multi_block_payload(block * 7 / 2);
-        let mut reader: IoCursor<Vec<u8>> = IoCursor::new(payload.clone());
         let entry = backend
             .upload(
                 Path::new("big.bin"),
-                &mut reader,
+                &payload.clone(),
                 &FileId("p2p-test:root".to_string()),
             )
             .await
@@ -2470,11 +2443,10 @@ mod tests {
         let (_dir, backend) = make_backend();
         let block = 128 * 1024;
         let payload = multi_block_payload(block * 3);
-        let mut reader: IoCursor<Vec<u8>> = IoCursor::new(payload.clone());
         let entry = backend
             .upload(
                 Path::new("three.bin"),
-                &mut reader,
+                &payload.clone(),
                 &FileId("p2p-test:root".to_string()),
             )
             .await
@@ -2495,11 +2467,10 @@ mod tests {
     async fn read_range_clamps_length_past_eof() {
         let (_dir, backend) = make_backend();
         let payload = multi_block_payload(5000);
-        let mut reader: IoCursor<Vec<u8>> = IoCursor::new(payload.clone());
         let entry = backend
             .upload(
                 Path::new("small.bin"),
-                &mut reader,
+                &payload.clone(),
                 &FileId("p2p-test:root".to_string()),
             )
             .await
@@ -2514,11 +2485,10 @@ mod tests {
     async fn read_range_whole_file() {
         let (_dir, backend) = make_backend();
         let payload = multi_block_payload(128 * 1024 * 2 + 99);
-        let mut reader: IoCursor<Vec<u8>> = IoCursor::new(payload.clone());
         let entry = backend
             .upload(
                 Path::new("whole.bin"),
-                &mut reader,
+                &payload.clone(),
                 &FileId("p2p-test:root".to_string()),
             )
             .await
@@ -2533,11 +2503,10 @@ mod tests {
     async fn read_range_offset_at_or_past_eof_is_empty() {
         let (_dir, backend) = make_backend();
         let payload = multi_block_payload(2048);
-        let mut reader: IoCursor<Vec<u8>> = IoCursor::new(payload.clone());
         let entry = backend
             .upload(
                 Path::new("eof.bin"),
-                &mut reader,
+                &payload.clone(),
                 &FileId("p2p-test:root".to_string()),
             )
             .await
@@ -2563,11 +2532,10 @@ mod tests {
     async fn read_range_zero_length_is_empty() {
         let (_dir, backend) = make_backend();
         let payload = multi_block_payload(2048);
-        let mut reader: IoCursor<Vec<u8>> = IoCursor::new(payload.clone());
         let entry = backend
             .upload(
                 Path::new("zero.bin"),
-                &mut reader,
+                &payload.clone(),
                 &FileId("p2p-test:root".to_string()),
             )
             .await
@@ -2627,11 +2595,10 @@ mod tests {
         // Five-block file (4 full 128 KB blocks + a short tail).
         let block = 128 * 1024;
         let payload = multi_block_payload(block * 4 + 1234);
-        let mut reader = IoCursor::new(payload.clone());
         backend_a
             .upload(
                 Path::new("range.bin"),
-                &mut reader,
+                &payload.clone(),
                 &FileId(format!("{}:root", backend_a.id())),
             )
             .await

@@ -31,7 +31,6 @@ use cascade_engine::backend::Backend;
 use cascade_engine::types::{Change, Cursor, FileEntry, FileId, ItemId, Quota};
 use chrono::{DateTime, Utc};
 use signing::{SigningParams, build_canonical_query_string, sha256_hex, sign, uri_encode};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -888,26 +887,19 @@ impl Backend for S3Backend {
         ))
     }
 
-    async fn download(
-        &self,
-        file: &FileEntry,
-        writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
-    ) -> anyhow::Result<()> {
+    async fn download(&self, file: &FileEntry) -> anyhow::Result<Vec<u8>> {
         let key = file.id.native_id();
         let url = self.object_url(key);
 
         let resp = self.signed_request("GET", &url, &[], &[], &[]).await?;
         let resp = Self::check_response(resp)?;
 
-        writer.write_all(&resp.body).await?;
-        writer.flush().await?;
-
         tracing::debug!(
             file = %file.id,
             size = resp.body.len(),
             "downloaded from S3"
         );
-        Ok(())
+        Ok(resp.body)
     }
 
     async fn read_range(
@@ -965,17 +957,14 @@ impl Backend for S3Backend {
     async fn upload(
         &self,
         path: &Path,
-        reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+        data: &[u8],
         _parent_id: &FileId,
     ) -> anyhow::Result<FileEntry> {
         let key = self.key_for_path(path);
         let url = self.object_url(&key);
 
-        let mut data = Vec::new();
-        reader.read_to_end(&mut data).await?;
-
         if data.len() > MULTIPART_THRESHOLD {
-            self.multipart_upload(&key, &data).await?;
+            self.multipart_upload(&key, data).await?;
         } else {
             let content_length = data.len().to_string();
             let resp = self
@@ -983,7 +972,7 @@ impl Backend for S3Backend {
                     "PUT",
                     &url,
                     &[],
-                    &data,
+                    data,
                     &[("content-length", &content_length)],
                 )
                 .await?;
@@ -1007,19 +996,12 @@ impl Backend for S3Backend {
         Ok(self.object_entry(&key, &name, size, Some(Utc::now()), &parent_id))
     }
 
-    async fn update(
-        &self,
-        file_id: &FileId,
-        reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
-    ) -> anyhow::Result<FileEntry> {
+    async fn update(&self, file_id: &FileId, data: &[u8]) -> anyhow::Result<FileEntry> {
         let key = file_id.native_id();
         let url = self.object_url(key);
 
-        let mut data = Vec::new();
-        reader.read_to_end(&mut data).await?;
-
         if data.len() > MULTIPART_THRESHOLD {
-            self.multipart_upload(key, &data).await?;
+            self.multipart_upload(key, data).await?;
         } else {
             let content_length = data.len().to_string();
             let resp = self
@@ -1027,7 +1009,7 @@ impl Backend for S3Backend {
                     "PUT",
                     &url,
                     &[],
-                    &data,
+                    data,
                     &[("content-length", &content_length)],
                 )
                 .await?;

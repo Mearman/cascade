@@ -26,7 +26,6 @@ use std::time::Duration;
 use async_trait::async_trait;
 use cascade_engine::backend::{Backend, BackendError};
 use cascade_engine::types::{Change, Cursor, FileEntry, FileId, ItemId, Quota};
-use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, RwLock};
 
 use auth::AuthTokens;
@@ -871,21 +870,14 @@ impl Backend for GdriveBackend {
             .ok_or_else(|| anyhow::anyhow!("File not found: {path_str}"))
     }
 
-    async fn download(
-        &self,
-        file: &FileEntry,
-        writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
-    ) -> anyhow::Result<()> {
+    async fn download(&self, file: &FileEntry) -> anyhow::Result<Vec<u8>> {
         let token = self.access_token().await?;
         let remote_id = file.id.native_id();
 
         let resp = self.drive.download_content(remote_id, &token).await?;
 
-        writer.write_all(&resp.body).await?;
-        writer.flush().await?;
-
         tracing::debug!(file = %file.id, size = file.size.unwrap_or(0), "downloaded");
-        Ok(())
+        Ok(resp.body)
     }
 
     async fn read_range(
@@ -915,7 +907,7 @@ impl Backend for GdriveBackend {
     async fn upload(
         &self,
         path: &Path,
-        reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+        data: &[u8],
         parent_id: &cascade_engine::types::FileId,
     ) -> anyhow::Result<FileEntry> {
         let native_parent = parent_id.native_id();
@@ -941,10 +933,6 @@ impl Backend for GdriveBackend {
 
         let token = self.access_token().await?;
 
-        // Read all data from the reader.
-        let mut data = Vec::<u8>::new();
-        tokio::io::AsyncReadExt::read_to_end(reader, &mut data).await?;
-
         let file_name = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -960,7 +948,7 @@ impl Backend for GdriveBackend {
 
         let file = self
             .drive
-            .upload_file(file_name, &drive_parent, &data, &token)
+            .upload_file(file_name, &drive_parent, data, &token)
             .await?;
 
         let mut entry = file
@@ -974,15 +962,12 @@ impl Backend for GdriveBackend {
     async fn update(
         &self,
         file_id: &cascade_engine::types::FileId,
-        reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+        data: &[u8],
     ) -> anyhow::Result<FileEntry> {
         let token = self.access_token().await?;
 
-        let mut data = Vec::<u8>::new();
-        tokio::io::AsyncReadExt::read_to_end(reader, &mut data).await?;
-
         let native_id = file_id.native_id();
-        let file = self.drive.update_file(native_id, &data, &token).await?;
+        let file = self.drive.update_file(native_id, data, &token).await?;
 
         file.to_file_entry(&self.instance_id)
             .ok_or_else(|| anyhow::anyhow!("update returned trashed file"))

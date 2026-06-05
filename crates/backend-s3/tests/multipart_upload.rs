@@ -72,10 +72,10 @@ async fn small_object_uses_single_put() {
         .await;
 
     let backend = backend(&server.url());
-    let mut reader = std::io::Cursor::new(body.to_vec());
+    let data = body.to_vec();
     let parent_id = FileId(String::new());
     backend
-        .upload(Path::new(key), &mut reader, &parent_id)
+        .upload(Path::new(key), &data, &parent_id)
         .await
         .unwrap();
 

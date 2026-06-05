@@ -355,9 +355,7 @@ async fn download_writes_file_content() {
         hash: None,
     };
 
-    let mut buf = Vec::<u8>::new();
-    let writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send) = &mut buf;
-    backend.download(&entry, writer).await.unwrap();
+    let buf = backend.download(&entry).await.unwrap();
     assert_eq!(buf, b"hello drive");
 }
 
@@ -533,11 +531,9 @@ async fn upload_file_sends_multipart_and_returns_entry() {
 
     let backend = make_backend(&server);
     let content = b"hello";
-    let mut reader = std::io::Cursor::new(&content[..]);
-    let reader_ref: &mut (dyn tokio::io::AsyncRead + Unpin + Send) = &mut reader;
     let parent = FileId("root".to_string());
     let entry = backend
-        .upload(Path::new("report.txt"), reader_ref, &parent)
+        .upload(Path::new("report.txt"), content, &parent)
         .await
         .unwrap();
     assert_eq!(entry.name, "report.txt");

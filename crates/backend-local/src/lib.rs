@@ -24,7 +24,6 @@ use cascade_engine::backend::{Backend, BackendError};
 use cascade_engine::types::{Change, Cursor, FileEntry, FileId, ItemId, Quota};
 use manifest::{FileState, Manifest, walk_tree};
 use sha2::Digest;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 
 /// Operating mode for the local backend.
@@ -327,11 +326,7 @@ impl Backend for LocalBackend {
         Ok(self.state_to_entry(&state, false))
     }
 
-    async fn download(
-        &self,
-        file: &FileEntry,
-        writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
-    ) -> anyhow::Result<()> {
+    async fn download(&self, file: &FileEntry) -> anyhow::Result<Vec<u8>> {
         let relative = file.id.native_id();
         let abs = self.root.join(relative);
 
@@ -340,11 +335,9 @@ impl Backend for LocalBackend {
         }
 
         let data = tokio::fs::read(&abs).await?;
-        writer.write_all(&data).await?;
-        writer.flush().await?;
 
         tracing::debug!(file = %file.id, size = data.len(), "downloaded from local");
-        Ok(())
+        Ok(data)
     }
 
     async fn read_range(
@@ -388,7 +381,7 @@ impl Backend for LocalBackend {
     async fn upload(
         &self,
         path: &Path,
-        reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+        data: &[u8],
         _parent_id: &FileId,
     ) -> anyhow::Result<FileEntry> {
         if self.mode == LocalMode::UploadOnly {
@@ -407,9 +400,7 @@ impl Backend for LocalBackend {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        let mut data = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(reader, &mut data).await?;
-        tokio::fs::write(&abs, &data).await?;
+        tokio::fs::write(&abs, data).await?;
 
         tracing::debug!(path = %relative, size = data.len(), "uploaded to local");
 
@@ -422,7 +413,7 @@ impl Backend for LocalBackend {
 
         let hash = {
             let mut hasher = sha2::Sha256::new();
-            sha2::Digest::update(&mut hasher, &data);
+            sha2::Digest::update(&mut hasher, data);
             hex::encode(hasher.finalize())
         };
 
@@ -443,21 +434,14 @@ impl Backend for LocalBackend {
         Ok(self.state_to_entry(&state, false))
     }
 
-    async fn update(
-        &self,
-        file_id: &FileId,
-        reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
-    ) -> anyhow::Result<FileEntry> {
+    async fn update(&self, file_id: &FileId, data: &[u8]) -> anyhow::Result<FileEntry> {
         let relative = file_id.native_id();
         let full_path = self.root.join(relative);
-
-        let mut data = Vec::new();
-        tokio::io::AsyncReadExt::read_to_end(reader, &mut data).await?;
 
         if let Some(parent) = full_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        tokio::fs::write(&full_path, &data).await?;
+        tokio::fs::write(&full_path, data).await?;
 
         let size = u64::try_from(data.len()).unwrap_or(u64::MAX);
         let metadata = tokio::fs::metadata(&full_path).await?;
@@ -707,9 +691,7 @@ mod tests {
         let backend = create_backend(&config).unwrap();
         let entry = backend.metadata(Path::new("test.txt")).await.unwrap();
 
-        let mut buf = Vec::new();
-        let mut writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send) = &mut buf;
-        backend.download(&entry, &mut writer).await.unwrap();
+        let buf = backend.download(&entry).await.unwrap();
 
         assert_eq!(buf, b"hello world");
     }
@@ -822,11 +804,10 @@ mod tests {
         let backend = create_backend(&config).unwrap();
 
         let data = b"uploaded content";
-        let mut cursor = std::io::Cursor::new(data);
         let parent_id = FileId("/".to_string());
 
         let entry = backend
-            .upload(Path::new("new-file.txt"), &mut cursor, &parent_id)
+            .upload(Path::new("new-file.txt"), data, &parent_id)
             .await
             .unwrap();
 
@@ -951,11 +932,10 @@ mod tests {
         let backend = create_backend(&config).unwrap();
 
         let data = b"content";
-        let mut cursor = std::io::Cursor::new(data);
         let parent_id = FileId("/".to_string());
 
         let result = backend
-            .upload(Path::new("file.txt"), &mut cursor, &parent_id)
+            .upload(Path::new("file.txt"), data, &parent_id)
             .await;
         assert!(result.is_err());
     }
