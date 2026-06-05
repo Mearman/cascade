@@ -188,7 +188,7 @@ fn mark_web_ready(runtime: &WebRuntimeOpt) {
 
 /// See [`mark_web_ready`] — the no-op form when the `web` feature is off.
 #[cfg(not(feature = "web"))]
-const fn mark_web_ready(_runtime: WebRuntimeOpt) {}
+const fn mark_web_ready(_runtime: &WebRuntimeOpt) {}
 
 /// Gracefully stop the HTTP API server on daemon shutdown, draining in-flight
 /// requests. A no-op without the `web` feature.
@@ -804,7 +804,7 @@ async fn try_fskit(
     // The presenter is up: spawn the HTTP API (feature-gated, when enabled) and
     // flip the F3 data-plane readiness bit so its data routes begin serving.
     let web_runtime = start_web(&engine_for_web, web).await?;
-    mark_web_ready(web_runtime);
+    mark_web_ready(&web_runtime);
 
     wait_for_shutdown_signal().await?;
 
@@ -993,7 +993,7 @@ async fn try_fileprovider(
     // The presenter is up: spawn the HTTP API (feature-gated, when enabled) and
     // flip the F3 data-plane readiness bit so its data routes begin serving.
     let web_runtime = start_web(&engine_for_web, web).await?;
-    mark_web_ready(web_runtime);
+    mark_web_ready(&web_runtime);
 
     wait_for_shutdown_signal().await?;
 
@@ -1155,7 +1155,7 @@ async fn try_projfs(
     // The presenter is up: spawn the HTTP API (feature-gated, when enabled) and
     // flip the F3 data-plane readiness bit so its data routes begin serving.
     let web_runtime = start_web(&engine_for_web, web).await?;
-    mark_web_ready(web_runtime);
+    mark_web_ready(&web_runtime);
 
     wait_for_shutdown_signal().await?;
 
@@ -1295,7 +1295,7 @@ async fn try_webdav(
     // The presenter is up: spawn the HTTP API (feature-gated, when enabled) and
     // flip the F3 data-plane readiness bit so its data routes begin serving.
     let web_runtime = start_web(&engine_for_web, web).await?;
-    mark_web_ready(web_runtime);
+    mark_web_ready(&web_runtime);
 
     wait_for_shutdown_signal().await?;
 
@@ -1399,7 +1399,7 @@ async fn try_fuse(
     // The presenter is up: spawn the HTTP API (feature-gated, when enabled) and
     // flip the F3 data-plane readiness bit so its data routes begin serving.
     let web_runtime = start_web(&engine_for_web, web).await?;
-    mark_web_ready(web_runtime);
+    mark_web_ready(&web_runtime);
 
     wait_for_shutdown_signal().await?;
 
@@ -1518,7 +1518,7 @@ async fn try_nfs(
     // The presenter is up: spawn the HTTP API (feature-gated, when enabled) and
     // flip the F3 data-plane readiness bit so its data routes begin serving.
     let web_runtime = start_web(&engine_for_web, web).await?;
-    mark_web_ready(web_runtime);
+    mark_web_ready(&web_runtime);
 
     wait_for_shutdown_signal().await?;
 
