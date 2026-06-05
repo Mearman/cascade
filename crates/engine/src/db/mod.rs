@@ -1,25 +1,36 @@
+#[cfg(feature = "native")]
 pub mod schema;
 
+#[cfg(feature = "native")]
 use crate::db::schema::SchemaVersion;
 #[cfg(feature = "p2p")]
 use crate::manage::token::CapabilityToken;
 use crate::manage::{Capability, DeviceId, Grant, Scope};
-use crate::types::{CacheState, Cursor, FileEntry, ItemId};
+use crate::types::ItemId;
+#[cfg(feature = "native")]
+use crate::types::{CacheState, Cursor, FileEntry};
+#[cfg(feature = "native")]
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+#[cfg(feature = "native")]
 use rusqlite::{Connection, OptionalExtension};
+#[cfg(feature = "native")]
 use std::path::Path;
+#[cfg(feature = "native")]
 use std::sync::Mutex;
 
-/// Cap a logical `u64` size into the `i64` range `SQLite` stores
-/// integers in, for binding via `Option::map`. A real file never exceeds
-/// `i64::MAX` bytes (8 EiB), so the saturation point is unreachable; this
-/// exists only because rusqlite 0.40 dropped the `u64` `ToSql` impl to
-/// prevent silent truncation.
+// ───────────── Native-only: StateDb (rusqlite-backed) ─────────────
+
+#[cfg(feature = "native")]
+/// Cap a logical `u64` size into the `i64` range SQLite stores integers in,
+/// for binding via `Option::map`. A real file never exceeds `i64::MAX` bytes
+/// (8 EiB), so the saturation point is unreachable; this exists only because
+/// rusqlite 0.40 dropped the `u64` `ToSql` impl to prevent silent truncation.
 fn size_to_sql(size: u64) -> i64 {
     i64::try_from(size).unwrap_or(i64::MAX)
 }
 
+#[cfg(feature = "native")]
 /// Read an optional `size` column back as `u64`. The column is stored as
 /// `i64` (see [`size_to_sql`]); a negative value is never written, so it
 /// clamps to 0. Mirrors the inline `Option<i64>` round-trip the
@@ -30,18 +41,21 @@ fn size_from_row(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<Option
         .map(|s| u64::try_from(s).unwrap_or(0)))
 }
 
-/// `SQLite` state database. Stores file metadata, backend config,
+#[cfg(feature = "native")]
+/// SQLite state database. Stores file metadata, backend config,
 /// pin rules, lifecycle policies, config cache, sync cursors, and P2P state.
 pub struct StateDb {
     conn: Mutex<Connection>,
 }
 
+#[cfg(feature = "native")]
 impl std::fmt::Debug for StateDb {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StateDb").finish_non_exhaustive()
     }
 }
 
+#[cfg(feature = "native")]
 impl StateDb {
     /// Open (or create) the state database at the given path.
     /// Creates the directory and initialises the schema if needed.
@@ -1377,6 +1391,7 @@ pub struct TokenRecord {
 }
 
 /// Raw column values for a `grants` row, before validation.
+#[cfg(feature = "native")]
 struct RawGrantRow {
     id: i64,
     grantee: String,
@@ -1400,6 +1415,7 @@ impl GrantRecord {
     /// Validate a raw grant row into a typed record. Fails loudly if the
     /// stored capability or scope cannot be parsed, rather than silently
     /// dropping an unrecognised grant.
+    #[cfg(feature = "native")]
     fn try_from_raw(raw: RawGrantRow) -> Result<Self> {
         let capability = Capability::from_wire(&raw.capability).ok_or_else(|| {
             anyhow::anyhow!("unknown capability in grant {}: {}", raw.id, raw.capability)
@@ -1438,6 +1454,7 @@ pub struct AuditEntry {
 }
 
 /// Raw column values for a `manage_audit` row, before validation.
+#[cfg(feature = "native")]
 struct RawAuditRow {
     id: i64,
     timestamp: i64,
@@ -1461,6 +1478,7 @@ pub struct AuditRecord {
 impl AuditRecord {
     /// Validate a raw audit row into a typed record. Fails loudly if the
     /// stored timestamp, capability, or scope cannot be parsed.
+    #[cfg(feature = "native")]
     fn try_from_raw(raw: RawAuditRow) -> Result<Self> {
         let timestamp = DateTime::from_timestamp(raw.timestamp, 0)
             .ok_or_else(|| anyhow::anyhow!("invalid audit timestamp in row {}", raw.id))?;
@@ -1601,7 +1619,7 @@ pub struct AuthCodeRecord {
     pub expires_at: String,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "native"))]
 mod tests {
     use super::*;
 
