@@ -121,6 +121,37 @@ pub(super) fn backend_remove(
     })
 }
 
+// ── Max file length rule operations ──
+
+/// Add a max file length rule.
+///
+/// Files matching `path_glob` that exceed `max_bytes` will be skipped during
+/// sync. Rules are ordered by `priority` (higher wins). An optional
+/// `conditions` expression is evaluated against the engine's `EvalContext`.
+pub(super) fn add_max_file_length_rule(
+    engine: &Engine,
+    path_glob: &str,
+    max_bytes: u64,
+    priority: i32,
+    conditions: Option<&str>,
+) -> Result<()> {
+    engine
+        .db
+        .add_max_file_length_rule(path_glob, max_bytes, priority, conditions)
+}
+
+/// List all max file length rules, ordered by priority descending.
+pub(super) fn list_max_file_length_rules(
+    engine: &Engine,
+) -> Result<Vec<crate::db::MaxFileLengthRecord>> {
+    engine.db.list_max_file_length_rules()
+}
+
+/// Remove a max file length rule by id. Returns `true` if a row was removed.
+pub(super) fn remove_max_file_length_rule(engine: &Engine, id: i64) -> Result<bool> {
+    engine.db.remove_max_file_length_rule(id)
+}
+
 /// Root a config rule's path under the fragment's target folder, joining
 /// unconditionally.
 ///

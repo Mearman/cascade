@@ -382,6 +382,30 @@ impl Engine {
         self.cache.pin(pattern, true)
     }
 
+    /// Add a max file length rule.
+    ///
+    /// Files matching `path_glob` that exceed `max_bytes` will be skipped during
+    /// sync. Rules are ordered by `priority` (higher wins). An optional
+    /// `conditions` expression is evaluated against the engine's `EvalContext`.
+    pub fn add_max_file_length_rule(
+        &self,
+        path_glob: &str,
+        max_bytes: u64,
+        conditions: Option<&str>,
+    ) -> Result<()> {
+        operations::add_max_file_length_rule(self, path_glob, max_bytes, 0, conditions)
+    }
+
+    /// List all max file length rules, ordered by priority descending.
+    pub fn list_max_file_length_rules(&self) -> Result<Vec<crate::db::MaxFileLengthRecord>> {
+        operations::list_max_file_length_rules(self)
+    }
+
+    /// Remove a max file length rule by id. Returns `true` if a row was removed.
+    pub fn remove_max_file_length_rule(&self, id: i64) -> Result<bool> {
+        operations::remove_max_file_length_rule(self, id)
+    }
+
     /// Merge a parsed `.cascade` fragment rooted at `folder` into the node's
     /// rule set.
     ///

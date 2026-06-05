@@ -212,6 +212,13 @@ impl SyncRunner {
                     if self.is_ignored_entry(entry) {
                         continue;
                     }
+                    if self.exceeds_max_file_length(entry) {
+                        tracing::warn!(
+                            file = %entry.name,
+                            "file exceeds max file length rule — skipped"
+                        );
+                        continue;
+                    }
                     self.db.upsert_file(entry)?;
                     // Auto-pin if the file matches any pin rule.
                     if self.is_pinned_entry(entry) {
@@ -235,6 +242,13 @@ impl SyncRunner {
                 }
                 Change::Updated { new, .. } => {
                     if self.is_ignored_entry(new) {
+                        continue;
+                    }
+                    if self.exceeds_max_file_length(new) {
+                        tracing::warn!(
+                            file = %new.name,
+                            "file exceeds max file length rule — skipped"
+                        );
                         continue;
                     }
                     // Check for conflict: if the local file is dirty and remote changed.
@@ -272,6 +286,13 @@ impl SyncRunner {
                     if self.is_ignored_entry(to) {
                         continue;
                     }
+                    if self.exceeds_max_file_length(to) {
+                        tracing::warn!(
+                            file = %to.name,
+                            "file exceeds max file length rule — skipped"
+                        );
+                        continue;
+                    }
                     self.db.upsert_file(to)?;
                     let item: VfsItem = to.clone().into();
                     self.presenter.upsert_item(item).await?;
@@ -287,6 +308,28 @@ impl SyncRunner {
     fn is_pinned_entry(&self, entry: &crate::types::FileEntry) -> bool {
         let path = std::path::Path::new(&entry.name);
         PinMatcher::load(&self.db).is_ok_and(|matcher| matcher.is_pinned(path))
+    }
+
+    /// Check if a file entry exceeds an applicable max file length rule.
+    ///
+    /// Returns `true` when the file should be skipped (its size exceeds the
+    /// limit). Files with no known size (`None`) are not blocked — the size
+    /// is only known after listing, not after download. Rules are checked in
+    /// priority order (highest first); the first matching rule wins.
+    fn exceeds_max_file_length(&self, entry: &crate::types::FileEntry) -> bool {
+        let Some(size) = entry.size else {
+            return false;
+        };
+        let Ok(rules) = self.db.list_max_file_length_rules() else {
+            return false;
+        };
+        let path_str = entry.name.as_str();
+        for rule in &rules {
+            if glob_matches(&rule.path_glob, path_str) && size > rule.max_bytes {
+                return true;
+            }
+        }
+        false
     }
 
     /// Check if a file entry should be ignored based on `.cascade` config.
@@ -454,6 +497,94 @@ impl SyncRunner {
         tracing::info!(count = total, "presenter hydrated from DB");
         Ok(())
     }
+}
+
+/// Match a glob pattern against a path string.
+///
+/// Supports `*` (any non-slash characters), `**` (any path segments including
+/// slashes), and exact matching. This is a lightweight implementation matching
+/// the glob semantics used throughout Cascade for pin and lifecycle rules.
+fn glob_matches(pattern: &str, path: &str) -> bool {
+    if pattern.contains("**") {
+        let parts: Vec<&str> = pattern.split("**").collect();
+        if parts.len() == 2 {
+            let prefix = parts.first().copied().unwrap_or("");
+            let suffix = parts.get(1).copied().unwrap_or("");
+            if !prefix.is_empty() && !path.starts_with(prefix) {
+                return false;
+            }
+            let suffix = suffix.strip_prefix('/').unwrap_or(suffix);
+            if suffix.is_empty() {
+                return true;
+            }
+            let after_prefix = path.get(prefix.len()..).unwrap_or("");
+            let after_prefix = after_prefix.strip_prefix('/').unwrap_or(after_prefix);
+            if after_prefix.is_empty() {
+                return false;
+            }
+            if suffix.contains('/') {
+                let trimmed = suffix.trim_start_matches('*');
+                if let Some(pos) = after_prefix.rfind(trimmed) {
+                    let from_pos = after_prefix.get(pos..).unwrap_or("");
+                    if from_pos.ends_with(trimmed) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            let last_segment = after_prefix.rsplit('/').next().unwrap_or(after_prefix);
+            if suffix.contains('*') {
+                return star_match(suffix, last_segment);
+            }
+            return last_segment == suffix;
+        }
+    }
+    if pattern.contains('*') {
+        return star_match(pattern, path);
+    }
+    pattern == path
+}
+
+/// Match a single-segment pattern with `*` wildcards against a string.
+fn star_match(pattern: &str, path: &str) -> bool {
+    let segments: Vec<&str> = pattern.split('*').collect();
+    if segments.len() == 1 {
+        return pattern == path;
+    }
+    let first = segments.first().copied().unwrap_or("");
+    let last = segments.last().copied().unwrap_or("");
+    if !first.is_empty() && !path.starts_with(first) {
+        return false;
+    }
+    if !last.is_empty() && !path.ends_with(last) {
+        return false;
+    }
+    let start = if first.is_empty() { 0 } else { first.len() };
+    let end = if last.is_empty() {
+        path.len()
+    } else {
+        path.len().saturating_sub(last.len())
+    };
+    if start > end {
+        return false;
+    }
+    let remaining = path.get(start..end).unwrap_or("");
+    let mut search_from = 0;
+    let middle = segments
+        .get(1..segments.len().saturating_sub(1))
+        .unwrap_or(&[]);
+    for seg in middle {
+        if seg.is_empty() {
+            continue;
+        }
+        let rest = remaining.get(search_from..).unwrap_or("");
+        if let Some(pos) = rest.find(seg) {
+            search_from += pos + seg.len();
+        } else {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
