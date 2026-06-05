@@ -35,7 +35,7 @@
 // They compile only for the native build: a `--features portable` build (wasm
 // or otherwise) drops them and supplies its own adapters over the browser's
 // equivalents instead.
-#[cfg(all(feature = "native", not(feature = "portable")))]
+#[cfg(feature = "native")]
 pub mod native;
 
 #[cfg(feature = "p2p")]

@@ -341,7 +341,9 @@ impl DirEntry {
 }
 
 /// A max file length rule: files matching `path_glob` must not exceed
-/// `max_bytes` in size. Rules are evaluated with child-overrides-parent
+/// `max_bytes` in size.
+///
+/// Rules are evaluated with child-overrides-parent
 /// precedence and first-match-wins ordering by `priority` (descending).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MaxFileLengthRule {

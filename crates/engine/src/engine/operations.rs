@@ -158,7 +158,7 @@ pub(super) fn remove_max_file_length_rule(engine: &Engine, id: i64) -> Result<bo
 /// in the subtree the push is authorised over. A `..` segment is left in the
 /// joined string for the caller's containment check to fold and reject; this
 /// function only performs the join.
-pub(crate) fn root_under(folder: &str, rule_path: &str) -> String {
+pub fn root_under(folder: &str, rule_path: &str) -> String {
     let folder = folder.trim_end_matches('/');
     let rule = rule_path.trim_start_matches('/');
     if folder.is_empty() {
@@ -177,7 +177,7 @@ pub(crate) fn root_under(folder: &str, rule_path: &str) -> String {
 /// containment test reuses [`Scope::covers`], which normalises `.`/`..`/empty
 /// segments and matches on path components, so the same defence the authz layer
 /// applies to scopes is applied to every rule path.
-pub(crate) fn confine_rule_path(
+pub fn confine_rule_path(
     folder: &str,
     rule_path: &str,
     folder_scope: &Scope,
@@ -208,7 +208,7 @@ const SECS_PER_WEEK: i64 = SECS_PER_DAY * 7;
 /// `m` (minutes), `h` (hours), `d` (days), or `w` (weeks). A bare integer is
 /// taken as seconds. Fails loudly on an empty, non-numeric, or unknown-unit
 /// value rather than guessing.
-pub(crate) fn parse_duration_secs(raw: &str) -> Result<i64> {
+pub fn parse_duration_secs(raw: &str) -> Result<i64> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         anyhow::bail!("empty duration");
@@ -257,7 +257,7 @@ const BYTES_PER_TIB: i64 = BYTES_PER_GIB * 1024;
 /// the cache sizing in this codebase). A bare integer is taken as bytes.
 /// Case-insensitive. Fails loudly on an empty, non-numeric, or unknown-unit
 /// value.
-pub(crate) fn parse_size_bytes(raw: &str) -> Result<i64> {
+pub fn parse_size_bytes(raw: &str) -> Result<i64> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         anyhow::bail!("empty size");
@@ -292,7 +292,7 @@ pub(crate) fn parse_size_bytes(raw: &str) -> Result<i64> {
 /// gitignore parser is infallible; the structured parsers surface a parse error
 /// loudly rather than yielding an empty config.
 #[cfg(feature = "p2p")]
-pub(crate) fn parse_config_fragment(
+pub fn parse_config_fragment(
     format: cascade_p2p::protocol::ManageConfigFormat,
     body: &str,
 ) -> Result<cascade_config::CascadeConfig> {
