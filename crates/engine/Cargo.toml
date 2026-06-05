@@ -40,15 +40,27 @@ p2p = ["dep:cascade-p2p"]
 # on any target.
 portable = []
 
+# WASM-only deps — used by the portable::wasm (spawn_local, setTimeout) and
+# portable::wasm_io (fetch, Blob, Headers) adapters.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-sys = { workspace = true, features = [
+    "Request",
+    "RequestInit",
+    "RequestMode",
+    "Response",
+    "Headers",
+    "Window",
+    "Blob",
+    "BlobPropertyBag",
+] }
+js-sys = { workspace = true }
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tempfile = "3"
+wasm-bindgen-test = "0.3"
 
 [lints]
 workspace = true
-
-# WASM-only deps — used by the portable::wasm adapters (spawn_local, setTimeout).
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-wasm-bindgen-futures.workspace = true
-js-sys.workspace = true
-web-sys = { workspace = true, features = ["Window"] }

@@ -38,11 +38,16 @@
 #[cfg(feature = "native")]
 pub mod native;
 
-// WASM adapters bind the same contracts to the browser's JS event loop and
-// an in-memory store. They compile only for wasm32 targets with the portable
-// feature enabled.
+// WASM core adapters (RuntimeHandle, StateStorage) for the portable feature.
+// StateStorage uses only std types so it compiles on any target; RuntimeHandle
+// is gated to wasm32 inside the module itself.
 #[cfg(feature = "portable")]
 pub mod wasm;
+
+// WASM IO adapters (HttpClient via fetch, FileSystem stub) for the wasm32
+// target. These depend on web_sys and compile only under wasm32.
+#[cfg(all(target_arch = "wasm32", feature = "portable"))]
+pub mod wasm_io;
 
 #[cfg(feature = "p2p")]
 use std::collections::HashSet;
