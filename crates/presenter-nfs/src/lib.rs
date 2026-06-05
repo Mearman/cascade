@@ -22,7 +22,6 @@ use cascade_engine::presenter::VfsPresenter;
 use cascade_engine::types::{CacheState, ItemId, VfsItem};
 use nfs::context::NfsContext;
 use nfs::xdr::NfsFh3;
-use tokio::io::AsyncWriteExt;
 
 /// Directory used for cached file contents.
 const CACHE_DIR_NAME: &str = "cascade/cache";
@@ -170,13 +169,8 @@ impl VfsPresenter for NfsPresenter {
         // Download to a temp file in the cache directory, then persist.
         tokio::fs::create_dir_all(&self.cache_dir).await?;
         let temp_path = cache_path.with_extension("tmp");
-        let mut file = tokio::fs::File::create(&temp_path).await?;
-        // Wrap in a compat writer for the Backend trait.
-        let mut writer = WriterAdapter { inner: file };
-        backend.download(&entry, &mut writer).await?;
-        // Flush and drop the writer, then close the inner file.
-        file = writer.inner;
-        file.flush().await?;
+        let data = backend.download(&entry).await?;
+        tokio::fs::write(&temp_path, &data).await?;
 
         tokio::fs::rename(&temp_path, &cache_path).await?;
         Ok(cache_path)
@@ -209,39 +203,6 @@ impl VfsPresenter for NfsPresenter {
         Ok(())
     }
 }
-
-/// Adapter from `tokio::fs::File` (`AsyncWrite`) to the
-/// `dyn AsyncWrite + Unpin + Send` that the Backend trait expects.
-#[derive(Debug)]
-struct WriterAdapter {
-    inner: tokio::fs::File,
-}
-
-impl tokio::io::AsyncWrite for WriterAdapter {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
-    }
-}
-
-impl Unpin for WriterAdapter {}
 
 /// Build a VFS path string from a `VfsItem`'s id.
 /// Uses the item's own id as a path key — this matches the convention

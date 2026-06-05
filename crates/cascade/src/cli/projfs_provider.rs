@@ -226,11 +226,7 @@ mod tests {
         async fn metadata(&self, _path: &Path) -> anyhow::Result<FileEntry> {
             anyhow::bail!("unused")
         }
-        async fn download(
-            &self,
-            _file: &FileEntry,
-            _writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
-        ) -> anyhow::Result<()> {
+        async fn download(&self, _file: &FileEntry) -> anyhow::Result<Vec<u8>> {
             panic!("download must not be called: read_range should fetch a bounded slice");
         }
         async fn read_range(
@@ -253,16 +249,12 @@ mod tests {
         async fn upload(
             &self,
             _path: &Path,
-            _reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+            _data: &[u8],
             _parent_id: &FileId,
         ) -> anyhow::Result<FileEntry> {
             anyhow::bail!("unused")
         }
-        async fn update(
-            &self,
-            _file_id: &FileId,
-            _reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
-        ) -> anyhow::Result<FileEntry> {
+        async fn update(&self, _file_id: &FileId, _data: &[u8]) -> anyhow::Result<FileEntry> {
             anyhow::bail!("unused")
         }
         async fn create_dir(&self, _path: &Path) -> anyhow::Result<FileEntry> {

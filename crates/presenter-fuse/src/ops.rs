@@ -217,8 +217,7 @@ impl FuseOps {
                 (Arc::clone(backend), relative)
             };
             let entry = backend.metadata(&relative).await?;
-            let mut buf = Vec::new();
-            backend.download(&entry, &mut buf).await?;
+            let buf = backend.download(&entry).await?;
 
             let off = usize::try_from(offset).unwrap_or(usize::MAX);
             if off >= buf.len() {
@@ -739,28 +738,20 @@ mod tests {
                     .ok_or_else(|| anyhow::anyhow!("not found: {key}"))
             }
 
-            async fn download(
-                &self,
-                _file: &FileEntry,
-                _writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
-            ) -> anyhow::Result<()> {
+            async fn download(&self, _file: &FileEntry) -> anyhow::Result<Vec<u8>> {
                 anyhow::bail!("FakeBackend: download not implemented")
             }
 
             async fn upload(
                 &self,
                 _path: &Path,
-                _reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+                _data: &[u8],
                 _parent_id: &FileId,
             ) -> anyhow::Result<FileEntry> {
                 anyhow::bail!("FakeBackend: upload not implemented")
             }
 
-            async fn update(
-                &self,
-                _file_id: &FileId,
-                _reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
-            ) -> anyhow::Result<FileEntry> {
+            async fn update(&self, _file_id: &FileId, _data: &[u8]) -> anyhow::Result<FileEntry> {
                 anyhow::bail!("FakeBackend: update not implemented")
             }
 

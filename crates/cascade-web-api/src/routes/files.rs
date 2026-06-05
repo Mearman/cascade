@@ -318,9 +318,8 @@ async fn put_file(
         }
         Ok(existing) => {
             check_if_match(&headers, existing.hash.as_deref())?;
-            let mut reader: &[u8] = &body;
             backend
-                .update(&FileId(existing.id.0.clone()), &mut reader)
+                .update(&FileId(existing.id.0.clone()), &body)
                 .await
                 .map_err(|e| ApiError::internal(format!("could not write file: {e}")))?
         }
@@ -334,9 +333,8 @@ async fn put_file(
                 .metadata(&parent_rel)
                 .await
                 .map_err(|e| ApiError::not_found(format!("parent directory not found: {e}")))?;
-            let mut reader: &[u8] = &body;
             backend
-                .upload(&backend_rel, &mut reader, &FileId(parent.id.0.clone()))
+                .upload(&backend_rel, &body, &FileId(parent.id.0.clone()))
                 .await
                 .map_err(|e| ApiError::internal(format!("could not write file: {e}")))?
         }
@@ -496,9 +494,8 @@ async fn download(
         let (backend, _) = tree.resolve(&rel);
         backend.clone()
     };
-    let mut buf = Vec::new();
-    backend
-        .download(entry, &mut buf)
+    let buf = backend
+        .download(entry)
         .await
         .map_err(|e| ApiError::internal(format!("could not download file: {e}")))?;
     Ok(buf)

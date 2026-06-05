@@ -183,12 +183,10 @@ pub fn write_file(
         let existing = lookup_existing(backend.as_ref(), &relative).await?;
 
         let mut buf = if let Some(entry) = &existing {
-            let mut current = Vec::new();
             backend
-                .download(entry, &mut current)
+                .download(entry)
                 .await
-                .map_err(|e| WriteError::from_backend(&e))?;
-            current
+                .map_err(|e| WriteError::from_backend(&e))?
         } else {
             Vec::new()
         };
@@ -210,16 +208,14 @@ pub fn write_file(
 
         if let Some(entry) = existing {
             let file_id = FileId(entry.id.0.clone());
-            let mut cursor = std::io::Cursor::new(buf);
             backend
-                .update(&file_id, &mut cursor)
+                .update(&file_id, &buf)
                 .await
                 .map_err(|e| WriteError::from_backend(&e))?;
         } else {
             let parent_id = parent_file_id(backend.as_ref(), &relative).await;
-            let mut cursor = std::io::Cursor::new(buf);
             backend
-                .upload(&relative, &mut cursor, &parent_id)
+                .upload(&relative, &buf, &parent_id)
                 .await
                 .map_err(|e| WriteError::from_backend(&e))?;
         }
@@ -283,9 +279,8 @@ pub fn create_file(
             (_, None) => {}
         }
         let parent_id = parent_file_id(backend.as_ref(), &relative).await;
-        let mut cursor = std::io::Cursor::new(Vec::new());
         backend
-            .upload(&relative, &mut cursor, &parent_id)
+            .upload(&relative, &[], &parent_id)
             .await
             .map_err(|e| WriteError::from_backend(&e))?;
         Ok(child_path)
@@ -309,17 +304,15 @@ pub fn truncate_file(ctx: &NfsContext, path: &str, size: u64) -> Result<(), Writ
             .await
             .map_err(|e| WriteError::from_backend(&e))?;
 
-        let mut buf = Vec::new();
-        backend
-            .download(&entry, &mut buf)
+        let mut buf = backend
+            .download(&entry)
             .await
             .map_err(|e| WriteError::from_backend(&e))?;
         buf.resize(target, 0);
 
         let file_id = FileId(entry.id.0.clone());
-        let mut cursor = std::io::Cursor::new(buf);
         backend
-            .update(&file_id, &mut cursor)
+            .update(&file_id, &buf)
             .await
             .map_err(|e| WriteError::from_backend(&e))?;
         Ok(())
@@ -572,27 +565,19 @@ mod discrimination_tests {
             // A transient/permission failure on an existing file — NOT absence.
             Err(BackendError::Forbidden("transient HEAD failure".to_string()).into())
         }
-        async fn download(
-            &self,
-            _file: &FileEntry,
-            _writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
-        ) -> anyhow::Result<()> {
+        async fn download(&self, _file: &FileEntry) -> anyhow::Result<Vec<u8>> {
             anyhow::bail!("unused")
         }
         async fn upload(
             &self,
             _path: &Path,
-            _reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+            _data: &[u8],
             _parent_id: &FileId,
         ) -> anyhow::Result<FileEntry> {
             self.wrote.store(true, Ordering::SeqCst);
             anyhow::bail!("upload must not be reached on a transient metadata error")
         }
-        async fn update(
-            &self,
-            _file_id: &FileId,
-            _reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
-        ) -> anyhow::Result<FileEntry> {
+        async fn update(&self, _file_id: &FileId, _data: &[u8]) -> anyhow::Result<FileEntry> {
             self.wrote.store(true, Ordering::SeqCst);
             anyhow::bail!("update must not be reached on a transient metadata error")
         }

@@ -308,8 +308,7 @@ fn fetch_file_data_sync(
             result
         };
         let entry = backend.metadata(&relative).await?;
-        let mut buf = Vec::new();
-        backend.download(&entry, &mut buf).await?;
+        let buf = backend.download(&entry).await?;
 
         // Apply offset and count bounds.
         let off = usize::try_from(offset.unwrap_or(0)).unwrap_or(usize::MAX);

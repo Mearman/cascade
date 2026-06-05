@@ -529,15 +529,14 @@ async fn populate_cache(
     };
 
     let _ = tokio::fs::create_dir_all(&state.cache_dir).await;
-    let mut file = match tokio::fs::File::create(cache_path).await {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::error!(error = %e, "failed to create cache file");
-            return Err(empty_response(StatusCode::INTERNAL_SERVER_ERROR));
+    match backend.download(&file_entry).await {
+        Ok(data) => {
+            tokio::fs::write(cache_path, &data).await.map_err(|e| {
+                tracing::error!(error = %e, "failed to write cache file");
+                empty_response(StatusCode::INTERNAL_SERVER_ERROR)
+            })?;
+            Ok(())
         }
-    };
-    match backend.download(&file_entry, &mut file).await {
-        Ok(()) => Ok(()),
         Err(e) => {
             let status = backend_error_status(&e);
             tracing::warn!(error = %e, ?status, "backend download failed");
@@ -760,8 +759,6 @@ async fn handle_put(state: &AppState, path: &str, req: Request) -> Response {
         }
     };
 
-    let mut cursor = std::io::Cursor::new(bytes.clone());
-
     // Check if a file with the same name already exists in the parent directory.
     let existing_file_id = {
         let items = state.items.read().await;
@@ -777,13 +774,14 @@ async fn handle_put(state: &AppState, path: &str, req: Request) -> Response {
 
     let parent_id_str = parent_id.0.clone();
     let relative_path_owned = relative_path.to_path_buf();
+    let upload_bytes = bytes.clone();
     let result = tokio::task::block_in_place(|| {
         run_isolated_blocking(async move {
             if let Some(file_id) = existing_file_id {
-                backend.update(&file_id, &mut cursor).await
+                backend.update(&file_id, &upload_bytes).await
             } else {
                 backend
-                    .upload(&relative_path_owned, &mut cursor, &parent_id)
+                    .upload(&relative_path_owned, &upload_bytes, &parent_id)
                     .await
             }
         })

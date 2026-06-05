@@ -18,7 +18,6 @@ use cascade_engine::vfs::{VfsTree, derive_sync_cursor};
 use chrono::{DateTime, Utc};
 use data_encoding::BASE64URL_NOPAD;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
 use crate::handlers::{
@@ -527,17 +526,16 @@ impl EngineHandlers {
     ) -> HandlerResult<FileEntry> {
         let staging_path = self.stage_for_move(src_entry, src_backend).await?;
 
-        let mut reader = tokio::fs::File::open(&staging_path).await.map_err(|err| {
+        let data = tokio::fs::read(&staging_path).await.map_err(|err| {
             HandlerError::internal(format!(
-                "open staging file {}: {err}",
+                "read staging file {}: {err}",
                 staging_path.display()
             ))
         })?;
         let dst_parent_file_id = FileId(dst_parent.0.clone());
         let upload_result = dst_backend
-            .upload(Path::new(new_name), &mut reader, &dst_parent_file_id)
+            .upload(Path::new(new_name), &data, &dst_parent_file_id)
             .await;
-        drop(reader);
 
         // The staging file is no longer needed after upload returns,
         // regardless of outcome. Best-effort cleanup — a failure here
@@ -794,17 +792,10 @@ impl EngineHandlers {
             .map_err(|err| HandlerError::internal(format!("create staging dir: {err}")))?;
         let staging_path = staging_dir.join("cross-backend-move.tmp");
 
-        let file = tokio::fs::File::create(&staging_path)
+        let data = src_backend.download(src_entry).await?;
+        tokio::fs::write(&staging_path, &data)
             .await
-            .map_err(|err| HandlerError::internal(format!("create staging file: {err}")))?;
-        let mut writer = WriterAdapter { inner: file };
-        src_backend.download(src_entry, &mut writer).await?;
-        writer
-            .inner
-            .flush()
-            .await
-            .map_err(|err| HandlerError::internal(format!("flush staging file: {err}")))?;
-        drop(writer);
+            .map_err(|err| HandlerError::internal(format!("write staging file: {err}")))?;
         Ok(staging_path)
     }
 }
@@ -898,16 +889,10 @@ impl FileProviderHandlers for EngineHandlers {
             )
         ));
 
-        let file = tokio::fs::File::create(&temp_path)
+        let data = backend.download(&entry).await?;
+        tokio::fs::write(&temp_path, &data)
             .await
-            .map_err(|error| HandlerError::internal(format!("create temp file: {error}")))?;
-        let mut writer = WriterAdapter { inner: file };
-        backend.download(&entry, &mut writer).await?;
-        writer
-            .inner
-            .flush()
-            .await
-            .map_err(|error| HandlerError::internal(format!("flush temp file: {error}")))?;
+            .map_err(|error| HandlerError::internal(format!("write temp file: {error}")))?;
         if let Err(error) = tokio::fs::rename(&temp_path, &cache_path).await {
             // Best-effort cleanup of the staged temp file so a failing
             // rename (cross-device, permissions, disk full) doesn't
@@ -940,14 +925,14 @@ impl FileProviderHandlers for EngineHandlers {
         let parent = ItemId(parent_id.to_string());
         let backend = self.backend_for(&parent)?;
 
-        let mut reader = tokio::fs::File::open(&source_path).await.map_err(|error| {
-            HandlerError::internal(format!("open source {}: {error}", source_path.display()))
+        let data = tokio::fs::read(&source_path).await.map_err(|error| {
+            HandlerError::internal(format!("read source {}: {error}", source_path.display()))
         })?;
 
         let entry = if let Some(existing) = existing_id {
             let existing_item = ItemId(existing.to_string());
             let file_id = FileId(existing_item.0.clone());
-            backend.update(&file_id, &mut reader).await?
+            backend.update(&file_id, &data).await?
         } else {
             let filename = match name {
                 Some(value) => value.to_string(),
@@ -963,7 +948,7 @@ impl FileProviderHandlers for EngineHandlers {
             };
             let parent_file_id = FileId(parent.0.clone());
             backend
-                .upload(Path::new(&filename), &mut reader, &parent_file_id)
+                .upload(Path::new(&filename), &data, &parent_file_id)
                 .await?
         };
 
@@ -1258,38 +1243,6 @@ fn safe_filename(id: &str) -> String {
     id.replace([':', '/', '\\'], "_")
 }
 
-/// Adapter that exposes a `tokio::fs::File` as the
-/// `dyn AsyncWrite + Unpin + Send` the `Backend` trait expects.
-struct WriterAdapter {
-    inner: tokio::fs::File,
-}
-
-impl tokio::io::AsyncWrite for WriterAdapter {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
-    }
-}
-
-impl Unpin for WriterAdapter {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1363,34 +1316,24 @@ mod tests {
             anyhow::bail!("metadata not implemented for stub")
         }
 
-        async fn download(
-            &self,
-            file: &FileEntry,
-            writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
-        ) -> anyhow::Result<()> {
-            let bytes = {
-                let content = self
-                    .content
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                content
-                    .get(&file.id.0)
-                    .ok_or_else(|| anyhow::anyhow!("no content for {}", file.id))?
-                    .clone()
-            };
-            writer.write_all(&bytes).await?;
-            writer.flush().await?;
-            Ok(())
+        async fn download(&self, file: &FileEntry) -> anyhow::Result<Vec<u8>> {
+            let content = self
+                .content
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            content
+                .get(&file.id.0)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("no content for {}", file.id))
         }
 
         async fn upload(
             &self,
             path: &Path,
-            reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+            data: &[u8],
             parent_id: &FileId,
         ) -> anyhow::Result<FileEntry> {
-            let mut bytes = Vec::new();
-            tokio::io::copy(reader, &mut bytes).await?;
+            let bytes = data.to_vec();
 
             let new_id = self.allocate_id();
             let item_id = ItemId::new(&self.id, &new_id);
@@ -1417,13 +1360,8 @@ mod tests {
             Ok(entry)
         }
 
-        async fn update(
-            &self,
-            file_id: &FileId,
-            reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
-        ) -> anyhow::Result<FileEntry> {
-            let mut bytes = Vec::new();
-            tokio::io::copy(reader, &mut bytes).await?;
+        async fn update(&self, file_id: &FileId, data: &[u8]) -> anyhow::Result<FileEntry> {
+            let bytes = data.to_vec();
 
             let mut files = self
                 .files
@@ -2118,18 +2056,14 @@ mod tests {
             self.inner.metadata(path).await
         }
 
-        async fn download(
-            &self,
-            file: &FileEntry,
-            writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
-        ) -> anyhow::Result<()> {
-            self.inner.download(file, writer).await
+        async fn download(&self, file: &FileEntry) -> anyhow::Result<Vec<u8>> {
+            self.inner.download(file).await
         }
 
         async fn upload(
             &self,
             path: &Path,
-            reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+            data: &[u8],
             parent_id: &FileId,
         ) -> anyhow::Result<FileEntry> {
             let call = {
@@ -2143,15 +2077,11 @@ mod tests {
             if call == self.fail_on {
                 anyhow::bail!("simulated upload failure on call {call}");
             }
-            self.inner.upload(path, reader, parent_id).await
+            self.inner.upload(path, data, parent_id).await
         }
 
-        async fn update(
-            &self,
-            file_id: &FileId,
-            reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
-        ) -> anyhow::Result<FileEntry> {
-            self.inner.update(file_id, reader).await
+        async fn update(&self, file_id: &FileId, data: &[u8]) -> anyhow::Result<FileEntry> {
+            self.inner.update(file_id, data).await
         }
 
         async fn create_dir(&self, path: &Path) -> anyhow::Result<FileEntry> {
@@ -2361,29 +2291,21 @@ mod tests {
             self.inner.metadata(path).await
         }
 
-        async fn download(
-            &self,
-            file: &FileEntry,
-            writer: &mut (dyn tokio::io::AsyncWrite + Unpin + Send),
-        ) -> anyhow::Result<()> {
-            self.inner.download(file, writer).await
+        async fn download(&self, file: &FileEntry) -> anyhow::Result<Vec<u8>> {
+            self.inner.download(file).await
         }
 
         async fn upload(
             &self,
             path: &Path,
-            reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+            data: &[u8],
             parent_id: &FileId,
         ) -> anyhow::Result<FileEntry> {
-            self.inner.upload(path, reader, parent_id).await
+            self.inner.upload(path, data, parent_id).await
         }
 
-        async fn update(
-            &self,
-            file_id: &FileId,
-            reader: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
-        ) -> anyhow::Result<FileEntry> {
-            self.inner.update(file_id, reader).await
+        async fn update(&self, file_id: &FileId, data: &[u8]) -> anyhow::Result<FileEntry> {
+            self.inner.update(file_id, data).await
         }
 
         async fn create_dir(&self, path: &Path) -> anyhow::Result<FileEntry> {
