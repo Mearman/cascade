@@ -38,6 +38,12 @@
 #[cfg(feature = "native")]
 pub mod native;
 
+// WASM IO adapters (HttpClient via fetch, FileSystem stub) for the wasm32
+// target. The companion wasm module (RuntimeHandle, StateStorage) is added
+// separately.
+#[cfg(all(target_arch = "wasm32", feature = "portable"))]
+pub mod wasm_io;
+
 #[cfg(feature = "p2p")]
 use std::collections::HashSet;
 use std::future::Future;

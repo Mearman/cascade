@@ -102,6 +102,7 @@ data-encoding = "2"
 wasm-bindgen = "0.2"
 js-sys = "0.3"
 wasm-bindgen-futures = "0.4"
+web-sys = "0.3"
 
 # OS process management (Unix-only)
 nix = { version = "0.31", features = ["signal", "process"] }
