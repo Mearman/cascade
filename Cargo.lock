@@ -457,6 +457,7 @@ dependencies = [
  "cascade-p2p",
  "chrono",
  "data-encoding",
+ "js-sys",
  "reqwest",
  "rusqlite",
  "serde",
@@ -466,6 +467,8 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

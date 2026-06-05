@@ -46,3 +46,9 @@ tempfile = "3"
 
 [lints]
 workspace = true
+
+# WASM-only deps — used by the portable::wasm adapters (spawn_local, setTimeout).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures.workspace = true
+js-sys.workspace = true
+web-sys = { workspace = true, features = ["Window"] }

@@ -38,6 +38,12 @@
 #[cfg(feature = "native")]
 pub mod native;
 
+// WASM adapters bind the same contracts to the browser's JS event loop and
+// an in-memory store. They compile only for wasm32 targets with the portable
+// feature enabled.
+#[cfg(feature = "portable")]
+pub mod wasm;
+
 #[cfg(feature = "p2p")]
 use std::collections::HashSet;
 use std::future::Future;
