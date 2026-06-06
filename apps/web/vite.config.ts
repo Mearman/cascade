@@ -27,7 +27,7 @@ export default defineConfig({
         ],
       },
       workbox: {
-        globPatterns: ['**/*.{js,css,html,svg,woff2}'],
+        globPatterns: ['**/*.{js,css,html,svg,woff2,wasm}'],
         runtimeCaching: [
           {
             urlPattern: ({ url }) => url.pathname.startsWith('/v1/') && url.method === 'GET',
@@ -39,6 +39,24 @@ export default defineConfig({
                 maxAgeSeconds: 60 * 5,
               },
               networkTimeoutSeconds: 5,
+            },
+          },
+          {
+            // Cache Drive API file content downloads for offline access.
+            urlPattern: ({ url }) =>
+              url.hostname === 'www.googleapis.com'
+              && url.pathname.includes('/drive/v3/files/')
+              && url.searchParams.get('alt') === 'media',
+            handler: 'CacheFirst',
+            options: {
+              cacheName: 'drive-content-cache',
+              expiration: {
+                maxEntries: 200,
+                maxAgeSeconds: 60 * 60 * 24 * 7, // 7 days
+              },
+              cacheableResponse: {
+                statuses: [0, 200],
+              },
             },
           },
         ],

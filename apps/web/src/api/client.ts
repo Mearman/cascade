@@ -57,6 +57,7 @@ import {
   isDevicePollResponse,
 } from './guards';
 import { createClient as createBridgeClient, type ApiClient as BridgeApiClient, type FileInput, RuntimeMode } from '@/wasm';
+import { downloadDriveFile, uploadDriveFile, deleteDriveFile } from '@/wasm/gdrive';
 
 export const API_BASE_KEY = 'cascade-api-base';
 export const TOKEN_KEY = 'cascade-token';
@@ -332,7 +333,12 @@ export class ApiClient {
 
   // ─── Files ─────────────────────────────────────────────────────────────────
 
+  /** Download a file's content. In WASM mode, `path` is the Drive file ID. */
   downloadFile(folder: string, path: string): Promise<Response> {
+    if (this.bridgeClient !== null) {
+      // WASM mode: fetch directly from Drive API using the stored access token.
+      return downloadDriveFile(path).then((blob) => new Response(blob));
+    }
     const token = this.getToken();
     const headers: Record<string, string> = {};
     if (token !== null) {
@@ -342,7 +348,22 @@ export class ApiClient {
     return fetch(`${getBase()}/v1/files/${encodeURIComponent(folder)}/entries/${encodeURIComponent(path)}`, { headers });
   }
 
+  /** Upload a new file. In WASM mode, `folder` is the backend ID and `path` is
+   *  interpreted as the parent folder ID. */
   uploadFile(folder: string, path: string, content: Blob, etag?: string): Promise<EntryMetaResponse> {
+    if (this.bridgeClient !== null) {
+      // WASM mode: upload directly to Drive API. `folder` is backend ID,
+      // `path` is the parent Drive folder ID. The file name comes from the
+      // Blob if available, or is generated.
+      const name = content instanceof File ? content.name : `upload-${String(Date.now())}`;
+      return uploadDriveFile(folder, path, name, content, content.type).then(() => ({
+        name,
+        kind: 'file' as const,
+        size: content.size,
+        mtime: null,
+        etag: null,
+      }));
+    }
     const token = this.getToken();
     const headers: Record<string, string> = {};
     if (token !== null) {
@@ -356,7 +377,11 @@ export class ApiClient {
     ).then((r) => r.json()).then((raw: unknown) => validated(raw, isEntryMetaResponse, 'upload'));
   }
 
+  /** Delete a file. In WASM mode, `path` is the Drive file ID. */
   deleteFile(folder: string, path: string): Promise<void> {
+    if (this.bridgeClient !== null) {
+      return deleteDriveFile(folder, path);
+    }
     return this.request('DELETE', `/files/${encodeURIComponent(folder)}/entries/${encodeURIComponent(path)}`).then(() => undefined);
   }
 
