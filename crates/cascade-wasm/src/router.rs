@@ -186,13 +186,20 @@ fn handle_create_backend(request: &WorkerRequest, _engine: &EngineState) -> Work
         (Some(backend_id), Some(backend_type)) => {
             // Persist to engine storage.
             state::with_engine(|engine| {
-                engine
-                    .storage
-                    .register_backend_sync(backend_id, backend_type, backend_id, None, None);
+                engine.storage.register_backend_sync(
+                    backend_id,
+                    backend_type,
+                    backend_id,
+                    None,
+                    None,
+                );
             });
             // Record in session state (no JS handle for HTTP-created backends).
             state::set_backend(backend_id.to_owned(), backend_type.to_owned(), None);
-            created(&request.id, json!({ "id": backend_id, "type": backend_type }))
+            created(
+                &request.id,
+                json!({ "id": backend_id, "type": backend_type }),
+            )
         }
         _ => error_response(
             &request.id,
@@ -320,7 +327,10 @@ fn handle_create_pin(request: &WorkerRequest, _engine: &EngineState) -> WorkerRe
             .storage
             .add_pin_rule_sync(path_glob, recursive, conditions);
     });
-    created(&request.id, json!({ "path": path_glob, "recursive": recursive, "conditions": conditions }))
+    created(
+        &request.id,
+        json!({ "path": path_glob, "recursive": recursive, "conditions": conditions }),
+    )
 }
 
 /// `DELETE /v1/pins/:id` — remove a pin rule by id.
@@ -385,28 +395,16 @@ fn handle_create_policy(request: &WorkerRequest, _engine: &EngineState) -> Worke
         );
     };
 
-    let max_age = body.get("max_age").and_then(|v| {
-        if v.is_null() {
-            None
-        } else {
-            v.as_i64()
-        }
-    });
-    let max_file_size = body.get("max_file_size").and_then(|v| {
-        if v.is_null() {
-            None
-        } else {
-            v.as_i64()
-        }
-    });
+    let max_age = body
+        .get("max_age")
+        .and_then(|v| if v.is_null() { None } else { v.as_i64() });
+    let max_file_size = body
+        .get("max_file_size")
+        .and_then(|v| if v.is_null() { None } else { v.as_i64() });
     let priority = body.get("priority").and_then(Value::as_i64).unwrap_or(0);
-    let conditions = body.get("conditions").and_then(|v| {
-        if v.is_null() {
-            None
-        } else {
-            v.as_str()
-        }
-    });
+    let conditions = body
+        .get("conditions")
+        .and_then(|v| if v.is_null() { None } else { v.as_str() });
 
     state::with_engine(|engine| {
         engine.storage.add_lifecycle_policy_sync(
