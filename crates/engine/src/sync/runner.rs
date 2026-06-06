@@ -702,7 +702,7 @@ mod tests {
         config: Arc<ConfigResolver>,
     ) -> SyncRunner<TokioRuntimeHandle> {
         let runtime = TokioRuntimeHandle::new(tokio::runtime::Handle::current());
-        let storage = SqliteStorage::new(db.clone(), runtime.clone());
+        let storage = SqliteStorage::new(db, runtime.clone());
         SyncRunner::new(
             Arc::new(storage),
             Arc::new(StdFileSystem),

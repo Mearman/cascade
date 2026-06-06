@@ -172,7 +172,7 @@ mod tests {
             .enumerate()
             .map(
                 |(idx, (path, max_age, max_file_size, priority))| LifecyclePolicyRecord {
-                    id: idx as i64,
+                    id: i64::try_from(idx).unwrap_or(i64::MAX),
                     path_glob: (*path).to_string(),
                     max_age: *max_age,
                     max_file_size: *max_file_size,
