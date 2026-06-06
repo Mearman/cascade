@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.81](https://github.com/Mearman/cascade/compare/cascade-v0.1.80...cascade-v0.1.81) - 2026-06-06
+
+### Fixed
+
+- *(clippy)* suppress trivially_copy_pass_by_ref on cfg-polymorphic no-op stub
+- *(cli)* align mark_web_ready signature across cfg variants
+
+### Other
+
+- *(engine)* port engine/cache/sync to portable traits for WASM
+- integrate max-file-length branch into main
+- *(presenters)* update all presenters to portable Backend trait signatures
+
 ## [0.1.80](https://github.com/Mearman/cascade/compare/cascade-v0.1.79...cascade-v0.1.80) - 2026-06-05
 
 ### Other

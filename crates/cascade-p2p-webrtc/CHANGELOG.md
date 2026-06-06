@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.81](https://github.com/Mearman/cascade/compare/cascade-p2p-webrtc-v0.1.80...cascade-p2p-webrtc-v0.1.81) - 2026-06-06
+
+### Added
+
+- *(wasm)* add browser File System Access and WebRTC transport crates
+
+### Other
+
+- release v0.1.80 [skip ci]
+- release v0.1.79 [skip ci]
+- release v0.1.78 [skip ci]
+- release v0.1.77 [skip ci]
+- release v0.1.76 [skip ci]
+
 ## [0.1.80](https://github.com/Mearman/cascade/compare/cascade-p2p-webrtc-v0.1.79...cascade-p2p-webrtc-v0.1.80) - 2026-06-05
 
 ### Added
