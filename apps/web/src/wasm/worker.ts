@@ -10,7 +10,9 @@ import type {
 // The WASM glue is served from public/wasm/ which Vite exposes at the base
 // path.  In a module worker import.meta.env.BASE_URL gives "/cascade/" so the
 // full URL resolves to /cascade/wasm/cascade_wasm.js.
-const WASM_GLUE_URL = `${import.meta.env.BASE_URL}wasm/cascade_wasm.js`;
+const BASE = import.meta.env.BASE_URL;
+const WASM_GLUE_URL = `${BASE}wasm/cascade_wasm.js`;
+const WASM_BINARY_URL = `${BASE}wasm/cascade_wasm_bg.wasm`;
 
 let wasmReady = false;
 
@@ -58,11 +60,30 @@ let glue: WasmGlue | undefined;
 
 async function initWasm(): Promise<void> {
   try {
-    const loaded: unknown = await import(/* @vite-ignore */ WASM_GLUE_URL);
+    // Files in public/ cannot be imported with dynamic import() in Vite dev
+    // mode — Vite intercepts the import and refuses to serve raw files from
+    // public/ through its transform pipeline.
+    //
+    // The wasm-bindgen glue uses ES module syntax (export), so we need an
+    // import that resolves to an ES module. Approach: fetch the glue JS,
+    // create a blob URL, and dynamic-import it. Blob URLs support ES module
+    // imports in module workers in Chrome 80+.
+    const jsText = await (await fetch(WASM_GLUE_URL)).text();
+    const blob = new Blob([jsText], { type: 'text/javascript' });
+    const blobUrl = URL.createObjectURL(blob);
+    let loaded: unknown;
+    try {
+      loaded = await import(/* @vite-ignore */ blobUrl);
+    } finally {
+      URL.revokeObjectURL(blobUrl);
+    }
+
     if (!isWasmGlue(loaded)) {
       throw new Error('Loaded WASM module does not match expected interface');
     }
-    await loaded.default();
+    // Pass the explicit WASM binary URL so the init function does not rely
+    // on import.meta.url (which was the blob URL).
+    await loaded.default({ module_or_path: WASM_BINARY_URL });
     glue = loaded;
     wasmReady = true;
   } catch (err) {

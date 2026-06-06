@@ -124,10 +124,9 @@ function WasmDashboard({ mode }: { mode: RuntimeMode }) {
   const [backends, setBackends] = useState<WasmBackend[]>([]);
   const [capabilities, setCapabilities] = useState<WasmCapabilities | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const cancelled = useRef<boolean>(false);
 
   useEffect(() => {
-    const cancelled = useRef<boolean>(false);
-
     async function load() {
       try {
         const isReady = await api.wasmReady();
