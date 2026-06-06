@@ -33,9 +33,11 @@ jobs:
           key: pnpm-${{ runner.os }}-${{ hashFiles('apps/web/pnpm-lock.yaml') }}
           restore-keys: pnpm-${{ runner.os }}-
       - name: Install dependencies
-        run: pnpm install --dir apps/web
+        run: pnpm install
+        working-directory: apps/web
       - name: TypeScript type check
-        run: pnpm --dir apps/web run typecheck
+        run: pnpm run typecheck
+        working-directory: apps/web
 
   build:
     name: Build
@@ -54,9 +56,11 @@ jobs:
           key: pnpm-${{ runner.os }}-${{ hashFiles('apps/web/pnpm-lock.yaml') }}
           restore-keys: pnpm-${{ runner.os }}-
       - name: Install dependencies
-        run: pnpm install --dir apps/web
+        run: pnpm install
+        working-directory: apps/web
       - name: Build
-        run: pnpm --dir apps/web run build
+        run: pnpm run build
+        working-directory: apps/web
       - name: Upload dist artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
