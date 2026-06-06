@@ -58,6 +58,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install
         working-directory: apps/web
+      - name: Ensure WASM placeholder
+        run: rm -f public/wasm && mkdir -p public/wasm
+        working-directory: apps/web
       - name: Build
         run: pnpm run build
         working-directory: apps/web
