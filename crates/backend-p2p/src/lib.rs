@@ -2263,7 +2263,7 @@ mod tests {
         backend
             .upload(
                 Path::new("a.txt"),
-                &b"a".to_vec(),
+                b"a".as_slice(),
                 &FileId("p2p-test:root".to_string()),
             )
             .await
@@ -2271,7 +2271,7 @@ mod tests {
         backend
             .upload(
                 Path::new("b.txt"),
-                &b"b".to_vec(),
+                b"b".as_slice(),
                 &FileId("p2p-test:root".to_string()),
             )
             .await
@@ -2291,7 +2291,7 @@ mod tests {
         backend
             .upload(
                 Path::new("x.txt"),
-                &b"data".to_vec(),
+                b"data".as_slice(),
                 &FileId("p2p-test:root".to_string()),
             )
             .await
@@ -2308,7 +2308,7 @@ mod tests {
         let entry = backend
             .upload(
                 Path::new("x.txt"),
-                &b"x".to_vec(),
+                b"x".as_slice(),
                 &FileId("p2p-test:root".to_string()),
             )
             .await
