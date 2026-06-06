@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.89](https://github.com/Mearman/cascade/compare/cascade-wasm-v0.1.88...cascade-wasm-v0.1.89) - 2026-06-06
+
+### Added
+
+- *(wasm)* wire Google Drive auth route and token restore
+- *(wasm)* wire engine storage through PWA request handlers
+- *(wasm)* wire WASM adapters into cascade-wasm for portable engine construction
+- *(wasm)* wire unified handle_request API and session state
+- *(wasm)* add cascade-wasm crate proving wasm32-unknown-unknown toolchain
+
+### Fixed
+
+- *(wasm)* suppress dead_code on EngineState scaffold
+
+### Other
+
+- release v0.1.88 [skip ci]
+- release v0.1.87 [skip ci]
+- release v0.1.86 [skip ci]
+- release v0.1.85 [skip ci]
+- release v0.1.84 [skip ci]
+- release v0.1.83 [skip ci]
+- release v0.1.82 [skip ci]
+- release v0.1.81 [skip ci]
+- release v0.1.80 [skip ci]
+- release v0.1.79 [skip ci]
+- release v0.1.78 [skip ci]
+- release v0.1.77 [skip ci]
+- *(wasm)* fix unresolved doc links in cascade-wasm crate root
+- release v0.1.76 [skip ci]
+- release v0.1.75 [skip ci]
+- apply cargo fmt to portable traits and cascade-wasm
+
 ## [0.1.88](https://github.com/Mearman/cascade/compare/cascade-wasm-v0.1.87...cascade-wasm-v0.1.88) - 2026-06-06
 
 ### Added
