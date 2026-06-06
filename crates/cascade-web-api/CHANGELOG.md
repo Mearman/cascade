@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.82](https://github.com/Mearman/cascade/compare/cascade-web-api-v0.1.81...cascade-web-api-v0.1.82) - 2026-06-06
+
+### Added
+
+- *(auth)* PWA authentication via pairing code, shared secret, and device code
+- *(web-api)* add daemon HTTP JSON API for the v1 PWA
+
+### Other
+
+- release v0.1.81 [skip ci]
+- *(engine)* port engine/cache/sync to portable traits for WASM
+- integrate max-file-length branch into main
+- *(presenters)* update all presenters to portable Backend trait signatures
+- release v0.1.79 [skip ci]
+- release v0.1.78 [skip ci]
+- release v0.1.77 [skip ci]
+- release v0.1.76 [skip ci]
+- release v0.1.75 [skip ci]
+- release v0.1.74 [skip ci]
+- release v0.1.73 [skip ci]
+- release v0.1.72 [skip ci]
+- release v0.1.71 [skip ci]
+- release v0.1.70 [skip ci]
+- *(web-api)* apply cargo fmt to web-api crate
+
 ## [0.1.81](https://github.com/Mearman/cascade/compare/cascade-web-api-v0.1.80...cascade-web-api-v0.1.81) - 2026-06-06
 
 ### Added
