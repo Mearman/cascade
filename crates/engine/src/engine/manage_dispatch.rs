@@ -1,11 +1,16 @@
 //! Management-plane dispatch: the engine as grant store, command executor, and
 //! dispatch endpoint.
 //!
-//! The engine is the production [`ManageGrantStore`],
-//! [`ManageCommandExecutor`], and [`ManageDispatch`] implementation. It owns
-//! the grant store, the audit log, and the command executor. A backend that
-//! runs its own peer transport receives inbound `ManageRequest` frames
-//! authorised, audited, and executed through these trait impls.
+//! The engine is the production grant store, command executor, and dispatch
+//! endpoint for the management plane. It owns the grant store, the audit log,
+//! and the command executor. A backend that runs its own peer transport
+//! receives inbound `ManageRequest` frames authorised, audited, and executed
+//! through these trait impls.
+//!
+//! With the `p2p` feature enabled, the engine implements
+//! [`ManageGrantStore`](crate::manage::ManageGrantStore),
+//! [`ManageCommandExecutor`](crate::manage::ManageCommandExecutor), and
+//! [`ManageDispatch`](cascade_p2p::protocol::ManageDispatch).
 
 use std::collections::HashSet;
 
