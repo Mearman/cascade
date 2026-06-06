@@ -83,6 +83,37 @@ struct TokenInput {
     expiry: i64,
 }
 
+/// A file entry sent from the JS side (e.g. by the Google Drive API client).
+/// Converted to a proper [`FileEntry`] with [`ItemId`] scoped to the backend.
+#[cfg(target_arch = "wasm32")]
+#[derive(Deserialize)]
+struct FileInput {
+    id: String,
+    parent_id: String,
+    name: String,
+    is_dir: bool,
+    #[serde(default)]
+    size: Option<u64>,
+    #[serde(default)]
+    mime_type: Option<String>,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl FileInput {
+    fn to_entry(&self, backend_id: &str) -> cascade_engine::types::FileEntry {
+        cascade_engine::types::FileEntry {
+            id: cascade_engine::types::ItemId::new(backend_id, &self.id),
+            parent_id: cascade_engine::types::ItemId::new(backend_id, &self.parent_id),
+            name: self.name.clone(),
+            is_dir: self.is_dir,
+            size: self.size,
+            mod_time: None,
+            mime_type: self.mime_type.clone(),
+            hash: None,
+        }
+    }
+}
+
 /// Handle a worker request and return the response as a JavaScript object.
 ///
 /// `request_json` is a JSON-encoded `WorkerRequest` (`id`, `method`, `path`).
@@ -161,6 +192,28 @@ pub fn store_auth_token(provider: &str, token_json: &str) -> Result<(), JsValue>
 #[must_use]
 pub fn clear_auth_token(provider: &str) -> bool {
     state::remove_token(provider)
+}
+
+/// Insert (or replace) file entries from the JS side into engine storage.
+///
+/// `backend_id` scopes every [`ItemId`] as `"{backend_id}:{native_id}"`.
+/// `files_json` is a JSON array of objects matching [`FileInput`].
+///
+/// # Errors
+///
+/// Returns a JS error if `files_json` cannot be deserialised.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn upsert_files(backend_id: &str, files_json: &str) -> Result<(), JsValue> {
+    let files: Vec<FileInput> = serde_json::from_str(files_json)
+        .map_err(|error| WasmError::InvalidToken(error.to_string()))?;
+    state::with_engine(|engine| {
+        for file in &files {
+            let entry = file.to_entry(backend_id);
+            engine.storage.upsert_file_sync(&entry);
+        }
+    });
+    Ok(())
 }
 
 /// Record (or replace) a peer connection, keyed by the relay session id that

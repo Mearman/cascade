@@ -9,6 +9,17 @@ export interface ApiClient {
   deregisterBackend(id: string): Promise<boolean>;
   storeAuthToken(provider: string, token: { scope: string; expiry: number }): Promise<void>;
   clearAuthToken(provider: string): Promise<boolean>;
+  upsertFiles(backendId: string, files: FileInput[]): Promise<void>;
+}
+
+/** A file entry to upsert into engine storage. */
+export interface FileInput {
+  id: string;
+  parent_id: string;
+  name: string;
+  is_dir: boolean;
+  size?: number | null;
+  mime_type?: string | null;
 }
 
 function isHttpMethod(m: string): m is WorkerRequest['method'] {
@@ -128,6 +139,20 @@ class WasmApiClient implements ApiClient {
   clearAuthToken(provider: string): Promise<boolean> {
     return this.sendMutator('clear_auth_token', [provider]).then((result) => result === true);
   }
+
+  upsertFiles(backendId: string, files: FileInput[]): Promise<void> {
+    // Filter out null/undefined values that JSON.stringify would drop but
+    // the Rust side expects to be absent (serde default).
+    const cleaned = files.map((f) => ({
+      id: f.id,
+      parent_id: f.parent_id,
+      name: f.name,
+      is_dir: f.is_dir,
+      size: f.size ?? undefined,
+      mime_type: f.mime_type ?? undefined,
+    }));
+    return this.sendMutator('upsert_files', [backendId, JSON.stringify(cleaned)]).then(() => undefined);
+  }
 }
 
 class HttpApiClient implements ApiClient {
@@ -163,7 +188,7 @@ class HttpApiClient implements ApiClient {
     });
     if (!res.ok) {
       const body: unknown = await res.json().catch(() => null);
-      throw new Error(`register_backend failed: ${res.status} ${JSON.stringify(body)}`);
+      throw new Error(`register_backend failed: ${String(res.status)} ${JSON.stringify(body)}`);
     }
   }
 
@@ -182,7 +207,7 @@ class HttpApiClient implements ApiClient {
     });
     if (!res.ok) {
       const body: unknown = await res.json().catch(() => null);
-      throw new Error(`store_auth_token failed: ${res.status} ${JSON.stringify(body)}`);
+      throw new Error(`store_auth_token failed: ${String(res.status)} ${JSON.stringify(body)}`);
     }
   }
 
@@ -191,6 +216,12 @@ class HttpApiClient implements ApiClient {
       method: 'DELETE',
     });
     return res.ok;
+  }
+
+  upsertFiles(_backendId: string, _files: FileInput[]): Promise<void> {
+    // Connected mode does not use the mutator channel — file state comes from
+    // the daemon's own backend polling.
+    throw new Error('upsertFiles is not available in Connected mode');
   }
 }
 

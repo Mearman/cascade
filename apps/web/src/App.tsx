@@ -18,6 +18,7 @@ import { loadToken, hasApiBase, saveApiBase, getStoredMode, saveMode } from '@/a
 import { detectCapabilities, recommendMode, RuntimeMode, type Capabilities } from '@/wasm';
 import { requestDirectory, persistHandle, restoreHandle } from '@/wasm/fsaccess';
 import { getStoredTokens } from '@/wasm/oauth';
+import { insertRootEntry, fetchDriveFiles } from '@/wasm/gdrive';
 import { AppContext, type AppContextValue } from '@/context';
 import { api } from '@/api/client';
 
@@ -25,6 +26,9 @@ import { api } from '@/api/client';
 /// worker is ready so the engine's session reflects any previously-stored
 /// tokens — without this, a page reload would lose the auth state because the
 /// engine's in-memory `WasmState` starts empty on each load.
+///
+/// Also seeds the engine with the Drive root entry and kicks off a background
+/// file fetch so the dashboard and files page have data on first render.
 async function restoreAuthState(): Promise<void> {
   try {
     const stored = await getStoredTokens();
@@ -32,6 +36,13 @@ async function restoreAuthState(): Promise<void> {
       await api.storeAuthToken('gdrive', {
         scope: stored.scope,
         expiry: stored.expiry,
+      });
+      await api.registerBackend('gdrive', 'gdrive');
+      // Seed root entry then fetch Drive files in the background.
+      await insertRootEntry('gdrive');
+      fetchDriveFiles('gdrive').catch(() => {
+        // Drive API failure is non-fatal — the dashboard will show an empty
+        // file list and the user can retry from the files page.
       });
     }
   } catch {
@@ -84,7 +95,7 @@ function ConnectionSetup({ onConnected }: {
     try {
       const trimmed = url.trim().replace(/\/$/, '');
       const res = await fetch(`${trimmed}/v1/health`);
-      if (!res.ok) throw new Error(`Daemon returned ${res.status}`);
+      if (!res.ok) throw new Error(`Daemon returned ${String(res.status)}`);
       saveApiBase(trimmed);
       onConnected(RuntimeMode.Connected);
     } catch (err) {
@@ -142,7 +153,7 @@ function ConnectionSetup({ onConnected }: {
         <button
           type="button"
           class={`mode-card${selectedMode === RuntimeMode.Standalone ? ' selected' : ''}`}
-          onClick={() => standaloneAvailable && setSelectedMode(RuntimeMode.Standalone)}
+          onClick={() => { if (standaloneAvailable) setSelectedMode(RuntimeMode.Standalone); }}
           disabled={!standaloneAvailable}
         >
           <div class="mode-card-header">
@@ -160,7 +171,7 @@ function ConnectionSetup({ onConnected }: {
         <button
           type="button"
           class={`mode-card${selectedMode === RuntimeMode.BrowseOnly ? ' selected' : ''}`}
-          onClick={() => browseOnlyAvailable && setSelectedMode(RuntimeMode.BrowseOnly)}
+          onClick={() => { if (browseOnlyAvailable) setSelectedMode(RuntimeMode.BrowseOnly); }}
           disabled={!browseOnlyAvailable}
         >
           <div class="mode-card-header">
@@ -175,7 +186,7 @@ function ConnectionSetup({ onConnected }: {
         <button
           type="button"
           class={`mode-card${selectedMode === RuntimeMode.Connected ? ' selected' : ''}`}
-          onClick={() => setSelectedMode(RuntimeMode.Connected)}
+          onClick={() => { setSelectedMode(RuntimeMode.Connected); }}
         >
           <div class="mode-card-header">
             <span class="mode-card-title">Connected</span>
@@ -188,15 +199,18 @@ function ConnectionSetup({ onConnected }: {
       </div>
 
       {selectedMode === RuntimeMode.Connected && (
-        <form class="setup-url-form" onSubmit={handleConnect}>
+        <form class="setup-url-form" onSubmit={(ev) => { void handleConnect(ev); }}>
           <input
             type="url"
             value={url}
             placeholder="http://192.168.1.100:7842"
-            onInput={(e) => setUrl((e.target as HTMLInputElement).value)}
+            onInput={(e) => {
+              const target = e.target;
+              if (target instanceof HTMLInputElement) setUrl(target.value);
+            }}
             disabled={testing}
           />
-          {error !== null && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
+          {error !== null && <ErrorBanner message={error} onDismiss={() => { setError(null); }} />}
           <div class="setup-actions">
             <button type="submit" disabled={testing || url.trim() === ''}>
               {testing ? 'Connecting…' : 'Connect'}
@@ -214,12 +228,12 @@ function ConnectionSetup({ onConnected }: {
             ? <p>Selected folder: <strong>{dirName}</strong></p>
             : <p class="muted">Optionally choose a local folder to sync files to your computer.</p>
           }
-          {error !== null && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
+          {error !== null && <ErrorBanner message={error} onDismiss={() => { setError(null); }} />}
           <div class="setup-actions">
-            <button type="button" class="secondary" onClick={handleChooseFolder} disabled={pickingDir}>
+            <button type="button" class="secondary" onClick={() => { void handleChooseFolder(); }} disabled={pickingDir}>
               {pickingDir ? 'Choosing…' : dirName !== null ? 'Choose a different folder' : 'Choose folder'}
             </button>
-            <button type="button" onClick={handleContinue} disabled={starting}>
+            <button type="button" onClick={() => { void handleContinue(); }} disabled={starting}>
               {starting ? 'Starting…' : dirName !== null ? 'Continue' : 'Continue without folder'}
             </button>
           </div>
@@ -228,8 +242,8 @@ function ConnectionSetup({ onConnected }: {
 
       {selectedMode === RuntimeMode.BrowseOnly && (
         <div class="setup-actions setup-actions-top">
-          {error !== null && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
-          <button type="button" onClick={handleContinue} disabled={starting}>
+          {error !== null && <ErrorBanner message={error} onDismiss={() => { setError(null); }} />}
+          <button type="button" onClick={() => { void handleContinue(); }} disabled={starting}>
             {starting ? 'Starting…' : 'Continue'}
           </button>
         </div>
@@ -279,14 +293,13 @@ export function App() {
         })
         .catch(() => { /* no stored handle */ });
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   function handleConnected(mode: RuntimeMode, dirName?: string) {
     saveMode(mode);
     api.setMode(mode);
     setAppMode(mode);
-    setDirectoryName(dirName !== undefined ? dirName : null);
+    setDirectoryName(dirName ?? null);
     setConnected(true);
   }
 

@@ -4,8 +4,9 @@ import { ApiError } from '@/api/types';
 import { api } from '@/api/client';
 import { AppContext } from '@/context';
 import { RuntimeMode } from '@/wasm';
-import { initiateAuth, handleCallback, getStoredTokens, GDRIVE_SCOPES } from '@/wasm/oauth';
+import { initiateAuth, handleCallback, GDRIVE_SCOPES } from '@/wasm/oauth';
 import type { OAuthTokens } from '@/wasm/oauth';
+import { insertRootEntry, fetchDriveFiles } from '@/wasm/gdrive';
 import { Spinner } from '@/components';
 
 const OAUTH_CLIENT_ID_KEY = 'cascade-oauth-client-id';
@@ -27,7 +28,6 @@ function ConnectedLoginPage() {
 
   // Device code state
   const [deviceCode, setDeviceCode] = useState<string | null>(null);
-  const [expiresIn, setExpiresIn] = useState(0);
   const [polling, setPolling] = useState(false);
   const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const countdownTimer = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -86,7 +86,6 @@ function ConnectedLoginPage() {
     try {
       const result = await api.authDeviceRequest();
       setDeviceCode(result.code);
-      setExpiresIn(result.expires_in);
       setCountdown(result.expires_in);
       setPolling(true);
 
@@ -94,7 +93,7 @@ function ConnectedLoginPage() {
       pollTimer.current = setInterval(async () => {
         try {
           const poll = await api.authDevicePoll(result.code);
-          if (poll.status === 'authorised' && poll.token) {
+          if (poll.status === 'authorised' && poll.token !== undefined) {
             if (pollTimer.current !== null) clearInterval(pollTimer.current);
             if (countdownTimer.current !== null) clearInterval(countdownTimer.current);
             setPolling(false);
@@ -143,7 +142,7 @@ function ConnectedLoginPage() {
             key={id}
             type="button"
             class={`auth-tab${tab === id ? ' active' : ''}`}
-            onClick={() => setTab(id)}
+            onClick={() => { setTab(id); }}
           >
             {label}
           </button>
@@ -151,13 +150,16 @@ function ConnectedLoginPage() {
       </div>
 
       {tab === 'pair' && (
-        <form onSubmit={handlePair}>
+        <form onSubmit={(ev) => { void handlePair(ev); }}>
           <p class="muted">Run <code>cascade auth pair</code> on the daemon host, then enter the code below.</p>
           <input
             type="text"
             value={pairCode}
             placeholder="ABC12345"
-            onInput={(e) => setPairCode((e.target as HTMLInputElement).value)}
+            onInput={(e) => {
+              const target = e.target;
+              if (target instanceof HTMLInputElement) setPairCode(target.value);
+            }}
             disabled={loading}
             autocomplete="off"
           />
@@ -169,13 +171,16 @@ function ConnectedLoginPage() {
       )}
 
       {tab === 'secret' && (
-        <form onSubmit={handleSecret}>
+        <form onSubmit={(ev) => { void handleSecret(ev); }}>
           <p class="muted">Run <code>cascade auth secret</code> on the daemon host to get the secret.</p>
           <input
             type="password"
             value={secret}
             placeholder="Daemon secret"
-            onInput={(e) => setSecret((e.target as HTMLInputElement).value)}
+            onInput={(e) => {
+              const target = e.target;
+              if (target instanceof HTMLInputElement) setSecret(target.value);
+            }}
             disabled={loading}
             autocomplete="off"
           />
@@ -192,7 +197,7 @@ function ConnectedLoginPage() {
             <>
               <p class="muted">Generate a code and enter it on the daemon host.</p>
               {error !== null && <p class="error">{error}</p>}
-              <button type="button" onClick={handleDeviceRequest} disabled={loading}>
+              <button type="button" onClick={() => { void handleDeviceRequest(); }} disabled={loading}>
                 {loading ? 'Generating…' : 'Generate code'}
               </button>
             </>
@@ -202,11 +207,11 @@ function ConnectedLoginPage() {
               <div class="device-code-display">{deviceCode}</div>
               <p class="muted">
                 {polling
-                  ? `Waiting for authorisation… ${Math.floor(countdown / 60)}:${String(countdown % 60).padStart(2, '0')} remaining`
-                  : error !== null ? error : 'Connecting…'}
+                  ? `Waiting for authorisation… ${String(Math.floor(countdown / 60))}:${String(countdown % 60).padStart(2, '0')} remaining`
+                  : error ?? 'Connecting…'}
               </p>
               {!polling && (
-                <button type="button" onClick={handleDeviceRequest}>
+                <button type="button" onClick={() => { void handleDeviceRequest(); }}>
                   Generate new code
                 </button>
               )}
@@ -252,16 +257,19 @@ function AdvancedTokenPaste() {
 
   return (
     <div class="advanced-section">
-      <button type="button" class="link" onClick={() => setOpen(!open)}>
+      <button type="button" class="link" onClick={() => { setOpen(!open); }}>
         {open ? 'Hide' : 'Paste capability token'}
       </button>
       {open && (
-        <form onSubmit={handleSubmit}>
+        <form onSubmit={(ev) => { void handleSubmit(ev); }}>
           <textarea
             rows={6}
             placeholder={'{\n  "token_id": "…",\n  "bearer": "…",\n  …\n}'}
             value={tokenJson}
-            onInput={(e) => setTokenJson((e.target as HTMLTextAreaElement).value)}
+            onInput={(e) => {
+              const target = e.target;
+              if (target instanceof HTMLTextAreaElement) setTokenJson(target.value);
+            }}
             disabled={loading}
           />
           {error !== null && <p class="error">{error}</p>}
@@ -300,6 +308,12 @@ function WasmLoginPage() {
           scope: tokens.scope,
           expiry: tokens.expiry,
         });
+        await api.registerBackend('gdrive', 'gdrive');
+        // Seed root entry and trigger a background Drive file fetch.
+        await insertRootEntry('gdrive');
+        fetchDriveFiles('gdrive').catch(() => {
+          // Drive API failure is non-fatal — the user can retry.
+        });
         window.history.replaceState({}, '', window.location.pathname);
         setSignedIn(true);
         setLoading(false);
@@ -325,12 +339,12 @@ function WasmLoginPage() {
         if (
           result.status === 200 &&
           result.body !== null &&
-          typeof result.body === 'object'
+          typeof result.body === 'object' &&
+          'scopes' in result.body &&
+          Array.isArray(result.body.scopes) &&
+          result.body.scopes.every((s: unknown) => typeof s === 'string')
         ) {
-          const config = result.body as Record<string, unknown>;
-          if (Array.isArray(config.scopes)) {
-            scopes = config.scopes as string[];
-          }
+          scopes = result.body.scopes;
         }
       } catch {
         // Engine unavailable (worker not ready) — use hardcoded fallback.
@@ -379,7 +393,10 @@ function WasmLoginPage() {
             type="text"
             value={clientId}
             placeholder="123456789.apps.googleusercontent.com"
-            onInput={(e) => setClientId((e.target as HTMLInputElement).value)}
+            onInput={(e) => {
+              const target = e.target;
+              if (target instanceof HTMLInputElement) setClientId(target.value);
+            }}
           />
         </div>
       )}
@@ -388,8 +405,8 @@ function WasmLoginPage() {
 
       <button
         type="button"
-        disabled={loading || clientId.trim() === ''}
-        onClick={handleSignIn}
+        disabled={clientId.trim() === ''}
+        onClick={() => { void handleSignIn(); }}
       >
         Sign in with Google
       </button>

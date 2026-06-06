@@ -24,17 +24,46 @@ interface WasmGlue {
   deregister_backend(id: string): boolean;
   store_auth_token(provider: string, token_json: string): void;
   clear_auth_token(provider: string): boolean;
+  upsert_files(backend_id: string, files_json: string): void;
   set_peer_connection(session_id: string, connection: unknown): void;
   remove_peer_connection(session_id: string): boolean;
+}
+
+function assertString(value: unknown, name: string): string {
+  if (typeof value !== 'string') throw new Error(`expected ${name} to be a string`);
+  return value;
+}
+
+function hasFunction(value: unknown, key: string): boolean {
+  if (typeof value !== 'object' || value === null) return false;
+  if (!(key in value)) return false;
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  return typeof descriptor?.value === 'function';
+}
+
+function isWasmGlue(value: unknown): value is WasmGlue {
+  if (typeof value !== 'object' || value === null) return false;
+  return hasFunction(value, 'default')
+    && hasFunction(value, 'handle_request')
+    && hasFunction(value, 'register_backend')
+    && hasFunction(value, 'deregister_backend')
+    && hasFunction(value, 'store_auth_token')
+    && hasFunction(value, 'clear_auth_token')
+    && hasFunction(value, 'upsert_files')
+    && hasFunction(value, 'set_peer_connection')
+    && hasFunction(value, 'remove_peer_connection');
 }
 
 let glue: WasmGlue | undefined;
 
 async function initWasm(): Promise<void> {
   try {
-    const mod: WasmGlue = await import(/* @vite-ignore */ WASM_GLUE_URL);
-    await mod.default();
-    glue = mod;
+    const loaded: unknown = await import(/* @vite-ignore */ WASM_GLUE_URL);
+    if (!isWasmGlue(loaded)) {
+      throw new Error('Loaded WASM module does not match expected interface');
+    }
+    await loaded.default();
+    glue = loaded;
     wasmReady = true;
   } catch (err) {
     const event: WorkerEvent = { type: 'error', data: String(err) };
@@ -94,39 +123,34 @@ function isWorkerResponse(value: unknown): value is WorkerResponse {
 
 const mutatorHandlers: Record<MutatorMethod, (...args: unknown[]) => unknown> = {
   register_backend(...args) {
-    const [id, backendType, handle] = args as [string, string, unknown?];
-    glue?.register_backend(id, backendType, handle);
+    glue?.register_backend(assertString(args[0], 'id'), assertString(args[1], 'backendType'), args[2]);
     return undefined;
   },
   deregister_backend(...args) {
-    const [id] = args as [string];
-    return glue?.deregister_backend(id) ?? false;
+    return glue?.deregister_backend(assertString(args[0], 'id')) ?? false;
   },
   store_auth_token(...args) {
-    const [provider, tokenJson] = args as [string, string];
-    glue?.store_auth_token(provider, tokenJson);
+    glue?.store_auth_token(assertString(args[0], 'provider'), assertString(args[1], 'tokenJson'));
     return undefined;
   },
   clear_auth_token(...args) {
-    const [provider] = args as [string];
-    return glue?.clear_auth_token(provider) ?? false;
+    return glue?.clear_auth_token(assertString(args[0], 'provider')) ?? false;
+  },
+  upsert_files(...args) {
+    glue?.upsert_files(assertString(args[0], 'backendId'), assertString(args[1], 'filesJson'));
+    return undefined;
   },
   set_peer_connection(...args) {
-    const [sessionId, connection] = args as [string, unknown];
-    glue?.set_peer_connection(sessionId, connection);
+    glue?.set_peer_connection(assertString(args[0], 'sessionId'), args[1]);
     return undefined;
   },
   remove_peer_connection(...args) {
-    const [sessionId] = args as [string];
-    return glue?.remove_peer_connection(sessionId) ?? false;
+    return glue?.remove_peer_connection(assertString(args[0], 'sessionId')) ?? false;
   },
 };
 
 function handleMutator(msg: WorkerMutator): MutatorAck {
   const handler = mutatorHandlers[msg.mutator];
-  if (handler === undefined) {
-    return { id: msg.id, result: undefined, error: `unknown mutator: ${msg.mutator}` };
-  }
   try {
     const result = handler(...msg.args);
     return { id: msg.id, result };

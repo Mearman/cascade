@@ -23,6 +23,7 @@ export type MutatorMethod =
   | 'deregister_backend'
   | 'store_auth_token'
   | 'clear_auth_token'
+  | 'upsert_files'
   | 'set_peer_connection'
   | 'remove_peer_connection';
 
