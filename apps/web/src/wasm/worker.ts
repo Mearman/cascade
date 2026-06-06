@@ -17,7 +17,10 @@ const WASM_BINARY_URL = `${BASE}wasm/cascade_wasm_bg.wasm`;
 let wasmReady = false;
 
 // Dynamically imported WASM glue exports. Available after initWasm().
-type WasmInit = (input?: RequestInfo | URL) => Promise<unknown>;
+// The wasm-bindgen init function accepts a string/URL/Request or an object
+// { module_or_path: string | URL | Request }.
+type WasmInitInput = string | URL | Request | { module_or_path: string | URL | Request };
+type WasmInit = (input?: WasmInitInput) => Promise<unknown>;
 
 interface WasmGlue {
   default: WasmInit;
