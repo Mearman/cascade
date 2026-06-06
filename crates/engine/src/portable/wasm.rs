@@ -275,6 +275,74 @@ impl WasmStateStorage {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.pin_rules.clone()
     }
+
+    /// Remove a pin rule by id synchronously. Returns whether one was removed.
+    pub fn remove_pin_rule_sync(&self, id: i64) -> bool {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = inner.pin_rules.len();
+        inner.pin_rules.retain(|r| r.id != id);
+        inner.pin_rules.len() < before
+    }
+
+    /// Add a lifecycle policy synchronously.
+    pub fn add_lifecycle_policy_sync(
+        &self,
+        path_glob: &str,
+        max_age: Option<i64>,
+        max_file_size: Option<i64>,
+        priority: i32,
+        conditions: Option<&str>,
+    ) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let id = inner.next_lifecycle_policy_id;
+        inner.next_lifecycle_policy_id += 1;
+        inner.lifecycle_policies.push(LifecyclePolicyRecord {
+            id,
+            path_glob: path_glob.to_owned(),
+            max_age,
+            max_file_size,
+            priority,
+            conditions: conditions.map(ToOwned::to_owned),
+        });
+    }
+
+    /// List all lifecycle policies synchronously, ordered by priority descending.
+    pub fn list_lifecycle_policies_sync(&self) -> Vec<LifecyclePolicyRecord> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner
+            .lifecycle_policies
+            .sort_by_key(|r| std::cmp::Reverse(r.priority));
+        inner.lifecycle_policies.clone()
+    }
+
+    /// Remove a lifecycle policy by id synchronously. Returns whether one was removed.
+    pub fn remove_lifecycle_policy_sync(&self, id: i64) -> bool {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = inner.lifecycle_policies.len();
+        inner.lifecycle_policies.retain(|p| p.id != id);
+        inner.lifecycle_policies.len() < before
+    }
+
+    /// List all peers synchronously.
+    pub fn list_peers_sync(&self) -> Vec<PeerRecord> {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.peers.clone()
+    }
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]

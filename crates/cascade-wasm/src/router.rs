@@ -12,6 +12,7 @@
 //! accessors. The remaining unrecognised routes return `404`; routes that
 //! depend on async browser interop return `501`.
 
+use cascade_engine::types::FileEntry;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -44,7 +45,13 @@ pub struct WorkerResponse {
 
 /// Route a parsed request to its handler.
 pub fn route(request: &WorkerRequest, engine: &EngineState) -> WorkerResponse {
-    let segments: Vec<&str> = request.path.split('/').filter(|s| !s.is_empty()).collect();
+    // Split path from query string. The worker sends "/v1/folders/id/children?path=X"
+    // as a single path string, so separate the segments from any trailing query.
+    let (path_part, query_part) = match request.path.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (request.path.as_str(), None),
+    };
+    let segments: Vec<&str> = path_part.split('/').filter(|s| !s.is_empty()).collect();
 
     match (request.method.as_str(), segments.as_slice()) {
         ("GET", ["health"] | ["v1", "health"]) => {
@@ -62,12 +69,21 @@ pub fn route(request: &WorkerRequest, engine: &EngineState) -> WorkerResponse {
 
         // ── Folders / files ──
         ("GET", ["v1", "folders", folder_id, "children"]) => {
-            handle_list_children(&request.id, engine, folder_id)
+            handle_list_children(&request.id, engine, folder_id, query_part.as_deref())
         }
 
         // ── Pin rules ──
         ("GET", ["v1", "pins"]) => handle_list_pins(&request.id, engine),
         ("POST", ["v1", "pins"]) => handle_create_pin(request, engine),
+        ("DELETE", ["v1", "pins", id]) => handle_delete_pin(&request.id, engine, id),
+
+        // ── Lifecycle policies ──
+        ("GET", ["v1", "policies"]) => handle_list_policies(&request.id, engine),
+        ("POST", ["v1", "policies"]) => handle_create_policy(request, engine),
+        ("DELETE", ["v1", "policies", id]) => handle_delete_policy(&request.id, engine, id),
+
+        // ── Peers ──
+        ("GET", ["v1", "peers"]) => handle_list_peers(&request.id, engine),
 
         // ── Auth ──
         ("POST", ["v1", "auth", "gdrive"]) => handle_auth_gdrive(&request.id),
@@ -205,9 +221,38 @@ fn handle_delete_backend(id: &str, engine: &EngineState, backend_id: &str) -> Wo
 }
 
 /// `GET /v1/folders/:id/children` — list children from engine storage.
-fn handle_list_children(id: &str, engine: &EngineState, folder_id: &str) -> WorkerResponse {
+fn handle_list_children(
+    id: &str,
+    engine: &EngineState,
+    folder_id: &str,
+    query: Option<&str>,
+) -> WorkerResponse {
     let children = engine.storage.list_children_sync(folder_id);
-    let children_json: Vec<Value> = children
+
+    // Parse optional query parameters: path, limit, cursor.
+    let path_filter = query.and_then(|q| {
+        q.split('&')
+            .find(|p| p.starts_with("path="))
+            .map(|p| &p[5..])
+    });
+    let limit = query.and_then(|q| {
+        q.split('&')
+            .find(|p| p.starts_with("limit="))
+            .and_then(|p| p[7..].parse::<usize>().ok())
+    });
+
+    let mut filtered: Vec<&FileEntry> = children
+        .iter()
+        .filter(|f| path_filter.is_none_or(|pf| f.name.contains(pf)))
+        .collect();
+
+    // Cursor is not yet meaningful for in-memory storage (no ordering guarantee),
+    // but we accept it silently for API compatibility.
+    if let Some(lim) = limit {
+        filtered.truncate(lim);
+    }
+
+    let children_json: Vec<Value> = filtered
         .iter()
         .map(|f| {
             json!({
@@ -276,6 +321,148 @@ fn handle_create_pin(request: &WorkerRequest, _engine: &EngineState) -> WorkerRe
             .add_pin_rule_sync(path_glob, recursive, conditions);
     });
     created(&request.id, json!({ "path": path_glob, "recursive": recursive, "conditions": conditions }))
+}
+
+/// `DELETE /v1/pins/:id` — remove a pin rule by id.
+fn handle_delete_pin(id: &str, engine: &EngineState, pin_id: &str) -> WorkerResponse {
+    let Ok(parsed_id) = pin_id.parse::<i64>() else {
+        return error_response(id, 400, "bad_request", "pin id must be an integer");
+    };
+    let removed = engine.storage.remove_pin_rule_sync(parsed_id);
+    if removed {
+        ok(id, json!({ "removed": parsed_id }))
+    } else {
+        error_response(
+            id,
+            404,
+            "not_found",
+            &format!("no pin rule with id {pin_id}"),
+        )
+    }
+}
+
+/// `GET /v1/policies` — list lifecycle policies from engine storage.
+fn handle_list_policies(id: &str, engine: &EngineState) -> WorkerResponse {
+    let policies = engine.storage.list_lifecycle_policies_sync();
+    let policies_json: Vec<Value> = policies
+        .iter()
+        .map(|p| {
+            json!({
+                "id": p.id,
+                "path": p.path_glob,
+                "max_age": p.max_age,
+                "max_file_size": p.max_file_size,
+                "priority": p.priority,
+                "conditions": p.conditions,
+            })
+        })
+        .collect();
+    ok(id, json!({ "policies": policies_json }))
+}
+
+/// `POST /v1/policies` — add a lifecycle policy through engine storage.
+/// Body: `{ "path": "...", "max_age": null, "max_file_size": null, "priority": 0, "conditions": null }`.
+fn handle_create_policy(request: &WorkerRequest, _engine: &EngineState) -> WorkerResponse {
+    let body = match request.body {
+        Some(ref b) => b,
+        None => {
+            return error_response(
+                &request.id,
+                400,
+                "bad_request",
+                "POST /v1/policies requires a JSON body with 'path'",
+            );
+        }
+    };
+
+    let path = body.get("path").and_then(Value::as_str);
+    let Some(path_glob) = path else {
+        return error_response(
+            &request.id,
+            400,
+            "bad_request",
+            "body must include a string 'path' field",
+        );
+    };
+
+    let max_age = body.get("max_age").and_then(|v| {
+        if v.is_null() {
+            None
+        } else {
+            v.as_i64()
+        }
+    });
+    let max_file_size = body.get("max_file_size").and_then(|v| {
+        if v.is_null() {
+            None
+        } else {
+            v.as_i64()
+        }
+    });
+    let priority = body.get("priority").and_then(Value::as_i64).unwrap_or(0);
+    let conditions = body.get("conditions").and_then(|v| {
+        if v.is_null() {
+            None
+        } else {
+            v.as_str()
+        }
+    });
+
+    state::with_engine(|engine| {
+        engine.storage.add_lifecycle_policy_sync(
+            path_glob,
+            max_age,
+            max_file_size,
+            i32::try_from(priority).unwrap_or(0),
+            conditions,
+        );
+    });
+    created(
+        &request.id,
+        json!({
+            "path": path_glob,
+            "max_age": max_age,
+            "max_file_size": max_file_size,
+            "priority": priority,
+            "conditions": conditions,
+        }),
+    )
+}
+
+/// `DELETE /v1/policies/:id` — remove a lifecycle policy by id.
+fn handle_delete_policy(id: &str, engine: &EngineState, policy_id: &str) -> WorkerResponse {
+    let Ok(parsed_id) = policy_id.parse::<i64>() else {
+        return error_response(id, 400, "bad_request", "policy id must be an integer");
+    };
+    let removed = engine.storage.remove_lifecycle_policy_sync(parsed_id);
+    if removed {
+        ok(id, json!({ "removed": parsed_id }))
+    } else {
+        error_response(
+            id,
+            404,
+            "not_found",
+            &format!("no policy with id {policy_id}"),
+        )
+    }
+}
+
+/// `GET /v1/peers` — list known peers from engine storage.
+fn handle_list_peers(id: &str, engine: &EngineState) -> WorkerResponse {
+    let peers = engine.storage.list_peers_sync();
+    let peers_json: Vec<Value> = peers
+        .iter()
+        .map(|p| {
+            json!({
+                "device_id": p.device_id,
+                "name": p.name,
+                "addresses": p.addresses,
+                "last_seen": p.last_seen,
+                "online": p.online,
+            })
+        })
+        .collect();
+    ok(id, json!({ "peers": peers_json }))
 }
 
 /// `POST /v1/auth/gdrive` — return the auth configuration the main thread
