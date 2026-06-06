@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -16,6 +17,43 @@ env:
   IMAGE_NAME: mearman/cascade-relay
 
 jobs:
+  # ── Change detection ────────────────────────────────────────────────
+  # Gates PWA and Pages jobs on apps/web/** changes so Rust-only pushes
+  # don't burn runner minutes on unrelated web tooling.
+  changes:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      web: ${{ steps.check.outputs.web }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+      - id: check
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "web=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+            HEAD="${{ github.event.pull_request.head.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+            HEAD="${{ github.event.after }}"
+          fi
+          if [[ "$BASE" == *"0000000000000000000000000000000000000000"* ]]; then
+            echo "web=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git diff --name-only "$BASE" "$HEAD" -- apps/web/ | grep -q .; then
+            echo "web=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "web=false" >> "$GITHUB_OUTPUT"
+          fi
+
   check:
     name: Check (${{ matrix.target }})
     timeout-minutes: 30
@@ -457,6 +495,65 @@ jobs:
         if: failure()
         working-directory: test/e2e/p2p
         run: docker compose logs --tail=200 || true
+
+  # ── PWA (was .github/workflows/pwa.yml) ────────────────────────────
+
+  pwa-check:
+    name: PWA typecheck
+    needs: [changes]
+    if: needs.changes.outputs.web == 'true'
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: pnpm/action-setup@d15e628ca66d93ee5f352c71671a7bc6a97af5c9 # v6.0.8
+        with:
+          version: 11
+      - name: Cache node_modules
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.pnpm-store
+          key: pnpm-${{ runner.os }}-${{ hashFiles('apps/web/pnpm-lock.yaml') }}
+          restore-keys: pnpm-${{ runner.os }}-
+      - name: Install dependencies
+        run: pnpm install
+        working-directory: apps/web
+      - name: TypeScript type check
+        run: pnpm run typecheck
+        working-directory: apps/web
+
+  pwa-build:
+    name: PWA build
+    needs: [changes, pwa-check]
+    if: needs.changes.outputs.web == 'true'
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: pnpm/action-setup@d15e628ca66d93ee5f352c71671a7bc6a97af5c9 # v6.0.8
+        with:
+          version: 11
+      - name: Cache node_modules
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.pnpm-store
+          key: pnpm-${{ runner.os }}-${{ hashFiles('apps/web/pnpm-lock.yaml') }}
+          restore-keys: pnpm-${{ runner.os }}-
+      - name: Install dependencies
+        run: pnpm install
+        working-directory: apps/web
+      - name: Ensure WASM placeholder
+        run: rm -f public/wasm && mkdir -p public/wasm
+        working-directory: apps/web
+      - name: Build
+        run: pnpm run build
+        working-directory: apps/web
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pwa-dist
+          path: apps/web/dist/
+          retention-days: 1
 
   release:
     name: Release
@@ -2182,3 +2279,66 @@ jobs:
           git add Formula/cascade-relay.rb
           git diff --cached --quiet || git commit -m "chore: update cascade-relay formula to ${RELAY_TAG}"
           git push
+
+  # ── GitHub Pages (was .github/workflows/pages.yml) ──────────────────
+
+  pages-build:
+    name: Build PWA for Pages
+    needs: [changes]
+    if: needs.changes.outputs.web == 'true' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Setup Node 22
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '22'
+      - name: Enable pnpm
+        run: corepack enable
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: "1.96.0"
+          components: rustfmt, clippy
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+      - name: Cache Cargo output
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            target/wasm32-unknown-unknown
+          key: wasm32-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: wasm32-${{ runner.os }}-
+      - name: Install wasm-bindgen CLI
+        run: |
+          VERSION=$(grep '^name = "wasm-bindgen"$' Cargo.lock -A1 | grep '^version' | head -1 | sed 's/.*"\(.*\)"/\1/')
+          cargo install wasm-bindgen-cli --version "$VERSION"
+      - name: Build WASM module
+        run: bash scripts/build-wasm.sh
+      - name: Install dependencies
+        working-directory: apps/web
+        run: pnpm install --frozen-lockfile
+      - name: Build
+        working-directory: apps/web
+        run: pnpm build
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: apps/web/dist
+
+  pages-deploy:
+    name: Deploy to GitHub Pages
+    needs: [pages-build]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
