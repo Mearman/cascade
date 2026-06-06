@@ -39,7 +39,7 @@ use crate::types::{CacheState, Cursor, FileEntry, ItemId};
 /// `spawn_blocking` runs synchronously (there is no thread pool to offload to),
 /// and `sleep` resolves via `window.setTimeout`.
 #[cfg(target_arch = "wasm32")]
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct WasmRuntimeHandle;
 
 #[cfg(target_arch = "wasm32")]
@@ -65,13 +65,13 @@ impl RuntimeHandle for WasmRuntimeHandle {
         if ms == 0 {
             return Box::pin(async {});
         }
-        let ms = u32::try_from(ms).unwrap_or(u32::MAX);
+        let ms = i32::try_from(ms).unwrap_or(i32::MAX);
         Box::pin(async move {
             let promise = js_sys::Promise::new(&mut |resolve, _| {
                 let window =
                     web_sys::window().expect("no window — sleep requires a browser environment");
                 window
-                    .set_timeout_with_callback_and_timeout(&resolve.into(), ms)
+                    .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve.into(), ms)
                     .expect("setTimeout failed");
             });
             wasm_bindgen_futures::JsFuture::from(promise)
@@ -166,7 +166,8 @@ impl std::fmt::Debug for WasmStateStorage {
     }
 }
 
-#[async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl StateStorage for WasmStateStorage {
     // ── File operations ──
 

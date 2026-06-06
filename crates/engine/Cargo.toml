@@ -50,7 +50,6 @@ web-sys = { workspace = true, features = [
     "Response",
     "Headers",
     "Window",
-    "WindowTimers",
     "Blob",
     "BlobPropertyBag",
 ] }

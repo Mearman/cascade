@@ -26,11 +26,11 @@ use super::{FileSystem, FsDirEntry, FsError, HeaderMap, HttpClient, HttpError, H
 /// Every method goes through [`send`], which builds a `web_sys::Request`,
 /// calls `window().fetch_with_request`, and buffers the response body into
 /// an [`HttpResponse`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct WasmHttpClient;
 
 /// Issue a GET request.
-#[async_trait]
+#[async_trait(?Send)]
 impl HttpClient for WasmHttpClient {
     async fn get(&self, url: &str, headers: HeaderMap) -> Result<HttpResponse, HttpError> {
         send("GET", url, &headers, None).await
@@ -86,8 +86,8 @@ async fn send(
     headers: &HeaderMap,
     body: Option<Vec<u8>>,
 ) -> Result<HttpResponse, HttpError> {
-    let mut init = RequestInit::new();
-    init.method(method);
+    let init = RequestInit::new();
+    init.set_method(method);
 
     if let Some(data) = body {
         let array = Uint8Array::new_with_length(
@@ -96,12 +96,14 @@ async fn send(
                 .map_err(|_| HttpError::Request("body too large for Uint8Array".into()))?,
         );
         array.copy_from(&data);
+        let blob_opts = web_sys::BlobPropertyBag::new();
+        blob_opts.set_type("application/octet-stream");
         let blob = web_sys::Blob::new_with_u8_array_sequence_and_options(
             &JsValue::from(array.buffer()),
-            &web_sys::BlobPropertyBag::new().type_("application/octet-stream"),
+            &blob_opts,
         )
         .map_err(|e| HttpError::Request(format!("failed to create Blob: {e:?}")))?;
-        init.body(Some(&blob));
+        init.set_body(blob.as_ref());
     }
 
     let request = Request::new_with_str_and_init(url, &init).map_err(|e| {
@@ -214,7 +216,7 @@ pub struct WasmFileSystem;
 
 const FS_ACCESS_REQUIRED: &str = "File System Access API requires a granted directory handle";
 
-#[async_trait]
+#[async_trait(?Send)]
 impl FileSystem for WasmFileSystem {
     async fn read_dir(&self, _path: &Path) -> Result<Vec<FsDirEntry>, FsError> {
         Err(FsError::Other(FS_ACCESS_REQUIRED.into()))

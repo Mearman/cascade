@@ -71,10 +71,19 @@ use crate::manage::token::CapabilityToken;
 use crate::manage::{Grant, Scope};
 use crate::types::{CacheState, Cursor, FileEntry, ItemId};
 
-/// A boxed, sendable future — the portable spelling of "some async work that
-/// yields `T`". Used where a trait must name a future type without committing
-/// to a concrete runtime's future.
+/// A boxed future — the portable spelling of "some async work that yields `T`".
+/// Used where a trait must name a future type without committing to a concrete
+/// runtime's future.
+///
+/// On native targets the future carries `+ Send` so it can cross thread
+/// boundaries (tokio's `spawn` requires it). On wasm32 the bound is dropped:
+/// JS interop types like `JsFuture` are `!Send` because they contain
+/// `Rc<RefCell<_>>`, and wasm32 is genuinely single-threaded so the bound is
+/// vacuous anyway.
+#[cfg(not(target_arch = "wasm32"))]
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+#[cfg(target_arch = "wasm32")]
+pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T>>>;
 
 // ─────────────────────────── Runtime ───────────────────────────
 
@@ -171,7 +180,8 @@ pub enum StorageError {
 /// Mirrors the public method set of [`crate::db::StateDb`] but names no
 /// rusqlite type and is asynchronous throughout, so a local `SQLite` file and a
 /// remote/async key-value store satisfy the same trait.
-#[async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait StateStorage: Send + Sync {
     // ── File operations ──
 
@@ -532,7 +542,8 @@ impl HttpResponse {
 
 /// Abstraction over an HTTP client (replaces reqwest). Each method buffers the
 /// full response; streaming bodies are out of scope for this contract.
-#[async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait HttpClient: Send + Sync + std::fmt::Debug {
     /// Issue a GET request.
     async fn get(&self, url: &str, headers: HeaderMap) -> Result<HttpResponse, HttpError>;
@@ -607,7 +618,8 @@ pub struct FsDirEntry {
 /// Abstraction over filesystem IO (replaces `std::fs` and walkdir). The native
 /// adapter wraps `std::fs`/`tokio::fs`; a wasm adapter wraps the browser's File
 /// System Access API.
-#[async_trait]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait FileSystem: Send + Sync {
     /// List the immediate entries of a directory.
     async fn read_dir(&self, path: &Path) -> Result<Vec<FsDirEntry>, FsError>;
