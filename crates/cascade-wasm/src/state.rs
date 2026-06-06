@@ -16,12 +16,11 @@
 //!
 //! # Engine state
 //!
-//! Alongside the in-memory session state, this module holds a lazily-initialised
-//! [`EngineState`] containing the four portable WASM adapters
-//! ([`WasmRuntimeHandle`], [`WasmStateStorage`], [`WasmHttpClient`],
-//! [`WasmFileSystem`]). These satisfy the engine's portable trait contracts and
-//! are available for future engine methods that need them. The in-memory session
-//! state remains the source of truth for the router handlers for now.
+//! The [`EngineState`] holds the four portable WASM adapters and is the source
+//! of truth for engine data (backends, files, pin rules). Session data that has
+//! no engine representation (auth tokens, peer connections, opaque JS handles)
+//! remains in [`WasmState`]. Router handlers read from both: engine data through
+//! [`with_engine`], session data through the session-state accessors.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -40,20 +39,31 @@ thread_local! {
 /// The portable WASM adapters that satisfy the engine's four trait contracts.
 /// Initialised once on first access and reused for the session lifetime.
 ///
-/// Fields are dead until the engine is wired to handle requests (the router
-/// still reads session state directly). The lint suppression drops once
-/// `ensure_engine` returns a reference that the request handler consumes.
-#[allow(dead_code)]
-struct EngineState {
-    storage: Arc<WasmStateStorage>,
-    http: WasmHttpClient,
-    fs: WasmFileSystem,
-    runtime: WasmRuntimeHandle,
+/// The `storage` field is the source of truth for engine data (backends, files,
+/// pin rules, lifecycle policies). The `http`, `fs`, and `runtime` fields are
+/// available for future engine operations that need async HTTP, filesystem
+/// access, or timer scheduling.
+pub(crate) struct EngineState {
+    pub(crate) storage: Arc<WasmStateStorage>,
+    /// HTTP, filesystem, and runtime adapters — consumed once the engine
+    /// performs real async operations (backend fetch, file download, timers).
+    #[allow(dead_code)]
+    pub(crate) http: WasmHttpClient,
+    #[allow(dead_code)]
+    pub(crate) fs: WasmFileSystem,
+    #[allow(dead_code)]
+    pub(crate) runtime: WasmRuntimeHandle,
 }
 
-/// Ensure the engine state has been initialised. Idempotent — subsequent calls
-/// are a no-op.
-pub fn ensure_engine() {
+/// Run a closure with immutable access to the engine state.
+///
+/// Initialises the engine state on first call (lazily). Idempotent for
+/// subsequent calls. The closure receives a reference to the [`EngineState`]
+/// and may read any field.
+pub fn with_engine<F, R>(f: F) -> R
+where
+    F: FnOnce(&EngineState) -> R,
+{
     ENGINE_STATE.with(|state| {
         if state.borrow().is_none() {
             *state.borrow_mut() = Some(EngineState {
@@ -63,7 +73,11 @@ pub fn ensure_engine() {
                 runtime: WasmRuntimeHandle,
             });
         }
-    });
+        f(state
+            .borrow()
+            .as_ref()
+            .expect("engine state just initialised"))
+    })
 }
 
 /// The engine's live browser-session state.

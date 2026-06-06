@@ -166,6 +166,117 @@ impl std::fmt::Debug for WasmStateStorage {
     }
 }
 
+// ─────────────── Synchronous accessors (WASM engine direct use) ───────────────
+//
+// The StateStorage trait methods are async (via async_trait), but the WASM
+// request handler is synchronous (#[wasm_bindgen] export). Since every
+// operation is synchronous internally (Mutex + HashMap, no IO), these
+// inherent methods let the WASM engine bypass the async boundary. The
+// trait methods remain for generic use.
+
+impl WasmStateStorage {
+    /// Register (or replace) a backend synchronously.
+    pub fn register_backend_sync(
+        &self,
+        id: &str,
+        backend_type: &str,
+        display_name: &str,
+        mount_path: Option<&str>,
+        config: Option<&str>,
+    ) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let record = BackendRecord {
+            id: id.to_owned(),
+            backend_type: backend_type.to_owned(),
+            display_name: display_name.to_owned(),
+            mount_path: mount_path.map(ToOwned::to_owned),
+            config: config.map(ToOwned::to_owned),
+        };
+        inner.backends.retain(|b| b.id != id);
+        inner.backends.push(record);
+    }
+
+    /// Remove a backend by id synchronously. Returns whether one was removed.
+    pub fn remove_backend_sync(&self, id: &str) -> bool {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = inner.backends.len();
+        inner.backends.retain(|b| b.id != id);
+        inner.backends.len() < before
+    }
+
+    /// List all registered backends synchronously.
+    pub fn list_backends_sync(&self) -> Vec<BackendRecord> {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.backends.clone()
+    }
+
+    /// List the immediate children of a directory by parent id synchronously.
+    pub fn list_children_sync(&self, parent_id: &str) -> Vec<FileEntry> {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner
+            .files
+            .values()
+            .filter(|f| f.parent_id.0 == parent_id)
+            .cloned()
+            .collect()
+    }
+
+    /// Insert or replace a file entry synchronously.
+    pub fn upsert_file_sync(&self, entry: &FileEntry) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.files.insert(entry.id.0.clone(), entry.clone());
+    }
+
+    /// List every file synchronously.
+    pub fn list_all_files_sync(&self) -> Vec<FileEntry> {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.files.values().cloned().collect()
+    }
+
+    /// Add a pin rule synchronously.
+    pub fn add_pin_rule_sync(&self, path_glob: &str, recursive: bool, conditions: Option<&str>) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let id = inner.next_pin_rule_id;
+        inner.next_pin_rule_id += 1;
+        inner.pin_rules.push(PinRuleRecord {
+            id,
+            path_glob: path_glob.to_owned(),
+            recursive,
+            conditions: conditions.map(ToOwned::to_owned),
+        });
+    }
+
+    /// List all pin rules synchronously.
+    pub fn list_pin_rules_sync(&self) -> Vec<PinRuleRecord> {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.pin_rules.clone()
+    }
+}
+
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl StateStorage for WasmStateStorage {

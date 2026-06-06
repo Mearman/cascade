@@ -97,15 +97,14 @@ struct TokenInput {
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub fn handle_request(request_json: &str) -> Result<JsValue, JsValue> {
-    state::ensure_engine();
     let response = match serde_json::from_str::<router::WorkerRequest>(request_json) {
-        Ok(request) => router::route(&request),
+        Ok(request) => state::with_engine(|engine| router::route(&request, engine)),
         Err(error) => router::bad_request(&format!("malformed request JSON: {error}")),
     };
     to_js(&response)
 }
 
-/// Register (or replace) a backend in the engine's session state.
+/// Register (or replace) a backend in the engine's session state and storage.
 ///
 /// `handle` is the opaque JS object backing the backend — a granted
 /// `FileSystemDirectoryHandle` for the `fsaccess` type — or `undefined`/`null`
@@ -118,6 +117,13 @@ pub fn register_backend(id: &str, backend_type: &str, handle: JsValue) {
     } else {
         Some(handle)
     };
+    // Persist to engine storage (source of truth for API reads).
+    state::with_engine(|engine| {
+        engine
+            .storage
+            .register_backend_sync(id, backend_type, id, None, None);
+    });
+    // Also record the opaque JS handle in session state.
     state::set_backend(id.to_string(), backend_type.to_string(), handle);
 }
 
@@ -126,7 +132,11 @@ pub fn register_backend(id: &str, backend_type: &str, handle: JsValue) {
 #[wasm_bindgen]
 #[must_use]
 pub fn deregister_backend(id: &str) -> bool {
-    state::remove_backend(id)
+    // Remove from engine storage.
+    let storage_removed = state::with_engine(|engine| engine.storage.remove_backend_sync(id));
+    // Remove session-state handle.
+    let session_removed = state::remove_backend(id);
+    storage_removed || session_removed
 }
 
 /// Cache OAuth token metadata for a provider (e.g. `"gdrive"`). The durable copy
