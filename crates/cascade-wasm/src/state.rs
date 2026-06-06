@@ -39,6 +39,11 @@ thread_local! {
 
 /// The portable WASM adapters that satisfy the engine's four trait contracts.
 /// Initialised once on first access and reused for the session lifetime.
+///
+/// Fields are dead until the engine is wired to handle requests (the router
+/// still reads session state directly). The lint suppression drops once
+/// `ensure_engine` returns a reference that the request handler consumes.
+#[allow(dead_code)]
 struct EngineState {
     storage: Arc<WasmStateStorage>,
     http: WasmHttpClient,
