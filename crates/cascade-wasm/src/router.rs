@@ -66,8 +66,11 @@ pub fn route(request: &WorkerRequest, engine: &EngineState) -> WorkerResponse {
         ("GET", ["v1", "pins"]) => handle_list_pins(&request.id, engine),
         ("POST", ["v1", "pins"]) => handle_create_pin(&request.id, engine),
 
+        // ── Auth ──
+        ("POST", ["v1", "auth", "gdrive"]) => handle_auth_gdrive(&request.id),
+
         // ── Not yet wired ──
-        ("POST", ["v1", "auth", "gdrive"] | ["v1", "fsaccess", "pick"]) => {
+        ("POST", ["v1", "fsaccess", "pick"]) => {
             not_implemented(&request.id, &request.method, &request.path)
         }
         _ => not_found(&request.id, &request.method, &request.path),
@@ -208,6 +211,33 @@ fn handle_list_pins(id: &str, engine: &EngineState) -> WorkerResponse {
 fn handle_create_pin(id: &str, _engine: &EngineState) -> WorkerResponse {
     // Body parsing not yet wired — the mutator path is the primary route.
     not_implemented(id, "POST", "/v1/pins")
+}
+
+/// `POST /v1/auth/gdrive` — return the auth configuration the main thread
+/// needs to initiate the Google Drive OAuth PKCE redirect flow. The engine
+/// declares what it needs; the main thread executes the browser-specific bits
+/// (PKCE generation, popup/redirect, code exchange) and posts the resulting
+/// token metadata back via the `store_auth_token` mutator.
+fn handle_auth_gdrive(id: &str) -> WorkerResponse {
+    ok(
+        id,
+        json!({
+            "action": "oauth_redirect",
+            "provider": "gdrive",
+            "auth_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
+            "token_endpoint": "https://oauth2.googleapis.com/token",
+            "scopes": [
+                "https://www.googleapis.com/auth/drive",
+                "https://www.googleapis.com/auth/drive.file",
+            ],
+            "response_type": "code",
+            "pkce_required": true,
+            "extra_params": {
+                "access_type": "offline",
+                "prompt": "consent",
+            },
+        }),
+    )
 }
 
 // ─────────────────────────── Response helpers ───────────────────────────

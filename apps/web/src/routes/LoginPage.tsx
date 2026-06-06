@@ -4,7 +4,8 @@ import { ApiError } from '@/api/types';
 import { api } from '@/api/client';
 import { AppContext } from '@/context';
 import { RuntimeMode } from '@/wasm';
-import { initiateAuth, handleCallback, GDRIVE_SCOPES } from '@/wasm/oauth';
+import { initiateAuth, handleCallback, getStoredTokens, GDRIVE_SCOPES } from '@/wasm/oauth';
+import type { OAuthTokens } from '@/wasm/oauth';
 import { Spinner } from '@/components';
 
 const OAUTH_CLIENT_ID_KEY = 'cascade-oauth-client-id';
@@ -283,14 +284,22 @@ function WasmLoginPage() {
   const [signedIn, setSignedIn] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Handle the OAuth redirect-back on mount: exchange the code for tokens.
+  // Handle the OAuth redirect-back on mount: exchange the code for tokens,
+  // then tell the WASM engine about the auth state.
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     if (!params.has('code')) return;
 
     setLoading(true);
     handleCallback()
-      .then(() => {
+      .then(async (tokens: OAuthTokens) => {
+        // Wait for the WASM worker to be ready (it initialises on page load)
+        // before storing the token metadata in the engine's session state.
+        await api.wasmReady();
+        await api.storeAuthToken('gdrive', {
+          scope: tokens.scope,
+          expiry: tokens.expiry,
+        });
         window.history.replaceState({}, '', window.location.pathname);
         setSignedIn(true);
         setLoading(false);
@@ -307,10 +316,30 @@ function WasmLoginPage() {
     setError(null);
     try {
       localStorage.setItem(OAUTH_CLIENT_ID_KEY, clientId.trim());
+
+      // Ask the engine for the auth config (scopes, endpoints). The engine
+      // returns what it needs; the main thread handles PKCE and redirect.
+      let scopes: string[] = [...GDRIVE_SCOPES];
+      try {
+        const result = await api.rawRequest('POST', '/auth/gdrive');
+        if (
+          result.status === 200 &&
+          result.body !== null &&
+          typeof result.body === 'object'
+        ) {
+          const config = result.body as Record<string, unknown>;
+          if (Array.isArray(config.scopes)) {
+            scopes = config.scopes as string[];
+          }
+        }
+      } catch {
+        // Engine unavailable (worker not ready) — use hardcoded fallback.
+      }
+
       await initiateAuth({
         clientId: clientId.trim(),
         redirectUri: window.location.origin + window.location.pathname,
-        scopes: [...GDRIVE_SCOPES],
+        scopes,
       });
       // Execution continues only if the redirect did not happen (error path).
     } catch (err) {

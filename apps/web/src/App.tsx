@@ -17,8 +17,27 @@ import {
 import { loadToken, hasApiBase, saveApiBase, getStoredMode, saveMode } from '@/auth';
 import { detectCapabilities, recommendMode, RuntimeMode, type Capabilities } from '@/wasm';
 import { requestDirectory, persistHandle, restoreHandle } from '@/wasm/fsaccess';
+import { getStoredTokens } from '@/wasm/oauth';
 import { AppContext, type AppContextValue } from '@/context';
 import { api } from '@/api/client';
+
+/// Restore auth state from IndexedDB into the WASM engine. Called after the
+/// worker is ready so the engine's session reflects any previously-stored
+/// tokens — without this, a page reload would lose the auth state because the
+/// engine's in-memory `WasmState` starts empty on each load.
+async function restoreAuthState(): Promise<void> {
+  try {
+    const stored = await getStoredTokens();
+    if (stored !== null) {
+      await api.storeAuthToken('gdrive', {
+        scope: stored.scope,
+        expiry: stored.expiry,
+      });
+    }
+  } catch {
+    // IndexedDB unavailable or corrupt — engine stays unauthenticated.
+  }
+}
 
 function ConnectionSetup({ onConnected }: {
   onConnected: (mode: RuntimeMode, dirName?: string) => void;
@@ -85,6 +104,12 @@ function ConnectionSetup({ onConnected }: {
     setStarting(true);
     try {
       if (selectedMode === RuntimeMode.BrowseOnly) {
+        api.setMode(RuntimeMode.BrowseOnly);
+        const ready = await api.wasmReady();
+        if (!ready) {
+          throw new Error('WASM engine failed to initialise');
+        }
+        await restoreAuthState();
         onConnected(RuntimeMode.BrowseOnly);
       } else if (selectedMode === RuntimeMode.Standalone) {
         // Set mode first so the bridge client is created and the worker starts.
@@ -96,6 +121,9 @@ function ConnectionSetup({ onConnected }: {
         if (directoryHandle !== null) {
           await api.registerBackend('local', 'local-fs', directoryHandle);
         }
+        // Restore auth state from IndexedDB so the engine knows about
+        // existing tokens across page reloads.
+        await restoreAuthState();
         onConnected(RuntimeMode.Standalone, dirName ?? undefined);
       }
     } catch (err) {
