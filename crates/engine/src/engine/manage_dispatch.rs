@@ -10,7 +10,7 @@
 //! With the `p2p` feature enabled, the engine implements
 //! [`ManageGrantStore`](crate::manage::ManageGrantStore),
 //! [`ManageCommandExecutor`](crate::manage::ManageCommandExecutor), and
-//! [`ManageDispatch`](cascade_p2p::protocol::ManageDispatch).
+//! the `ManageDispatch` trait from the `cascade_p2p` protocol module.
 
 use std::collections::HashSet;
 
