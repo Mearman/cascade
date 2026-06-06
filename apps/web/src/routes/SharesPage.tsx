@@ -16,9 +16,9 @@ export function SharesPage() {
 
   useEffect(() => {
     api.shares()
-      .then((r) => setShares(r.shares))
-      .catch((err) => setError(err instanceof Error ? err.message : String(err)))
-      .finally(() => setLoading(false));
+      .then((r) => { setShares(r.shares); })
+      .catch((err: unknown) => { setError(err instanceof Error ? err.message : String(err)); })
+      .finally(() => { setLoading(false); });
   }, []);
 
   async function revoke(id: number) {
@@ -35,7 +35,7 @@ export function SharesPage() {
   return (
     <div class="shares-page">
       <h2>Shares</h2>
-      {error && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
+      {error !== null && error !== '' && <ErrorBanner message={error} onDismiss={() => { setError(null); }} />}
       {shares.length === 0 ? (
         <p class="muted">No shares configured.</p>
       ) : (
@@ -59,7 +59,7 @@ export function SharesPage() {
                 <td>
                   <span class={postureBadgeClass(s.posture)}>{s.posture}</span>
                 </td>
-                <td>{s.expires ? new Date(s.expires).toLocaleString() : 'never'}</td>
+                <td>{s.expires !== null ? new Date(s.expires).toLocaleString() : 'never'}</td>
                 <td>
                   {s.grant_ids.map((id) => (
                     <button

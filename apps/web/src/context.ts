@@ -18,5 +18,5 @@ export const AppContext = createContext<AppContextValue>({
     indexedDb: false,
   },
   directoryName: null,
-  setDirectoryName: () => {},
+  setDirectoryName: (_name: string | null) => { /* no-op default */ },
 });

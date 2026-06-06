@@ -1,19 +1,9 @@
-import { useEffect, useState, useContext } from 'preact/hooks';
+import { useEffect, useState, useContext, useRef } from 'preact/hooks';
 import { api } from '@/api/client';
 import type { HealthResponse, SessionResponse } from '@/api/types';
 import { ErrorBanner, Spinner } from '@/components';
 import { AppContext } from '@/context';
 import { RuntimeMode } from '@/wasm';
-
-function formatBytes(bytes: number): string {
-  if (bytes === 0) return '0 B';
-  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'] as const;
-  const k = 1024;
-  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(k)), units.length - 1);
-  const unit = units[i];
-  if (unit === undefined) return `${bytes} B`;
-  return `${(bytes / Math.pow(k, i)).toFixed(1)} ${unit}`;
-}
 
 // ─── Connected mode dashboard ─────────────────────────────────────────────────
 
@@ -29,8 +19,8 @@ function ConnectedDashboard() {
         setHealth(h);
         setSession(s);
       })
-      .catch((err) => setError(err instanceof Error ? err.message : String(err)))
-      .finally(() => setLoading(false));
+      .catch((err: unknown) => { setError(err instanceof Error ? err.message : String(err)); })
+      .finally(() => { setLoading(false); });
   }, []);
 
   if (loading) return <Spinner />;
@@ -103,8 +93,30 @@ function ConnectedDashboard() {
 // ─── WASM mode dashboard ──────────────────────────────────────────────────────
 
 interface WasmHealth { version: string; status: string }
-interface WasmBackend { id: string; type: string; status: string }
+interface WasmBackend { id: string; type: string; display_name: string; hasHandle: boolean }
 interface WasmCapabilities { backends: boolean; config: boolean; files: boolean; sync: boolean }
+
+function isWasmHealth(value: unknown): value is WasmHealth {
+  if (typeof value !== 'object' || value === null) return false;
+  return 'version' in value && typeof value.version === 'string'
+    && 'status' in value && typeof value.status === 'string';
+}
+
+function isWasmBackend(value: unknown): value is WasmBackend {
+  if (typeof value !== 'object' || value === null) return false;
+  return 'id' in value && typeof value.id === 'string'
+    && 'type' in value && typeof value.type === 'string'
+    && 'display_name' in value && typeof value.display_name === 'string'
+    && 'hasHandle' in value && typeof value.hasHandle === 'boolean';
+}
+
+function isWasmCapabilities(value: unknown): value is WasmCapabilities {
+  if (typeof value !== 'object' || value === null) return false;
+  return 'backends' in value && typeof value.backends === 'boolean'
+    && 'config' in value && typeof value.config === 'boolean'
+    && 'files' in value && typeof value.files === 'boolean'
+    && 'sync' in value && typeof value.sync === 'boolean';
+}
 
 function WasmDashboard({ mode }: { mode: RuntimeMode }) {
   const [ready, setReady] = useState<boolean | null>(null);
@@ -114,51 +126,54 @@ function WasmDashboard({ mode }: { mode: RuntimeMode }) {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    let cancelled = false;
+    const cancelled = useRef<boolean>(false);
 
     async function load() {
       try {
         const isReady = await api.wasmReady();
-        if (cancelled) return;
+        if (cancelled.current) return;
         setReady(isReady);
         if (!isReady) return;
 
         // Query the WASM engine for health, backends, and capabilities.
+        // The WASM engine returns different response shapes than the daemon
+        // API, so we use rawRequest and validate locally.
         const [healthRes, backendsRes, capsRes] = await Promise.allSettled([
-          api.health(),
-          api.backends(),
+          api.rawRequest('GET', '/health'),
+          api.rawRequest('GET', '/backends'),
           api.rawRequest('GET', '/capabilities'),
         ]);
 
-        if (cancelled) return;
-
-        if (healthRes.status === 'fulfilled') {
-          setHealth(healthRes.value as unknown as WasmHealth);
+        if (healthRes.status === 'fulfilled' && healthRes.value.status === 200) {
+          if (isWasmHealth(healthRes.value.body)) {
+            setHealth(healthRes.value.body);
+          }
         }
-        if (backendsRes.status === 'fulfilled') {
-          const body = (backendsRes.value as unknown as { backends?: WasmBackend[] });
-          setBackends(body.backends ?? []);
+        if (backendsRes.status === 'fulfilled' && backendsRes.value.status === 200) {
+          const body = backendsRes.value.body;
+          if (typeof body === 'object' && body !== null && 'backends' in body && Array.isArray(body.backends) && body.backends.every(isWasmBackend)) {
+            setBackends(body.backends);
+          }
         }
-        if (capsRes.status === 'fulfilled') {
-          const capsBody = capsRes.value as { status: number; body: unknown };
-          if (capsBody.status === 200 && typeof capsBody.body === 'object' && capsBody.body !== null) {
-            setCapabilities(capsBody.body as WasmCapabilities);
+        if (capsRes.status === 'fulfilled' && capsRes.value.status === 200) {
+          if (isWasmCapabilities(capsRes.value.body)) {
+            setCapabilities(capsRes.value.body);
           }
         }
       } catch (err) {
-        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+        if (!cancelled.current) setError(err instanceof Error ? err.message : String(err));
       }
     }
 
-    load();
-    return () => { cancelled = true; };
+    void load();
+    return () => { cancelled.current = true; };
   }, []);
 
   return (
     <div class="dashboard">
       <h2>Dashboard</h2>
 
-      {error !== null && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
+      {error !== null && <ErrorBanner message={error} onDismiss={() => { setError(null); }} />}
 
       <section class="dashboard-section">
         <h3>WASM Engine</h3>
@@ -210,7 +225,7 @@ function WasmDashboard({ mode }: { mode: RuntimeMode }) {
               {backends.map((b) => (
                 <li key={b.id}>
                   <code>{b.id}</code> ({b.type})
-                  <span class={`badge ${b.status === 'ok' ? 'ok' : 'danger'}`}>{b.status}</span>
+                  {b.hasHandle && <span class="badge ok">connected</span>}
                 </li>
               ))}
             </ul>

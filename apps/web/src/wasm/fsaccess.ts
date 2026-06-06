@@ -60,8 +60,8 @@ function openFsDb(): Promise<IDBDatabase> {
         db.createObjectStore(FS_STORE_NAME, { keyPath: 'key' });
       }
     };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
+    req.onsuccess = () => { resolve(req.result); };
+    req.onerror = () => { reject(new Error(String(req.error))); };
   });
 }
 
@@ -111,8 +111,8 @@ export async function requestDirectory(): Promise<FileSystemDirectoryHandle> {
 // Returns all immediate children of the given directory handle.
 export async function enumerateDirectory(
   handle: FileSystemDirectoryHandle,
-): Promise<Array<FileSystemDirectoryHandle | FileSystemFileHandle>> {
-  const entries: Array<FileSystemDirectoryHandle | FileSystemFileHandle> = [];
+): Promise<(FileSystemDirectoryHandle | FileSystemFileHandle)[]> {
+  const entries: (FileSystemDirectoryHandle | FileSystemFileHandle)[] = [];
   for await (const child of handle.values()) {
     if (isFileHandle(child) || isDirHandle(child)) {
       entries.push(child);
@@ -210,8 +210,8 @@ export async function persistHandle(
   await new Promise<void>((resolve, reject) => {
     const tx = db.transaction(FS_STORE_NAME, 'readwrite');
     const req = tx.objectStore(FS_STORE_NAME).put(record);
-    req.onsuccess = () => resolve();
-    req.onerror = () => reject(req.error);
+    req.onsuccess = () => { resolve(); };
+    req.onerror = () => { reject(new Error(String(req.error))); };
   });
 }
 
@@ -225,8 +225,8 @@ export async function restoreHandle(
   const record: unknown = await new Promise((resolve, reject) => {
     const tx = db.transaction(FS_STORE_NAME, 'readonly');
     const req = tx.objectStore(FS_STORE_NAME).get(key);
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
+    req.onsuccess = () => { resolve(req.result); };
+    req.onerror = () => { reject(new Error(String(req.error))); };
   });
   if (!isStoredHandleRecord(record)) return null;
   return record.handle;

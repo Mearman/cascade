@@ -15,9 +15,9 @@ export function GrantsPage() {
 
   useEffect(() => {
     api.grants()
-      .then((r) => setGrants(r.grants))
-      .catch((err) => setError(err instanceof Error ? err.message : String(err)))
-      .finally(() => setLoading(false));
+      .then((r) => { setGrants(r.grants); })
+      .catch((err: unknown) => { setError(err instanceof Error ? err.message : String(err)); })
+      .finally(() => { setLoading(false); });
   }, []);
 
   async function revoke(id: number) {
@@ -34,7 +34,7 @@ export function GrantsPage() {
   return (
     <div class="grants-page">
       <h2>Grants</h2>
-      {error && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
+      {error !== null && error !== '' && <ErrorBanner message={error} onDismiss={() => { setError(null); }} />}
       {grants.length === 0 ? (
         <p class="muted">No grants configured.</p>
       ) : (
@@ -55,7 +55,7 @@ export function GrantsPage() {
                 <td><code>{g.grantee}</code></td>
                 <td>{g.capability}</td>
                 <td><code>{scopeLabel(g)}</code></td>
-                <td>{g.expires ? new Date(g.expires).toLocaleString() : 'never'}</td>
+                <td>{g.expires !== null ? new Date(g.expires).toLocaleString() : 'never'}</td>
                 <td><code>{g.granted_by}</code></td>
                 <td>
                   <button class="danger" onClick={() => void revoke(g.id)}>

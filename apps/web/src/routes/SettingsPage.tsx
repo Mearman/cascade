@@ -1,5 +1,4 @@
 import { useState, useContext } from 'preact/hooks';
-import { api } from '@/api/client';
 import { saveApiBase, clearToken, getApiBase, clearMode } from '@/auth';
 import { ErrorBanner } from '@/components';
 import { AppContext } from '@/context';
@@ -35,7 +34,7 @@ export function SettingsPage({ onBaseChanged }: Props) {
     const trimmed = url.trim().replace(/\/$/, '');
     try {
       const res = await fetch(`${trimmed}/v1/health`);
-      if (!res.ok) throw new Error(`Daemon returned ${res.status}`);
+      if (!res.ok) throw new Error(`Daemon returned ${String(res.status)}`);
       saveApiBase(trimmed);
       setUrl(trimmed);
       setSaved(true);
@@ -83,7 +82,7 @@ export function SettingsPage({ onBaseChanged }: Props) {
                 <button
                   type="button"
                   class="link"
-                  onClick={handleChangeDir}
+                  onClick={() => { void handleChangeDir(); }}
                   disabled={changingDir}
                 >
                   {changingDir ? 'Choosing…' : 'Change'}
@@ -145,7 +144,7 @@ export function SettingsPage({ onBaseChanged }: Props) {
               : `Connected to ${getApiBase()}`}
           </p>
 
-          <form class="settings-form" onSubmit={handleSubmit}>
+          <form class="settings-form" onSubmit={(ev) => { void handleSubmit(ev); }}>
             <label>
               Daemon address
               <input
@@ -153,12 +152,15 @@ export function SettingsPage({ onBaseChanged }: Props) {
                 value={url}
                 placeholder="http://192.168.1.100:7842"
                 onInput={(e) => {
-                  setUrl((e.target as HTMLInputElement).value);
+                  const target = e.target;
+                  if (target instanceof HTMLInputElement) {
+                    setUrl(target.value);
+                  }
                   setSaved(false);
                 }}
               />
             </label>
-            {error !== null && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
+            {error !== null && <ErrorBanner message={error} onDismiss={() => { setError(null); }} />}
             {saved && <p class="success-msg">Saved — connection verified.</p>}
             <div class="settings-actions">
               <button type="submit" disabled={testing}>

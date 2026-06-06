@@ -1,5 +1,4 @@
 import { api, API_BASE_KEY, TOKEN_KEY } from '@/api/client';
-import { ApiError } from '@/api/types';
 import type { CapabilityToken, SessionResponse } from '@/api/types';
 import { RuntimeMode } from '@/wasm';
 

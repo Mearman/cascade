@@ -180,7 +180,7 @@ class WebRtcTransportImpl implements FrameTransport {
       this.sendRelay({ type: 'sdp-answer', sdp: answer.sdp });
     } else if (msg.type === 'sdp-answer') {
       await this.pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
-    } else if (msg.type === 'ice-candidate') {
+    } else {
       await this.pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
     }
   }

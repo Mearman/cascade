@@ -45,7 +45,7 @@ function base64UrlEncode(bytes: Uint8Array): string {
     .replace(/=/g, '');
 }
 
-async function generateCodeVerifier(): Promise<string> {
+function generateCodeVerifier(): string {
   return base64UrlEncode(crypto.getRandomValues(new Uint8Array(32)));
 }
 
@@ -66,8 +66,8 @@ function openAuthDb(): Promise<IDBDatabase> {
         db.createObjectStore(AUTH_STORE_NAME, { keyPath: 'provider' });
       }
     };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
+    req.onsuccess = () => { resolve(req.result); };
+    req.onerror = () => { reject(new Error(String(req.error))); };
   });
 }
 
@@ -124,7 +124,7 @@ function isGoogleErrorResponse(value: unknown): value is GoogleErrorResponse {
 export async function initiateAuth(config: OAuthConfig): Promise<void> {
   cachedClientId = config.clientId;
 
-  const verifier = await generateCodeVerifier();
+  const verifier = generateCodeVerifier();
   const challenge = await generateCodeChallenge(verifier);
   const state = base64UrlEncode(crypto.getRandomValues(new Uint8Array(16)));
 
@@ -185,8 +185,8 @@ export async function handleCallback(): Promise<OAuthTokens> {
     const record: unknown = await new Promise((resolve, reject) => {
       const tx = db.transaction(AUTH_STORE_NAME, 'readonly');
       const req = tx.objectStore(AUTH_STORE_NAME).get('gdrive');
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
+      req.onsuccess = () => { resolve(req.result); };
+      req.onerror = () => { reject(new Error(String(req.error))); };
     });
     if (!isStoredTokenRecord(record)) {
       throw new Error('OAuth callback: stored token record corrupt');
@@ -214,7 +214,7 @@ export async function handleCallback(): Promise<OAuthTokens> {
     if (isGoogleErrorResponse(json)) {
       throw new Error(`Token exchange failed: ${json.error_description ?? json.error}`);
     }
-    throw new Error(`Token exchange failed with status ${resp.status}`);
+    throw new Error(`Token exchange failed with status ${String(resp.status)}`);
   }
 
   if (!isGoogleTokenResponse(json)) {
@@ -245,8 +245,8 @@ export async function refreshTokens(refreshToken: string): Promise<OAuthTokens> 
     const record: unknown = await new Promise((resolve, reject) => {
       const tx = db.transaction(AUTH_STORE_NAME, 'readonly');
       const req = tx.objectStore(AUTH_STORE_NAME).get('gdrive');
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
+      req.onsuccess = () => { resolve(req.result); };
+      req.onerror = () => { reject(new Error(String(req.error))); };
     });
     if (!isStoredTokenRecord(record)) {
       throw new Error('refreshTokens: no stored token record found — call initiateAuth first');
@@ -272,7 +272,7 @@ export async function refreshTokens(refreshToken: string): Promise<OAuthTokens> 
     if (isGoogleErrorResponse(json)) {
       throw new Error(`Token refresh failed: ${json.error_description ?? json.error}`);
     }
-    throw new Error(`Token refresh failed with status ${resp.status}`);
+    throw new Error(`Token refresh failed with status ${String(resp.status)}`);
   }
 
   if (!isGoogleTokenResponse(json)) {
@@ -297,8 +297,8 @@ export async function getStoredTokens(): Promise<OAuthTokens | null> {
   const record: unknown = await new Promise((resolve, reject) => {
     const tx = db.transaction(AUTH_STORE_NAME, 'readonly');
     const req = tx.objectStore(AUTH_STORE_NAME).get('gdrive');
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
+    req.onsuccess = () => { resolve(req.result); };
+    req.onerror = () => { reject(new Error(String(req.error))); };
   });
   if (!isStoredTokenRecord(record)) return null;
   cachedClientId = record.client_id;
@@ -325,7 +325,7 @@ export async function storeTokens(tokens: OAuthTokens): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     const tx = db.transaction(AUTH_STORE_NAME, 'readwrite');
     const req = tx.objectStore(AUTH_STORE_NAME).put(record);
-    req.onsuccess = () => resolve();
-    req.onerror = () => reject(req.error);
+    req.onsuccess = () => { resolve(); };
+    req.onerror = () => { reject(new Error(String(req.error))); };
   });
 }

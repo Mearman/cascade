@@ -15,9 +15,9 @@ export function TokensPage() {
 
   useEffect(() => {
     api.tokens()
-      .then((r) => setTokens(r.tokens))
-      .catch((err) => setError(err instanceof Error ? err.message : String(err)))
-      .finally(() => setLoading(false));
+      .then((r) => { setTokens(r.tokens); })
+      .catch((err: unknown) => { setError(err instanceof Error ? err.message : String(err)); })
+      .finally(() => { setLoading(false); });
   }, []);
 
   async function revoke(tokenId: string) {
@@ -36,7 +36,7 @@ export function TokensPage() {
   return (
     <div class="tokens-page">
       <h2>Tokens</h2>
-      {error && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
+      {error !== null && error !== '' && <ErrorBanner message={error} onDismiss={() => { setError(null); }} />}
       {tokens.length === 0 ? (
         <p class="muted">No tokens issued.</p>
       ) : (

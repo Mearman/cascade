@@ -9,7 +9,7 @@ function formatBytes(bytes: number): string {
   const k = 1024;
   const i = Math.min(Math.floor(Math.log(bytes) / Math.log(k)), units.length - 1);
   const unit = units[i];
-  if (unit === undefined) return `${bytes} B`;
+  if (unit === undefined) return `${String(bytes)} B`;
   return `${(bytes / Math.pow(k, i)).toFixed(1)} ${unit}`;
 }
 
@@ -30,12 +30,12 @@ export function FilesPage() {
         const p2p = r.backends.filter((b) => b.folder_id !== null);
         setBackends(p2p);
         const first = p2p[0];
-        if (first?.folder_id !== null && first !== undefined) {
-          setSelectedFolder(first.folder_id ?? null);
+        if (first !== undefined && first.folder_id !== null) {
+          setSelectedFolder(first.folder_id);
         }
       })
-      .catch((err) => setError(err instanceof Error ? err.message : String(err)))
-      .finally(() => setLoadingBackends(false));
+      .catch((err: unknown) => { setError(err instanceof Error ? err.message : String(err)); })
+      .finally(() => { setLoadingBackends(false); });
   }, []);
 
   useEffect(() => {
@@ -49,8 +49,8 @@ export function FilesPage() {
         setNextCursor(r.next_cursor);
         setError(null);
       })
-      .catch((err) => setError(err instanceof Error ? err.message : String(err)))
-      .finally(() => setLoadingEntries(false));
+      .catch((err: unknown) => { setError(err instanceof Error ? err.message : String(err)); })
+      .finally(() => { setLoadingEntries(false); });
   }, [selectedFolder, currentPath]);
 
   function navigate(entry: FileEntry) {
@@ -68,14 +68,16 @@ export function FilesPage() {
   }
 
   function handleFolderChange(e: Event) {
-    const value = (e.target as HTMLSelectElement).value;
+    const target = e.target;
+    if (!(target instanceof HTMLSelectElement)) return;
+    const value = target.value;
     setSelectedFolder(value);
     setCurrentPath('');
     setBreadcrumb(['']);
   }
 
   async function loadMore() {
-    if (!selectedFolder || nextCursor === null) return;
+    if (selectedFolder === null || nextCursor === null) return;
     try {
       const r = await api.folderChildren(selectedFolder, currentPath, { cursor: nextCursor });
       setEntries((prev) => [...prev, ...r.entries]);
@@ -121,7 +123,7 @@ export function FilesPage() {
             {i > 0 && ' / '}
             <button
               class="link"
-              onClick={() => navigateToBreadcrumb(i)}
+              onClick={() => { navigateToBreadcrumb(i); }}
               disabled={i === breadcrumb.length - 1}
             >
               {i === 0 ? folderLabel : seg.split('/').pop() ?? seg}
@@ -130,7 +132,7 @@ export function FilesPage() {
         ))}
       </nav>
 
-      {error && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
+      {error !== null && error !== '' && <ErrorBanner message={error} onDismiss={() => { setError(null); }} />}
 
       {loadingEntries ? (
         <Spinner />
@@ -152,7 +154,7 @@ export function FilesPage() {
                   <td>
                     <button
                       class="name-btn"
-                      onClick={() => navigate(entry)}
+                      onClick={() => { navigate(entry); }}
                       disabled={entry.kind !== 'directory'}
                     >
                       {entry.kind === 'directory' ? '📁 ' : '📄 '}
@@ -160,7 +162,7 @@ export function FilesPage() {
                     </button>
                   </td>
                   <td>{entry.size !== null ? formatBytes(entry.size) : '—'}</td>
-                  <td>{entry.mtime ? new Date(entry.mtime).toLocaleString() : '—'}</td>
+                  <td>{entry.mtime !== null ? new Date(entry.mtime).toLocaleString() : '—'}</td>
                 </tr>
               ))}
             </tbody>

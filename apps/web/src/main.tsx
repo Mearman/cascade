@@ -8,4 +8,6 @@ initAuth(() => {
   window.location.reload();
 });
 
-render(<App />, document.getElementById('app')!);
+const root = document.getElementById('app');
+if (root === null) throw new Error('Root element #app not found');
+render(<App />, root);
