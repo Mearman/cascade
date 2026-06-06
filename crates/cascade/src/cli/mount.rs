@@ -188,6 +188,7 @@ fn mark_web_ready(runtime: &WebRuntimeOpt) {
 
 /// See [`mark_web_ready`] — the no-op form when the `web` feature is off.
 #[cfg(not(feature = "web"))]
+#[allow(clippy::trivially_copy_pass_by_ref)] // must match the #[cfg(web)] signature
 const fn mark_web_ready(_runtime: &WebRuntimeOpt) {}
 
 /// Gracefully stop the HTTP API server on daemon shutdown, draining in-flight
