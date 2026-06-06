@@ -19,14 +19,17 @@ use crate::caps;
 use crate::state;
 use crate::state::EngineState;
 
-/// A request from the worker: an HTTP-shaped method and path. The `body` and
-/// `headers` of the wire message are ignored by the routes implemented so far
-/// and so are not deserialised.
+/// A request from the worker: an HTTP-shaped method, path, and optional body.
 #[derive(Debug, Deserialize)]
 pub struct WorkerRequest {
     pub id: String,
     pub method: String,
     pub path: String,
+    #[serde(default)]
+    pub body: Option<Value>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub headers: Option<std::collections::HashMap<String, String>>,
 }
 
 /// A response to the worker. `error` is omitted from the wire form when absent.
@@ -54,7 +57,7 @@ pub fn route(request: &WorkerRequest, engine: &EngineState) -> WorkerResponse {
 
         // ── Backends ──
         ("GET", ["v1", "backends"]) => handle_list_backends(&request.id, engine),
-        ("POST", ["v1", "backends"]) => handle_create_backend(&request.id, engine),
+        ("POST", ["v1", "backends"]) => handle_create_backend(request, engine),
         ("DELETE", ["v1", "backends", id]) => handle_delete_backend(&request.id, engine, id),
 
         // ── Folders / files ──
@@ -64,7 +67,7 @@ pub fn route(request: &WorkerRequest, engine: &EngineState) -> WorkerResponse {
 
         // ── Pin rules ──
         ("GET", ["v1", "pins"]) => handle_list_pins(&request.id, engine),
-        ("POST", ["v1", "pins"]) => handle_create_pin(&request.id, engine),
+        ("POST", ["v1", "pins"]) => handle_create_pin(request, engine),
 
         // ── Auth ──
         ("POST", ["v1", "auth", "gdrive"]) => handle_auth_gdrive(&request.id),
@@ -147,12 +150,41 @@ fn handle_list_backends(id: &str, engine: &EngineState) -> WorkerResponse {
 
 /// `POST /v1/backends` — register a backend through engine storage and session
 /// state. Body: `{ "id": "...", "type": "..." }`.
-fn handle_create_backend(id: &str, _engine: &EngineState) -> WorkerResponse {
-    // The body comes through the request but isn't deserialised into
-    // WorkerRequest yet. For now the mutator path (register_backend export)
-    // is the primary registration route; the HTTP POST path returns 501
-    // until request body parsing is added.
-    not_implemented(id, "POST", "/v1/backends")
+fn handle_create_backend(request: &WorkerRequest, _engine: &EngineState) -> WorkerResponse {
+    let body = match request.body {
+        Some(ref b) => b,
+        None => {
+            return error_response(
+                &request.id,
+                400,
+                "bad_request",
+                "POST /v1/backends requires a JSON body with 'id' and 'type'",
+            );
+        }
+    };
+
+    let id_val = body.get("id").and_then(Value::as_str);
+    let type_val = body.get("type").and_then(Value::as_str);
+
+    match (id_val, type_val) {
+        (Some(backend_id), Some(backend_type)) => {
+            // Persist to engine storage.
+            state::with_engine(|engine| {
+                engine
+                    .storage
+                    .register_backend_sync(backend_id, backend_type, backend_id, None, None);
+            });
+            // Record in session state (no JS handle for HTTP-created backends).
+            state::set_backend(backend_id.to_owned(), backend_type.to_owned(), None);
+            created(&request.id, json!({ "id": backend_id, "type": backend_type }))
+        }
+        _ => error_response(
+            &request.id,
+            400,
+            "bad_request",
+            "body must include string 'id' and 'type' fields",
+        ),
+    }
 }
 
 /// `DELETE /v1/backends/:id` — remove from engine storage and session state.
@@ -208,9 +240,42 @@ fn handle_list_pins(id: &str, engine: &EngineState) -> WorkerResponse {
 }
 
 /// `POST /v1/pins` — add a pin rule through engine storage.
-fn handle_create_pin(id: &str, _engine: &EngineState) -> WorkerResponse {
-    // Body parsing not yet wired — the mutator path is the primary route.
-    not_implemented(id, "POST", "/v1/pins")
+/// Body: `{ "path": "...", "recursive": true, "conditions": "..." }`.
+fn handle_create_pin(request: &WorkerRequest, _engine: &EngineState) -> WorkerResponse {
+    let body = match request.body {
+        Some(ref b) => b,
+        None => {
+            return error_response(
+                &request.id,
+                400,
+                "bad_request",
+                "POST /v1/pins requires a JSON body with 'path'",
+            );
+        }
+    };
+
+    let path = body.get("path").and_then(Value::as_str);
+    let Some(path_glob) = path else {
+        return error_response(
+            &request.id,
+            400,
+            "bad_request",
+            "body must include a string 'path' field",
+        );
+    };
+
+    let recursive = body
+        .get("recursive")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let conditions = body.get("conditions").and_then(Value::as_str);
+
+    state::with_engine(|engine| {
+        engine
+            .storage
+            .add_pin_rule_sync(path_glob, recursive, conditions);
+    });
+    created(&request.id, json!({ "path": path_glob, "recursive": recursive, "conditions": conditions }))
 }
 
 /// `POST /v1/auth/gdrive` — return the auth configuration the main thread
@@ -253,6 +318,16 @@ fn ok(id: &str, body: Value) -> WorkerResponse {
     WorkerResponse {
         id: id.to_string(),
         status: 200,
+        body,
+        error: None,
+    }
+}
+
+/// A `201 Created` response carrying `body`.
+fn created(id: &str, body: Value) -> WorkerResponse {
+    WorkerResponse {
+        id: id.to_string(),
+        status: 201,
         body,
         error: None,
     }
