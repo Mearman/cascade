@@ -322,8 +322,9 @@ export async function updateDriveFile(
   return entry;
 }
 
-// Permanently delete a file from Google Drive and remove it from engine storage.
-// Note: this bypasses the trash. Use `trashed = true` query in fetchDriveFiles
+// Permanently delete a file from Google Drive. Engine storage cleanup is
+// handled by the caller (bridge.deleteFiles).
+// Bypasses the trash — use a `trashed = true` query in fetchDriveFiles
 // to soft-delete instead if needed.
 export async function deleteDriveFile(
   backendId: string,
@@ -340,10 +341,6 @@ export async function deleteDriveFile(
   if (!resp.ok) {
     throw new Error(`Drive delete failed: status ${String(resp.status)}`);
   }
-  // Remove from engine storage by upserting a tombstone marker — the engine
-  // doesn't have a delete mutator exposed to JS yet, so re-fetch is needed
-  // for full consistency. The next fetchDriveFiles call with trashed=false
-  // will exclude it.
 }
 
 // Type guard for a single Drive file resource.
