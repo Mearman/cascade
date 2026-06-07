@@ -936,4 +936,27 @@ mod tests {
             .expect("children");
         assert_eq!(children.len(), 1);
     }
+
+    #[test]
+    fn limit_query_truncates_the_child_listing() {
+        let engine = EngineState::new();
+        for native in ["a", "b", "c"] {
+            engine.storage.upsert_file_sync(&FileEntry::file(
+                ItemId::new("b1", native),
+                ItemId::new("b1", "root"),
+                format!("{native}.txt"),
+            ));
+        }
+        // `limit=` is six characters, so the value begins at index 6. A
+        // limit of 1 must return exactly one child (an off-by-one here would
+        // read an empty/garbled value and fail to truncate).
+        let resp = route(&get("/v1/folders/b1:root/children?limit=1"), &engine);
+        assert_eq!(resp.status, 200);
+        let children = resp
+            .body
+            .get("children")
+            .and_then(Value::as_array)
+            .expect("children");
+        assert_eq!(children.len(), 1);
+    }
 }
