@@ -498,6 +498,33 @@ pub async fn start(
         return Ok(());
     }
 
+    // Read the diagnostic HTTP mode once, here on the daemon's stable main
+    // runtime, so both the backend-injection decision and the WebDAV
+    // isolation decision derive from the same OnceLock value.
+    //
+    // In pooled-shared mode we build a single long-lived pooled reqwest::Client
+    // NOW — on the main runtime — and wrap it in the portable ReqwestClient
+    // adapter. The connection driver lives on this runtime for the daemon's
+    // lifetime, so it is always polled and never stranded. Every `rebuild_backends`
+    // call receives the same `Arc` so the client is never recreated or dropped.
+    //
+    // In all other modes `shared_http` is `None` and the default per-request
+    // path runs unchanged.
+    let (shared_http, skip_isolation) = {
+        use cascade_backend_gdrive::client::{DiagHttpMode, diag_http_mode};
+        if diag_http_mode() == DiagHttpMode::PooledShared {
+            let pooled_client = reqwest::Client::builder()
+                .build()
+                .context("failed to build shared pooled reqwest::Client for pooled-shared mode")?;
+            let http: Arc<dyn cascade_engine::portable::HttpClient> = Arc::new(
+                cascade_engine::portable::native::ReqwestClient::from_client(pooled_client),
+            );
+            (Some(http), true)
+        } else {
+            (None, false)
+        }
+    };
+
     // Resolve mount point: CLI arg > config.toml [mount].point > ~/Cloud.
     let mount_path = if let Some(p) = mount_point {
         resolve_mount_path(p)
@@ -523,7 +550,7 @@ pub async fn start(
     // forces the WebDAV presenter on any platform. Useful for Linux
     // containers where /dev/fuse may be unavailable and NFS needs root.
     if std::env::var("CASCADE_PRESENTER").as_deref() == Ok("webdav") {
-        let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
+        let backends = rebuild_backends(&main_config, &ctx.config_dir, shared_http.clone())?;
         tracing::info!(
             strategy = "webdav-forced",
             "honouring CASCADE_PRESENTER=webdav"
@@ -535,6 +562,7 @@ pub async fn start(
             no_mount,
             &p2p_config,
             &web_options,
+            skip_isolation,
         )
         .await;
     }
@@ -550,7 +578,7 @@ pub async fn start(
 
     #[cfg(target_os = "macos")]
     if file_provider {
-        let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
+        let backends = rebuild_backends(&main_config, &ctx.config_dir, shared_http.clone())?;
         tracing::info!(strategy = "fileprovider", "attempting File Provider mount");
         return try_fileprovider(
             ctx,
@@ -573,7 +601,7 @@ pub async fn start(
     {
         // Attempt 1: FSKit (skipped if --no-mount since FSKit always self-mounts).
         if !no_mount {
-            let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
+            let backends = rebuild_backends(&main_config, &ctx.config_dir, shared_http.clone())?;
             tracing::info!(strategy = "fskit", "attempting FSKit mount");
             match try_fskit(ctx, &mount_path, backends, &p2p_config, &web_options).await {
                 Ok(()) => return Ok(()),
@@ -585,7 +613,7 @@ pub async fn start(
         }
 
         // Attempt 2: WebDAV.
-        let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
+        let backends = rebuild_backends(&main_config, &ctx.config_dir, shared_http.clone())?;
         tracing::info!(strategy = "webdav", "attempting WebDAV mount");
         match try_webdav(
             ctx,
@@ -594,6 +622,7 @@ pub async fn start(
             no_mount,
             &p2p_config,
             &web_options,
+            skip_isolation,
         )
         .await
         {
@@ -605,7 +634,7 @@ pub async fn start(
         }
 
         // Attempt 3: NFS (v4 → v3 escalation inside mount_nfs).
-        let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
+        let backends = rebuild_backends(&main_config, &ctx.config_dir, shared_http.clone())?;
         try_nfs(
             ctx,
             &mount_path,
@@ -628,7 +657,7 @@ pub async fn start(
         if no_mount {
             // Headless seed mode used by the Docker entrypoint: run the WebDAV
             // server without mounting.
-            let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
+            let backends = rebuild_backends(&main_config, &ctx.config_dir, shared_http.clone())?;
             tracing::info!(
                 strategy = "webdav-seed",
                 "--no-mount set on Linux; starting WebDAV server in seed mode"
@@ -640,10 +669,11 @@ pub async fn start(
                 no_mount,
                 &p2p_config,
                 &web_options,
+                skip_isolation,
             )
             .await
         } else {
-            let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
+            let backends = rebuild_backends(&main_config, &ctx.config_dir, shared_http.clone())?;
             tracing::info!(strategy = "fuse", "attempting FUSE mount");
             match try_fuse(ctx, &mount_path, backends, &p2p_config, &web_options).await {
                 Ok(()) => return Ok(()),
@@ -653,7 +683,7 @@ pub async fn start(
                 }
             }
 
-            let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
+            let backends = rebuild_backends(&main_config, &ctx.config_dir, shared_http.clone())?;
             try_nfs(
                 ctx,
                 &mount_path,
@@ -676,7 +706,7 @@ pub async fn start(
         // cannot be used without mounting, so it is skipped when
         // --no-mount is set.
         if !no_mount {
-            let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
+            let backends = rebuild_backends(&main_config, &ctx.config_dir, shared_http.clone())?;
             tracing::info!(strategy = "projfs", "attempting ProjFS mount");
             match try_projfs(ctx, &mount_path, backends, &p2p_config, &web_options).await {
                 Ok(()) => return Ok(()),
@@ -688,7 +718,7 @@ pub async fn start(
         }
 
         // Attempt 2: WebDAV via the built-in WebClient service.
-        let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
+        let backends = rebuild_backends(&main_config, &ctx.config_dir, shared_http.clone())?;
         tracing::info!(strategy = "webdav", "attempting WebDAV mount");
         try_webdav(
             ctx,
@@ -697,13 +727,14 @@ pub async fn start(
             no_mount,
             &p2p_config,
             &web_options,
+            skip_isolation,
         )
         .await
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
-        let backends = rebuild_backends(&main_config, &ctx.config_dir)?;
+        let backends = rebuild_backends(&main_config, &ctx.config_dir, shared_http.clone())?;
         try_nfs(
             ctx,
             &mount_path,
@@ -1190,6 +1221,7 @@ async fn try_webdav(
     no_mount: bool,
     p2p: &ResolvedP2pConfig,
     web: &WebOptions,
+    skip_isolation: bool,
 ) -> Result<()> {
     let engine_config = EngineConfig {
         db_path: ctx.db_path.clone(),
@@ -1214,7 +1246,7 @@ async fn try_webdav(
     // presenter is confirmed up, so a failed attempt never binds the port.
     let engine_for_web = engine.clone();
 
-    let mut presenter = WebDavPresenter::new(mount_path);
+    let mut presenter = WebDavPresenter::new(mount_path).with_skip_isolation(skip_isolation);
     if let Ok(bind) = std::env::var("CASCADE_WEBDAV_BIND") {
         presenter = presenter.with_bind_addr(bind);
     }
@@ -1772,7 +1804,9 @@ impl cascade_engine::backend::BackendFactory for CliBackendFactory {
     ) -> Result<Arc<dyn cascade_engine::backend::Backend>> {
         let config: toml::Value = toml::from_str(config_toml)
             .with_context(|| format!("parsing config for backend `{name}`"))?;
-        let backend = create_backend(name, backend_type, &config)?;
+        // The management-plane hot-reload path does not carry a shared HTTP
+        // client; pass None so the backend falls back to the per-request path.
+        let backend = create_backend(name, backend_type, &config, None)?;
         Ok(Arc::from(backend))
     }
 }
@@ -1783,14 +1817,23 @@ fn cli_backend_factory() -> Arc<dyn cascade_engine::backend::BackendFactory> {
 }
 
 /// Instantiate a backend by type, using its per-backend TOML config.
+///
+/// `shared_http` is `Some` only in pooled-shared mode
+/// (`CASCADE_GDRIVE_HTTP_DIAG=pooled-shared`). When provided, the gdrive
+/// backend receives the shared pooled client instead of building a fresh
+/// per-request client. All other backend types currently ignore it.
 fn create_backend(
     name: &str,
     backend_type: &str,
     config: &toml::Value,
+    shared_http: Option<Arc<dyn cascade_engine::portable::HttpClient>>,
 ) -> Result<Box<dyn cascade_engine::backend::Backend>> {
     match backend_type {
-        "gdrive" => cascade_backend_gdrive::create_backend(config)
-            .with_context(|| format!("failed to create gdrive backend `{name}`")),
+        "gdrive" => {
+            let store = Arc::new(cascade_backend_gdrive::token_store::PlatformTokenStore);
+            cascade_backend_gdrive::create_backend_with_store_and_http(config, store, shared_http)
+                .with_context(|| format!("failed to create gdrive backend `{name}`"))
+        }
         "s3" => cascade_backend_s3::create_backend(config)
             .with_context(|| format!("failed to create s3 backend `{name}`")),
         "local" => cascade_backend_local::create_backend(config)
@@ -1803,9 +1846,14 @@ fn create_backend(
 
 /// Rebuild backends from the main config — used when falling back between
 /// presenters and the first engine consumed the original backend instances.
+///
+/// `shared_http` is threaded through to `create_backend` and injected into the
+/// gdrive backend when pooled-shared mode is active. The same `Arc` is passed
+/// on every call so the pooled client is never recreated or dropped mid-session.
 fn rebuild_backends(
     main_config: &CascadeConfig,
     config_dir: &Path,
+    shared_http: Option<Arc<dyn cascade_engine::portable::HttpClient>>,
 ) -> Result<Vec<Arc<dyn cascade_engine::backend::Backend>>> {
     let mut backends: Vec<Arc<dyn cascade_engine::backend::Backend>> = Vec::new();
     for (name, value) in &main_config.backends {
@@ -1814,7 +1862,12 @@ fn rebuild_backends(
             .try_into()
             .with_context(|| format!("invalid config for backend `{name}`"))?;
         let per_backend_config = load_backend_config(config_dir, name)?;
-        let backend = create_backend(name, &backend_cfg.backend_type, &per_backend_config)?;
+        let backend = create_backend(
+            name,
+            &backend_cfg.backend_type,
+            &per_backend_config,
+            shared_http.clone(),
+        )?;
         backends.push(Arc::from(backend));
     }
     Ok(backends)
