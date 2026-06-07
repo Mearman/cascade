@@ -1934,7 +1934,21 @@ jobs:
           key: relay-aarch64-apple-darwin
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build
-        run: cargo build --release --target aarch64-apple-darwin -p cascade-relay-server
+        # Retry on transient cargo registry network failures. The last
+        # attempt's exit code propagates, so permanent build errors
+        # still fail the job.
+        shell: bash
+        run: |
+          status=1
+          for i in 1 2 3; do
+            if cargo build --release --target aarch64-apple-darwin -p cascade-relay-server; then
+              status=0
+              break
+            fi
+            echo "::warning::Build attempt $i failed, retrying..."
+            sleep 10
+          done
+          exit $status
       - name: sccache stats
         run: sccache --show-stats
       - name: Save sccache
@@ -2007,7 +2021,21 @@ jobs:
           key: relay-x86_64-apple-darwin
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build
-        run: cargo build --release --target x86_64-apple-darwin -p cascade-relay-server
+        # Retry on transient cargo registry network failures. The last
+        # attempt's exit code propagates, so permanent build errors
+        # still fail the job.
+        shell: bash
+        run: |
+          status=1
+          for i in 1 2 3; do
+            if cargo build --release --target x86_64-apple-darwin -p cascade-relay-server; then
+              status=0
+              break
+            fi
+            echo "::warning::Build attempt $i failed, retrying..."
+            sleep 10
+          done
+          exit $status
       - name: sccache stats
         run: sccache --show-stats
       - name: Save sccache
@@ -2081,7 +2109,21 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libfuse3-dev
       - name: Build
-        run: cargo build --release --target x86_64-unknown-linux-gnu -p cascade-relay-server
+        # Retry on transient cargo registry network failures. The last
+        # attempt's exit code propagates, so permanent build errors
+        # still fail the job.
+        shell: bash
+        run: |
+          status=1
+          for i in 1 2 3; do
+            if cargo build --release --target x86_64-unknown-linux-gnu -p cascade-relay-server; then
+              status=0
+              break
+            fi
+            echo "::warning::Build attempt $i failed, retrying..."
+            sleep 10
+          done
+          exit $status
       - name: sccache stats
         run: sccache --show-stats
       - name: Save sccache
@@ -2158,7 +2200,21 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu libfuse3-dev
       - name: Build
-        run: cargo build --release --target aarch64-unknown-linux-gnu -p cascade-relay-server
+        # Retry on transient cargo registry network failures. The last
+        # attempt's exit code propagates, so permanent build errors
+        # still fail the job.
+        shell: bash
+        run: |
+          status=1
+          for i in 1 2 3; do
+            if cargo build --release --target aarch64-unknown-linux-gnu -p cascade-relay-server; then
+              status=0
+              break
+            fi
+            echo "::warning::Build attempt $i failed, retrying..."
+            sleep 10
+          done
+          exit $status
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
       - name: sccache stats
