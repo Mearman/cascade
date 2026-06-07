@@ -1266,7 +1266,13 @@ jobs:
           fi
           echo "/home/linuxbrew/.linuxbrew/bin" >> $GITHUB_PATH
       - name: Tap Homebrew formula
-        run: brew tap Mearman/cascade
+        # brew tap can trigger SIGPIPE (exit 141) on Linux when its verbose
+        # output overflows the Actions runner's stdout pipe.  The tap itself
+        # succeeds — the failure is in output flushing.  Suppress stdout and
+        # verify the tap directory exists instead of relying on the exit code.
+        run: |
+          brew tap Mearman/cascade >/dev/null || true
+          test -d /home/linuxbrew/.linuxbrew/Homebrew/Library/Taps/mearman/homebrew-cascade
       - name: Install via Homebrew
         run: brew install Mearman/cascade/cascade
       - name: Run cascade --version
@@ -1424,7 +1430,9 @@ jobs:
           fi
           echo "/home/linuxbrew/.linuxbrew/bin" >> "$GITHUB_PATH"
       - name: Tap Homebrew formula
-        run: brew tap Mearman/cascade
+        run: |
+          brew tap Mearman/cascade >/dev/null || true
+          test -d /home/linuxbrew/.linuxbrew/Homebrew/Library/Taps/mearman/homebrew-cascade
       - name: Install via Homebrew
         run: brew install Mearman/cascade/cascade
       - name: Prepare smoke config (local backend)
