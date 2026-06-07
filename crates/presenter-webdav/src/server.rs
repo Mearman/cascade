@@ -501,6 +501,16 @@ async fn handle_head(state: &AppState, path: &str) -> Response {
     resp
 }
 
+/// Generous upper-bound on a backend download. A hung request produces a
+/// visible 504 with the item ID rather than wedging the handler forever.
+/// This value is intentionally very large — a legitimate large-file download
+/// should complete well under 60 s on any reasonable connection; if it hasn't
+/// in that window the call has almost certainly stalled.
+const BACKEND_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(1);
+
+/// Upper-bound on the isolated PUT backend call (upload or update).
+const BACKEND_UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(2);
+
 /// Download `item_id` from its backend into `cache_path`. Returns
 /// `Err(response)` if the download failed so the caller can pass that
 /// response through unmodified.
@@ -529,7 +539,30 @@ async fn populate_cache(
     };
 
     let _ = tokio::fs::create_dir_all(&state.cache_dir).await;
-    match backend.download(&file_entry).await {
+
+    // Log before-download without holding the span guard across `.await` —
+    // `EnteredSpan` is not `Send`.
+    tracing::debug_span!("webdav_backend_download", item_id, backend_id)
+        .in_scope(|| tracing::debug!(item_id, backend_id, "before backend.download"));
+    let download_result =
+        tokio::time::timeout(BACKEND_DOWNLOAD_TIMEOUT, backend.download(&file_entry)).await;
+
+    let download_result = match download_result {
+        Err(_elapsed) => {
+            tracing::error!(
+                item_id,
+                backend_id,
+                timeout_secs = BACKEND_DOWNLOAD_TIMEOUT.as_secs(),
+                "backend.download timed out — suspected pooled-connection hang"
+            );
+            return Err(empty_response(StatusCode::GATEWAY_TIMEOUT));
+        }
+        Ok(r) => r,
+    };
+
+    tracing::debug!(item_id, backend_id, "after backend.download");
+
+    match download_result {
         Ok(data) => {
             tokio::fs::write(cache_path, &data).await.map_err(|e| {
                 tracing::error!(error = %e, "failed to write cache file");
@@ -775,17 +808,42 @@ async fn handle_put(state: &AppState, path: &str, req: Request) -> Response {
     let parent_id_str = parent_id.0.clone();
     let relative_path_owned = relative_path.to_path_buf();
     let upload_bytes = bytes.clone();
+    let upload_path_for_log = normalised.clone();
+    tracing::debug!(
+        path = %normalised,
+        backend_id,
+        existing = existing_file_id.is_some(),
+        "before isolated backend upload"
+    );
     let result = tokio::task::block_in_place(|| {
         run_isolated_blocking(async move {
-            if let Some(file_id) = existing_file_id {
-                backend.update(&file_id, &upload_bytes).await
+            let backend_result = if let Some(file_id) = existing_file_id {
+                tokio::time::timeout(
+                    BACKEND_UPLOAD_TIMEOUT,
+                    backend.update(&file_id, &upload_bytes),
+                )
+                .await
             } else {
-                backend
-                    .upload(&relative_path_owned, &upload_bytes, &parent_id)
-                    .await
+                tokio::time::timeout(
+                    BACKEND_UPLOAD_TIMEOUT,
+                    backend.upload(&relative_path_owned, &upload_bytes, &parent_id),
+                )
+                .await
+            };
+            match backend_result {
+                Ok(r) => r,
+                Err(_elapsed) => {
+                    tracing::error!(
+                        path = %upload_path_for_log,
+                        timeout_secs = BACKEND_UPLOAD_TIMEOUT.as_secs(),
+                        "isolated backend upload timed out — suspected pooled-connection hang"
+                    );
+                    Err(anyhow::anyhow!("backend upload timed out after 120 s"))
+                }
             }
         })
     });
+    tracing::debug!(path = %normalised, "after isolated backend upload");
 
     match result {
         Ok(mut entry) => {
