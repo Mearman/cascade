@@ -57,6 +57,10 @@ pub struct WebDavPresenter {
     backends: Arc<tokio::sync::RwLock<Vec<Arc<dyn Backend>>>>,
     /// State DB for persisting expanded items.
     db: Option<Arc<StateDb>>,
+    /// When `true`, PUT uploads await the backend directly on the main runtime
+    /// instead of routing through `run_isolated_blocking`. `false` by default.
+    /// Set to `true` only in pooled-shared mode. See `AppState::skip_isolation`.
+    skip_isolation: bool,
 }
 
 impl std::fmt::Debug for WebDavPresenter {
@@ -79,7 +83,21 @@ impl WebDavPresenter {
             server: Arc::new(tokio::sync::Mutex::new(None)),
             backends: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             db: None,
+            skip_isolation: false,
         }
+    }
+
+    /// Enable or disable the upload isolation workaround.
+    ///
+    /// When `skip = true`, PUT uploads are awaited directly on the main runtime
+    /// instead of routing through `run_isolated_blocking`. This must only be set
+    /// to `true` when the daemon is running in pooled-shared mode
+    /// (`CASCADE_GDRIVE_HTTP_DIAG=pooled-shared`). The default is `false` and
+    /// the default behaviour is byte-for-byte unchanged.
+    #[must_use]
+    pub const fn with_skip_isolation(mut self, skip: bool) -> Self {
+        self.skip_isolation = skip;
+        self
     }
 
     /// Override the bind address (e.g. `0.0.0.0:8080` for containers).
@@ -198,6 +216,7 @@ impl VfsPresenter for WebDavPresenter {
             self.cache_dir.clone(),
             self.backends.clone(),
             self.db.clone(),
+            self.skip_isolation,
         )
         .await?;
         let port = server.port();
