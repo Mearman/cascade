@@ -5,16 +5,24 @@ edition.workspace = true
 license.workspace = true
 description = "Browser File System Access API backend for the Cascade WASM core"
 
-# All dependencies are wasm32-only: on native targets the crate compiles as an
-# empty lib with no code and no deps, so `cargo check --workspace` succeeds.
+# Portable dependencies: the data types (FsAccessError, DirectoryChanges) and
+# the struct accessors compile and run on the host too (gated on
+# `cfg(any(target_arch = "wasm32", test))`), so their dependencies are available
+# on every target. This lets the accessor contract be unit-tested natively.
+[dependencies]
+thiserror.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+
+# JavaScript-interop dependencies are wasm32-only: the `wasm-bindgen` exports,
+# the async bridge methods, and the js-sys decode helpers exist only on the
+# browser target.
 # Verify the WASM build with:
 #   cargo check -p cascade-backend-fsaccess --target wasm32-unknown-unknown
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
 js-sys.workspace = true
-thiserror.workspace = true
-serde = { workspace = true }
 
 [lints]
 workspace = true

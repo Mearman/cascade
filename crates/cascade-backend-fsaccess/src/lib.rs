@@ -11,7 +11,7 @@
 // `Rc`-backed and so fundamentally `!Send`. The browser's WASM context is
 // single-threaded, so a `Send` future is neither achievable nor meaningful;
 // `future_not_send` cannot apply on this target.
-#![allow(clippy::future_not_send)]
+#![cfg_attr(target_arch = "wasm32", allow(clippy::future_not_send))]
 //! Browser File System Access backend for Cascade.
 //!
 //! This crate is the Rust side of the File System Access API bridge. It compiles
@@ -21,10 +21,13 @@
 //! and writes, change detection); this crate marshals data across the boundary
 //! and presents a small, deterministic Rust surface.
 //!
-//! On native targets the crate builds as an empty lib — every module and public
-//! item is gated on `#[cfg(target_arch = "wasm32")]`, so an ordinary
-//! `cargo check --workspace` succeeds without pulling in any wasm-only
-//! dependency. Verify the WASM build with:
+//! The data types (`FsAccessError`, `DirectoryChanges`) and the struct accessors
+//! (`id`, `display_name`) are portable and host-testable under
+//! `cfg(any(target_arch = "wasm32", test))`. The async bridge methods
+//! (`changes`, `download`, `upload`) and the `js` module are wasm32-only
+//! because they depend on `js-sys` and `wasm-bindgen-futures`.
+//!
+//! Verify the WASM build with:
 //!
 //! ```text
 //! cargo check -p cascade-backend-fsaccess --target wasm32-unknown-unknown
@@ -41,10 +44,12 @@
 //! (`id`, `display_name`, `changes`, `download`, `upload`) shaped after the
 //! backend contract rather than implementing the native trait directly.
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", test))]
 mod backend;
 #[cfg(target_arch = "wasm32")]
 mod js;
 
 #[cfg(target_arch = "wasm32")]
-pub use backend::{DirectoryChanges, FsAccessBackend, FsAccessError, create_backend};
+pub use backend::create_backend;
+#[cfg(any(target_arch = "wasm32", test))]
+pub use backend::{DirectoryChanges, FsAccessBackend, FsAccessError};

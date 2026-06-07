@@ -7,11 +7,34 @@
 
 use std::cell::RefCell;
 
-use js_sys::{Array, Map, Reflect, Uint8Array};
 use serde::{Deserialize, Serialize};
-use wasm_bindgen::{JsCast, JsValue};
 
+/// An opaque handle minted on the JavaScript side — a granted
+/// `FileSystemDirectoryHandle` or a JS `Map` snapshot. On the browser target
+/// it is a [`wasm_bindgen::JsValue`]; off-wasm (host unit tests) there is no
+/// JS runtime, so it is a zero-sized placeholder ([`NativeOpaqueHandle`]).
+/// Portable code never inspects either handle, so the placeholder is sufficient
+/// to construct and access the struct natively.
+#[cfg(target_arch = "wasm32")]
+pub type OpaqueHandle = wasm_bindgen::JsValue;
+/// Host-side placeholder for an opaque JS handle. See [`OpaqueHandle`].
+#[cfg(not(target_arch = "wasm32"))]
+pub type OpaqueHandle = NativeOpaqueHandle;
+
+/// Host-side placeholder for an opaque JS handle.
+///
+/// `Default` makes the snapshot's empty initial value constructible on the
+/// host without reaching into `js-sys`.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Default)]
+pub struct NativeOpaqueHandle;
+
+#[cfg(target_arch = "wasm32")]
 use crate::js;
+#[cfg(target_arch = "wasm32")]
+use js_sys::{Array, Map, Reflect, Uint8Array};
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::{JsCast, JsValue};
 
 /// A failure crossing the File System Access bridge.
 #[derive(Debug, thiserror::Error)]
@@ -50,29 +73,18 @@ pub struct DirectoryChanges {
 pub struct FsAccessBackend {
     id: String,
     display_name: String,
+    // `dir` and `snapshot` are read by the wasm32-gated impl block, so they
+    // appear dead on the native host target; the allow is required cross-target.
+    #[allow(dead_code)]
     /// The granted `FileSystemDirectoryHandle`, opaque to Rust.
-    dir: JsValue,
+    dir: OpaqueHandle,
+    #[allow(dead_code)]
     /// The last snapshot returned by the JS change detector, passed back on the
     /// next [`Self::changes`] call. Starts as an empty `Map`.
-    snapshot: RefCell<JsValue>,
+    snapshot: RefCell<OpaqueHandle>,
 }
 
-/// Prompt the user to grant a directory and build a backend over it.
-///
-/// Resolves once the user has picked a directory in the browser's native
-/// picker; rejects if the picker is dismissed or the API is unavailable.
-pub async fn create_backend() -> Result<FsAccessBackend, FsAccessError> {
-    let dir = js::request_directory()
-        .await
-        .map_err(|e| FsAccessError::Js(describe(&e)))?;
-    Ok(FsAccessBackend {
-        id: "fsaccess".to_string(),
-        display_name: "Local directory (browser)".to_string(),
-        dir,
-        snapshot: RefCell::new(Map::new().into()),
-    })
-}
-
+/// Portable accessors — these compile and are testable on the host.
 impl FsAccessBackend {
     /// The stable backend identifier.
     #[must_use]
@@ -85,7 +97,12 @@ impl FsAccessBackend {
     pub fn display_name(&self) -> &str {
         &self.display_name
     }
+}
 
+/// Async bridge methods — wasm32 only because they await `JsFuture` and use
+/// `js-sys` decode helpers.
+#[cfg(target_arch = "wasm32")]
+impl FsAccessBackend {
     /// Enumerate the directory and report file-name changes since the previous
     /// call, advancing the stored snapshot.
     pub async fn changes(&self) -> Result<DirectoryChanges, FsAccessError> {
@@ -138,14 +155,33 @@ impl FsAccessBackend {
     }
 }
 
+/// Prompt the user to grant a directory and build a backend over it.
+///
+/// Resolves once the user has picked a directory in the browser's native
+/// picker; rejects if the picker is dismissed or the API is unavailable.
+#[cfg(target_arch = "wasm32")]
+pub async fn create_backend() -> Result<FsAccessBackend, FsAccessError> {
+    let dir = js::request_directory()
+        .await
+        .map_err(|e| FsAccessError::Js(describe(&e)))?;
+    Ok(FsAccessBackend {
+        id: "fsaccess".to_string(),
+        display_name: "Local directory (browser)".to_string(),
+        dir,
+        snapshot: RefCell::new(JsValue::from(Map::new())),
+    })
+}
+
 /// Read a named property from a JS object, mapping a missing or non-object
 /// target to a decode error.
+#[cfg(target_arch = "wasm32")]
 fn field(value: &JsValue, key: &str) -> Result<JsValue, FsAccessError> {
     Reflect::get(value, &JsValue::from_str(key))
         .map_err(|e| FsAccessError::Decode(format!("missing property '{key}': {}", describe(&e))))
 }
 
 /// Convert a JS array of strings into a `Vec<String>`.
+#[cfg(target_arch = "wasm32")]
 fn string_array(value: &JsValue) -> Result<Vec<String>, FsAccessError> {
     let array: Array = value
         .clone()
@@ -162,6 +198,101 @@ fn string_array(value: &JsValue) -> Result<Vec<String>, FsAccessError> {
 }
 
 /// Best-effort human-readable rendering of a JS error value.
+#[cfg(target_arch = "wasm32")]
 fn describe(value: &JsValue) -> String {
     value.as_string().unwrap_or_else(|| format!("{value:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── FsAccessError Display ────────────────────────────────────────────────
+
+    #[test]
+    fn error_js_display() {
+        let err = FsAccessError::Js("boom".to_string());
+        assert_eq!(err.to_string(), "File System Access call failed: boom");
+    }
+
+    #[test]
+    fn error_decode_display() {
+        let err = FsAccessError::Decode("bad".to_string());
+        assert_eq!(
+            err.to_string(),
+            "could not decode a value from the File System Access bridge: bad"
+        );
+    }
+
+    #[test]
+    fn error_not_found_display() {
+        let err = FsAccessError::NotFound("a.txt".to_string());
+        assert_eq!(err.to_string(), "file not found in directory: a.txt");
+    }
+
+    // ── DirectoryChanges serde ───────────────────────────────────────────────
+
+    #[test]
+    fn directory_changes_default_empty() {
+        let changes = DirectoryChanges::default();
+        assert!(changes.created.is_empty());
+        assert!(changes.modified.is_empty());
+        assert!(changes.deleted.is_empty());
+    }
+
+    #[test]
+    fn directory_changes_serde_round_trip() {
+        let original = DirectoryChanges {
+            created: vec!["new.txt".to_string()],
+            modified: vec!["changed.rs".to_string()],
+            deleted: vec!["gone.md".to_string()],
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: DirectoryChanges = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.created, original.created);
+        assert_eq!(restored.modified, original.modified);
+        assert_eq!(restored.deleted, original.deleted);
+    }
+
+    #[test]
+    fn directory_changes_json_field_names() {
+        let changes = DirectoryChanges {
+            created: vec!["a".to_string()],
+            modified: vec!["b".to_string()],
+            deleted: vec!["c".to_string()],
+        };
+        let value: serde_json::Value = serde_json::to_value(&changes).unwrap();
+        assert!(value.get("created").is_some(), "key 'created' missing");
+        assert!(value.get("modified").is_some(), "key 'modified' missing");
+        assert!(value.get("deleted").is_some(), "key 'deleted' missing");
+        assert_eq!(value["created"][0], "a");
+        assert_eq!(value["modified"][0], "b");
+        assert_eq!(value["deleted"][0], "c");
+    }
+
+    // ── FsAccessBackend accessors ────────────────────────────────────────────
+
+    #[test]
+    fn backend_accessors() {
+        let backend = FsAccessBackend {
+            id: "fsaccess".to_string(),
+            display_name: "Local directory (browser)".to_string(),
+            dir: NativeOpaqueHandle,
+            snapshot: RefCell::new(NativeOpaqueHandle),
+        };
+        assert_eq!(backend.id(), "fsaccess");
+        assert_eq!(backend.display_name(), "Local directory (browser)");
+    }
+
+    #[test]
+    fn backend_debug_does_not_panic() {
+        let backend = FsAccessBackend {
+            id: "fsaccess".to_string(),
+            display_name: "Local directory (browser)".to_string(),
+            dir: NativeOpaqueHandle,
+            snapshot: RefCell::new(NativeOpaqueHandle),
+        };
+        let rendered = format!("{backend:?}");
+        assert!(!rendered.is_empty());
+    }
 }
