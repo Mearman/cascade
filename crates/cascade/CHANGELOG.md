@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.108](https://github.com/Mearman/cascade/compare/cascade-v0.1.107...cascade-v0.1.108) - 2026-06-07
+
+### Other
+
+- *(p2p)* split sync.rs relay/session methods to a submodule; add source-length cap
+- extract large test modules to sibling files via #[path]
+
 ## [0.1.107](https://github.com/Mearman/cascade/compare/cascade-v0.1.106...cascade-v0.1.107) - 2026-06-07
 
 ### Other
