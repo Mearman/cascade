@@ -98,7 +98,7 @@ impl ResolvedConfigBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{CacheConfig, IgnoreRule};
+    use crate::types::{CacheConfig, IgnoreRule, P2PConfig, PinRule};
 
     #[test]
     fn ancestors_between_collects_root_to_target() {
@@ -167,5 +167,81 @@ mod tests {
         let resolved = resolve_from_configs(configs);
         // Second config wins
         assert_eq!(resolved.cache.unwrap().max_size, cache_5gb.max_size);
+    }
+
+    #[test]
+    fn resolve_accumulates_pins_and_unpins() {
+        let pin = |path: &str| PinRule {
+            path: path.to_string(),
+            conditions: vec![],
+        };
+        let configs = vec![
+            {
+                let mut c = CascadeConfig::empty();
+                c.pin.push(pin("Documents/Accounts"));
+                c
+            },
+            {
+                let mut c = CascadeConfig::empty();
+                c.pin.push(pin("Work/Active"));
+                c.unpin.push(pin("Work/Active/archive"));
+                c
+            },
+        ];
+        let resolved = resolve_from_configs(configs);
+        assert_eq!(resolved.pins.len(), 2, "pins from both layers accumulate");
+        assert_eq!(resolved.unpins.len(), 1);
+    }
+
+    #[test]
+    fn resolve_nearest_wins_for_p2p() {
+        let parent: P2PConfig = toml::from_str("enabled = false").unwrap();
+        let child: P2PConfig = toml::from_str("enabled = true").unwrap();
+        let configs = vec![
+            {
+                let mut c = CascadeConfig::empty();
+                c.p2p = Some(parent);
+                c
+            },
+            {
+                let mut c = CascadeConfig::empty();
+                c.p2p = Some(child);
+                c
+            },
+        ];
+        let resolved = resolve_from_configs(configs);
+        assert_eq!(
+            resolved.p2p.and_then(|p| p.enabled),
+            Some(true),
+            "the child (nearest) p2p config wins"
+        );
+    }
+
+    #[test]
+    fn ancestors_between_target_outside_root_is_empty() {
+        // A target that is not under the mount root yields no directories, so
+        // resolve() applies no layers rather than walking arbitrary parents.
+        let dirs = ancestors_between(Path::new("/mount"), Path::new("/elsewhere/x"));
+        assert!(dirs.is_empty());
+    }
+
+    #[test]
+    fn is_ignored_applies_last_match_and_negation() {
+        let rule = |pattern: &str, negated: bool| IgnoreRule {
+            pattern: pattern.to_string(),
+            negated,
+            dir_only: false,
+            conditions: vec![],
+        };
+        let mut c = CascadeConfig::empty();
+        // Ignore everything, then re-include *.rs — last match wins.
+        c.ignore.push(rule("*", false));
+        c.ignore.push(rule("*.rs", true));
+        let resolved = resolve_from_configs(vec![c]);
+        assert!(resolved.is_ignored("notes.txt", false), "covered by '*'");
+        assert!(
+            !resolved.is_ignored("main.rs", false),
+            "re-included by negated '*.rs'"
+        );
     }
 }

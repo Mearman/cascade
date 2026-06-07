@@ -22,25 +22,32 @@ impl std::fmt::Debug for LifecycleEvaluator {
 }
 
 impl LifecycleEvaluator {
-    /// Build an evaluator from a pre-loaded policy set.
+    /// Build an evaluator from a policy set.
+    ///
+    /// The policies are sorted by priority (highest first) here, so
+    /// [`should_evict`](Self::should_evict)'s first-match-wins evaluation honours
+    /// the documented priority order regardless of the order the caller (or the
+    /// storage query) supplies. The sort is stable, so equal-priority policies
+    /// keep their input order.
     #[must_use]
-    pub const fn from_policies(policies: Vec<LifecyclePolicyRecord>) -> Self {
+    pub fn from_policies(mut policies: Vec<LifecyclePolicyRecord>) -> Self {
+        policies.sort_by_key(|p| std::cmp::Reverse(p.priority));
         Self { policies }
     }
 
     /// Load all lifecycle policies from the native state database.
     #[cfg(feature = "native")]
     pub fn load_native(db: &crate::db::StateDb) -> anyhow::Result<Self> {
-        let policies = db.list_lifecycle_policies()?;
-        Ok(Self { policies })
+        Ok(Self::from_policies(db.list_lifecycle_policies()?))
     }
 
     /// Load all lifecycle policies from the portable state storage.
     pub async fn load(
         storage: &dyn crate::portable::StateStorage,
     ) -> Result<Self, crate::portable::StorageError> {
-        let policies = storage.list_lifecycle_policies().await?;
-        Ok(Self { policies })
+        Ok(Self::from_policies(
+            storage.list_lifecycle_policies().await?,
+        ))
     }
 
     /// Evaluate whether a file should be evicted based on lifecycle policies.
@@ -232,5 +239,84 @@ mod tests {
                 reason: EvictionReason::MaxSize { .. }
             }
         ));
+    }
+
+    /// `from_policies` must sort by priority itself. Two policies both evict the
+    /// same file but for different reasons; supplied in *ascending* priority
+    /// order, the higher-priority policy's reason must still win — proving the
+    /// evaluator sorts and callers need not pre-sort.
+    #[test]
+    fn from_policies_sorts_unsorted_input_by_priority() {
+        let evaluator = LifecycleEvaluator::from_policies(make_policies(&[
+            // prio 0 (supplied first): would evict by size.
+            ("**", None, Some(0), 0),
+            // prio 10 (supplied last): would evict by age.
+            ("Temp/**", Some(3600), None, 10),
+        ]));
+        let file = make_file("cache.tmp", Some(100));
+        let decision = evaluator.should_evict(&file, Path::new("Temp/cache.tmp"));
+        assert!(
+            matches!(
+                decision,
+                EvictionDecision::Evict {
+                    reason: EvictionReason::MaxAge { .. }
+                }
+            ),
+            "highest-priority policy (prio 10, MaxAge) must win even when supplied last, got {decision:?}"
+        );
+    }
+
+    #[test]
+    fn max_age_policy_evicts_with_maxage_reason() {
+        let evaluator =
+            LifecycleEvaluator::from_policies(make_policies(&[("Cache/**", Some(3600), None, 0)]));
+        let file = make_file("x.bin", Some(10));
+        let decision = evaluator.should_evict(&file, Path::new("Cache/x.bin"));
+        assert!(matches!(
+            decision,
+            EvictionDecision::Evict {
+                reason: EvictionReason::MaxAge {
+                    max_age_secs: 3600,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn glob_exact_and_directory_prefix_match() {
+        // Exact path match.
+        assert!(path_matches_policy("a/b.txt", "a/b.txt"));
+        assert!(!path_matches_policy("a/b.txt", "a/c.txt"));
+        // A bare directory pattern matches its descendants but not a sibling
+        // sharing the name prefix.
+        assert!(path_matches_policy("Documents", "Documents/report.pdf"));
+        assert!(!path_matches_policy("Doc", "Documents/report.pdf"));
+        assert!(path_matches_policy("Documents", "Documents"));
+    }
+
+    #[test]
+    fn glob_single_star_prefix_and_suffix() {
+        // Suffix wildcard.
+        assert!(simple_star_match("*.tmp", "Cache/a.tmp"));
+        assert!(!simple_star_match("*.tmp", "Cache/a.txt"));
+        // Prefix wildcard.
+        assert!(simple_star_match("Cache/*", "Cache/a.tmp"));
+        assert!(!simple_star_match("Logs/*", "Cache/a.tmp"));
+        // No wildcard via simple_star_match degrades to exact compare.
+        assert!(simple_star_match("exact", "exact"));
+        assert!(!simple_star_match("exact", "other"));
+    }
+
+    #[test]
+    fn glob_double_star_prefix_and_suffix() {
+        // `prefix/**` matches anything under the prefix.
+        assert!(path_matches_policy("Documents/**", "Documents/a/b.pdf"));
+        assert!(!path_matches_policy("Documents/**", "Other/a.pdf"));
+        // `**/suffix` matches by suffix only.
+        assert!(path_matches_policy("**/.cache", "a/b/.cache"));
+        assert!(!path_matches_policy("**/.cache", "a/b/file"));
+        // A bare `**` matches everything.
+        assert!(path_matches_policy("**", "anything/at/all"));
     }
 }
