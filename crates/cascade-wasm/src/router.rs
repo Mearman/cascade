@@ -70,9 +70,12 @@ pub fn route(request: &WorkerRequest, engine: &EngineState) -> WorkerResponse {
         ("GET", ["v1", "folders", folder_id, "children"]) => {
             handle_list_children(&request.id, engine, folder_id, query_part)
         }
-        ("DELETE", ["v1", "files", backend_id, "entries", ..]) => {
-            handle_delete_file_entry(&request.id, engine, backend_id, &segments[4..])
-        }
+        ("DELETE", ["v1", "files", backend_id, "entries", ..]) => handle_delete_file_entry(
+            &request.id,
+            engine,
+            backend_id,
+            segments.get(4..).unwrap_or(&[]),
+        ),
 
         // ── Pin rules ──
         ("GET", ["v1", "pins"]) => handle_list_pins(&request.id, engine),
@@ -116,12 +119,10 @@ fn handle_session(id: &str, engine: &EngineState) -> WorkerResponse {
     });
 
     let mut body = session_body;
-    body.as_object_mut()
-        .expect("session body is an object")
-        .insert("cache".to_owned(), cache_body);
-    body.as_object_mut()
-        .expect("session body is an object")
-        .insert("backendCount".to_owned(), json!(backends.len()));
+    if let Some(map) = body.as_object_mut() {
+        map.insert("cache".to_owned(), cache_body);
+        map.insert("backendCount".to_owned(), json!(backends.len()));
+    }
 
     if established || !backends.is_empty() {
         ok(id, body)
@@ -235,12 +236,12 @@ fn handle_list_children(
     let path_filter = query.and_then(|q| {
         q.split('&')
             .find(|p| p.starts_with("path="))
-            .map(|p| &p[5..])
+            .and_then(|p| p.get(5..))
     });
     let limit = query.and_then(|q| {
         q.split('&')
             .find(|p| p.starts_with("limit="))
-            .and_then(|p| p[7..].parse::<usize>().ok())
+            .and_then(|p| p.get(6..).and_then(|s| s.parse::<usize>().ok()))
     });
 
     let mut filtered: Vec<&FileEntry> = children

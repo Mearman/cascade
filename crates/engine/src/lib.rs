@@ -10,7 +10,15 @@
 //! Cascade engine — core types, backend trait, VFS tree, state database.
 
 pub mod backend;
-#[cfg(any(feature = "native", feature = "portable"))]
+// The cache manager and sync runner are daemon-level concerns: they schedule
+// background work, flush dirty files, and run eviction sweeps. A wasm32 build
+// uses the storage `_sync` helpers directly and has no need for these modules.
+// Compile them only for native, or for a non-wasm32 portable build (e.g. a
+// test harness running on a native host with the portable feature enabled).
+#[cfg(any(
+    feature = "native",
+    all(feature = "portable", not(target_arch = "wasm32"))
+))]
 pub mod cache;
 #[cfg(feature = "native")]
 pub mod changefeed;
@@ -25,7 +33,10 @@ pub mod p2p_bridge;
 pub mod portable;
 pub mod presenter;
 pub mod protocol;
-#[cfg(any(feature = "native", feature = "portable"))]
+#[cfg(any(
+    feature = "native",
+    all(feature = "portable", not(target_arch = "wasm32"))
+))]
 pub mod sync;
 pub mod types;
 #[cfg(feature = "native")]

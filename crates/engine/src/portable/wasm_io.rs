@@ -80,6 +80,10 @@ impl HttpClient for WasmHttpClient {
 /// - A `fetch()` failure (network) becomes [`HttpError::Connection`].
 /// - An abort/timeout surfaces as [`HttpError::Timeout`].
 /// - Everything else becomes [`HttpError::Request`].
+// `JsFuture` is `!Send` by design: it wraps an `Rc<RefCell<_>>` and wasm32 is
+// genuinely single-threaded. The whole module is `cfg(target_arch = "wasm32")`,
+// so the `!Send` future is correct and the lint is not applicable here.
+#[allow(clippy::future_not_send)]
 async fn send(
     method: &str,
     url: &str,
@@ -173,7 +177,7 @@ async fn send(
     })
 }
 
-/// Map a JS error from a rejected fetch/array_buffer promise into the portable
+/// Map a JS error from a rejected `fetch`/`array_buffer` promise into the portable
 /// [`HttpError`] vocabulary. Aborts and timeouts surface as [`HttpError::Timeout`];
 /// network failures as [`HttpError::Connection`]; everything else as
 /// [`HttpError::Request`].
@@ -183,19 +187,16 @@ fn map_fetch_err(err: &JsValue) -> HttpError {
     // generic network errors.
     if let Some(obj) = err.dyn_ref::<js_sys::Object>() {
         let name_key = JsValue::from_str("name");
-        if let Some(name) = js_sys::Reflect::get(obj, &name_key).ok() {
-            if let Some(name_str) = name.as_string() {
-                if name_str == "AbortError" {
-                    return HttpError::Timeout;
-                }
-                if name_str == "TimeoutError" {
-                    return HttpError::Timeout;
-                }
-                if name_str == "TypeError" {
-                    // fetch() rejects with TypeError on network-level failures
-                    // (DNS, refused connection, CORS block).
-                    return HttpError::Connection(msg);
-                }
+        if let Ok(name) = js_sys::Reflect::get(obj, &name_key)
+            && let Some(name_str) = name.as_string()
+        {
+            if name_str == "AbortError" || name_str == "TimeoutError" {
+                return HttpError::Timeout;
+            }
+            if name_str == "TypeError" {
+                // fetch() rejects with TypeError on network-level failures
+                // (DNS, refused connection, CORS block).
+                return HttpError::Connection(msg);
             }
         }
     }

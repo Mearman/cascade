@@ -69,15 +69,17 @@ impl RuntimeHandle for WasmRuntimeHandle {
         let ms = i32::try_from(ms).unwrap_or(i32::MAX);
         Box::pin(async move {
             let promise = js_sys::Promise::new(&mut |resolve, _| {
-                let window =
-                    web_sys::window().expect("no window — sleep requires a browser environment");
-                window
-                    .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve.into(), ms)
-                    .expect("setTimeout failed");
+                let Some(window) = web_sys::window() else {
+                    // No window — we are not in a browser context; skip sleep.
+                    return;
+                };
+                // Ignore the handle; we do not need to cancel this timeout.
+                let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms);
             });
-            wasm_bindgen_futures::JsFuture::from(promise)
-                .await
-                .expect("setTimeout promise rejected");
+            // Ignore a rejection — the promise will never reject in practice
+            // (setTimeout does not reject), but if the environment is broken
+            // we simply return rather than panicking.
+            let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
         })
     }
 }

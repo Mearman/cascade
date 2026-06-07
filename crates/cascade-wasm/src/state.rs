@@ -94,13 +94,21 @@ where
     F: FnOnce(&EngineState) -> R,
 {
     ENGINE_STATE.with(|state| {
+        // Initialise on first call.
         if state.borrow().is_none() {
             *state.borrow_mut() = Some(EngineState::new());
         }
-        f(state
-            .borrow()
-            .as_ref()
-            .expect("engine state just initialised"))
+        // `Ref::filter_map` lets us borrow into the `Some` variant without a
+        // panic, holding the guard alive for the duration of `f`.
+        let opt_ref = std::cell::Ref::filter_map(state.borrow(), Option::as_ref);
+        if let Ok(engine_ref) = opt_ref {
+            f(&engine_ref)
+        } else {
+            // Unreachable: the init branch above always produces `Some`.
+            // If somehow reached, construct a local state rather than panicking.
+            let fallback = EngineState::new();
+            f(&fallback)
+        }
     })
 }
 
