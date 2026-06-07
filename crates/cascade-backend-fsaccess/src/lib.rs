@@ -37,7 +37,7 @@
 //! JS stub module):
 //!
 //! ```text
-//! wasm-pack test --node crates/cascade-backend-fsaccess -- --features js-test-stub
+//! wasm-pack test --node crates/cascade-backend-fsaccess --features js-test-stub
 //! ```
 //!
 //! ## Why not `cascade_engine::backend::Backend`

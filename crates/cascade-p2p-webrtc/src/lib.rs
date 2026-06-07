@@ -33,7 +33,7 @@
 //! against a JS stub module):
 //!
 //! ```text
-//! wasm-pack test --node crates/cascade-p2p-webrtc -- --features js-test-stub
+//! wasm-pack test --node crates/cascade-p2p-webrtc --features js-test-stub
 //! ```
 //!
 //! ## Why not `cascade_p2p::transport::Transport`
