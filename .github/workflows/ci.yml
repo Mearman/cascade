@@ -1225,10 +1225,10 @@ jobs:
           path: ~/Library/Caches/Homebrew/downloads
           key: brew-cache-macos-${{ needs.release.outputs.version }}
           restore-keys: brew-cache-macos-
-      - name: Install via Homebrew tap
-        run: |
-          brew tap Mearman/cascade
-          brew install Mearman/cascade/cascade
+      - name: Tap Homebrew formula
+        run: brew tap Mearman/cascade
+      - name: Install via Homebrew
+        run: brew install Mearman/cascade/cascade
       - name: Run cascade --version
         run: |
           cascade --version
@@ -1265,10 +1265,10 @@ jobs:
             /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" </dev/null
           fi
           echo "/home/linuxbrew/.linuxbrew/bin" >> $GITHUB_PATH
-      - name: Install via Homebrew tap
-        run: |
-          brew tap Mearman/cascade
-          brew install Mearman/cascade/cascade
+      - name: Tap Homebrew formula
+        run: brew tap Mearman/cascade
+      - name: Install via Homebrew
+        run: brew install Mearman/cascade/cascade
       - name: Run cascade --version
         run: |
           cascade --version
@@ -1339,10 +1339,10 @@ jobs:
           path: ~/Library/Caches/Homebrew/downloads
           key: brew-cache-macos-${{ needs.release.outputs.version }}
           restore-keys: brew-cache-macos-
-      - name: Install via Homebrew tap
-        run: |
-          brew tap Mearman/cascade
-          brew install Mearman/cascade/cascade
+      - name: Tap Homebrew formula
+        run: brew tap Mearman/cascade
+      - name: Install via Homebrew
+        run: brew install Mearman/cascade/cascade
       - name: Prepare smoke config (local backend)
         run: |
           set -eux
@@ -1423,10 +1423,10 @@ jobs:
             /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" </dev/null
           fi
           echo "/home/linuxbrew/.linuxbrew/bin" >> "$GITHUB_PATH"
-      - name: Install via Homebrew tap
-        run: |
-          brew tap Mearman/cascade
-          brew install Mearman/cascade/cascade
+      - name: Tap Homebrew formula
+        run: brew tap Mearman/cascade
+      - name: Install via Homebrew
+        run: brew install Mearman/cascade/cascade
       - name: Prepare smoke config (local backend)
         run: |
           set -eux
