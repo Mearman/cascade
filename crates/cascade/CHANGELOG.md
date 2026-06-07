@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.105](https://github.com/Mearman/cascade/compare/cascade-v0.1.104...cascade-v0.1.105) - 2026-06-07
+
+### Added
+
+- *(gdrive)* make the shared pooled HTTP client the default; workaround is now an escape hatch
+
 ## [0.1.104](https://github.com/Mearman/cascade/compare/cascade-v0.1.103...cascade-v0.1.104) - 2026-06-07
 
 ### Other
