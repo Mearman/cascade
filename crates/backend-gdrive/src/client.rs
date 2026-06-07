@@ -139,7 +139,16 @@ impl RateLimiter {
 /// their clients here so the workaround configuration lives in exactly one
 /// place. See the `DriveClient::http` rationale below for the full background.
 /// The builder error is propagated rather than swallowed — a fallback to the
-/// default client would silently re-enable pooling and HTTP/2.
+/// default client would silently re-enable connection pooling.
+///
+/// `pool_max_idle_per_host(0)` is the load-bearing mitigation: it stops a stale
+/// idle connection ever being reused. `http1_only()` is currently redundant —
+/// the workspace `reqwest` is built with `default-features = false` and no
+/// `http2` feature (since the first commit), so the client cannot negotiate
+/// HTTP/2 regardless. It is kept as a guard should that feature ever be enabled.
+/// The deadlock itself is HTTP/1.1; a faithful local reproduction never
+/// triggered it (see `crates/presenter-webdav/tests/tls_topology_repro.rs`), so
+/// the trigger lives at the real Drive endpoint and the workaround stays.
 #[cfg(not(feature = "portable"))]
 pub fn build_unpooled_http1_client(timeout: Duration) -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
