@@ -242,6 +242,16 @@ impl WasmStateStorage {
         inner.files.insert(entry.id.0.clone(), entry.clone());
     }
 
+    /// Remove a file entry by its scoped id (`"{backend_id}:{native_id}"`),
+    /// returning whether one was removed.
+    pub fn remove_file_sync(&self, scoped_id: &str) -> bool {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.files.remove(scoped_id).is_some()
+    }
+
     /// List every file synchronously.
     pub fn list_all_files_sync(&self) -> Vec<FileEntry> {
         let inner = self

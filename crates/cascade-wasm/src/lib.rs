@@ -216,6 +216,29 @@ pub fn upsert_files(backend_id: &str, files_json: &str) -> Result<(), JsValue> {
     Ok(())
 }
 
+/// Remove file entries from engine storage by their native (unscoped) ids.
+///
+/// `backend_id` identifies the backend that owns the files (used to build the
+/// scoped key `{backend_id}:{native_id}` that `upsert_files` creates).
+/// `file_ids_json` is a JSON array of native id strings.
+///
+/// # Errors
+///
+/// Returns a JS error if `file_ids_json` cannot be deserialised.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn delete_files(backend_id: &str, file_ids_json: &str) -> Result<(), JsValue> {
+    let ids: Vec<String> = serde_json::from_str(file_ids_json)
+        .map_err(|error| WasmError::InvalidToken(error.to_string()))?;
+    state::with_engine(|engine| {
+        for id in &ids {
+            let scoped = format!("{backend_id}:{id}");
+            engine.storage.remove_file_sync(&scoped);
+        }
+    });
+    Ok(())
+}
+
 /// Record (or replace) a peer connection, keyed by the relay session id that
 /// established it. `connection` is the opaque transport object owned by
 /// `webrtc.ts`.

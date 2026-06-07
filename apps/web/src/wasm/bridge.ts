@@ -10,6 +10,7 @@ export interface ApiClient {
   storeAuthToken(provider: string, token: { scope: string; expiry: number }): Promise<void>;
   clearAuthToken(provider: string): Promise<boolean>;
   upsertFiles(backendId: string, files: FileInput[]): Promise<void>;
+  deleteFiles(backendId: string, fileIds: string[]): Promise<void>;
 }
 
 /** A file entry to upsert into engine storage. */
@@ -153,6 +154,10 @@ class WasmApiClient implements ApiClient {
     }));
     return this.sendMutator('upsert_files', [backendId, JSON.stringify(cleaned)]).then(() => undefined);
   }
+
+  deleteFiles(backendId: string, fileIds: string[]): Promise<void> {
+    return this.sendMutator('delete_files', [backendId, JSON.stringify(fileIds)]).then(() => undefined);
+  }
 }
 
 class HttpApiClient implements ApiClient {
@@ -222,6 +227,10 @@ class HttpApiClient implements ApiClient {
     // Connected mode does not use the mutator channel — file state comes from
     // the daemon's own backend polling.
     throw new Error('upsertFiles is not available in Connected mode');
+  }
+
+  deleteFiles(_backendId: string, _fileIds: string[]): Promise<void> {
+    throw new Error('deleteFiles is not available in Connected mode');
   }
 }
 

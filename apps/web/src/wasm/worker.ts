@@ -30,6 +30,7 @@ interface WasmGlue {
   store_auth_token(provider: string, token_json: string): void;
   clear_auth_token(provider: string): boolean;
   upsert_files(backend_id: string, files_json: string): void;
+  delete_files(backend_id: string, file_ids_json: string): void;
   set_peer_connection(session_id: string, connection: unknown): void;
   remove_peer_connection(session_id: string): boolean;
 }
@@ -55,6 +56,7 @@ function isWasmGlue(value: unknown): value is WasmGlue {
     && hasFunction(value, 'store_auth_token')
     && hasFunction(value, 'clear_auth_token')
     && hasFunction(value, 'upsert_files')
+    && hasFunction(value, 'delete_files')
     && hasFunction(value, 'set_peer_connection')
     && hasFunction(value, 'remove_peer_connection');
 }
@@ -162,6 +164,10 @@ const mutatorHandlers: Record<MutatorMethod, (...args: unknown[]) => unknown> = 
   },
   upsert_files(...args) {
     glue?.upsert_files(assertString(args[0], 'backendId'), assertString(args[1], 'filesJson'));
+    return undefined;
+  },
+  delete_files(...args) {
+    glue?.delete_files(assertString(args[0], 'backendId'), assertString(args[1], 'fileIdsJson'));
     return undefined;
   },
   set_peer_connection(...args) {

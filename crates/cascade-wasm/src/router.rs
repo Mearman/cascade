@@ -71,6 +71,9 @@ pub fn route(request: &WorkerRequest, engine: &EngineState) -> WorkerResponse {
         ("GET", ["v1", "folders", folder_id, "children"]) => {
             handle_list_children(&request.id, engine, folder_id, query_part.as_deref())
         }
+        ("DELETE", ["v1", "files", backend_id, "entries", ..]) => {
+            handle_delete_file_entry(&request.id, engine, backend_id, &segments[4..])
+        }
 
         // ── Pin rules ──
         ("GET", ["v1", "pins"]) => handle_list_pins(&request.id, engine),
@@ -272,6 +275,30 @@ fn handle_list_children(
         })
         .collect();
     ok(id, json!({ "children": children_json }))
+}
+
+/// `DELETE /v1/files/:backend_id/entries/*path` — remove a file entry from
+/// engine storage. The trailing path segments are joined to form the native file
+/// id, then scoped as `{backend_id}:{native_id}`.
+fn handle_delete_file_entry(
+    id: &str,
+    engine: &EngineState,
+    backend_id: &str,
+    path_segments: &[&str],
+) -> WorkerResponse {
+    let native_id = path_segments.join("/");
+    let scoped = format!("{backend_id}:{native_id}");
+    let removed = engine.storage.remove_file_sync(&scoped);
+    if removed {
+        ok(id, json!({ "deleted": true }))
+    } else {
+        error_response(
+            id,
+            404,
+            "not_found",
+            &format!("no file entry with id '{scoped}'"),
+        )
+    }
 }
 
 /// `GET /v1/pins` — list pin rules from engine storage.

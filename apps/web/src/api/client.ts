@@ -380,7 +380,8 @@ export class ApiClient {
   /** Delete a file. In WASM mode, `path` is the Drive file ID. */
   deleteFile(folder: string, path: string): Promise<void> {
     if (this.bridgeClient !== null) {
-      return deleteDriveFile(folder, path);
+      return deleteDriveFile(folder, path)
+        .then(() => this.bridgeClient!.deleteFiles(folder, [path]));
     }
     return this.request('DELETE', `/files/${encodeURIComponent(folder)}/entries/${encodeURIComponent(path)}`).then(() => undefined);
   }
