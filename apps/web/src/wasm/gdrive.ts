@@ -138,6 +138,63 @@ export async function fetchDriveFiles(
   return totalFetched;
 }
 
+// Fetch children of a specific Drive folder and upsert them into engine storage.
+//
+// Unlike `fetchDriveFiles` which fetches all files, this targets a single folder
+// for on-demand loading when the user navigates into it. Returns the total number
+// of children fetched across all pages.
+export async function fetchFolderChildren(
+  backendId: string,
+  parentId: string,
+  options?: { pageSize?: number },
+): Promise<number> {
+  const accessToken = await ensureAccessToken();
+  const pageSize = options?.pageSize ?? 100;
+  const query = `'${parentId}' in parents and trashed = false`;
+
+  let totalFetched = 0;
+  let pageToken: string | undefined;
+
+  do {
+    const params = new URLSearchParams({
+      q: query,
+      pageSize: String(pageSize),
+      fields: 'nextPageToken,files(id,name,mimeType,parents,size,modifiedTime)',
+    });
+    if (pageToken !== undefined) {
+      params.set('pageToken', pageToken);
+    }
+
+    const resp = await fetch(`${DRIVE_FILES_ENDPOINT}?${params.toString()}`, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+
+    if (!resp.ok) {
+      const body: unknown = await resp.json().catch(() => null);
+      const msg = body !== null && typeof body === 'object' && 'error' in body
+        ? JSON.stringify(body)
+        : `status ${String(resp.status)}`;
+      throw new Error(`Google Drive API error: ${msg}`);
+    }
+
+    const json: unknown = await resp.json();
+    if (!isDriveListResponse(json)) {
+      throw new Error('Google Drive API: unexpected response shape');
+    }
+
+    const files = json.files ?? [];
+    if (files.length > 0) {
+      const entries = files.map(toFileInput);
+      await api.upsertFiles(backendId, entries);
+      totalFetched += files.length;
+    }
+
+    pageToken = json.nextPageToken;
+  } while (pageToken !== undefined);
+
+  return totalFetched;
+}
+
 // Insert the Google Drive root folder entry into engine storage so that
 // `GET /v1/folders/{backend_id}:root/children` has a parent to list against.
 export async function insertRootEntry(backendId: string): Promise<void> {
