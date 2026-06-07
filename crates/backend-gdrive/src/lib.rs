@@ -76,29 +76,30 @@ pub fn create_backend_with_store(
     config: &toml::Value,
     token_store: Arc<dyn TokenStore>,
 ) -> anyhow::Result<Box<dyn Backend>> {
-    create_backend_with_store_and_http(config, token_store, None)
+    // No explicit client injected (standalone/CLI Drive calls, tests): build the
+    // default pooled `reqwest::Client` wrapped in `ReqwestClient`. The daemon
+    // injects its own long-lived shared client via
+    // `create_backend_with_store_and_http` so all its backends share one pool.
+    let http: Arc<dyn cascade_engine::portable::HttpClient> =
+        Arc::new(cascade_engine::portable::native::ReqwestClient::new());
+    create_backend_with_store_and_http(config, token_store, http)
 }
 
-/// Build a backend with an injected [`TokenStore`] and an optional shared HTTP
-/// client (native build).
+/// Build a backend with an injected [`TokenStore`] and a shared
+/// [`HttpClient`](cascade_engine::portable::HttpClient).
 ///
-/// When `http` is `Some`, the backend routes all Drive API calls **and** the
-/// `OAuth2` token-refresh path through the supplied shared client instead of
-/// building a fresh per-request client. This is the pooled-shared mode seam.
-///
-/// When `http` is `None`, the behaviour is byte-for-byte identical to
-/// [`create_backend_with_store`]: every request builds a fresh unpooled
-/// HTTP/1.1 `reqwest::Client` (the TLS deadlock workaround). Passing `None`
-/// is always safe; `Some` requires a human capture run against the real Drive
-/// endpoint before it can be promoted to the default (see
-/// `docs/tls-deadlock-capture.md`).
-#[cfg(not(feature = "portable"))]
+/// All Drive API calls **and** the `OAuth2` token-refresh path route through the
+/// supplied client. The daemon builds one long-lived pooled `reqwest::Client`
+/// and shares it across every Drive backend so the pooled connection driver
+/// lives on the daemon's stable runtime. Portable builds inject their own
+/// adapter because `reqwest` is unavailable.
 pub fn create_backend_with_store_and_http(
     config: &toml::Value,
     token_store: Arc<dyn TokenStore>,
-    http: Option<Arc<dyn cascade_engine::portable::HttpClient>>,
+    http: Arc<dyn cascade_engine::portable::HttpClient>,
 ) -> anyhow::Result<Box<dyn Backend>> {
-    let (oauth, drive, initial_tokens, instance_id) = parse_gdrive_config(config, http.clone());
+    let (oauth, drive, initial_tokens, instance_id) =
+        parse_gdrive_config(config, Arc::clone(&http));
 
     Ok(Box::new(GdriveBackend {
         drive,
@@ -119,111 +120,11 @@ pub fn create_backend_with_store_and_http(
     }))
 }
 
-/// Build a backend with an injected [`TokenStore`] and HTTP client (portable build).
-///
-/// Use this function when the `portable` feature is active. The `http` argument
-/// supplies the `HttpClient` implementation used for both Drive API calls and
-/// the `OAuth2` token-refresh path.
-#[cfg(feature = "portable")]
-pub fn create_backend_with_store_and_http(
-    config: &toml::Value,
-    token_store: Arc<dyn TokenStore>,
-    http: Arc<dyn cascade_engine::portable::HttpClient>,
-) -> anyhow::Result<Box<dyn Backend>> {
-    let (oauth, drive_native, initial_tokens, instance_id) =
-        parse_gdrive_config_portable(config, Arc::clone(&http));
-
-    Ok(Box::new(GdriveBackend {
-        drive: drive_native,
-        oauth,
-        account: config
-            .get("account")
-            .and_then(|v| v.as_str())
-            .unwrap_or("default")
-            .to_string(),
-        instance_id,
-        token_store,
-        tokens: Arc::new(Mutex::new(initial_tokens)),
-        http,
-        shared_drive_ids: Arc::new(RwLock::new(HashSet::new())),
-        folder_drive_ids: Arc::new(RwLock::new(HashMap::new())),
-        my_drive_root_id: Arc::new(RwLock::new(None)),
-        trashed_ids: Arc::new(RwLock::new(HashSet::new())),
-    }))
-}
-
-/// Parse common config fields shared between native and portable backends.
+/// Parse common config fields and construct a `DriveClient` with the supplied
+/// shared HTTP client.
 ///
 /// Returns `(oauth_config, drive_client, initial_tokens, instance_id)`.
-///
-/// When `http` is `Some`, the resulting `DriveClient` holds the shared client
-/// and routes all requests through it (pooled-shared mode). When `None`, the
-/// `DriveClient` uses the default per-request `build_diag_http_client` path.
-#[cfg(not(feature = "portable"))]
 fn parse_gdrive_config(
-    config: &toml::Value,
-    http: Option<Arc<dyn cascade_engine::portable::HttpClient>>,
-) -> (
-    auth::OAuthConfig,
-    DriveClient,
-    Option<auth::AuthTokens>,
-    String,
-) {
-    const DEFAULT_TOKEN_LIFETIME_HOURS: i64 = 24;
-
-    let client_id = config
-        .get("client_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let client_secret = config
-        .get("client_secret")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let account = config
-        .get("account")
-        .and_then(|v| v.as_str())
-        .unwrap_or("default")
-        .to_string();
-    let token_url = config
-        .get("token_url")
-        .and_then(|v| v.as_str())
-        .unwrap_or(auth::GOOGLE_TOKEN_URL)
-        .to_string();
-
-    let base_url = config
-        .get("base_url")
-        .and_then(|v| v.as_str())
-        .unwrap_or("https://www.googleapis.com/drive/v3")
-        .to_string();
-    let upload_url = config
-        .get("upload_url")
-        .and_then(|v| v.as_str())
-        .unwrap_or("https://www.googleapis.com/upload/drive/v3")
-        .to_string();
-
-    let drive = if let Some(http) = http {
-        DriveClient::with_urls_and_http_client_native(base_url, upload_url, http)
-    } else {
-        DriveClient::with_urls(base_url, upload_url)
-    };
-
-    let initial_tokens = build_initial_tokens(config, DEFAULT_TOKEN_LIFETIME_HOURS);
-    let instance_id = format!("gdrive-{account}");
-    let oauth = auth::OAuthConfig {
-        client_id,
-        client_secret,
-        token_url,
-    };
-
-    (oauth, drive, initial_tokens, instance_id)
-}
-
-/// Parse common config fields for the portable build, constructing a
-/// `DriveClient` with the supplied HTTP client.
-#[cfg(feature = "portable")]
-fn parse_gdrive_config_portable(
     config: &toml::Value,
     http: Arc<dyn cascade_engine::portable::HttpClient>,
 ) -> (
@@ -320,21 +221,11 @@ pub struct GdriveBackend {
     /// in-memory under test).
     token_store: Arc<dyn TokenStore>,
     tokens: Arc<Mutex<Option<AuthTokens>>>,
-    /// Injected HTTP client for the `OAuth2` token-refresh path.
-    ///
-    /// Under the `portable` feature this is always `Some` — the backend
-    /// requires an explicit client because `reqwest` is unavailable.
-    ///
-    /// Under the `native` feature this is `Some` only in `pooled-shared`
-    /// mode, where the daemon injects a single long-lived pooled client.
-    /// When `None`, `access_token()` builds a fresh per-request client via
-    /// `build_diag_http_client` (the default TLS deadlock workaround).
-    #[cfg(feature = "portable")]
+    /// Injected shared HTTP client, used for the `OAuth2` token-refresh path
+    /// (Drive API calls go through the same client held inside `drive`). The
+    /// daemon injects one long-lived pooled client; portable builds inject their
+    /// own adapter.
     http: Arc<dyn cascade_engine::portable::HttpClient>,
-    /// Optional injected HTTP client for the token-refresh path (native builds,
-    /// pooled-shared mode only). `None` → default per-request path unchanged.
-    #[cfg(not(feature = "portable"))]
-    http: Option<Arc<dyn cascade_engine::portable::HttpClient>>,
     /// IDs of shared drives this user is a member of.
     /// Populated on first `list_children("__shared_drives")` call.
     shared_drive_ids: Arc<RwLock<HashSet<String>>>,
@@ -404,31 +295,10 @@ impl GdriveBackend {
             // guard is dropped here — mutex released before the HTTP call.
         };
 
-        // Perform the token refresh.
-        //
-        // - Portable path: always uses the injected `HttpClient` (reqwest is unavailable).
-        // - Native injected path (pooled-shared mode): uses the daemon's shared
-        //   `HttpClient`; the per-request builder is not used, so the refresh
-        //   runs on the same stable runtime as Drive API calls.
-        // - Native default path: builds a fresh per-request client via
-        //   `build_diag_http_client` (unpooled, HTTP/1.1 only — the TLS
-        //   deadlock workaround). See client.rs for full background.
-        #[cfg(feature = "portable")]
+        // Perform the token refresh through the injected shared client so the
+        // OAuth2 call runs on the same pooled client as Drive API calls.
         let refreshed =
             auth::refresh_access_token(self.http.as_ref(), &self.oauth, &refresh_token).await?;
-        #[cfg(not(feature = "portable"))]
-        let refreshed = if let Some(http) = &self.http {
-            // Pooled-shared mode: refresh through the injected shared client so
-            // the OAuth2 call runs on the same pooled connection as Drive API
-            // calls, never on a transient per-request client.
-            auth::refresh_access_token_with_http_client(http.as_ref(), &self.oauth, &refresh_token)
-                .await?
-        } else {
-            /// Per-request timeout for the `OAuth2` token-refresh call.
-            const REFRESH_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-            let http = client::build_diag_http_client(REFRESH_REQUEST_TIMEOUT)?;
-            auth::refresh_access_token(&http, &self.oauth, &refresh_token).await?
-        };
         self.token_store.save(&self.account, &refreshed).await?;
 
         let mut guard = self.tokens.lock().await;

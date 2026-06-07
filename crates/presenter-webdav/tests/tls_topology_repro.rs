@@ -1,5 +1,14 @@
 //! Faithful-topology reproduction harness for the `WebDAV` TLS deadlock.
 //!
+//! Historical note: the production workaround this harness refers to (a
+//! per-request unpooled HTTP/1.1 client built by `build_unpooled_http1_client`,
+//! plus the WebDAV `run_isolated_blocking` path) has since been **removed** in
+//! favour of a single daemon-owned pooled `reqwest::Client` awaited directly on
+//! the main runtime — see the "Google Drive HTTP client" section of
+//! `docs/design.md`. This harness is retained, `#[ignore]`d, as a self-contained
+//! regression repro; its knobs and the `build_unpooled_http1_client` name below
+//! describe the former production shape, not current code.
+//!
 //! The earlier `tls_repro_harness.rs` drives a standalone reqwest client and
 //! never reproduces the hang. This harness recreates the *nested* production
 //! topology — a reqwest TLS call awaited inside an axum request handler on the

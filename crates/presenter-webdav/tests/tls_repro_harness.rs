@@ -1,5 +1,12 @@
 //! Real-TLS repro harness for the pooled-connection hang.
 //!
+//! Historical note: the per-request unpooled workaround described below has been
+//! **removed** in favour of a single daemon-owned pooled `reqwest::Client` (see
+//! the "Google Drive HTTP client" section of `docs/design.md`). This harness is
+//! retained, `#[ignore]`d, as a regression repro. The `CASCADE_GDRIVE_HTTP_DIAG`
+//! environment variable it reads below is now purely this test's own pooling
+//! toggle — it no longer affects production code, which has no such switch.
+//!
 //! # Background
 //!
 //! The TLS deadlock workaround (per-request unpooled HTTP/1.1 client) was

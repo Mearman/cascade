@@ -59,35 +59,6 @@ fn last_component(normalised_path: &str) -> &str {
         .unwrap_or("")
 }
 
-/// Build a response with an explicit empty body and Content-Length: 0.
-///
-/// Run an async future on a completely separate OS thread with its own
-/// tokio runtime, blocking the current thread until it completes.
-/// This avoids any `.await` on the axum runtime after body consumption,
-/// working around a hyper 1.x bug where responses get stuck.
-fn run_isolated_blocking<F, T>(future: F) -> anyhow::Result<T>
-where
-    F: std::future::Future<Output = anyhow::Result<T>> + Send + 'static,
-    T: Send + 'static,
-{
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(rt) => {
-                let _ = tx.send(rt.block_on(future));
-            }
-            Err(e) => {
-                let _ = tx.send(Err(anyhow::anyhow!("isolated runtime build failed: {e}")));
-            }
-        }
-    });
-    rx.recv()
-        .map_err(|e| anyhow::anyhow!("isolated thread terminated without result: {e}"))?
-}
-
 /// Build a response with explicit Content-Length: 0.
 fn empty_response(status: StatusCode) -> Response {
     let mut resp = Response::new(axum::body::Body::empty());
@@ -113,21 +84,6 @@ pub struct AppState {
     pub expanded: Arc<RwLock<std::collections::HashSet<String>>>,
     /// Semaphore limiting concurrent backend API calls during expansion.
     pub expand_sem: Arc<tokio::sync::Semaphore>,
-    /// When `true`, `handle_put` awaits the backend upload directly on the
-    /// axum/main runtime instead of routing through `run_isolated_blocking`.
-    ///
-    /// This must be `true` only when a daemon-owned long-lived pooled
-    /// `reqwest::Client` is injected into every backend
-    /// (`CASCADE_GDRIVE_HTTP_DIAG=pooled-shared`). In that mode the connection
-    /// driver lives on the main runtime and must stay polled there; running the
-    /// upload inside a transient current-thread runtime (as
-    /// `run_isolated_blocking` does) would strand the driver and reintroduce
-    /// the exact hang the workaround is protecting against.
-    ///
-    /// When `false` (the production default), `handle_put` uses
-    /// `tokio::task::block_in_place` + `run_isolated_blocking` exactly as
-    /// before this change, so the default behaviour is byte-for-byte unchanged.
-    pub skip_isolation: bool,
 }
 
 impl std::fmt::Debug for AppState {
@@ -149,11 +105,6 @@ impl WebDavServer {
     ///
     /// The address should typically be `127.0.0.1:0` for an OS-assigned port.
     ///
-    /// `skip_isolation` controls whether PUT uploads use `run_isolated_blocking`
-    /// (the default TLS deadlock workaround, `false`) or await the backend
-    /// directly on the main runtime (`true`, pooled-shared mode only). Set to
-    /// `false` in all existing call sites so the default behaviour is unchanged.
-    ///
     /// # Errors
     ///
     /// Returns an error if the TCP listener cannot bind.
@@ -163,7 +114,6 @@ impl WebDavServer {
         cache_dir: PathBuf,
         backends: Arc<tokio::sync::RwLock<Vec<Arc<dyn cascade_engine::backend::Backend>>>>,
         db: Option<Arc<cascade_engine::db::StateDb>>,
-        skip_isolation: bool,
     ) -> anyhow::Result<Self> {
         let listener = TcpListener::bind(bind_addr).await?;
         let port = listener.local_addr()?.port();
@@ -175,7 +125,6 @@ impl WebDavServer {
             db,
             expanded: Arc::new(RwLock::new(std::collections::HashSet::new())),
             expand_sem: Arc::new(tokio::sync::Semaphore::new(4)),
-            skip_isolation,
         };
 
         let app = Router::new().fallback(webdav_handler).with_state(state);
@@ -835,26 +784,16 @@ async fn handle_put(state: &AppState, path: &str, req: Request) -> Response {
         path = %normalised,
         backend_id,
         existing = existing_file_id.is_some(),
-        skip_isolation = state.skip_isolation,
         "before backend upload"
     );
 
-    // The upload path branches on `skip_isolation`:
-    //
-    // - Default (`false`): `tokio::task::block_in_place` + `run_isolated_blocking`
-    //   spawns a fresh current-thread runtime on a separate OS thread. This is the
-    //   TLS deadlock workaround: it prevents a pooled-connection driver from being
-    //   stranded on the axum runtime by running the upload in isolation.
-    //
-    // - Pooled-shared mode (`true`): the upload is awaited directly on the main
-    //   runtime. The daemon-owned pooled `reqwest::Client`'s connection driver
-    //   lives on the main runtime and must stay polled there; routing it through a
-    //   transient current-thread runtime would strand the driver and reintroduce
-    //   the exact hang. `skip_isolation` is set only when the mode is `PooledShared`
-    //   (derived from the same OnceLock as the injection decision, so the two halves
-    //   can never disagree).
-    let result: anyhow::Result<cascade_engine::types::FileEntry> = if state.skip_isolation {
-        // Pooled-shared mode: await directly on the main runtime.
+    // The upload is awaited directly on the main runtime. Every backend holds
+    // the daemon's single long-lived pooled `reqwest::Client`, whose connection
+    // driver lives on this runtime and stays polled — so there is nothing to
+    // isolate. (The earlier `run_isolated_blocking` workaround, which ran the
+    // upload in a transient current-thread runtime, was the very thing that
+    // could strand the driver; it has been removed.)
+    let result: anyhow::Result<cascade_engine::types::FileEntry> = {
         let backend_result = if let Some(file_id) = existing_file_id {
             tokio::time::timeout(
                 BACKEND_UPLOAD_TIMEOUT,
@@ -874,41 +813,11 @@ async fn handle_put(state: &AppState, path: &str, req: Request) -> Response {
                 tracing::error!(
                     path = %upload_path_for_log,
                     timeout_secs = BACKEND_UPLOAD_TIMEOUT.as_secs(),
-                    "direct backend upload timed out"
+                    "backend upload timed out"
                 );
                 Err(anyhow::anyhow!("backend upload timed out after 120 s"))
             }
         }
-    } else {
-        // Default path: isolated runtime (TLS deadlock workaround).
-        tokio::task::block_in_place(|| {
-            run_isolated_blocking(async move {
-                let backend_result = if let Some(file_id) = existing_file_id {
-                    tokio::time::timeout(
-                        BACKEND_UPLOAD_TIMEOUT,
-                        backend.update(&file_id, &upload_bytes),
-                    )
-                    .await
-                } else {
-                    tokio::time::timeout(
-                        BACKEND_UPLOAD_TIMEOUT,
-                        backend.upload(&relative_path_owned, &upload_bytes, &parent_id),
-                    )
-                    .await
-                };
-                match backend_result {
-                    Ok(r) => r,
-                    Err(_elapsed) => {
-                        tracing::error!(
-                            path = %upload_path_for_log,
-                            timeout_secs = BACKEND_UPLOAD_TIMEOUT.as_secs(),
-                            "isolated backend upload timed out — suspected pooled-connection hang"
-                        );
-                        Err(anyhow::anyhow!("backend upload timed out after 120 s"))
-                    }
-                }
-            })
-        })
     };
     tracing::debug!(path = %normalised, "after backend upload");
 
@@ -1797,7 +1706,6 @@ mod tests {
             cache_dir.path().to_path_buf(),
             Arc::new(tokio::sync::RwLock::new(Vec::new())),
             None,
-            false,
         )
         .await
         .unwrap();
@@ -1815,7 +1723,6 @@ mod tests {
             cache_dir.path().to_path_buf(),
             Arc::new(tokio::sync::RwLock::new(Vec::new())),
             None,
-            false,
         )
         .await
         .unwrap();
@@ -1850,7 +1757,6 @@ mod tests {
             cache_dir.path().to_path_buf(),
             Arc::new(tokio::sync::RwLock::new(Vec::new())),
             None,
-            false,
         )
         .await
         .unwrap();
@@ -1878,7 +1784,6 @@ mod tests {
             cache_dir.path().to_path_buf(),
             Arc::new(tokio::sync::RwLock::new(Vec::new())),
             None,
-            false,
         )
         .await
         .unwrap();
@@ -1919,7 +1824,6 @@ mod tests {
             cache_dir.path().to_path_buf(),
             Arc::new(tokio::sync::RwLock::new(Vec::new())),
             None,
-            false,
         )
         .await
         .unwrap();
@@ -1958,7 +1862,6 @@ mod tests {
             cache_dir.path().to_path_buf(),
             Arc::new(tokio::sync::RwLock::new(Vec::new())),
             None,
-            false,
         )
         .await
         .unwrap();
@@ -1995,7 +1898,6 @@ mod tests {
             cache_dir.path().to_path_buf(),
             Arc::new(tokio::sync::RwLock::new(Vec::new())),
             None,
-            false,
         )
         .await
         .unwrap();

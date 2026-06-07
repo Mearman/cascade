@@ -498,34 +498,14 @@ pub async fn start(
         return Ok(());
     }
 
-    // Read the diagnostic HTTP mode once, here on the daemon's stable main
-    // runtime, so both the backend-injection decision and the WebDAV
-    // isolation decision derive from the same OnceLock value.
-    //
-    // pooled-shared is the default mode: we build a single long-lived pooled
-    // reqwest::Client NOW — on the main runtime — and wrap it in the portable
-    // ReqwestClient adapter. The connection driver lives on this runtime for the
-    // daemon's lifetime, so it is always polled and never stranded. Every
-    // `rebuild_backends` call receives the same `Arc` so the client is never
-    // recreated or dropped.
-    //
-    // The escape hatch (CASCADE_GDRIVE_HTTP_DIAG=unpooled-legacy) and the
-    // diagnostic pooled/pooled-http2 modes resolve away from PooledShared, so
-    // `shared_http` is `None` and the legacy per-request workaround path runs.
-    let (shared_http, skip_isolation) = {
-        use cascade_backend_gdrive::client::{DiagHttpMode, diag_http_mode};
-        if diag_http_mode() == DiagHttpMode::PooledShared {
-            let pooled_client = reqwest::Client::builder()
-                .build()
-                .context("failed to build shared pooled reqwest::Client for pooled-shared mode")?;
-            let http: Arc<dyn cascade_engine::portable::HttpClient> = Arc::new(
-                cascade_engine::portable::native::ReqwestClient::from_client(pooled_client),
-            );
-            (Some(http), true)
-        } else {
-            (None, false)
-        }
-    };
+    // Build the single long-lived pooled reqwest::Client NOW, here on the
+    // daemon's stable main runtime, and wrap it in the portable ReqwestClient
+    // adapter. The connection driver lives on this runtime for the daemon's
+    // lifetime, so it is always polled and never stranded — the architectural
+    // fix for the Drive TLS deadlock. Every `rebuild_backends` call receives the
+    // same `Arc`, so all Drive backends share one pooled client.
+    let shared_http: Arc<dyn cascade_engine::portable::HttpClient> =
+        Arc::new(cascade_engine::portable::native::ReqwestClient::new());
 
     // Resolve mount point: CLI arg > config.toml [mount].point > ~/Cloud.
     let mount_path = if let Some(p) = mount_point {
@@ -564,7 +544,6 @@ pub async fn start(
             no_mount,
             &p2p_config,
             &web_options,
-            skip_isolation,
         )
         .await;
     }
@@ -624,7 +603,6 @@ pub async fn start(
             no_mount,
             &p2p_config,
             &web_options,
-            skip_isolation,
         )
         .await
         {
@@ -671,7 +649,6 @@ pub async fn start(
                 no_mount,
                 &p2p_config,
                 &web_options,
-                skip_isolation,
             )
             .await
         } else {
@@ -729,7 +706,6 @@ pub async fn start(
             no_mount,
             &p2p_config,
             &web_options,
-            skip_isolation,
         )
         .await
     }
@@ -1223,7 +1199,6 @@ async fn try_webdav(
     no_mount: bool,
     p2p: &ResolvedP2pConfig,
     web: &WebOptions,
-    skip_isolation: bool,
 ) -> Result<()> {
     let engine_config = EngineConfig {
         db_path: ctx.db_path.clone(),
@@ -1248,7 +1223,7 @@ async fn try_webdav(
     // presenter is confirmed up, so a failed attempt never binds the port.
     let engine_for_web = engine.clone();
 
-    let mut presenter = WebDavPresenter::new(mount_path).with_skip_isolation(skip_isolation);
+    let mut presenter = WebDavPresenter::new(mount_path);
     if let Ok(bind) = std::env::var("CASCADE_WEBDAV_BIND") {
         presenter = presenter.with_bind_addr(bind);
     }
@@ -1806,8 +1781,9 @@ impl cascade_engine::backend::BackendFactory for CliBackendFactory {
     ) -> Result<Arc<dyn cascade_engine::backend::Backend>> {
         let config: toml::Value = toml::from_str(config_toml)
             .with_context(|| format!("parsing config for backend `{name}`"))?;
-        // The management-plane hot-reload path does not carry a shared HTTP
-        // client; pass None so the backend falls back to the per-request path.
+        // The management-plane hot-reload path does not carry the daemon's
+        // shared HTTP client; pass None so the gdrive backend builds its own
+        // default pooled client (still on the daemon's runtime, so no stranding).
         let backend = create_backend(name, backend_type, &config, None)?;
         Ok(Arc::from(backend))
     }
@@ -1820,10 +1796,9 @@ fn cli_backend_factory() -> Arc<dyn cascade_engine::backend::BackendFactory> {
 
 /// Instantiate a backend by type, using its per-backend TOML config.
 ///
-/// `shared_http` is `Some` only in pooled-shared mode
-/// (`CASCADE_GDRIVE_HTTP_DIAG=pooled-shared`). When provided, the gdrive
-/// backend receives the shared pooled client instead of building a fresh
-/// per-request client. All other backend types currently ignore it.
+/// When `shared_http` is `Some`, the gdrive backend uses the daemon's shared
+/// pooled client; when `None` (the management-plane hot-reload path), it builds
+/// its own default pooled client. All other backend types ignore it.
 fn create_backend(
     name: &str,
     backend_type: &str,
@@ -1833,8 +1808,13 @@ fn create_backend(
     match backend_type {
         "gdrive" => {
             let store = Arc::new(cascade_backend_gdrive::token_store::PlatformTokenStore);
-            cascade_backend_gdrive::create_backend_with_store_and_http(config, store, shared_http)
-                .with_context(|| format!("failed to create gdrive backend `{name}`"))
+            match shared_http {
+                Some(http) => {
+                    cascade_backend_gdrive::create_backend_with_store_and_http(config, store, http)
+                }
+                None => cascade_backend_gdrive::create_backend_with_store(config, store),
+            }
+            .with_context(|| format!("failed to create gdrive backend `{name}`"))
         }
         "s3" => cascade_backend_s3::create_backend(config)
             .with_context(|| format!("failed to create s3 backend `{name}`")),
@@ -1849,13 +1829,13 @@ fn create_backend(
 /// Rebuild backends from the main config — used when falling back between
 /// presenters and the first engine consumed the original backend instances.
 ///
-/// `shared_http` is threaded through to `create_backend` and injected into the
-/// gdrive backend when pooled-shared mode is active. The same `Arc` is passed
-/// on every call so the pooled client is never recreated or dropped mid-session.
+/// The daemon's single shared pooled HTTP client is injected into every gdrive
+/// backend. The same `Arc` is passed on every call so all Drive backends share
+/// one pooled client, kept alive for the daemon's lifetime.
 fn rebuild_backends(
     main_config: &CascadeConfig,
     config_dir: &Path,
-    shared_http: Option<Arc<dyn cascade_engine::portable::HttpClient>>,
+    shared_http: Arc<dyn cascade_engine::portable::HttpClient>,
 ) -> Result<Vec<Arc<dyn cascade_engine::backend::Backend>>> {
     let mut backends: Vec<Arc<dyn cascade_engine::backend::Backend>> = Vec::new();
     for (name, value) in &main_config.backends {
@@ -1868,7 +1848,7 @@ fn rebuild_backends(
             name,
             &backend_cfg.backend_type,
             &per_backend_config,
-            shared_http.clone(),
+            Some(shared_http.clone()),
         )?;
         backends.push(Arc::from(backend));
     }

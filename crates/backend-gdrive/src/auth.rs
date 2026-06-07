@@ -371,103 +371,13 @@ pub async fn poll_for_token(
 // Token refresh
 // ---------------------------------------------------------------------------
 
-/// Refresh an access token using a refresh token (native path).
-#[cfg(not(feature = "portable"))]
-pub async fn refresh_access_token(
-    http: &reqwest::Client,
-    config: &OAuthConfig,
-    refresh_token: &str,
-) -> anyhow::Result<AuthTokens> {
-    let resp = http
-        .post(&config.token_url)
-        .form(&[
-            ("client_id", config.client_id.as_str()),
-            ("client_secret", config.client_secret.as_str()),
-            ("refresh_token", refresh_token),
-            ("grant_type", "refresh_token"),
-        ])
-        .send()
-        .await?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("Token refresh failed ({status}): {body}");
-    }
-
-    let token_resp: TokenResponse = resp.json().await?;
-    let secs = i64::try_from(token_resp.expires_in).unwrap_or(i64::MAX);
-    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(secs);
-
-    Ok(AuthTokens {
-        access_token: token_resp.access_token,
-        refresh_token: token_resp
-            .refresh_token
-            .unwrap_or_else(|| refresh_token.to_string()),
-        expires_at,
-    })
-}
-
-/// Refresh an access token using a refresh token (portable path).
+/// Refresh an access token using a refresh token.
 ///
 /// Sends `application/x-www-form-urlencoded` via the portable `HttpClient`
-/// trait instead of `reqwest`, so the backend can run in environments where
-/// `reqwest` is not available.
-#[cfg(feature = "portable")]
+/// trait, so a single path serves both native builds (which inject a shared
+/// pooled `reqwest::Client` wrapped in `ReqwestClient`) and portable builds
+/// (which inject their own adapter).
 pub async fn refresh_access_token(
-    http: &dyn cascade_engine::portable::HttpClient,
-    config: &OAuthConfig,
-    refresh_token: &str,
-) -> anyhow::Result<AuthTokens> {
-    use cascade_engine::portable::HeaderMap;
-
-    let form_body = format!(
-        "client_id={}&client_secret={}&refresh_token={}&grant_type=refresh_token",
-        urlencoding::encode(&config.client_id),
-        urlencoding::encode(&config.client_secret),
-        urlencoding::encode(refresh_token),
-    );
-
-    let mut headers = HeaderMap::new();
-    headers.insert("content-type", "application/x-www-form-urlencoded");
-
-    let resp = http
-        .post(&config.token_url, headers, form_body.into_bytes())
-        .await
-        .map_err(|e| anyhow::anyhow!("Token refresh request failed: {e}"))?;
-
-    if resp.status < 200 || resp.status >= 300 {
-        let body = String::from_utf8_lossy(&resp.body).into_owned();
-        anyhow::bail!("Token refresh failed (HTTP {}): {body}", resp.status);
-    }
-
-    let token_resp: TokenResponse = serde_json::from_slice(&resp.body)?;
-    let secs = i64::try_from(token_resp.expires_in).unwrap_or(i64::MAX);
-    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(secs);
-
-    Ok(AuthTokens {
-        access_token: token_resp.access_token,
-        refresh_token: token_resp
-            .refresh_token
-            .unwrap_or_else(|| refresh_token.to_string()),
-        expires_at,
-    })
-}
-
-/// Refresh an access token via the portable `HttpClient` trait (native builds,
-/// pooled-shared mode).
-///
-/// This overload is distinct from the reqwest-based `refresh_access_token` and
-/// from the portable-feature version. It is used by `GdriveBackend::access_token`
-/// when the daemon has injected a shared `Arc<dyn HttpClient>` (i.e. when
-/// `CASCADE_GDRIVE_HTTP_DIAG=pooled-shared` is set) so the refresh call routes
-/// through the same long-lived pooled client as Drive API calls instead of
-/// building a fresh per-request `reqwest::Client`.
-///
-/// The body is `application/x-www-form-urlencoded`, identical to the portable
-/// version, so the two can be kept in sync trivially.
-#[cfg(not(feature = "portable"))]
-pub async fn refresh_access_token_with_http_client(
     http: &dyn cascade_engine::portable::HttpClient,
     config: &OAuthConfig,
     refresh_token: &str,

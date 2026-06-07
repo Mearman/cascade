@@ -168,9 +168,11 @@ async fn load_token(account: &str) -> anyhow::Result<String> {
     if !tokens.is_expired() {
         return Ok(tokens.access_token);
     }
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()?;
+    let http = cascade_engine::portable::native::ReqwestClient::from_client(
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?,
+    );
     let refreshed = auth::refresh_access_token(&http, &oauth, &tokens.refresh_token).await?;
     auth::save_tokens(account, &refreshed)?;
     Ok(refreshed.access_token)
