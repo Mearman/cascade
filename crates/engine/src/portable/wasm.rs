@@ -1316,7 +1316,11 @@ mod tests {
         storage.register_backend_sync("b1", "s3", "Second", Some("/mnt"), Some("{}"));
 
         let backends = storage.list_backends_sync();
-        assert_eq!(backends.len(), 1, "second register must replace, not append");
+        assert_eq!(
+            backends.len(),
+            1,
+            "second register must replace, not append"
+        );
         let record = &backends[0];
         assert_eq!(record.backend_type, "s3");
         assert_eq!(record.display_name, "Second");
@@ -1432,10 +1436,16 @@ mod tests {
         let rules = storage.list_pin_rules_sync();
         assert_eq!(rules.len(), 2);
         assert_ne!(rules[0].id, rules[1].id);
-        let first = rules.iter().find(|r| r.path_glob == "/work/**").expect("first");
+        let first = rules
+            .iter()
+            .find(|r| r.path_glob == "/work/**")
+            .expect("first");
         assert!(first.recursive);
         assert!(first.conditions.is_none());
-        let second = rules.iter().find(|r| r.path_glob == "/archive/**").expect("second");
+        let second = rules
+            .iter()
+            .find(|r| r.path_glob == "/archive/**")
+            .expect("second");
         assert!(!second.recursive);
         assert_eq!(second.conditions.as_deref(), Some("on-battery"));
     }

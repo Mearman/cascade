@@ -477,10 +477,7 @@ mod tests {
             Ok(None)
         }
 
-        async fn changes(
-            &self,
-            _cursor: Option<&Cursor>,
-        ) -> anyhow::Result<(Vec<Change>, Cursor)> {
+        async fn changes(&self, _cursor: Option<&Cursor>) -> anyhow::Result<(Vec<Change>, Cursor)> {
             let files = self
                 .files
                 .lock()
@@ -624,7 +621,10 @@ mod tests {
     fn mount_adds_child_at_prefix() {
         let mut tree = make_tree();
         tree.mount(PathBuf::from("Work"), Arc::new(NullBackend::new("work")));
-        tree.mount(PathBuf::from("Assets"), Arc::new(NullBackend::new("assets")));
+        tree.mount(
+            PathBuf::from("Assets"),
+            Arc::new(NullBackend::new("assets")),
+        );
 
         let prefixes: Vec<&std::ffi::OsStr> =
             tree.children().iter().map(|(p, _)| p.as_os_str()).collect();
@@ -638,10 +638,7 @@ mod tests {
         let mut tree = make_tree();
         // Mount the shorter prefix first; the longer one should still
         // end up ahead of it in the iteration order.
-        tree.mount(
-            PathBuf::from("Work"),
-            Arc::new(NullBackend::new("work")),
-        );
+        tree.mount(PathBuf::from("Work"), Arc::new(NullBackend::new("work")));
         tree.mount(
             PathBuf::from("Work/Projects"),
             Arc::new(NullBackend::new("projects")),
@@ -666,8 +663,7 @@ mod tests {
     #[test]
     fn unmount_returns_the_removed_backend() {
         let mut tree = make_tree();
-        let backend = Arc::new(NullBackend::new("work"));
-        tree.mount(PathBuf::from("Work"), backend.clone());
+        tree.mount(PathBuf::from("Work"), Arc::new(NullBackend::new("work")));
         let removed = tree.unmount(Path::new("Work"));
         assert!(removed.is_some());
         let removed = removed.expect("present");
@@ -678,10 +674,7 @@ mod tests {
     fn resolve_picks_child_for_partial_overlap() {
         // A shorter prefix should not win when a longer one matches.
         let mut tree = make_tree();
-        tree.mount(
-            PathBuf::from("Work"),
-            Arc::new(NullBackend::new("work")),
-        );
+        tree.mount(PathBuf::from("Work"), Arc::new(NullBackend::new("work")));
         tree.mount(
             PathBuf::from("Workbench"),
             Arc::new(NullBackend::new("bench")),
@@ -695,10 +688,7 @@ mod tests {
     #[test]
     fn resolve_falls_back_to_root_when_no_prefix_matches() {
         let mut tree = make_tree();
-        tree.mount(
-            PathBuf::from("Work"),
-            Arc::new(NullBackend::new("work")),
-        );
+        tree.mount(PathBuf::from("Work"), Arc::new(NullBackend::new("work")));
         let (backend, rest) = tree.resolve(Path::new("Personal/notes.txt"));
         assert_eq!(backend.id(), "root");
         assert_eq!(rest, Path::new("Personal/notes.txt"));
@@ -711,7 +701,10 @@ mod tests {
         backend.put("b", "root", "beta.txt", b"bb".to_vec());
 
         let tree = VfsTree::new(backend);
-        let entries = tree.read_dir(Path::new("anywhere")).await.expect("read_dir");
+        let entries = tree
+            .read_dir(Path::new("anywhere"))
+            .await
+            .expect("read_dir");
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"alpha.txt"));
         assert!(names.contains(&"beta.txt"));
@@ -720,14 +713,17 @@ mod tests {
     #[tokio::test]
     async fn read_dir_injects_child_mount_point_into_parent() {
         let mut tree = VfsTree::new(Arc::new(MemBackend::new("root")));
-        tree.mount(
-            PathBuf::from("Work"),
-            Arc::new(MemBackend::new("work")),
-        );
+        tree.mount(PathBuf::from("Work"), Arc::new(MemBackend::new("work")));
         let entries = tree.read_dir(Path::new("")).await.expect("read_dir");
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"Work"), "mount point must be injected: {names:?}");
-        let work = entries.iter().find(|e| e.name == "Work").expect("Work entry");
+        assert!(
+            names.contains(&"Work"),
+            "mount point must be injected: {names:?}"
+        );
+        let work = entries
+            .iter()
+            .find(|e| e.name == "Work")
+            .expect("Work entry");
         assert!(work.is_dir, "injected mount point must be a directory");
     }
 
@@ -738,10 +734,7 @@ mod tests {
         let backend = Arc::new(MemBackend::new("root"));
         backend.put("w", "root", "Work", b"x".to_vec());
         let mut tree = VfsTree::new(backend);
-        tree.mount(
-            PathBuf::from("Work"),
-            Arc::new(MemBackend::new("work")),
-        );
+        tree.mount(PathBuf::from("Work"), Arc::new(MemBackend::new("work")));
         let entries = tree.read_dir(Path::new("")).await.expect("read_dir");
         let work_count = entries.iter().filter(|e| e.name == "Work").count();
         assert_eq!(work_count, 1);
@@ -800,8 +793,7 @@ mod tests {
             .list_children_by_id(&id)
             .await
             .expect("list_children_by_id");
-        let names: Vec<&str> = children.iter().map(|c| c.name.as_str()).collect();
-        assert!(names.contains(&"child.txt"));
+        assert!(children.iter().any(|c| c.name == "child.txt"));
     }
 
     #[tokio::test]
