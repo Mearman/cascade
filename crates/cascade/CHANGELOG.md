@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.106](https://github.com/Mearman/cascade/compare/cascade-v0.1.105...cascade-v0.1.106) - 2026-06-07
+
+### Other
+
+- *(gdrive)* remove the TLS deadlock workaround, collapse onto one shared pooled client
+
 ## [0.1.105](https://github.com/Mearman/cascade/compare/cascade-v0.1.104...cascade-v0.1.105) - 2026-06-07
 
 ### Added
