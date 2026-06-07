@@ -11,16 +11,21 @@ Every automated reproduction attempt in
 `crates/presenter-webdav/tests/tls_topology_repro.rs` — synthetic local TLS
 server, idle-drop-and-reuse, concurrent requests, varying worker counts — passed
 across all configurations. The deadlock does not reproduce against a synthetic
-server; only the real googleapis.com TLS frontend triggers it. That frontend
-requires a live, authenticated Drive session whose OAuth credentials cannot be
-embedded in a test.
+server, and — as the next paragraph shows — not even against the public
+googleapis.com frontend. In production it was only ever observed through the
+real, authenticated Drive endpoint, so capturing it needs a live, authenticated
+Drive session whose OAuth credentials cannot be embedded in a test.
 
 The automated `real_googleapis_nested_topology` test (in the same file, run
-with `--ignored --nocapture`) partially exercises the real frontend using the
-public, no-auth discovery endpoint. If that test stalls on the pooled config and
-passes on the unpooled config, that is strong evidence the googleapis frontend
-is the trigger. But the discovery endpoint is not Drive itself. If it does not
-reproduce, the only remaining path is this runbook.
+with `--ignored --nocapture`) exercises the real frontend using the public,
+no-auth discovery endpoint (`https://www.googleapis.com/discovery/v1/apis`),
+driving the nested axum-handler topology across eight rounds with escalating
+idle pauses (5 s / 15 s / 30 s) under both the pooled and the unpooled client
+configs. It has been run, and it **did not reproduce** the hang — both configs
+passed every round. The discovery endpoint shares the googleapis.com TLS
+frontend but is not Drive itself, so this narrows the trigger to the
+authenticated Drive upload host and leaves this runbook as the only remaining
+path to a confirmed root cause.
 
 ## Prerequisites
 
@@ -54,6 +59,11 @@ in `crates/backend-gdrive/src/client.rs`. Each request logs:
   `url`.
 - `after-headers` — logged after `.send().await` returns, same `seq`.
 
+Both are logged at `debug` level inside a `drive_request` span, so `RUST_LOG`
+must be at least `debug` for the backend crate to see them; `trace` is needed on
+top to capture the hyper/reqwest/rustls connection-lifecycle lines (pool reuse,
+TLS handshake, idle close) that surround the wedge.
+
 A wedged request shows `before-send` for some `seq=N` and **no** matching
 `after-headers` for that `seq`. The Finder copy will be stuck at the same
 moment.
@@ -80,16 +90,25 @@ RUST_LOG=trace \
 cascade start 2>&1 | tee ~/cascade-tls-deadlock-$(date +%Y%m%d-%H%M%S).log
 ```
 
-The startup log must contain the line:
+`RUST_LOG=trace` over the whole daemon is correct but very noisy. A targeted
+filter that keeps the wedge signature and the connection-lifecycle lines while
+dropping the rest is usually easier to read:
+
+```bash
+RUST_LOG="cascade_backend_gdrive=debug,cascade_presenter_webdav=debug,hyper=trace,hyper_util=trace,reqwest=trace,rustls=trace"
+```
+
+The startup log must contain a `WARN` line beginning:
 
 ```
-CASCADE_GDRIVE_HTTP_DIAG=pooled: Drive HTTP client is using pooled connections.
-This re-introduces the known-bad configuration and may reproduce the TLS hang.
-Diagnostic use only.
+CASCADE_GDRIVE_HTTP_DIAG=pooled: Drive HTTP client is using pooled connections …
 ```
 
-If it does not appear, the env var did not take and the run is invalid. Stop
-the daemon and check your shell environment.
+(the full message continues "… This re-introduces the known-bad configuration
+and may reproduce the TLS hang. Diagnostic use only." on the same logical line).
+If it does not appear, the env var did not take and the run is invalid — the
+default unpooled client emits no such warning. Stop the daemon and check your
+shell environment.
 
 **3. Confirm the WebDAV mount came up.**
 
@@ -167,17 +186,33 @@ confirms the workaround mitigates it.
 
 **8. Optional: bisect the load-bearing mitigation.**
 
-If you want to know which of the three workaround layers is individually
-sufficient, re-run the pooled config with one layer re-enabled at a time:
+`CASCADE_GDRIVE_HTTP_DIAG` controls **only** the client-side layer: `pooled`
+re-enables connection pooling; `pooled-http2` additionally drops `http1_only()`
+— but that is a no-op, because the workspace `reqwest` is built without the
+`http2` feature, so the client cannot negotiate HTTP/2 either way (see
+`build_unpooled_http1_client` in `crates/backend-gdrive/src/client.rs`). So the
+client layer that actually matters is `pool_max_idle_per_host(0)` (no pooling),
+which `pooled` flips off.
 
-- `pool_max_idle_per_host(0)` with pooled config → only this knob re-enabled.
-- Runtime isolation (`run_isolated_blocking`) stripped from pooled config.
-- `Connection: close` removed from the WebDAV response, pooled config.
+The two server-side layers — `Connection: close` on every WebDAV response and
+`run_isolated_blocking` for the backend write — are hardcoded in
+`crates/presenter-webdav/src/server.rs`. They are **not** reachable from the
+env var; bisecting them means editing that file and rebuilding.
 
-The standing hypothesis from the synthetic bisection is that
-`pool_max_idle_per_host(0)` is the load-bearing mitigation. The others may be
-belt-and-braces. Do not remove any layer from production until the root cause
-is confirmed and a reproduction passes.
+So, holding the pooled client constant (`CASCADE_GDRIVE_HTTP_DIAG=pooled`):
+
+- Client pooling alone: pooled (hang expected) versus the default unpooled (no
+  hang). This is steps 2 and 7 above and isolates the client-pooling layer.
+- Server `Connection: close`: strip it from the WebDAV response in `server.rs`,
+  rebuild, re-run the pooled config.
+- Server runtime isolation: replace `run_isolated_blocking` with a direct
+  `.await` of the backend write on the axum runtime in `server.rs`, rebuild,
+  re-run the pooled config.
+
+The standing hypothesis from the synthetic bisection is that the client-side
+`pool_max_idle_per_host(0)` is the load-bearing mitigation and the two
+server-side layers are belt-and-braces. Do not remove any layer from production
+until the root cause is confirmed and a reproduction passes.
 
 ## After capture
 
