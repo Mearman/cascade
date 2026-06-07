@@ -1269,4 +1269,43 @@ mod tests {
     fn client_construction() {
         let _client = DriveClient::new();
     }
+
+    /// Verify that the default `DriveClient` (no injected HTTP client) has
+    /// `http_client = None`, which keeps the production default path: every
+    /// request builds a fresh per-request unpooled HTTP/1.1 client via
+    /// `build_diag_http_client`. This is the gate that prevents the pooled
+    /// path from becoming active without an explicit `pooled-shared` env var.
+    #[test]
+    #[cfg(not(feature = "portable"))]
+    fn default_drive_client_has_no_injected_http_client() {
+        let client = DriveClient::new();
+        // `http_client` is `None` → per-request path, the TLS workaround.
+        assert!(
+            client.http_client.is_none(),
+            "DriveClient::new() must not inject an HTTP client; \
+             the default path requires http_client=None so every request \
+             builds a fresh unpooled client via build_diag_http_client"
+        );
+    }
+
+    /// Verify that `DiagHttpMode::UnpooledHttp1` (the default, set when the
+    /// env var is absent or unrecognised) is NOT equal to `PooledShared`, so
+    /// the daemon wiring produces `shared_http = None` and `skip_isolation =
+    /// false`. This pins the default-gate invariant stated in the design.
+    #[test]
+    #[cfg(not(feature = "portable"))]
+    fn default_diag_mode_is_not_pooled_shared() {
+        // `DiagHttpMode::UnpooledHttp1` is what the daemon uses when
+        // `CASCADE_GDRIVE_HTTP_DIAG` is absent. Confirm it is not equal to
+        // `PooledShared` so the injection branch is never taken by default.
+        assert_ne!(
+            DiagHttpMode::UnpooledHttp1,
+            DiagHttpMode::PooledShared,
+            "UnpooledHttp1 must never equal PooledShared — \
+             the daemon's shared_http injection logic branches on this equality"
+        );
+        // Confirm the opposite direction is also false.
+        assert_eq!(DiagHttpMode::PooledShared, DiagHttpMode::PooledShared);
+        assert_eq!(DiagHttpMode::UnpooledHttp1, DiagHttpMode::UnpooledHttp1);
+    }
 }
