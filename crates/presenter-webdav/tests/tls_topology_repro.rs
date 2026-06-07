@@ -2,7 +2,7 @@
 //!
 //! Historical note: the production workaround this harness refers to (a
 //! per-request unpooled HTTP/1.1 client built by `build_unpooled_http1_client`,
-//! plus the WebDAV `run_isolated_blocking` path) has since been **removed** in
+//! plus the `WebDAV` `run_isolated_blocking` path) has since been **removed** in
 //! favour of a single daemon-owned pooled `reqwest::Client` awaited directly on
 //! the main runtime — see the "Google Drive HTTP client" section of
 //! `docs/design.md`. This harness is retained, `#[ignore]`d, as a self-contained
