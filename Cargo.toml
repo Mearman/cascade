@@ -44,7 +44,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.1.95"
+version = "0.1.96"
 edition = "2024"
 license = "MIT"
 
