@@ -521,6 +521,12 @@ jobs:
       - name: TypeScript type check
         run: pnpm run typecheck
         working-directory: apps/web
+      - name: Lint
+        run: pnpm run lint
+        working-directory: apps/web
+      - name: Unit tests
+        run: pnpm run test:run
+        working-directory: apps/web
 
   pwa-build:
     name: PWA build

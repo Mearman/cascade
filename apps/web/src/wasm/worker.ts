@@ -19,10 +19,10 @@ let wasmReady = false;
 // Dynamically imported WASM glue exports. Available after initWasm().
 // The wasm-bindgen init function accepts a string/URL/Request or an object
 // { module_or_path: string | URL | Request }.
-type WasmInitInput = string | URL | Request | { module_or_path: string | URL | Request };
-type WasmInit = (input?: WasmInitInput) => Promise<unknown>;
+export type WasmInitInput = string | URL | Request | { module_or_path: string | URL | Request };
+export type WasmInit = (input?: WasmInitInput) => Promise<unknown>;
 
-interface WasmGlue {
+export interface WasmGlue {
   default: WasmInit;
   handle_request(request_json: string): unknown;
   register_backend(id: string, backend_type: string, handle?: unknown): void;
@@ -47,7 +47,10 @@ function hasFunction(value: unknown, key: string): boolean {
   return typeof descriptor?.value === 'function';
 }
 
-function isWasmGlue(value: unknown): value is WasmGlue {
+// `isWasmGlue` and `mutatorHandlers` are exported only for unit tests; the
+// production surface still goes through the message listener at the bottom of
+// this file.
+export function isWasmGlue(value: unknown): value is WasmGlue {
   if (typeof value !== 'object' || value === null) return false;
   return hasFunction(value, 'default')
     && hasFunction(value, 'handle_request')
@@ -147,42 +150,45 @@ function isWorkerResponse(value: unknown): value is WorkerResponse {
 
 // ─── Mutator dispatch ───────────────────────────────────────────────────────
 
-const mutatorHandlers: Record<MutatorMethod, (...args: unknown[]) => unknown> = {
-  register_backend(...args) {
+// `mutatorHandlers` closes over the module-level `glue`. `handleMutator` takes
+// `glue` as a parameter so unit tests can drive it with a fake. Exported for
+// the same reason.
+export const mutatorHandlers: Record<MutatorMethod, (glue: WasmGlue | undefined, ...args: unknown[]) => unknown> = {
+  register_backend(glue, ...args) {
     glue?.register_backend(assertString(args[0], 'id'), assertString(args[1], 'backendType'), args[2]);
     return undefined;
   },
-  deregister_backend(...args) {
+  deregister_backend(glue, ...args) {
     return glue?.deregister_backend(assertString(args[0], 'id')) ?? false;
   },
-  store_auth_token(...args) {
+  store_auth_token(glue, ...args) {
     glue?.store_auth_token(assertString(args[0], 'provider'), assertString(args[1], 'tokenJson'));
     return undefined;
   },
-  clear_auth_token(...args) {
+  clear_auth_token(glue, ...args) {
     return glue?.clear_auth_token(assertString(args[0], 'provider')) ?? false;
   },
-  upsert_files(...args) {
+  upsert_files(glue, ...args) {
     glue?.upsert_files(assertString(args[0], 'backendId'), assertString(args[1], 'filesJson'));
     return undefined;
   },
-  delete_files(...args) {
+  delete_files(glue, ...args) {
     glue?.delete_files(assertString(args[0], 'backendId'), assertString(args[1], 'fileIdsJson'));
     return undefined;
   },
-  set_peer_connection(...args) {
+  set_peer_connection(glue, ...args) {
     glue?.set_peer_connection(assertString(args[0], 'sessionId'), args[1]);
     return undefined;
   },
-  remove_peer_connection(...args) {
+  remove_peer_connection(glue, ...args) {
     return glue?.remove_peer_connection(assertString(args[0], 'sessionId')) ?? false;
   },
 };
 
-function handleMutator(msg: WorkerMutator): MutatorAck {
+export function handleMutator(msg: WorkerMutator, glueArg: WasmGlue | undefined = glue): MutatorAck {
   const handler = mutatorHandlers[msg.mutator];
   try {
-    const result = handler(...msg.args);
+    const result = handler(glueArg, ...msg.args);
     return { id: msg.id, result };
   } catch (err: unknown) {
     return { id: msg.id, result: undefined, error: String(err) };
