@@ -289,6 +289,7 @@ export function FilesPage() {
     return (
       <div class="files-page">
         <h2>Files</h2>
+        {error !== null && <ErrorBanner message={error} onDismiss={() => { setError(null); }} />}
         {isWasm ? (
           <p class="muted">No backends registered. <a href="/login">Log in</a> to connect Google Drive.</p>
         ) : (
