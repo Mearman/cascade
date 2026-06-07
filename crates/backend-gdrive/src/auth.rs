@@ -21,12 +21,17 @@
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
+// Only the native interactive-OAuth flow reads/writes the localhost callback
+// socket; under the `portable` feature those functions are gated out.
+#[cfg(not(feature = "portable"))]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Drive scope: full read-write access to all files the user can see.
+#[cfg(not(feature = "portable"))]
 const DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive";
 
 /// Device code flow scope: limited to per-file access (Google restriction).
+#[cfg(not(feature = "portable"))]
 const DEVICE_CODE_SCOPE: &str = "https://www.googleapis.com/auth/drive.file";
 
 /// Google's `OAuth2` token endpoint.
@@ -52,6 +57,7 @@ struct TokenResponse {
 }
 
 /// Device code response from Google.
+#[cfg(not(feature = "portable"))]
 #[derive(Debug, Deserialize)]
 struct DeviceCodeResponse {
     device_code: String,
@@ -139,6 +145,10 @@ const KEYCHAIN_SERVICE: &str = "com.cascade.gdrive";
 /// 2. Print the authorisation URL and attempt to open the browser
 /// 3. Wait for the callback with the auth code
 /// 4. Exchange the code for tokens
+///
+/// Native-only: it binds a localhost listener and opens a browser, neither of
+/// which exists under the `portable` (wasm) feature.
+#[cfg(not(feature = "portable"))]
 pub async fn start_local_redirect(
     http: &reqwest::Client,
     config: &OAuthConfig,
@@ -181,6 +191,7 @@ pub async fn start_local_redirect(
 ///
 /// Parses the query string from the GET request, extracts the `code` parameter,
 /// sends a simple HTML response to the browser, and returns the auth code.
+#[cfg(not(feature = "portable"))]
 async fn wait_for_callback(listener: &tokio::net::TcpListener) -> anyhow::Result<String> {
     let (stream, _addr) = listener.accept().await?;
     let mut buf = vec![0u8; 4096];
@@ -243,6 +254,7 @@ async fn wait_for_callback(listener: &tokio::net::TcpListener) -> anyhow::Result
 }
 
 /// Exchange an authorisation code for tokens.
+#[cfg(not(feature = "portable"))]
 async fn exchange_code(
     http: &reqwest::Client,
     config: &OAuthConfig,
@@ -271,9 +283,19 @@ async fn exchange_code(
     let secs = i64::try_from(token_resp.expires_in).unwrap_or(i64::MAX);
     let expires_at = chrono::Utc::now() + chrono::Duration::seconds(secs);
 
+    // A missing refresh token on the initial grant is a hard failure, not an
+    // empty string: without it every later refresh fails. Google only returns
+    // one with `access_type=offline` and a fresh consent.
+    let refresh_token = token_resp.refresh_token.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Google did not return a refresh token; re-authorise with offline access \
+             (access_type=offline & prompt=consent)"
+        )
+    })?;
+
     Ok(AuthTokens {
         access_token: token_resp.access_token,
-        refresh_token: token_resp.refresh_token.unwrap_or_default(),
+        refresh_token,
         expires_at,
     })
 }
@@ -283,6 +305,10 @@ async fn exchange_code(
 // ---------------------------------------------------------------------------
 
 /// Initiate the device code flow. Returns the URL and user code.
+///
+/// Native-only: the device-code poll loop and its `reqwest` client are not
+/// available under the `portable` (wasm) feature.
+#[cfg(not(feature = "portable"))]
 pub async fn start_device_code(
     http: &reqwest::Client,
     config: &OAuthConfig,
@@ -312,6 +338,7 @@ pub async fn start_device_code(
 }
 
 /// Poll for the device code token. Blocks until the user authorises.
+#[cfg(not(feature = "portable"))]
 pub async fn poll_for_token(
     http: &reqwest::Client,
     config: &OAuthConfig,
@@ -344,9 +371,16 @@ pub async fn poll_for_token(
             let token_resp: TokenResponse = serde_json::from_str(&body)?;
             let secs = i64::try_from(token_resp.expires_in).unwrap_or(i64::MAX);
             let expires_at = chrono::Utc::now() + chrono::Duration::seconds(secs);
+            // A missing refresh token here would silently break every later
+            // refresh; fail loud instead of storing an empty string.
+            let refresh_token = token_resp.refresh_token.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Google did not return a refresh token; re-authorise with offline access"
+                )
+            })?;
             return Ok(AuthTokens {
                 access_token: token_resp.access_token,
-                refresh_token: token_resp.refresh_token.unwrap_or_default(),
+                refresh_token,
                 expires_at,
             });
         }

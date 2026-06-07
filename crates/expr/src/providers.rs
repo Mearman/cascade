@@ -155,8 +155,16 @@ impl DiskProvider {
     #[allow(unsafe_code)]
     #[must_use]
     pub fn collect_for_path(path: &str) -> DiskContext {
+        // A path with an interior NUL cannot be passed to `statfs`; treat it as
+        // "disk stats unavailable" (zeroed) explicitly, rather than letting an
+        // empty `CString` stand in for a real path and silently fail the syscall.
+        let Ok(c_path) = std::ffi::CString::new(path) else {
+            return DiskContext {
+                total_bytes: 0,
+                free_bytes: 0,
+            };
+        };
         let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
-        let c_path = std::ffi::CString::new(path).unwrap_or_default();
         let result = unsafe { libc::statfs(c_path.as_ptr(), &raw mut stat) };
         if result == 0 {
             #[cfg(target_os = "linux")]
