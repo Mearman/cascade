@@ -5,15 +5,22 @@ edition.workspace = true
 license.workspace = true
 description = "Browser WebRTC data-channel transport for the Cascade WASM core"
 
-# All dependencies are wasm32-only: on native targets the crate compiles as an
-# empty lib with no code and no deps, so `cargo check --workspace` succeeds.
+# Portable dependencies: the config and error types, their serde-shape
+# projection, and their native tests compile on every target (gated on
+# `cfg(any(target_arch = "wasm32", test))`). This lets the wire contract be
+# unit-tested natively without a wasm runtime.
+[dependencies]
+thiserror.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+
+# JavaScript-interop dependencies are wasm32-only: the `#[wasm_bindgen]`
+# bindings and the live transport exist only on the browser target.
 # Verify the WASM build with:
 #   cargo check -p cascade-p2p-webrtc --target wasm32-unknown-unknown
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen.workspace = true
 js-sys.workspace = true
-thiserror.workspace = true
-serde = { workspace = true }
 
 [lints]
 workspace = true

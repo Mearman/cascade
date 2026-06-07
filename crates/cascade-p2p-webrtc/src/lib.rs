@@ -16,10 +16,14 @@
 //! this crate wraps the resulting frame transport in a small Rust surface
 //! (`send`, `on_frame`, `on_close`, `close`, `connected`).
 //!
-//! On native targets the crate builds as an empty lib — every module and public
-//! item is gated on `#[cfg(target_arch = "wasm32")]`, so an ordinary
-//! `cargo check --workspace` succeeds without pulling in any wasm-only
-//! dependency. Verify the WASM build with:
+//! The config and error types (`WebRtcConfig`, `WebRtcError`) are portable:
+//! they compile and are testable on native targets. The `#[cfg(any(target_arch =
+//! "wasm32", test))]` gate makes them available for native unit tests.
+//!
+//! The JS-interop modules (`js`, `transport`) and the live transport types
+//! (`WebRtcTransport`, `create_transport`, `supported`) are wasm32-only.
+//!
+//! Verify the WASM build with:
 //!
 //! ```text
 //! cargo check -p cascade-p2p-webrtc --target wasm32-unknown-unknown
@@ -34,10 +38,21 @@
 //! crate therefore exposes its own callback-based transport surface rather than
 //! implementing the native trait.
 
+// The config and error types are portable: they compile on the host so the wire
+// contract can be unit-tested natively.
+#[cfg(any(target_arch = "wasm32", test))]
+mod config;
+
+// The JS-interop bindings and live transport are wasm32-only.
 #[cfg(target_arch = "wasm32")]
 mod js;
 #[cfg(target_arch = "wasm32")]
 mod transport;
 
+// Portable re-exports: available to both wasm consumers and native test code.
+#[cfg(any(target_arch = "wasm32", test))]
+pub use config::{WebRtcConfig, WebRtcError};
+
+// Wasm-only re-exports: the live transport is wasm32-only.
 #[cfg(target_arch = "wasm32")]
-pub use transport::{WebRtcConfig, WebRtcError, WebRtcTransport, create_transport, supported};
+pub use transport::{WebRtcTransport, create_transport, supported};

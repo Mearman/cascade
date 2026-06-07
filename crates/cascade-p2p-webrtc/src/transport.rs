@@ -7,36 +7,12 @@
 
 use std::cell::RefCell;
 
-use js_sys::{Array, Object, Reflect, Uint8Array};
-use serde::{Deserialize, Serialize};
+use js_sys::Uint8Array;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 
+use crate::config::{WebRtcConfig, WebRtcError};
 use crate::js::{self, FrameTransport};
-
-/// A failure crossing the WebRTC bridge.
-#[derive(Debug, thiserror::Error)]
-pub enum WebRtcError {
-    /// A JavaScript-side call rejected or threw. The message carries the JS
-    /// error text where one was available.
-    #[error("WebRTC bridge call failed: {0}")]
-    Js(String),
-}
-
-/// Configuration for establishing a peer connection.
-///
-/// The role is implied by `session_id`: `None` makes this peer the initiator
-/// (it generates a session id and sends the SDP offer); `Some` makes it the
-/// responder for an existing session.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WebRtcConfig {
-    /// WebSocket URL of the relay used for signalling.
-    pub relay_url: String,
-    /// STUN server URLs for ICE candidate gathering.
-    pub stun_servers: Vec<String>,
-    /// The rendezvous session id, or `None` to act as the initiator.
-    pub session_id: Option<String>,
-}
 
 /// A frame transport over a browser WebRTC data channel.
 ///
@@ -120,31 +96,13 @@ impl WebRtcTransport {
 }
 
 /// Build the `WebRtcConfig`-shaped JS object the bridge expects.
+///
+/// Uses the portable `to_wire_json` serde projection (the single source of
+/// truth for the boundary shape) and turns it into a `JsValue` via
+/// `serde_json::to_string` + `js_sys::JSON::parse`.
 fn to_js_config(config: &WebRtcConfig) -> Result<JsValue, WebRtcError> {
-    let object = Object::new();
-    set(&object, "relayUrl", &JsValue::from_str(&config.relay_url))?;
-
-    let servers = Array::new();
-    for url in &config.stun_servers {
-        servers.push(&JsValue::from_str(url));
-    }
-    set(&object, "stunServers", servers.as_ref())?;
-
-    if let Some(session_id) = &config.session_id {
-        set(&object, "sessionId", &JsValue::from_str(session_id))?;
-    }
-
-    Ok(object.into())
-}
-
-/// Set a property on a JS object, mapping a rejected write to a bridge error.
-fn set(object: &Object, key: &str, value: &JsValue) -> Result<(), WebRtcError> {
-    Reflect::set(object.as_ref(), &JsValue::from_str(key), value)
-        .map(|_| ())
-        .map_err(|e| WebRtcError::Js(describe(&e)))
-}
-
-/// Best-effort human-readable rendering of a JS error value.
-fn describe(value: &JsValue) -> String {
-    value.as_string().unwrap_or_else(|| format!("{value:?}"))
+    let value = config.to_wire_json()?;
+    let json = serde_json::to_string(&value).map_err(|error| WebRtcError::Js(error.to_string()))?;
+    js_sys::JSON::parse(&json)
+        .map_err(|_| WebRtcError::Js("serialised WebRTC config was not valid JSON".into()))
 }
