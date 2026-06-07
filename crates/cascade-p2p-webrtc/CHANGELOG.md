@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.104](https://github.com/Mearman/cascade/compare/cascade-p2p-webrtc-v0.1.103...cascade-p2p-webrtc-v0.1.104) - 2026-06-07
+
+### Added
+
+- *(wasm)* add wasm-bindgen-test lane for browser bridge crates
+- *(wasm)* add browser File System Access and WebRTC transport crates
+
+### Other
+
+- release v0.1.103 [skip ci]
+- release v0.1.102 [skip ci]
+- release v0.1.101 [skip ci]
+- release v0.1.100 [skip ci]
+- *(wasm)* correct the wasm-pack test invocation in the crate docs
+- release v0.1.99 [skip ci]
+- release v0.1.98 [skip ci]
+- release v0.1.97 [skip ci]
+- *(p2p-webrtc)* make the config and error surface natively testable
+- release v0.1.96 [skip ci]
+- release v0.1.95 [skip ci]
+- release v0.1.94 [skip ci]
+- release v0.1.93 [skip ci]
+- release v0.1.92 [skip ci]
+- release v0.1.91 [skip ci]
+- release v0.1.90 [skip ci]
+- release v0.1.89 [skip ci]
+- release v0.1.88 [skip ci]
+- release v0.1.87 [skip ci]
+- release v0.1.86 [skip ci]
+- release v0.1.85 [skip ci]
+- release v0.1.84 [skip ci]
+- release v0.1.83 [skip ci]
+- release v0.1.82 [skip ci]
+- release v0.1.81 [skip ci]
+- release v0.1.80 [skip ci]
+- release v0.1.79 [skip ci]
+- release v0.1.78 [skip ci]
+- release v0.1.77 [skip ci]
+- release v0.1.76 [skip ci]
+
 ## [0.1.103](https://github.com/Mearman/cascade/compare/cascade-p2p-webrtc-v0.1.102...cascade-p2p-webrtc-v0.1.103) - 2026-06-07
 
 ### Added
