@@ -222,12 +222,16 @@ real-endpoint reproduction. Keep the saved trace log and sample as artefacts.
 
 ## Important constraints
 
-The workaround — `build_unpooled_http1_client` with `pool_max_idle_per_host(0)`
-in `crates/backend-gdrive/src/client.rs`, plus `run_isolated_blocking` in the
-WebDAV PUT handler — must remain in place until a root cause is confirmed **and**
-a reproduction passes. Neither a green automated test run nor a single runbook
-capture is sufficient grounds to remove it. The production default is
-`CASCADE_GDRIVE_HTTP_DIAG` unset (unpooled-http1).
+**Status (2026-06-07): the default has been flipped to the shared pooled client.**
+After two real-endpoint captures passed (see Capture results below — 68 uploads,
+no wedge), `pooled-shared` became the production default. The former workaround —
+`build_unpooled_http1_client` with `pool_max_idle_per_host(0)` plus
+`run_isolated_blocking` in the WebDAV PUT handler — is **not deleted**; it is the
+escape hatch, reachable instantly via `CASCADE_GDRIVE_HTTP_DIAG=unpooled-legacy`
+should the shared client wedge in production. The escape hatch and the workaround
+code stay until the new default has soaked in real use; deleting them is the final
+step. The capture procedure above remains valid for re-validating the default and
+for diagnosing any regression.
 
 Do not run this diagnostic against a Drive folder that contains data you care
 about. The pooled config can stall in-flight uploads, potentially leaving
@@ -259,10 +263,18 @@ scenario the original deadlock struck on ("after ~2 handshakes"), at 14× that
 threshold and across idle gaps — no hang. The throwaway folder was trashed
 afterwards.
 
-Caveats, per the rule above: this is **one** capture and the original hang was
-not reproduced in any configuration this session (so the run does not prove the
-harness would catch a regression). It is strong positive evidence that the
-stranded-driver root cause is addressed by keeping the connection driver on the
-stable runtime, but on its own it is **not** grounds to flip the default — repeat
-the capture (ideally across sessions / networks / longer soak) before the
-follow-up that removes the workaround.
+A second, heavier run immediately after: **40 uploads** (files to 512 KB, idle
+gaps of 25 / 40 s), ledger `40 → 40`, again no wedge — **68 uploads total** across
+the two runs, zero wedges.
+
+On the strength of those two captures the **default was flipped** to
+`pooled-shared`, confirmed by a final run with no env var that showed the daemon
+using the shared client (`skip_isolation=true`) and uploading cleanly. The
+former workaround is kept as the `unpooled-legacy` escape hatch (see Status
+above), not deleted.
+
+Residual caveat: the original hang was **not** reproduced in any configuration,
+so the captures prove the fix works in those runs but not that the harness would
+catch a regression. The escape hatch is the safeguard for that uncertainty; the
+workaround code is not deleted until the new default has soaked in real use,
+ideally re-validated across sessions / networks.

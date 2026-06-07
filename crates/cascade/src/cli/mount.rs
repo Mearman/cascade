@@ -502,14 +502,16 @@ pub async fn start(
     // runtime, so both the backend-injection decision and the WebDAV
     // isolation decision derive from the same OnceLock value.
     //
-    // In pooled-shared mode we build a single long-lived pooled reqwest::Client
-    // NOW — on the main runtime — and wrap it in the portable ReqwestClient
-    // adapter. The connection driver lives on this runtime for the daemon's
-    // lifetime, so it is always polled and never stranded. Every `rebuild_backends`
-    // call receives the same `Arc` so the client is never recreated or dropped.
+    // pooled-shared is the default mode: we build a single long-lived pooled
+    // reqwest::Client NOW — on the main runtime — and wrap it in the portable
+    // ReqwestClient adapter. The connection driver lives on this runtime for the
+    // daemon's lifetime, so it is always polled and never stranded. Every
+    // `rebuild_backends` call receives the same `Arc` so the client is never
+    // recreated or dropped.
     //
-    // In all other modes `shared_http` is `None` and the default per-request
-    // path runs unchanged.
+    // The escape hatch (CASCADE_GDRIVE_HTTP_DIAG=unpooled-legacy) and the
+    // diagnostic pooled/pooled-http2 modes resolve away from PooledShared, so
+    // `shared_http` is `None` and the legacy per-request workaround path runs.
     let (shared_http, skip_isolation) = {
         use cascade_backend_gdrive::client::{DiagHttpMode, diag_http_mode};
         if diag_http_mode() == DiagHttpMode::PooledShared {

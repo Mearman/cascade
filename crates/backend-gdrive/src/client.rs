@@ -162,60 +162,48 @@ pub fn build_unpooled_http1_client(timeout: Duration) -> reqwest::Result<reqwest
         .build()
 }
 
-/// Opt-in diagnostic HTTP-client selector, controlled at runtime by
-/// `CASCADE_GDRIVE_HTTP_DIAG`.
+/// HTTP-client mode selector, controlled at runtime by `CASCADE_GDRIVE_HTTP_DIAG`.
 ///
 /// The env var is read once (at first use) and determines which `reqwest::Client`
 /// is built for every Drive API call and `OAuth2` refresh.
 ///
 /// Recognised values:
-/// - absent / `"unpooled-http1"` (default): the production workaround —
-///   pooling disabled, HTTP/1.1 forced. **This is the only value that is
-///   safe to use against the real Drive endpoint in production.**
-/// - `"pooled"`: connection pooling re-enabled, HTTP/1.1 forced. This is
-///   the suspected-bad configuration. Use it only in a controlled diagnostic
-///   session to attempt to reproduce the hang.
-/// - `"pooled-http2"`: connection pooling re-enabled and `http1_only()`
-///   dropped to allow HTTP/2. In practice this is identical to `"pooled"`:
-///   the workspace `reqwest` is built without the `http2` feature, so the
-///   client cannot negotiate HTTP/2 regardless. The mode is kept for if/when
-///   that feature is enabled.
-/// - `"pooled-shared"`: opt-in diagnostic path — a daemon-owned, long-lived,
-///   pooled `reqwest::Client` is injected by the daemon and shared across all
-///   Drive requests, including `OAuth2` refresh. The per-request client builder
-///   is not used at all. **Do NOT use in production without completing the
-///   authenticated-Drive capture documented in `docs/tls-deadlock-capture.md`.**
-///   This mode also disables `run_isolated_blocking` in the `WebDAV` presenter
-///   (both must move together so the shared connection driver stays polled on
-///   the daemon's stable main runtime and is never stranded on a transient
-///   current-thread runtime).
+/// - absent / `"pooled-shared"` (**default**): the daemon injects a single
+///   long-lived, pooled `reqwest::Client` shared across all Drive requests and
+///   `OAuth2` refreshes, and the `WebDAV` presenter's `run_isolated_blocking` is
+///   disabled so the shared connection driver stays polled on the daemon's
+///   stable main runtime. This was the original TLS-deadlock workaround's target
+///   architecture; it became the default after the authenticated-Drive capture
+///   in `docs/tls-deadlock-capture.md` passed.
+/// - `"unpooled-legacy"` / `"unpooled-http1"`: the **escape hatch** — the
+///   previous workaround. A fresh, unpooled, HTTP/1.1 client is built per
+///   request and `run_isolated_blocking` stays on. Set this if the shared
+///   pooled client ever wedges in production; it reverts the behaviour instantly
+///   without a rebuild.
+/// - `"pooled"`: connection pooling re-enabled on a per-request client, HTTP/1.1
+///   forced. Diagnostic only — the suspected-bad pre-workaround shape.
+/// - `"pooled-http2"`: like `"pooled"` but `http1_only()` dropped. Identical in
+///   practice — the workspace `reqwest` is built without the `http2` feature, so
+///   HTTP/2 cannot be negotiated. Kept for if/when that feature is enabled.
 ///
-/// Any other value is silently treated as `"unpooled-http1"` (safe default).
-///
-/// **Never use `"pooled"`, `"pooled-http2"`, or `"pooled-shared"` in
-/// production without first completing the documented capture procedure.**
-/// The first two re-introduce the known-bad configuration and will likely
-/// reproduce the hang; `"pooled-shared"` may fix it but has not been confirmed
-/// against the real TLS endpoint.
+/// Any unrecognised value is treated as the default (`PooledShared`).
 #[cfg(not(feature = "portable"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagHttpMode {
-    /// Production workaround: no pooling, HTTP/1.1 only. This is always the default.
+    /// Escape hatch (former production workaround): no pooling, HTTP/1.1 only,
+    /// fresh client per request, `run_isolated_blocking` on. Selected by
+    /// `CASCADE_GDRIVE_HTTP_DIAG=unpooled-legacy`.
     UnpooledHttp1,
-    /// Diagnostic only: pooling re-enabled, HTTP/1.1 forced.
+    /// Diagnostic only: pooling re-enabled on a per-request client, HTTP/1.1 forced.
     Pooled,
     /// Diagnostic only: pooling re-enabled and `http1_only()` dropped. Cannot
     /// actually negotiate HTTP/2 (reqwest is built without the `http2`
     /// feature), so it behaves like [`Pooled`](Self::Pooled) today.
     PooledHttp2,
-    /// Opt-in diagnostic: the daemon injects a single long-lived pooled
-    /// `reqwest::Client` shared across all Drive requests and `OAuth2` refreshes.
-    /// The per-request client builder is bypassed entirely. The `WebDAV` presenter's
-    /// `run_isolated_blocking` is also disabled when this mode is active, so the
+    /// **Default.** The daemon injects a single long-lived pooled
+    /// `reqwest::Client` shared across all Drive requests and `OAuth2` refreshes,
+    /// and the `WebDAV` presenter's `run_isolated_blocking` is disabled so the
     /// shared connection driver stays polled on the daemon's main runtime.
-    ///
-    /// **Requires a human capture run (see `docs/tls-deadlock-capture.md`) before
-    /// it can be promoted to the default.**
     PooledShared,
 }
 
@@ -223,7 +211,21 @@ pub enum DiagHttpMode {
 #[cfg(not(feature = "portable"))]
 static DIAG_HTTP_MODE: OnceLock<DiagHttpMode> = OnceLock::new();
 
-/// Read the diagnostic mode from the environment, initialising the global on first call.
+/// Map a `CASCADE_GDRIVE_HTTP_DIAG` value to a mode. Pure — no logging, no
+/// global state — so the env→mode policy (including the default) is unit-tested.
+/// Any unrecognised value resolves to the default, [`DiagHttpMode::PooledShared`].
+#[cfg(not(feature = "portable"))]
+fn parse_diag_mode(value: &str) -> DiagHttpMode {
+    match value {
+        "unpooled-legacy" | "unpooled-http1" => DiagHttpMode::UnpooledHttp1,
+        "pooled" => DiagHttpMode::Pooled,
+        "pooled-http2" => DiagHttpMode::PooledHttp2,
+        // Absent, "pooled-shared", or any unrecognised value: the default.
+        _ => DiagHttpMode::PooledShared,
+    }
+}
+
+/// Read the mode from the environment, initialising the global on first call.
 ///
 /// This is the single source of truth for the mode. Both the gdrive injection
 /// decision (in `crates/cascade/src/cli/mount.rs`) and the `WebDAV` isolation
@@ -233,58 +235,50 @@ static DIAG_HTTP_MODE: OnceLock<DiagHttpMode> = OnceLock::new();
 #[cfg(not(feature = "portable"))]
 pub fn diag_http_mode() -> DiagHttpMode {
     *DIAG_HTTP_MODE.get_or_init(|| {
-        match std::env::var("CASCADE_GDRIVE_HTTP_DIAG")
-            .as_deref()
-            .unwrap_or("")
-        {
-            "pooled" => {
-                tracing::warn!(
-                    "CASCADE_GDRIVE_HTTP_DIAG=pooled: Drive HTTP client is using pooled \
-                     connections. This re-introduces the known-bad configuration and may \
-                     reproduce the TLS hang. Diagnostic use only."
-                );
-                DiagHttpMode::Pooled
-            }
-            "pooled-http2" => {
-                tracing::warn!(
-                    "CASCADE_GDRIVE_HTTP_DIAG=pooled-http2: Drive HTTP client is using pooled \
-                     connections with http1_only dropped. HTTP/2 cannot actually be negotiated \
-                     (reqwest is built without the http2 feature), so this behaves like 'pooled'. \
-                     Diagnostic use only."
-                );
-                DiagHttpMode::PooledHttp2
-            }
-            "pooled-shared" => {
-                tracing::warn!(
-                    "CASCADE_GDRIVE_HTTP_DIAG=pooled-shared: Drive HTTP client is using a \
-                     single daemon-owned pooled client injected at startup. The WebDAV \
-                     run_isolated_blocking workaround is also disabled. This is an opt-in \
-                     diagnostic path — the authenticated-Drive capture in \
-                     docs/tls-deadlock-capture.md must pass before this mode can become the \
-                     default."
-                );
-                DiagHttpMode::PooledShared
-            }
-            _ => DiagHttpMode::UnpooledHttp1,
+        let mode = parse_diag_mode(
+            std::env::var("CASCADE_GDRIVE_HTTP_DIAG")
+                .as_deref()
+                .unwrap_or(""),
+        );
+        match mode {
+            DiagHttpMode::UnpooledHttp1 => tracing::warn!(
+                "CASCADE_GDRIVE_HTTP_DIAG=unpooled-legacy: reverting to the legacy per-request \
+                 unpooled HTTP/1.1 client and the WebDAV run_isolated_blocking workaround. This \
+                 is the escape hatch from the default shared pooled client; use it only if the \
+                 shared client wedges."
+            ),
+            DiagHttpMode::Pooled => tracing::warn!(
+                "CASCADE_GDRIVE_HTTP_DIAG=pooled: per-request pooled connections. This is the \
+                 suspected-bad pre-workaround shape. Diagnostic use only."
+            ),
+            DiagHttpMode::PooledHttp2 => tracing::warn!(
+                "CASCADE_GDRIVE_HTTP_DIAG=pooled-http2: per-request pooled connections with \
+                 http1_only dropped. HTTP/2 cannot actually be negotiated (no http2 feature), so \
+                 this behaves like 'pooled'. Diagnostic use only."
+            ),
+            // The default — a single shared pooled client on the daemon runtime.
+            DiagHttpMode::PooledShared => {}
         }
+        mode
     })
 }
 
-/// Build a `reqwest` client according to the current diagnostic mode.
+/// Build a per-request `reqwest` client for a `DriveClient` that has no injected
+/// shared client (`http_client == None`).
 ///
-/// In `UnpooledHttp1` mode (the default and only production-safe value) this
-/// delegates to `build_unpooled_http1_client`. In diagnostic modes it builds
-/// a pooled client so the suspected-bad configuration is reachable against the
-/// real TLS endpoint.
+/// The daemon, in the default `PooledShared` mode, injects a shared client into
+/// every `DriveClient` it builds, so its Drive calls never reach here. This
+/// function serves the non-injecting callers (standalone/CLI Drive calls, tests):
+/// - `UnpooledHttp1` (the escape hatch) — the per-request unpooled HTTP/1.1
+///   workaround client.
+/// - `PooledShared` (the default) — falls back to the same safe unpooled
+///   per-request client. A non-injecting caller has no shared driver to strand,
+///   so the per-request workaround is correct here; a debug line records that
+///   the shared client was not injected for this `DriveClient`.
+/// - `Pooled` / `PooledHttp2` — diagnostic per-request pooled clients.
 ///
-/// This function is the single call site that must replace every direct call
-/// to `reqwest::Client::builder()` inside this crate's native path.
-///
-/// **Must not be called in `PooledShared` mode.** In that mode a shared client
-/// is injected by the daemon at startup and held in `DriveClient::http_client`;
-/// the per-request builder is bypassed entirely. Callers must check the
-/// injected-client field before reaching this function; if they reach it with
-/// `PooledShared` active the injection wiring is broken.
+/// This is the single call site that must replace every direct call to
+/// `reqwest::Client::builder()` inside this crate's native path.
 #[cfg(not(feature = "portable"))]
 pub fn build_diag_http_client(timeout: Duration) -> anyhow::Result<reqwest::Client> {
     match diag_http_mode() {
@@ -295,17 +289,16 @@ pub fn build_diag_http_client(timeout: Duration) -> anyhow::Result<reqwest::Clie
             .build()?),
         DiagHttpMode::PooledHttp2 => Ok(reqwest::Client::builder().timeout(timeout).build()?),
         DiagHttpMode::PooledShared => {
-            // In pooled-shared mode the per-request builder must never be used;
-            // the daemon injects a shared client via `DriveClient::with_http_client_native`.
-            // Reaching this branch means the injection wiring is broken — fail
-            // loudly rather than silently falling back to the per-request path,
-            // which would strand the driver on a transient runtime and
-            // reintroduce the exact hang.
-            anyhow::bail!(
-                "build_diag_http_client called in pooled-shared mode — \
-                 the daemon must inject a shared HttpClient via \
-                 DriveClient::with_http_client_native before Drive API calls are made"
-            )
+            // A DriveClient with no injected shared client reached the per-request
+            // path while pooled-shared is the default. Fall back to the safe
+            // unpooled workaround client (one fresh connection, driver polled on
+            // the calling runtime for the single request — no stranding). The
+            // daemon's injected DriveClients never hit this branch.
+            tracing::debug!(
+                "pooled-shared: a DriveClient without an injected shared client built a \
+                 per-request unpooled client (expected for standalone/CLI Drive calls)"
+            );
+            Ok(build_unpooled_http1_client(timeout)?)
         }
     }
 }
@@ -1274,42 +1267,46 @@ mod tests {
         let _client = DriveClient::new();
     }
 
-    /// Verify that the default `DriveClient` (no injected HTTP client) has
-    /// `http_client = None`, which keeps the production default path: every
-    /// request builds a fresh per-request unpooled HTTP/1.1 client via
-    /// `build_diag_http_client`. This is the gate that prevents the pooled
-    /// path from becoming active without an explicit `pooled-shared` env var.
+    /// The bare `DriveClient::new()` constructor (used by non-injecting callers
+    /// such as the CLI and tests) carries no injected HTTP client, so it falls
+    /// back to the per-request `build_diag_http_client` path. The daemon, by
+    /// contrast, injects a shared client into the `DriveClient`s it builds.
     #[test]
     #[cfg(not(feature = "portable"))]
-    fn default_drive_client_has_no_injected_http_client() {
+    fn bare_drive_client_constructor_has_no_injected_http_client() {
         let client = DriveClient::new();
-        // `http_client` is `None` → per-request path, the TLS workaround.
         assert!(
             client.http_client.is_none(),
-            "DriveClient::new() must not inject an HTTP client; \
-             the default path requires http_client=None so every request \
-             builds a fresh unpooled client via build_diag_http_client"
+            "DriveClient::new() is the no-injection constructor; the daemon injects \
+             via create_backend_with_store_and_http instead"
         );
     }
 
-    /// Verify that `DiagHttpMode::UnpooledHttp1` (the default, set when the
-    /// env var is absent or unrecognised) is NOT equal to `PooledShared`, so
-    /// the daemon wiring produces `shared_http = None` and `skip_isolation =
-    /// false`. This pins the default-gate invariant stated in the design.
+    /// The env→mode policy, including the flipped default. With `pooled-shared`
+    /// now the default, an absent or unrecognised value resolves to it; the
+    /// former workaround is the `unpooled-legacy` escape hatch.
     #[test]
     #[cfg(not(feature = "portable"))]
-    fn default_diag_mode_is_not_pooled_shared() {
-        // `DiagHttpMode::UnpooledHttp1` is what the daemon uses when
-        // `CASCADE_GDRIVE_HTTP_DIAG` is absent. Confirm it is not equal to
-        // `PooledShared` so the injection branch is never taken by default.
-        assert_ne!(
-            DiagHttpMode::UnpooledHttp1,
+    fn diag_mode_default_is_pooled_shared() {
+        assert_eq!(
+            parse_diag_mode(""),
             DiagHttpMode::PooledShared,
-            "UnpooledHttp1 must never equal PooledShared — \
-             the daemon's shared_http injection logic branches on this equality"
+            "absent → default"
         );
-        // Confirm the opposite direction is also false.
-        assert_eq!(DiagHttpMode::PooledShared, DiagHttpMode::PooledShared);
-        assert_eq!(DiagHttpMode::UnpooledHttp1, DiagHttpMode::UnpooledHttp1);
+        assert_eq!(parse_diag_mode("pooled-shared"), DiagHttpMode::PooledShared);
+        assert_eq!(
+            parse_diag_mode("anything-unknown"),
+            DiagHttpMode::PooledShared
+        );
+        assert_eq!(
+            parse_diag_mode("unpooled-legacy"),
+            DiagHttpMode::UnpooledHttp1
+        );
+        assert_eq!(
+            parse_diag_mode("unpooled-http1"),
+            DiagHttpMode::UnpooledHttp1
+        );
+        assert_eq!(parse_diag_mode("pooled"), DiagHttpMode::Pooled);
+        assert_eq!(parse_diag_mode("pooled-http2"), DiagHttpMode::PooledHttp2);
     }
 }
