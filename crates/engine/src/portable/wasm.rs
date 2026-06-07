@@ -1288,4 +1288,212 @@ mod tests {
             assert!(storage.list_pin_rules().await.expect("list").is_empty());
         });
     }
+
+    // ── Sync method coverage ──
+    //
+    // The async `StateStorage` trait is the generic contract; the `_sync`
+    // accessors are the engine's direct call path on WASM (where the request
+    // handler is itself synchronous). Tests below cover the sync surface.
+
+    #[test]
+    fn sync_register_backend_creates_record() {
+        let storage = WasmStateStorage::new();
+        storage.register_backend_sync("b1", "local", "Local", None, None);
+        let backends = storage.list_backends_sync();
+        assert_eq!(backends.len(), 1);
+        let record = &backends[0];
+        assert_eq!(record.id, "b1");
+        assert_eq!(record.backend_type, "local");
+        assert_eq!(record.display_name, "Local");
+        assert!(record.mount_path.is_none());
+        assert!(record.config.is_none());
+    }
+
+    #[test]
+    fn sync_register_backend_replaces_existing_record() {
+        let storage = WasmStateStorage::new();
+        storage.register_backend_sync("b1", "local", "First", None, None);
+        storage.register_backend_sync("b1", "s3", "Second", Some("/mnt"), Some("{}"));
+
+        let backends = storage.list_backends_sync();
+        assert_eq!(backends.len(), 1, "second register must replace, not append");
+        let record = &backends[0];
+        assert_eq!(record.backend_type, "s3");
+        assert_eq!(record.display_name, "Second");
+        assert_eq!(record.mount_path.as_deref(), Some("/mnt"));
+        assert_eq!(record.config.as_deref(), Some("{}"));
+    }
+
+    #[test]
+    fn sync_remove_backend_returns_true_for_present() {
+        let storage = WasmStateStorage::new();
+        storage.register_backend_sync("b1", "local", "Local", None, None);
+        assert!(storage.remove_backend_sync("b1"));
+        assert!(storage.list_backends_sync().is_empty());
+    }
+
+    #[test]
+    fn sync_remove_backend_returns_false_for_missing() {
+        let storage = WasmStateStorage::new();
+        assert!(!storage.remove_backend_sync("ghost"));
+    }
+
+    #[test]
+    fn sync_list_backends_empty_for_new_storage() {
+        let storage = WasmStateStorage::new();
+        assert!(storage.list_backends_sync().is_empty());
+    }
+
+    #[test]
+    fn sync_upsert_file_inserts_new_entry() {
+        let storage = WasmStateStorage::new();
+        let id = ItemId::new("b1", "f1");
+        let parent = ItemId::new("b1", "root");
+        let entry = file_entry(&id, &parent, "hello.txt");
+        storage.upsert_file_sync(&entry);
+
+        let files = storage.list_all_files_sync();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].id, id);
+        assert_eq!(files[0].name, "hello.txt");
+    }
+
+    #[test]
+    fn sync_upsert_file_replaces_entry_with_same_scoped_id() {
+        let storage = WasmStateStorage::new();
+        let id = ItemId::new("b1", "f1");
+        let parent = ItemId::new("b1", "root");
+        let first = FileEntry::file(id.clone(), parent.clone(), "first.txt".to_owned());
+        let second = FileEntry::file(id.clone(), parent, "second.txt".to_owned());
+        storage.upsert_file_sync(&first);
+        storage.upsert_file_sync(&second);
+
+        let files = storage.list_all_files_sync();
+        assert_eq!(files.len(), 1, "upsert must replace, not duplicate");
+        assert_eq!(files[0].name, "second.txt");
+    }
+
+    #[test]
+    fn sync_remove_file_returns_true_for_present() {
+        let storage = WasmStateStorage::new();
+        let id = ItemId::new("b1", "f1");
+        let parent = ItemId::new("b1", "root");
+        let entry = file_entry(&id, &parent, "data.bin");
+        storage.upsert_file_sync(&entry);
+        assert!(storage.remove_file_sync(&id.0));
+        assert!(storage.list_all_files_sync().is_empty());
+    }
+
+    #[test]
+    fn sync_remove_file_returns_false_for_missing() {
+        let storage = WasmStateStorage::new();
+        assert!(!storage.remove_file_sync("b1:missing"));
+    }
+
+    #[test]
+    fn sync_list_all_files_returns_every_inserted_entry() {
+        let storage = WasmStateStorage::new();
+        let ids = ["a", "b", "c"];
+        for (i, suffix) in ids.iter().enumerate() {
+            let id = ItemId::new("b1", *suffix);
+            let parent = ItemId::new("b1", "root");
+            let entry = file_entry(&id, &parent, &format!("file-{i}.txt"));
+            storage.upsert_file_sync(&entry);
+        }
+        let files = storage.list_all_files_sync();
+        assert_eq!(files.len(), 3);
+    }
+
+    #[test]
+    fn sync_list_children_filters_by_parent_id() {
+        let storage = WasmStateStorage::new();
+        let dir = ItemId::new("b1", "dir");
+        let other = ItemId::new("b1", "other");
+        for native in ["a", "b"] {
+            let id = ItemId::new("b1", native);
+            storage.upsert_file_sync(&file_entry(&id, &dir, "x.txt"));
+        }
+        let id = ItemId::new("b1", "c");
+        storage.upsert_file_sync(&file_entry(&id, &other, "y.txt"));
+
+        let in_dir = storage.list_children_sync(&dir.0);
+        assert_eq!(in_dir.len(), 2);
+        let in_other = storage.list_children_sync(&other.0);
+        assert_eq!(in_other.len(), 1);
+        let empty = storage.list_children_sync("b1:nope");
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn sync_add_pin_rule_assigns_distinct_ids() {
+        let storage = WasmStateStorage::new();
+        storage.add_pin_rule_sync("/work/**", true, None);
+        storage.add_pin_rule_sync("/archive/**", false, Some("on-battery"));
+        let rules = storage.list_pin_rules_sync();
+        assert_eq!(rules.len(), 2);
+        assert_ne!(rules[0].id, rules[1].id);
+        let first = rules.iter().find(|r| r.path_glob == "/work/**").expect("first");
+        assert!(first.recursive);
+        assert!(first.conditions.is_none());
+        let second = rules.iter().find(|r| r.path_glob == "/archive/**").expect("second");
+        assert!(!second.recursive);
+        assert_eq!(second.conditions.as_deref(), Some("on-battery"));
+    }
+
+    #[test]
+    fn sync_remove_pin_rule_returns_true_for_present() {
+        let storage = WasmStateStorage::new();
+        storage.add_pin_rule_sync("/work/**", true, None);
+        let id = storage.list_pin_rules_sync()[0].id;
+        assert!(storage.remove_pin_rule_sync(id));
+        assert!(storage.list_pin_rules_sync().is_empty());
+    }
+
+    #[test]
+    fn sync_remove_pin_rule_returns_false_for_missing() {
+        let storage = WasmStateStorage::new();
+        assert!(!storage.remove_pin_rule_sync(99_999));
+    }
+
+    #[test]
+    fn sync_add_lifecycle_policy_assigns_distinct_ids() {
+        let storage = WasmStateStorage::new();
+        storage.add_lifecycle_policy_sync("/tmp/**", Some(86_400), Some(1_000_000), 10, None);
+        storage.add_lifecycle_policy_sync("/cache/**", None, Some(500_000), 5, None);
+        let policies = storage.list_lifecycle_policies_sync();
+        assert_eq!(policies.len(), 2);
+        assert_ne!(policies[0].id, policies[1].id);
+    }
+
+    #[test]
+    fn sync_list_lifecycle_policies_orders_by_priority_descending() {
+        let storage = WasmStateStorage::new();
+        storage.add_lifecycle_policy_sync("/low/**", None, None, 1, None);
+        storage.add_lifecycle_policy_sync("/high/**", None, None, 100, None);
+        storage.add_lifecycle_policy_sync("/mid/**", None, None, 50, None);
+        let policies = storage.list_lifecycle_policies_sync();
+        let priorities: Vec<i32> = policies.iter().map(|p| p.priority).collect();
+        assert_eq!(priorities, vec![100, 50, 1]);
+    }
+
+    #[test]
+    fn sync_remove_lifecycle_policy_returns_true_for_present() {
+        let storage = WasmStateStorage::new();
+        storage.add_lifecycle_policy_sync("/x/**", None, None, 0, None);
+        let id = storage.list_lifecycle_policies_sync()[0].id;
+        assert!(storage.remove_lifecycle_policy_sync(id));
+        assert!(storage.list_lifecycle_policies_sync().is_empty());
+    }
+
+    #[test]
+    fn sync_remove_lifecycle_policy_returns_false_for_missing() {
+        let storage = WasmStateStorage::new();
+        assert!(!storage.remove_lifecycle_policy_sync(99_999));
+    }
+
+    #[test]
+    fn sync_list_peers_empty_for_new_storage() {
+        let storage = WasmStateStorage::new();
+        assert!(storage.list_peers_sync().is_empty());
+    }
 }

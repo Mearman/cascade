@@ -402,6 +402,416 @@ mod tests {
         assert!(tree.backend_by_id("missing").is_none());
     }
 
+    /// In-memory backend that supports `metadata`, `download`, `upload`,
+    /// `delete`, and `move_entry` — the operations exercised by
+    /// `VfsTree::read_dir` and `VfsTree::rename`. Tracks content by native id
+    /// and records delete and move operations so cross-backend behaviour can
+    /// be verified.
+    #[derive(Debug)]
+    struct MemBackend {
+        id: String,
+        files: Mutex<HashMap<String, FileEntry>>,
+        content: Mutex<HashMap<String, Vec<u8>>>,
+        deleted: Mutex<Vec<String>>,
+        moved: Mutex<Vec<(String, String)>>,
+    }
+
+    impl MemBackend {
+        fn new(id: &str) -> Self {
+            Self {
+                id: id.to_owned(),
+                files: Mutex::new(HashMap::new()),
+                content: Mutex::new(HashMap::new()),
+                deleted: Vec::new().into(),
+                moved: Vec::new().into(),
+            }
+        }
+
+        fn put(&self, native_id: &str, parent: &str, name: &str, data: Vec<u8>) {
+            let entry = FileEntry {
+                id: ItemId::new(&self.id, native_id),
+                parent_id: ItemId::new(&self.id, parent),
+                name: name.to_owned(),
+                is_dir: false,
+                size: Some(data.len() as u64),
+                mod_time: None,
+                mime_type: None,
+                hash: None,
+            };
+            self.files
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(native_id.to_owned(), entry);
+            self.content
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(native_id.to_owned(), data);
+        }
+
+        fn deleted(&self) -> Vec<String> {
+            self.deleted
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        fn moved(&self) -> Vec<(String, String)> {
+            self.moved
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl Backend for MemBackend {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn display_name(&self) -> &str {
+            &self.id
+        }
+
+        async fn quota(&self) -> anyhow::Result<Option<Quota>> {
+            Ok(None)
+        }
+
+        async fn changes(
+            &self,
+            _cursor: Option<&Cursor>,
+        ) -> anyhow::Result<(Vec<Change>, Cursor)> {
+            let files = self
+                .files
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let changes = files.values().map(|e| Change::Created(e.clone())).collect();
+            Ok((changes, Cursor("mem".to_owned())))
+        }
+
+        async fn metadata(&self, path: &Path) -> anyhow::Result<FileEntry> {
+            let target = path.to_string_lossy().to_string();
+            let files = self
+                .files
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            files
+                .values()
+                .find(|e| e.name == target || e.id.native_id() == target)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("no entry at {target}"))
+        }
+
+        async fn download(&self, file: &FileEntry) -> anyhow::Result<Vec<u8>> {
+            let native = file.id.native_id().to_owned();
+            let content = self
+                .content
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            content
+                .get(&native)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("no content for {native}"))
+        }
+
+        async fn upload(
+            &self,
+            path: &Path,
+            data: &[u8],
+            parent_id: &FileId,
+        ) -> anyhow::Result<FileEntry> {
+            let native = path.to_string_lossy().to_string();
+            let entry = FileEntry {
+                id: ItemId::new(&self.id, &native),
+                parent_id: ItemId::new(&self.id, &parent_id.0),
+                name: path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map_or_else(String::new, ToOwned::to_owned),
+                is_dir: false,
+                size: Some(data.len() as u64),
+                mod_time: None,
+                mime_type: None,
+                hash: None,
+            };
+            self.files
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(native.clone(), entry.clone());
+            self.content
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(native, data.to_vec());
+            Ok(entry)
+        }
+
+        async fn update(&self, _file_id: &FileId, _data: &[u8]) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("update not supported in MemBackend")
+        }
+
+        async fn create_dir(&self, _path: &Path) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("create_dir not supported in MemBackend")
+        }
+
+        async fn delete(&self, file: &FileEntry) -> anyhow::Result<()> {
+            let native = file.id.native_id().to_owned();
+            self.files
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&native);
+            self.content
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&native);
+            self.deleted
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(native);
+            Ok(())
+        }
+
+        async fn move_entry(&self, src: &Path, dst: &Path) -> anyhow::Result<FileEntry> {
+            let src_key = src.to_string_lossy().to_string();
+            let dst_key = dst.to_string_lossy().to_string();
+            self.moved
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((src_key.clone(), dst_key.clone()));
+            let mut files = self
+                .files
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entry = files
+                .values()
+                .find(|e| e.name == src_key || e.id.native_id() == src_key)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("no entry at {src_key}"))?;
+            let remove_key = entry.id.native_id().to_owned();
+            files.remove(&remove_key);
+            let new_entry = FileEntry {
+                id: ItemId::new(&self.id, &dst_key),
+                name: dst
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map_or_else(|| entry.name.clone(), ToOwned::to_owned),
+                ..entry
+            };
+            files.insert(dst_key, new_entry.clone());
+            Ok(new_entry)
+        }
+
+        async fn list_children(&self, _parent: &str) -> anyhow::Result<Vec<FileEntry>> {
+            let files = self
+                .files
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Ok(files.values().cloned().collect())
+        }
+
+        async fn poll_interval(&self) -> Option<Duration> {
+            None
+        }
+    }
+
+    #[test]
+    fn new_creates_tree_with_root_backend() {
+        let tree = make_tree();
+        assert_eq!(tree.root().id(), "root");
+        assert!(tree.children().is_empty());
+    }
+
+    #[test]
+    fn mount_adds_child_at_prefix() {
+        let mut tree = make_tree();
+        tree.mount(PathBuf::from("Work"), Arc::new(NullBackend::new("work")));
+        tree.mount(PathBuf::from("Assets"), Arc::new(NullBackend::new("assets")));
+
+        let prefixes: Vec<&std::ffi::OsStr> =
+            tree.children().iter().map(|(p, _)| p.as_os_str()).collect();
+        assert_eq!(prefixes.len(), 2);
+        assert!(prefixes.contains(&std::ffi::OsStr::new("Work")));
+        assert!(prefixes.contains(&std::ffi::OsStr::new("Assets")));
+    }
+
+    #[test]
+    fn mount_orders_longest_prefix_first() {
+        let mut tree = make_tree();
+        // Mount the shorter prefix first; the longer one should still
+        // end up ahead of it in the iteration order.
+        tree.mount(
+            PathBuf::from("Work"),
+            Arc::new(NullBackend::new("work")),
+        );
+        tree.mount(
+            PathBuf::from("Work/Projects"),
+            Arc::new(NullBackend::new("projects")),
+        );
+
+        let prefixes: Vec<String> = tree
+            .children()
+            .iter()
+            .map(|(p, _)| p.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(prefixes.first().map(String::as_str), Some("Work/Projects"));
+    }
+
+    #[test]
+    fn unmount_returns_none_for_missing_prefix() {
+        let mut tree = make_tree();
+        let removed = tree.unmount(Path::new("Does/Not/Exist"));
+        assert!(removed.is_none());
+        assert!(tree.children().is_empty());
+    }
+
+    #[test]
+    fn unmount_returns_the_removed_backend() {
+        let mut tree = make_tree();
+        let backend = Arc::new(NullBackend::new("work"));
+        tree.mount(PathBuf::from("Work"), backend.clone());
+        let removed = tree.unmount(Path::new("Work"));
+        assert!(removed.is_some());
+        let removed = removed.expect("present");
+        assert_eq!(removed.id(), "work");
+    }
+
+    #[test]
+    fn resolve_picks_child_for_partial_overlap() {
+        // A shorter prefix should not win when a longer one matches.
+        let mut tree = make_tree();
+        tree.mount(
+            PathBuf::from("Work"),
+            Arc::new(NullBackend::new("work")),
+        );
+        tree.mount(
+            PathBuf::from("Workbench"),
+            Arc::new(NullBackend::new("bench")),
+        );
+
+        let (backend, rest) = tree.resolve(Path::new("Workbench/tool"));
+        assert_eq!(backend.id(), "bench");
+        assert_eq!(rest, Path::new("tool"));
+    }
+
+    #[test]
+    fn resolve_falls_back_to_root_when_no_prefix_matches() {
+        let mut tree = make_tree();
+        tree.mount(
+            PathBuf::from("Work"),
+            Arc::new(NullBackend::new("work")),
+        );
+        let (backend, rest) = tree.resolve(Path::new("Personal/notes.txt"));
+        assert_eq!(backend.id(), "root");
+        assert_eq!(rest, Path::new("Personal/notes.txt"));
+    }
+
+    #[tokio::test]
+    async fn read_dir_includes_backend_entries() {
+        let backend = Arc::new(MemBackend::new("root"));
+        backend.put("a", "root", "alpha.txt", b"a".to_vec());
+        backend.put("b", "root", "beta.txt", b"bb".to_vec());
+
+        let tree = VfsTree::new(backend);
+        let entries = tree.read_dir(Path::new("anywhere")).await.expect("read_dir");
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"alpha.txt"));
+        assert!(names.contains(&"beta.txt"));
+    }
+
+    #[tokio::test]
+    async fn read_dir_injects_child_mount_point_into_parent() {
+        let mut tree = VfsTree::new(Arc::new(MemBackend::new("root")));
+        tree.mount(
+            PathBuf::from("Work"),
+            Arc::new(MemBackend::new("work")),
+        );
+        let entries = tree.read_dir(Path::new("")).await.expect("read_dir");
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"Work"), "mount point must be injected: {names:?}");
+        let work = entries.iter().find(|e| e.name == "Work").expect("Work entry");
+        assert!(work.is_dir, "injected mount point must be a directory");
+    }
+
+    #[tokio::test]
+    async fn read_dir_does_not_duplicate_mount_point_already_in_backend() {
+        // A backend that already reports "Work" via changes() should not
+        // cause the injected entry to be added a second time.
+        let backend = Arc::new(MemBackend::new("root"));
+        backend.put("w", "root", "Work", b"x".to_vec());
+        let mut tree = VfsTree::new(backend);
+        tree.mount(
+            PathBuf::from("Work"),
+            Arc::new(MemBackend::new("work")),
+        );
+        let entries = tree.read_dir(Path::new("")).await.expect("read_dir");
+        let work_count = entries.iter().filter(|e| e.name == "Work").count();
+        assert_eq!(work_count, 1);
+    }
+
+    #[tokio::test]
+    async fn rename_within_same_backend_calls_move_entry() {
+        let backend = Arc::new(MemBackend::new("root"));
+        backend.put("a", "root", "old.txt", b"data".to_vec());
+        let tree = VfsTree::new(backend.clone());
+
+        tree.rename(Path::new("old.txt"), Path::new("new.txt"))
+            .await
+            .expect("rename");
+
+        let moved = backend.moved();
+        assert_eq!(moved, vec![("old.txt".to_owned(), "new.txt".to_owned())]);
+        assert!(backend.deleted().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rename_across_backends_downloads_uploads_and_deletes() {
+        let src = Arc::new(MemBackend::new("src"));
+        let dst = Arc::new(MemBackend::new("dst"));
+        src.put("a", "root", "file.txt", b"hello".to_vec());
+
+        let mut tree = VfsTree::new(Arc::new(MemBackend::new("root")));
+        tree.mount(PathBuf::from("Work"), src.clone());
+        tree.mount(PathBuf::from("Archive"), dst.clone());
+
+        tree.rename(Path::new("Work/file.txt"), Path::new("Archive/file.txt"))
+            .await
+            .expect("rename");
+
+        // Source should have been deleted.
+        assert_eq!(src.deleted(), vec!["a".to_owned()]);
+        // Destination should now hold the file with the original content.
+        let stored = dst
+            .metadata(Path::new("file.txt"))
+            .await
+            .expect("destination entry exists");
+        let downloaded = dst.download(&stored).await.expect("download");
+        assert_eq!(downloaded, b"hello".to_vec());
+    }
+
+    #[tokio::test]
+    async fn list_children_by_id_delegates_to_named_backend() {
+        let src = Arc::new(MemBackend::new("src"));
+        src.put("c1", "parent", "child.txt", b"x".to_vec());
+
+        let mut tree = VfsTree::new(Arc::new(MemBackend::new("root")));
+        tree.mount(PathBuf::from("Work"), src.clone());
+
+        let id = ItemId::new("src", "parent");
+        let children = tree
+            .list_children_by_id(&id)
+            .await
+            .expect("list_children_by_id");
+        let names: Vec<&str> = children.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"child.txt"));
+    }
+
+    #[tokio::test]
+    async fn list_children_by_id_errors_for_unknown_backend() {
+        let tree = make_tree();
+        let id = ItemId::new("ghost", "parent");
+        let err = tree.list_children_by_id(&id).await.unwrap_err();
+        assert!(err.to_string().contains("ghost"));
+    }
+
     #[tokio::test]
     async fn current_sync_cursor_is_stable_when_no_changes() {
         let backend = Arc::new(StubBackend::new("stub"));
