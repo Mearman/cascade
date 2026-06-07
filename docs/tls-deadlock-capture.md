@@ -232,3 +232,37 @@ capture is sufficient grounds to remove it. The production default is
 Do not run this diagnostic against a Drive folder that contains data you care
 about. The pooled config can stall in-flight uploads, potentially leaving
 partial uploads or duplicates.
+
+## Capture results
+
+### 2026-06-07 — `pooled-shared` against real authenticated Drive: PASS (no hang)
+
+First real-endpoint capture of the architectural-fix mode. Setup: a debug daemon
+authenticated against a real Google Drive account, started with
+`CASCADE_PRESENTER=webdav CASCADE_GDRIVE_HTTP_DIAG=pooled-shared … start --no-mount`
+(WebDAV HTTP server on localhost, no OS mount), driving the write path with HTTP
+PUTs directly at the server — so every PUT runs the handler's `skip_isolation`
+branch and uploads through the single daemon-owned pooled client on the main
+runtime.
+
+- **28 sequential uploads** into a throwaway folder: one warm-up, seven with
+  escalating idle gaps (0/0/5/12/20/35/50 s — spanning the remote idle-close
+  window), then a 20-upload back-to-back burst (maximal connection reuse). Every
+  PUT returned `201`, ~2 s each; the daemon's `before backend upload` /
+  `after backend upload` ledger was **28 → 28** with no `before-send` left
+  without its `after-headers`, and no timeout/stall/wedge in the trace.
+- **Control** (default mode, isolation on): six uploads, all `201`, ledger
+  `6 → 6`.
+
+So the shared pooled client survived exactly the write-path-with-connection-reuse
+scenario the original deadlock struck on ("after ~2 handshakes"), at 14× that
+threshold and across idle gaps — no hang. The throwaway folder was trashed
+afterwards.
+
+Caveats, per the rule above: this is **one** capture and the original hang was
+not reproduced in any configuration this session (so the run does not prove the
+harness would catch a regression). It is strong positive evidence that the
+stranded-driver root cause is addressed by keeping the connection driver on the
+stable runtime, but on its own it is **not** grounds to flip the default — repeat
+the capture (ideally across sessions / networks / longer soak) before the
+follow-up that removes the workaround.

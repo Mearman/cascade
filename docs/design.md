@@ -1560,6 +1560,8 @@ That target architecture is now implemented as an **opt-in migration seam**, wit
 
 The capture-gated follow-up (out of scope until the authenticated-Drive capture passes against `pooled-shared`): make the shared pooled client the unconditional default, delete `build_unpooled_http1_client` / `build_diag_http_client` / the `DiagHttpMode` selector and the per-request native path, delete `run_isolated_blocking` and the `skip_isolation` branch, and drop the forced `Connection: close` — collapsing native onto the single shared-client path. The opt-in mode is a clean migration seam, not permanent debt.
 
+A first real-endpoint capture of `pooled-shared` (2026-06-07, full results in [`docs/tls-deadlock-capture.md`](tls-deadlock-capture.md)) **passed**: 28 sequential WebDAV uploads to a real authenticated Drive account — including a 20-upload back-to-back burst and idle gaps up to 50 s — completed with the `before-send`/`after-headers` ledger balanced and no wedge, exercising exactly the write-path-with-connection-reuse scenario the hang struck on. This is strong evidence the shared-runtime client fixes it, but one capture is not grounds to flip the default; the workaround stays until the capture is repeated with more confidence.
+
 ## Conflict resolution
 
 When the same file is modified in two places simultaneously:
