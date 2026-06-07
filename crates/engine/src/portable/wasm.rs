@@ -2,8 +2,9 @@
 //!
 //! Each adapter here binds one [`super`] trait to the browser's equivalent:
 //!
-//! - [`WasmRuntimeHandle`] → browser event loop (`wasm_bindgen_futures`)
-//!   ([`super::RuntimeHandle`]). Only available on `wasm32`.
+//! - `WasmRuntimeHandle` → browser event loop (`wasm_bindgen_futures`)
+//!   ([`super::RuntimeHandle`]). Only available on `wasm32`, so it is not an
+//!   intra-doc link here (the host doc build cannot resolve it).
 //! - [`WasmStateStorage`] → in-memory `HashMap` store
 //!   ([`super::StateStorage`]). Available on all targets so it can be tested
 //!   natively.
@@ -1261,11 +1262,7 @@ mod tests {
                 .await
                 .expect("set");
             assert_eq!(
-                storage
-                    .get_cursor("b1")
-                    .await
-                    .expect("get")
-                    .map(|c| c.0.clone()),
+                storage.get_cursor("b1").await.expect("get").map(|c| c.0),
                 Some("token123".to_owned())
             );
         });
@@ -1368,7 +1365,7 @@ mod tests {
         let id = ItemId::new("b1", "f1");
         let parent = ItemId::new("b1", "root");
         let first = FileEntry::file(id.clone(), parent.clone(), "first.txt".to_owned());
-        let second = FileEntry::file(id.clone(), parent, "second.txt".to_owned());
+        let second = FileEntry::file(id, parent, "second.txt".to_owned());
         storage.upsert_file_sync(&first);
         storage.upsert_file_sync(&second);
 
@@ -1399,7 +1396,7 @@ mod tests {
         let storage = WasmStateStorage::new();
         let ids = ["a", "b", "c"];
         for (i, suffix) in ids.iter().enumerate() {
-            let id = ItemId::new("b1", *suffix);
+            let id = ItemId::new("b1", suffix);
             let parent = ItemId::new("b1", "root");
             let entry = file_entry(&id, &parent, &format!("file-{i}.txt"));
             storage.upsert_file_sync(&entry);
