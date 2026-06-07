@@ -34,13 +34,17 @@
 //! cargo check -p cascade-wasm --target wasm32-unknown-unknown
 //! ```
 
-#[cfg(target_arch = "wasm32")]
+// The request router, the in-memory engine state, and capability detection are
+// portable Rust: they compile and run on the host so the request contract can be
+// unit-tested without a wasm runtime. Only the JS-interop context handlers are
+// strictly wasm32.
+#[cfg(any(target_arch = "wasm32", test))]
 mod caps;
 #[cfg(target_arch = "wasm32")]
 mod context;
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", test))]
 mod router;
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", test))]
 mod state;
 
 #[cfg(target_arch = "wasm32")]
@@ -148,14 +152,16 @@ pub fn register_backend(id: &str, backend_type: &str, handle: JsValue) {
     } else {
         Some(handle)
     };
-    // Persist to engine storage (source of truth for API reads).
     state::with_engine(|engine| {
+        // Persist to engine storage (source of truth for API reads).
         engine
             .storage
             .register_backend_sync(id, backend_type, id, None, None);
+        // Also record the opaque JS handle in session state.
+        engine
+            .session
+            .set_backend(id.to_string(), backend_type.to_string(), handle);
     });
-    // Also record the opaque JS handle in session state.
-    state::set_backend(id.to_string(), backend_type.to_string(), handle);
 }
 
 /// Remove a backend by id, returning whether one was registered.
@@ -163,11 +169,12 @@ pub fn register_backend(id: &str, backend_type: &str, handle: JsValue) {
 #[wasm_bindgen]
 #[must_use]
 pub fn deregister_backend(id: &str) -> bool {
-    // Remove from engine storage.
-    let storage_removed = state::with_engine(|engine| engine.storage.remove_backend_sync(id));
-    // Remove session-state handle.
-    let session_removed = state::remove_backend(id);
-    storage_removed || session_removed
+    state::with_engine(|engine| {
+        // Remove from both engine storage and the session-state handle.
+        let storage_removed = engine.storage.remove_backend_sync(id);
+        let session_removed = engine.session.remove_backend(id);
+        storage_removed || session_removed
+    })
 }
 
 /// Cache OAuth token metadata for a provider (e.g. `"gdrive"`). The durable copy
@@ -182,7 +189,11 @@ pub fn deregister_backend(id: &str) -> bool {
 pub fn store_auth_token(provider: &str, token_json: &str) -> Result<(), JsValue> {
     let token: TokenInput = serde_json::from_str(token_json)
         .map_err(|error| WasmError::InvalidToken(error.to_string()))?;
-    state::set_token(provider.to_string(), token.scope, token.expiry);
+    state::with_engine(|engine| {
+        engine
+            .session
+            .set_token(provider.to_string(), token.scope, token.expiry);
+    });
     Ok(())
 }
 
@@ -191,7 +202,7 @@ pub fn store_auth_token(provider: &str, token_json: &str) -> Result<(), JsValue>
 #[wasm_bindgen]
 #[must_use]
 pub fn clear_auth_token(provider: &str) -> bool {
-    state::remove_token(provider)
+    state::with_engine(|engine| engine.session.remove_token(provider))
 }
 
 /// Insert (or replace) file entries from the JS side into engine storage.
@@ -245,7 +256,9 @@ pub fn delete_files(backend_id: &str, file_ids_json: &str) -> Result<(), JsValue
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub fn set_peer_connection(session_id: &str, connection: JsValue) {
-    state::set_peer(session_id.to_string(), connection);
+    state::with_engine(|engine| {
+        engine.session.set_peer(session_id.to_string(), connection);
+    });
 }
 
 /// Drop a peer connection by relay session id, returning whether one was present.
@@ -253,7 +266,7 @@ pub fn set_peer_connection(session_id: &str, connection: JsValue) {
 #[wasm_bindgen]
 #[must_use]
 pub fn remove_peer_connection(session_id: &str) -> bool {
-    state::remove_peer(session_id)
+    state::with_engine(|engine| engine.session.remove_peer(session_id))
 }
 
 /// Serialise a value to a JavaScript object via its JSON form.

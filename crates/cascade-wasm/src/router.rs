@@ -17,7 +17,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::caps;
-use crate::state;
 use crate::state::EngineState;
 
 /// A request from the worker: an HTTP-shaped method, path, and optional body.
@@ -69,7 +68,7 @@ pub fn route(request: &WorkerRequest, engine: &EngineState) -> WorkerResponse {
 
         // ── Folders / files ──
         ("GET", ["v1", "folders", folder_id, "children"]) => {
-            handle_list_children(&request.id, engine, folder_id, query_part.as_deref())
+            handle_list_children(&request.id, engine, folder_id, query_part)
         }
         ("DELETE", ["v1", "files", backend_id, "entries", ..]) => {
             handle_delete_file_entry(&request.id, engine, backend_id, &segments[4..])
@@ -103,9 +102,9 @@ pub fn route(request: &WorkerRequest, engine: &EngineState) -> WorkerResponse {
 
 /// `GET /v1/session` — merge engine backends with auth-token session state.
 fn handle_session(id: &str, engine: &EngineState) -> WorkerResponse {
+    let (established, session_body) = engine.session.session();
     let backends = engine.storage.list_backends_sync();
     let files = engine.storage.list_all_files_sync();
-    let (established, session_body) = state::session();
 
     // Enrich session body with engine data.
     let online = files.iter().filter(|f| !f.is_dir).count();
@@ -135,7 +134,7 @@ fn handle_session(id: &str, engine: &EngineState) -> WorkerResponse {
 /// state's JS handle info.
 fn handle_list_backends(id: &str, engine: &EngineState) -> WorkerResponse {
     let backends = engine.storage.list_backends_sync();
-    let session_backends = state::list_backends();
+    let session_backends = engine.session.list_backends();
 
     // Build a lookup of session-state handles by backend id.
     let session_map: std::collections::HashMap<String, bool> = session_backends
@@ -169,17 +168,14 @@ fn handle_list_backends(id: &str, engine: &EngineState) -> WorkerResponse {
 
 /// `POST /v1/backends` — register a backend through engine storage and session
 /// state. Body: `{ "id": "...", "type": "..." }`.
-fn handle_create_backend(request: &WorkerRequest, _engine: &EngineState) -> WorkerResponse {
-    let body = match request.body {
-        Some(ref b) => b,
-        None => {
-            return error_response(
-                &request.id,
-                400,
-                "bad_request",
-                "POST /v1/backends requires a JSON body with 'id' and 'type'",
-            );
-        }
+fn handle_create_backend(request: &WorkerRequest, engine: &EngineState) -> WorkerResponse {
+    let Some(ref body) = request.body else {
+        return error_response(
+            &request.id,
+            400,
+            "bad_request",
+            "POST /v1/backends requires a JSON body with 'id' and 'type'",
+        );
     };
 
     let id_val = body.get("id").and_then(Value::as_str);
@@ -188,17 +184,13 @@ fn handle_create_backend(request: &WorkerRequest, _engine: &EngineState) -> Work
     match (id_val, type_val) {
         (Some(backend_id), Some(backend_type)) => {
             // Persist to engine storage.
-            state::with_engine(|engine| {
-                engine.storage.register_backend_sync(
-                    backend_id,
-                    backend_type,
-                    backend_id,
-                    None,
-                    None,
-                );
-            });
+            engine
+                .storage
+                .register_backend_sync(backend_id, backend_type, backend_id, None, None);
             // Record in session state (no JS handle for HTTP-created backends).
-            state::set_backend(backend_id.to_owned(), backend_type.to_owned(), None);
+            engine
+                .session
+                .set_backend(backend_id.to_owned(), backend_type.to_owned(), None);
             created(
                 &request.id,
                 json!({ "id": backend_id, "type": backend_type }),
@@ -216,7 +208,7 @@ fn handle_create_backend(request: &WorkerRequest, _engine: &EngineState) -> Work
 /// `DELETE /v1/backends/:id` — remove from engine storage and session state.
 fn handle_delete_backend(id: &str, engine: &EngineState, backend_id: &str) -> WorkerResponse {
     let storage_removed = engine.storage.remove_backend_sync(backend_id);
-    let session_removed = state::remove_backend(backend_id);
+    let session_removed = engine.session.remove_backend(backend_id);
 
     if storage_removed || session_removed {
         ok(id, json!({ "removed": backend_id }))
@@ -320,17 +312,14 @@ fn handle_list_pins(id: &str, engine: &EngineState) -> WorkerResponse {
 
 /// `POST /v1/pins` — add a pin rule through engine storage.
 /// Body: `{ "path": "...", "recursive": true, "conditions": "..." }`.
-fn handle_create_pin(request: &WorkerRequest, _engine: &EngineState) -> WorkerResponse {
-    let body = match request.body {
-        Some(ref b) => b,
-        None => {
-            return error_response(
-                &request.id,
-                400,
-                "bad_request",
-                "POST /v1/pins requires a JSON body with 'path'",
-            );
-        }
+fn handle_create_pin(request: &WorkerRequest, engine: &EngineState) -> WorkerResponse {
+    let Some(ref body) = request.body else {
+        return error_response(
+            &request.id,
+            400,
+            "bad_request",
+            "POST /v1/pins requires a JSON body with 'path'",
+        );
     };
 
     let path = body.get("path").and_then(Value::as_str);
@@ -349,11 +338,9 @@ fn handle_create_pin(request: &WorkerRequest, _engine: &EngineState) -> WorkerRe
         .unwrap_or(true);
     let conditions = body.get("conditions").and_then(Value::as_str);
 
-    state::with_engine(|engine| {
-        engine
-            .storage
-            .add_pin_rule_sync(path_glob, recursive, conditions);
-    });
+    engine
+        .storage
+        .add_pin_rule_sync(path_glob, recursive, conditions);
     created(
         &request.id,
         json!({ "path": path_glob, "recursive": recursive, "conditions": conditions }),
@@ -399,17 +386,14 @@ fn handle_list_policies(id: &str, engine: &EngineState) -> WorkerResponse {
 
 /// `POST /v1/policies` — add a lifecycle policy through engine storage.
 /// Body: `{ "path": "...", "max_age": null, "max_file_size": null, "priority": 0, "conditions": null }`.
-fn handle_create_policy(request: &WorkerRequest, _engine: &EngineState) -> WorkerResponse {
-    let body = match request.body {
-        Some(ref b) => b,
-        None => {
-            return error_response(
-                &request.id,
-                400,
-                "bad_request",
-                "POST /v1/policies requires a JSON body with 'path'",
-            );
-        }
+fn handle_create_policy(request: &WorkerRequest, engine: &EngineState) -> WorkerResponse {
+    let Some(ref body) = request.body else {
+        return error_response(
+            &request.id,
+            400,
+            "bad_request",
+            "POST /v1/policies requires a JSON body with 'path'",
+        );
     };
 
     let path = body.get("path").and_then(Value::as_str);
@@ -433,15 +417,13 @@ fn handle_create_policy(request: &WorkerRequest, _engine: &EngineState) -> Worke
         .get("conditions")
         .and_then(|v| if v.is_null() { None } else { v.as_str() });
 
-    state::with_engine(|engine| {
-        engine.storage.add_lifecycle_policy_sync(
-            path_glob,
-            max_age,
-            max_file_size,
-            i32::try_from(priority).unwrap_or(0),
-            conditions,
-        );
-    });
+    engine.storage.add_lifecycle_policy_sync(
+        path_glob,
+        max_age,
+        max_file_size,
+        i32::try_from(priority).unwrap_or(0),
+        conditions,
+    );
     created(
         &request.id,
         json!({
@@ -578,4 +560,379 @@ fn not_implemented(id: &str, method: &str, path: &str) -> WorkerResponse {
         "not_implemented",
         &format!("{method} {path} is not yet implemented in the WASM engine"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cascade_engine::types::{FileEntry, ItemId};
+
+    /// Build a request with no body.
+    fn get(path: &str) -> WorkerRequest {
+        WorkerRequest {
+            id: "req".to_owned(),
+            method: "GET".to_owned(),
+            path: path.to_owned(),
+            body: None,
+            headers: None,
+        }
+    }
+
+    /// Build a request with a method and an optional JSON body.
+    fn request(method: &str, path: &str, body: Option<Value>) -> WorkerRequest {
+        WorkerRequest {
+            id: "req".to_owned(),
+            method: method.to_owned(),
+            path: path.to_owned(),
+            body,
+            headers: None,
+        }
+    }
+
+    /// Read the error code out of an error-envelope response body.
+    fn error_code(resp: &WorkerResponse) -> &str {
+        resp.body
+            .pointer("/error/code")
+            .and_then(Value::as_str)
+            .expect("error envelope has a string code")
+    }
+
+    #[test]
+    fn health_reports_wasm_mode() {
+        let engine = EngineState::new();
+        let resp = route(&get("/v1/health"), &engine);
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            resp.body.pointer("/status").and_then(Value::as_str),
+            Some("ok")
+        );
+        assert_eq!(
+            resp.body.pointer("/mode").and_then(Value::as_str),
+            Some("wasm")
+        );
+    }
+
+    #[test]
+    fn capabilities_are_all_absent_off_wasm() {
+        let engine = EngineState::new();
+        let resp = route(&get("/v1/capabilities"), &engine);
+        assert_eq!(resp.status, 200);
+        // The host projection reports every capability false.
+        for key in [
+            "fileSystemAccess",
+            "webRtc",
+            "serviceWorker",
+            "wasm",
+            "indexedDb",
+        ] {
+            assert_eq!(
+                resp.body.get(key).and_then(Value::as_bool),
+                Some(false),
+                "capability {key} should be false off-wasm"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_route_is_not_found() {
+        let engine = EngineState::new();
+        let resp = route(&get("/v1/nonexistent"), &engine);
+        assert_eq!(resp.status, 404);
+        assert_eq!(error_code(&resp), "not_found");
+    }
+
+    #[test]
+    fn fsaccess_pick_is_not_implemented() {
+        let engine = EngineState::new();
+        let resp = route(&request("POST", "/v1/fsaccess/pick", None), &engine);
+        assert_eq!(resp.status, 501);
+        assert_eq!(error_code(&resp), "not_implemented");
+    }
+
+    #[test]
+    fn malformed_request_helper_is_bad_request() {
+        let resp = bad_request("could not parse");
+        assert_eq!(resp.status, 400);
+        assert_eq!(error_code(&resp), "bad_request");
+        // The id is unknown because parsing the request is what failed.
+        assert_eq!(resp.id, "unknown");
+    }
+
+    // ── Backends ──
+
+    #[test]
+    fn create_then_list_backends_round_trips() {
+        let engine = EngineState::new();
+        let body = json!({ "id": "gdrive-1", "type": "gdrive" });
+        let created = route(&request("POST", "/v1/backends", Some(body)), &engine);
+        assert_eq!(created.status, 201);
+
+        let listed = route(&get("/v1/backends"), &engine);
+        assert_eq!(listed.status, 200);
+        let backends = listed
+            .body
+            .get("backends")
+            .and_then(Value::as_array)
+            .expect("backends array");
+        assert_eq!(backends.len(), 1);
+        assert_eq!(
+            backends[0].get("id").and_then(Value::as_str),
+            Some("gdrive-1")
+        );
+        assert_eq!(
+            backends[0].get("type").and_then(Value::as_str),
+            Some("gdrive")
+        );
+        // An HTTP-created backend carries no JS handle.
+        assert_eq!(
+            backends[0].get("hasHandle").and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn create_backend_without_body_is_bad_request() {
+        let engine = EngineState::new();
+        let resp = route(&request("POST", "/v1/backends", None), &engine);
+        assert_eq!(resp.status, 400);
+        assert_eq!(error_code(&resp), "bad_request");
+    }
+
+    #[test]
+    fn create_backend_missing_type_is_bad_request() {
+        let engine = EngineState::new();
+        let resp = route(
+            &request("POST", "/v1/backends", Some(json!({ "id": "x" }))),
+            &engine,
+        );
+        assert_eq!(resp.status, 400);
+        assert_eq!(error_code(&resp), "bad_request");
+    }
+
+    #[test]
+    fn delete_backend_removes_then_404s() {
+        let engine = EngineState::new();
+        route(
+            &request(
+                "POST",
+                "/v1/backends",
+                Some(json!({ "id": "b", "type": "gdrive" })),
+            ),
+            &engine,
+        );
+        let removed = route(&request("DELETE", "/v1/backends/b", None), &engine);
+        assert_eq!(removed.status, 200);
+        assert_eq!(
+            removed.body.get("removed").and_then(Value::as_str),
+            Some("b")
+        );
+
+        let again = route(&request("DELETE", "/v1/backends/b", None), &engine);
+        assert_eq!(again.status, 404);
+        assert_eq!(error_code(&again), "not_found");
+    }
+
+    // ── Folders / files ──
+
+    #[test]
+    fn list_children_returns_files_under_the_folder() {
+        let engine = EngineState::new();
+        engine.storage.upsert_file_sync(&FileEntry::file(
+            ItemId::new("b1", "child"),
+            ItemId::new("b1", "root"),
+            "child.txt".to_owned(),
+        ));
+        let resp = route(&get("/v1/folders/b1:root/children"), &engine);
+        assert_eq!(resp.status, 200);
+        let children = resp
+            .body
+            .get("children")
+            .and_then(Value::as_array)
+            .expect("children array");
+        assert_eq!(children.len(), 1);
+        assert_eq!(
+            children[0].get("name").and_then(Value::as_str),
+            Some("child.txt")
+        );
+    }
+
+    #[test]
+    fn delete_file_entry_joins_path_then_404s_when_absent() {
+        let engine = EngineState::new();
+        engine.storage.upsert_file_sync(&FileEntry::file(
+            ItemId::new("b1", "dir/file.txt"),
+            ItemId::new("b1", "dir"),
+            "file.txt".to_owned(),
+        ));
+        // The trailing segments after `entries` join into the native id.
+        let deleted = route(
+            &request("DELETE", "/v1/files/b1/entries/dir/file.txt", None),
+            &engine,
+        );
+        assert_eq!(deleted.status, 200);
+        assert_eq!(
+            deleted.body.get("deleted").and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let again = route(
+            &request("DELETE", "/v1/files/b1/entries/dir/file.txt", None),
+            &engine,
+        );
+        assert_eq!(again.status, 404);
+        assert_eq!(error_code(&again), "not_found");
+    }
+
+    // ── Pins ──
+
+    #[test]
+    fn create_and_list_pins() {
+        let engine = EngineState::new();
+        let created = route(
+            &request(
+                "POST",
+                "/v1/pins",
+                Some(json!({ "path": "/work/**", "recursive": true })),
+            ),
+            &engine,
+        );
+        assert_eq!(created.status, 201);
+
+        let listed = route(&get("/v1/pins"), &engine);
+        assert_eq!(listed.status, 200);
+        let pins = listed
+            .body
+            .get("pins")
+            .and_then(Value::as_array)
+            .expect("pins array");
+        assert_eq!(pins.len(), 1);
+        assert_eq!(
+            pins[0].get("path").and_then(Value::as_str),
+            Some("/work/**")
+        );
+    }
+
+    #[test]
+    fn create_pin_without_body_is_bad_request() {
+        let engine = EngineState::new();
+        let resp = route(&request("POST", "/v1/pins", None), &engine);
+        assert_eq!(resp.status, 400);
+        assert_eq!(error_code(&resp), "bad_request");
+    }
+
+    #[test]
+    fn delete_pin_with_non_integer_id_is_bad_request() {
+        let engine = EngineState::new();
+        let resp = route(&request("DELETE", "/v1/pins/not-a-number", None), &engine);
+        assert_eq!(resp.status, 400);
+        assert_eq!(error_code(&resp), "bad_request");
+    }
+
+    #[test]
+    fn delete_absent_pin_is_not_found() {
+        let engine = EngineState::new();
+        let resp = route(&request("DELETE", "/v1/pins/999", None), &engine);
+        assert_eq!(resp.status, 404);
+        assert_eq!(error_code(&resp), "not_found");
+    }
+
+    // ── Policies ──
+
+    #[test]
+    fn create_and_list_policies() {
+        let engine = EngineState::new();
+        let created = route(
+            &request(
+                "POST",
+                "/v1/policies",
+                Some(json!({ "path": "/tmp/**", "priority": 5 })),
+            ),
+            &engine,
+        );
+        assert_eq!(created.status, 201);
+
+        let listed = route(&get("/v1/policies"), &engine);
+        assert_eq!(listed.status, 200);
+        let policies = listed
+            .body
+            .get("policies")
+            .and_then(Value::as_array)
+            .expect("policies array");
+        assert_eq!(policies.len(), 1);
+        assert_eq!(
+            policies[0].get("path").and_then(Value::as_str),
+            Some("/tmp/**")
+        );
+    }
+
+    #[test]
+    fn delete_policy_with_non_integer_id_is_bad_request() {
+        let engine = EngineState::new();
+        let resp = route(&request("DELETE", "/v1/policies/abc", None), &engine);
+        assert_eq!(resp.status, 400);
+        assert_eq!(error_code(&resp), "bad_request");
+    }
+
+    // ── Peers ──
+
+    #[test]
+    fn list_peers_is_empty_for_a_fresh_engine() {
+        let engine = EngineState::new();
+        let resp = route(&get("/v1/peers"), &engine);
+        assert_eq!(resp.status, 200);
+        let peers = resp
+            .body
+            .get("peers")
+            .and_then(Value::as_array)
+            .expect("peers array");
+        assert!(peers.is_empty());
+    }
+
+    // ── Auth ──
+
+    #[test]
+    fn auth_gdrive_returns_a_config() {
+        let engine = EngineState::new();
+        let resp = route(&request("POST", "/v1/auth/gdrive", None), &engine);
+        assert_eq!(resp.status, 200);
+    }
+
+    // ── Session ──
+
+    #[test]
+    fn session_is_401_until_a_token_is_stored() {
+        let engine = EngineState::new();
+        let empty = route(&get("/v1/session"), &engine);
+        assert_eq!(empty.status, 401);
+        assert_eq!(error_code(&empty), "no_session");
+
+        engine
+            .session
+            .set_token("gdrive".to_owned(), "drive.file".to_owned(), 42);
+        let active = route(&get("/v1/session"), &engine);
+        assert_eq!(active.status, 200);
+        assert_eq!(
+            active.body.get("authenticated").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn query_string_is_split_from_the_path() {
+        let engine = EngineState::new();
+        engine.storage.upsert_file_sync(&FileEntry::file(
+            ItemId::new("b1", "a"),
+            ItemId::new("b1", "root"),
+            "alpha.txt".to_owned(),
+        ));
+        // The `?path=` query must not become part of the matched segments.
+        let resp = route(&get("/v1/folders/b1:root/children?path=alpha"), &engine);
+        assert_eq!(resp.status, 200);
+        let children = resp
+            .body
+            .get("children")
+            .and_then(Value::as_array)
+            .expect("children");
+        assert_eq!(children.len(), 1);
+    }
 }
