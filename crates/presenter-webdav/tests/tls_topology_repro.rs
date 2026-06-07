@@ -329,6 +329,284 @@ fn run_scenario(k: Knobs, requests: usize, per_req: Duration) -> Result<(), Stri
     })
 }
 
+// ── Real googleapis.com nested topology ──────────────────────────────────────
+
+/// Knobs for the real-endpoint scenario.
+#[derive(Clone, Copy)]
+struct RealKnobs {
+    /// `pool_max_idle_per_host` for the handler's backend reqwest client.
+    /// 0 = unpooled (workaround), > 0 = pooled (suspected-bad).
+    backend_pool_idle: usize,
+    /// Pause in ms between rounds. Each round fires one GET to googleapis.
+    /// A long pause lets a pooled keep-alive connection sit idle until the
+    /// remote (googleapis) half-closes or RSTs it, then gets reused on the
+    /// next round — the exact reuse-a-dead-pooled-connection window the
+    /// synthetic local server could not reproduce.
+    idle_pause_ms: u64,
+}
+
+/// An axum handler whose backend client GETs the public googleapis discovery
+/// endpoint instead of the synthetic local TLS server.  A non-2xx response is
+/// mapped to `BAD_GATEWAY` exactly as the production handler does.
+async fn real_get_handler(
+    axum::extract::State(st): axum::extract::State<HandlerState>,
+    _body: axum::body::Bytes,
+) -> axum::response::Response {
+    let backend = st.backend.clone();
+    // Public, no-auth, always 200 discovery endpoint confirmed by scout.
+    // Using a GET matches the read path; no request body needed.
+    let call = async move {
+        backend
+            .get("https://www.googleapis.com/discovery/v1/apis")
+            .send()
+            .await
+            .map(|r| r.status().as_u16())
+    };
+
+    // Never isolate here — we want to exercise the direct-await topology that
+    // triggered the hang.
+    let status = call.await;
+
+    let mut resp = axum::response::Response::new(axum::body::Body::from("ok"));
+    match status {
+        Ok(s) if s < 400 => {}
+        _ => {
+            *resp.status_mut() = axum::http::StatusCode::BAD_GATEWAY;
+        }
+    }
+    // Keep-alive on the axum→WebDAV-client side so the external client
+    // exercises connection reuse to axum across all rounds.
+    resp
+}
+
+/// Start the axum server for the real-endpoint scenario on the CURRENT runtime.
+async fn start_real_axum_server(state: HandlerState) -> u16 {
+    let app = axum::Router::new()
+        .route("/get", axum::routing::get(real_get_handler))
+        .with_state(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    port
+}
+
+/// Run one real-endpoint scenario: `rounds` sequential GETs, each after an
+/// idle pause.  The external client runs on its own thread + runtime, reusing
+/// a single keep-alive connection to axum.
+///
+/// `per_req` is the per-request timeout measured from the outer client's
+/// perspective, set well above real RTT to distinguish genuine wedges from
+/// slow-but-completing requests.
+fn run_real_scenario(k: RealKnobs, rounds: usize, per_req: Duration) -> Result<(), String> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        // Build the handler's backend client — this is the client that talks to
+        // googleapis inside the axum handler.
+        let backend = reqwest::Client::builder()
+            .pool_max_idle_per_host(k.backend_pool_idle)
+            .http1_only() // Workspace reqwest has no http2 feature; kept as intent guard.
+            .timeout(Duration::from_secs(20))
+            .build()
+            .unwrap();
+
+        let state = HandlerState {
+            backend,
+            // backend_url is unused in real_get_handler; set to a placeholder.
+            backend_url: String::new(),
+            // isolation and keepalive fields come from HandlerState but are not
+            // consulted by real_get_handler.
+            isolate: false,
+            keepalive: true,
+        };
+        let axum_port = start_real_axum_server(state).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let crt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let res = crt.block_on(async move {
+                // External client: one keep-alive connection to axum reused
+                // across all rounds (mirroring the OS WebDAV client).
+                let client = reqwest::Client::builder()
+                    .http1_only()
+                    .pool_max_idle_per_host(10)
+                    .build()
+                    .unwrap();
+                let url = format!("http://localhost:{axum_port}/get");
+
+                for round in 0..rounds {
+                    if round > 0 && k.idle_pause_ms > 0 {
+                        println!(
+                            "  round {round}: pausing {}ms to let pooled backend connection go idle …",
+                            k.idle_pause_ms
+                        );
+                        tokio::time::sleep(Duration::from_millis(k.idle_pause_ms)).await;
+                    }
+                    println!("  round {round}: firing GET …");
+                    match tokio::time::timeout(per_req, client.get(&url).send()).await {
+                        Err(_) => {
+                            return Err(format!(
+                                "round {round} STALLED (> {per_req:?}) — no response from axum"
+                            ));
+                        }
+                        Ok(Err(e)) => return Err(format!("round {round} request error: {e}")),
+                        Ok(Ok(r)) => {
+                            let status = r.status();
+                            println!("  round {round}: axum responded {status}");
+                            if status == axum::http::StatusCode::BAD_GATEWAY {
+                                return Err(format!(
+                                    "round {round} BAD_GATEWAY — backend GET to googleapis failed"
+                                ));
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            });
+            let _ = tx.send(res);
+        });
+
+        // Overall guard: per_req per round + idle pauses + small margin.
+        // per_req.as_millis() returns u128; the value is a short test timeout
+        // (tens of seconds) so u64 is never saturated, but we convert
+        // explicitly to satisfy the lint rather than casting.
+        let per_req_ms = u64::try_from(per_req.as_millis()).unwrap_or(u64::MAX);
+        let overall = Duration::from_millis(
+            per_req_ms
+                .saturating_mul(rounds as u64)
+                .saturating_add(k.idle_pause_ms.saturating_mul(rounds.saturating_sub(1) as u64))
+                .saturating_add(10_000),
+        );
+        tokio::task::spawn_blocking(move || rx.recv_timeout(overall))
+            .await
+            .unwrap()
+            .unwrap_or_else(|_| Err("scenario wedged (overall timeout)".to_string()))
+    })
+}
+
+/// Real-endpoint nested topology: axum handler GETs the public googleapis
+/// discovery API inside its handler body, exercised by an external keep-alive
+/// client across rounds with idle pauses.
+///
+/// # What this tests
+///
+/// The synthetic local-TLS bisection (`bisect_tls_deadlock_topology`) failed to
+/// reproduce the hang across all configurations.  This test exercises the same
+/// nested topology but targets the **real** `www.googleapis.com` TLS frontend,
+/// which the synthetic server cannot faithfully replicate: real RTT, Google's
+/// server-side keep-alive / idle-close behaviour, and Google's actual TLS
+/// session semantics.
+///
+/// The scenario runs twice: first with `pool_max_idle_per_host(10)` (the
+/// suspected-bad configuration) and then with `pool_max_idle_per_host(0)` (the
+/// production workaround).  Between rounds the external client pauses long
+/// enough for a pooled keep-alive connection to sit idle past Google's
+/// server-side idle timeout, creating the reuse-a-dead-connection window.
+///
+/// # Interpreting results
+///
+/// A STALLED verdict on the pooled run with the unpooled run passing is the
+/// smoking gun that the real googleapis frontend triggers what the synthetic
+/// server cannot.  A PASS on both does **not** prove the bug is absent — the
+/// hang is non-deterministic and may require the authenticated Drive hosts
+/// (`drive/v3`, `upload/drive/v3`) rather than the public discovery endpoint.
+/// See `docs/tls-deadlock-capture.md` for the human-in-the-loop runbook that
+/// covers the authenticated path.
+///
+/// # Caveats
+///
+/// - This test talks to a live Google service.  Keep request volume **low** —
+///   a handful of sequential GETs per run, never in a stress loop.
+/// - A transient network failure or Google rate-limit will produce a
+///   `BAD_GATEWAY` or error that is not the deadlock; re-run once before
+///   concluding.
+/// - The workaround (`build_unpooled_http1_client`, `pool_max_idle_per_host(0)`)
+///   must remain in place regardless of this test's outcome.  A green run does
+///   not licence removal; only a confirmed root cause and a passing reproduction
+///   on the authenticated Drive path does.
+/// - The discovery endpoint shares the googleapis.com TLS frontend but is not
+///   Drive itself.  If the hang does not reproduce here, see the runbook for
+///   the authenticated path.
+///
+/// # Run
+///
+/// ```text
+/// cargo test -p cascade-presenter-webdav --test tls_topology_repro \
+///     real_googleapis_nested_topology -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "diagnostic: real-network repro against www.googleapis.com — run with --ignored --nocapture"]
+fn real_googleapis_nested_topology() {
+    // 8 rounds: idle pauses progress 5 s → 15 s → 30 s across the sequence so
+    // early rounds probe short idle windows and later rounds probe the longer
+    // windows where googleapis is more likely to have half-closed the connection.
+    //
+    // IMPORTANT: keep this low-volume — one sequential GET per round, a small
+    // total count. This is a diagnostic, not a stress test.
+    let rounds = 8;
+    // Per-request timeout: generous above real RTT + server latency to avoid
+    // false positives from slow-but-completing requests.
+    let per_req = Duration::from_secs(30);
+    // Idle pauses: escalate to maximise the chance of reusing a dead pooled
+    // connection on the later rounds.
+    let idle_pauses_ms: &[u64] = &[5_000, 5_000, 15_000, 15_000, 30_000, 30_000, 30_000];
+
+    // Use the highest pause in this sequence as the uniform knob so
+    // run_real_scenario accounts for it in the overall timeout. Rounds with
+    // shorter pauses will finish early; this is conservative.
+    let max_idle_ms = *idle_pauses_ms.iter().max().unwrap_or(&30_000);
+
+    let configs: &[(&str, RealKnobs)] = &[
+        (
+            "POOLED  pool_max_idle_per_host(10) — suspected-bad config",
+            RealKnobs {
+                backend_pool_idle: 10,
+                idle_pause_ms: max_idle_ms,
+            },
+        ),
+        (
+            "UNPOOLED pool_max_idle_per_host(0) — production workaround (control)",
+            RealKnobs {
+                backend_pool_idle: 0,
+                idle_pause_ms: max_idle_ms,
+            },
+        ),
+    ];
+
+    println!("\n========= REAL-ENDPOINT TLS TOPOLOGY (googleapis.com) =========");
+    println!("Discovery endpoint: https://www.googleapis.com/discovery/v1/apis");
+    println!("Rounds: {rounds}  per_req: {per_req:?}  idle_pause: {max_idle_ms}ms");
+    println!(
+        "NOTE: a PASS does not prove absence of bug — see doc-comment and\n\
+         docs/tls-deadlock-capture.md for the authenticated Drive runbook."
+    );
+    println!("----------------------------------------------------------------");
+
+    for (label, k) in configs {
+        println!("\n[config] {label}");
+        let res = run_real_scenario(*k, rounds, per_req);
+        let verdict = match &res {
+            Ok(()) => "PASS — all rounds completed".to_string(),
+            Err(e) => format!("HANG/FAIL -> {e}"),
+        };
+        println!(
+            "[{:>4}] {label}\n        => {verdict}",
+            if res.is_ok() { "ok" } else { "HANG" }
+        );
+    }
+    println!("\n================================================================\n");
+}
+
 #[test]
 #[ignore = "diagnostic TLS topology repro — run with --ignored --nocapture"]
 fn bisect_tls_deadlock_topology() {
