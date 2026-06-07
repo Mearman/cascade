@@ -1,5 +1,9 @@
 //! HTTP client, rate limiting, retry for Google Drive API.
 
+// `OnceLock` backs the native-only diagnostic-mode global; under the `portable`
+// feature there is no per-request client selector, so the import is gated to
+// match its users and avoid an unused-import warning.
+#[cfg(not(feature = "portable"))]
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
