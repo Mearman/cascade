@@ -176,12 +176,23 @@ pub fn build_unpooled_http1_client(timeout: Duration) -> reqwest::Result<reqwest
 ///   the workspace `reqwest` is built without the `http2` feature, so the
 ///   client cannot negotiate HTTP/2 regardless. The mode is kept for if/when
 ///   that feature is enabled.
+/// - `"pooled-shared"`: opt-in diagnostic path — a daemon-owned, long-lived,
+///   pooled `reqwest::Client` is injected by the daemon and shared across all
+///   Drive requests, including `OAuth2` refresh. The per-request client builder
+///   is not used at all. **Do NOT use in production without completing the
+///   authenticated-Drive capture documented in `docs/tls-deadlock-capture.md`.**
+///   This mode also disables `run_isolated_blocking` in the `WebDAV` presenter
+///   (both must move together so the shared connection driver stays polled on
+///   the daemon's stable main runtime and is never stranded on a transient
+///   current-thread runtime).
 ///
 /// Any other value is silently treated as `"unpooled-http1"` (safe default).
 ///
-/// **Never use `"pooled"` or `"pooled-http2"` in production.** Those modes
-/// re-introduce the known-bad configuration and will likely reproduce the hang
-/// against the real googleapis.com TLS endpoint.
+/// **Never use `"pooled"`, `"pooled-http2"`, or `"pooled-shared"` in
+/// production without first completing the documented capture procedure.**
+/// The first two re-introduce the known-bad configuration and will likely
+/// reproduce the hang; `"pooled-shared"` may fix it but has not been confirmed
+/// against the real TLS endpoint.
 #[cfg(not(feature = "portable"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagHttpMode {
@@ -193,6 +204,15 @@ pub enum DiagHttpMode {
     /// actually negotiate HTTP/2 (reqwest is built without the `http2`
     /// feature), so it behaves like [`Pooled`](Self::Pooled) today.
     PooledHttp2,
+    /// Opt-in diagnostic: the daemon injects a single long-lived pooled
+    /// `reqwest::Client` shared across all Drive requests and `OAuth2` refreshes.
+    /// The per-request client builder is bypassed entirely. The `WebDAV` presenter's
+    /// `run_isolated_blocking` is also disabled when this mode is active, so the
+    /// shared connection driver stays polled on the daemon's main runtime.
+    ///
+    /// **Requires a human capture run (see `docs/tls-deadlock-capture.md`) before
+    /// it can be promoted to the default.**
+    PooledShared,
 }
 
 /// Global diagnostic mode, read once from `CASCADE_GDRIVE_HTTP_DIAG` on first call.
@@ -200,8 +220,14 @@ pub enum DiagHttpMode {
 static DIAG_HTTP_MODE: OnceLock<DiagHttpMode> = OnceLock::new();
 
 /// Read the diagnostic mode from the environment, initialising the global on first call.
+///
+/// This is the single source of truth for the mode. Both the gdrive injection
+/// decision (in `crates/cascade/src/cli/mount.rs`) and the `WebDAV` isolation
+/// decision (`WebDavServer::start`'s `skip_isolation` parameter) must derive
+/// their mode from this accessor — never by re-parsing the env var — so the two
+/// halves can never disagree.
 #[cfg(not(feature = "portable"))]
-fn diag_http_mode() -> DiagHttpMode {
+pub fn diag_http_mode() -> DiagHttpMode {
     *DIAG_HTTP_MODE.get_or_init(|| {
         match std::env::var("CASCADE_GDRIVE_HTTP_DIAG")
             .as_deref()
@@ -224,6 +250,17 @@ fn diag_http_mode() -> DiagHttpMode {
                 );
                 DiagHttpMode::PooledHttp2
             }
+            "pooled-shared" => {
+                tracing::warn!(
+                    "CASCADE_GDRIVE_HTTP_DIAG=pooled-shared: Drive HTTP client is using a \
+                     single daemon-owned pooled client injected at startup. The WebDAV \
+                     run_isolated_blocking workaround is also disabled. This is an opt-in \
+                     diagnostic path — the authenticated-Drive capture in \
+                     docs/tls-deadlock-capture.md must pass before this mode can become the \
+                     default."
+                );
+                DiagHttpMode::PooledShared
+            }
             _ => DiagHttpMode::UnpooledHttp1,
         }
     })
@@ -238,15 +275,34 @@ fn diag_http_mode() -> DiagHttpMode {
 ///
 /// This function is the single call site that must replace every direct call
 /// to `reqwest::Client::builder()` inside this crate's native path.
+///
+/// **Must not be called in `PooledShared` mode.** In that mode a shared client
+/// is injected by the daemon at startup and held in `DriveClient::http_client`;
+/// the per-request builder is bypassed entirely. Callers must check the
+/// injected-client field before reaching this function; if they reach it with
+/// `PooledShared` active the injection wiring is broken.
 #[cfg(not(feature = "portable"))]
-pub fn build_diag_http_client(timeout: Duration) -> reqwest::Result<reqwest::Client> {
+pub fn build_diag_http_client(timeout: Duration) -> anyhow::Result<reqwest::Client> {
     match diag_http_mode() {
-        DiagHttpMode::UnpooledHttp1 => build_unpooled_http1_client(timeout),
-        DiagHttpMode::Pooled => reqwest::Client::builder()
+        DiagHttpMode::UnpooledHttp1 => Ok(build_unpooled_http1_client(timeout)?),
+        DiagHttpMode::Pooled => Ok(reqwest::Client::builder()
             .timeout(timeout)
             .http1_only()
-            .build(),
-        DiagHttpMode::PooledHttp2 => reqwest::Client::builder().timeout(timeout).build(),
+            .build()?),
+        DiagHttpMode::PooledHttp2 => Ok(reqwest::Client::builder().timeout(timeout).build()?),
+        DiagHttpMode::PooledShared => {
+            // In pooled-shared mode the per-request builder must never be used;
+            // the daemon injects a shared client via `DriveClient::with_http_client_native`.
+            // Reaching this branch means the injection wiring is broken — fail
+            // loudly rather than silently falling back to the per-request path,
+            // which would strand the driver on a transient runtime and
+            // reintroduce the exact hang.
+            anyhow::bail!(
+                "build_diag_http_client called in pooled-shared mode — \
+                 the daemon must inject a shared HttpClient via \
+                 DriveClient::with_http_client_native before Drive API calls are made"
+            )
+        }
     }
 }
 
@@ -257,12 +313,23 @@ pub struct DriveClient {
     rate_limiter: RateLimiter,
     pub(crate) base_url: String,
     pub(crate) upload_url: String,
-    /// Injected HTTP client, present only under the `portable` feature.
+    /// Injected HTTP client.
     ///
-    /// Under the `native` feature the backend builds a fresh unpooled
-    /// `reqwest::Client` per request instead (the TLS deadlock workaround).
+    /// Under the `portable` feature this is always `Some` — the backend requires
+    /// an explicit client because `reqwest` is unavailable.
+    ///
+    /// Under the `native` feature this is `Some` only in `pooled-shared` mode,
+    /// where a single daemon-owned pooled `reqwest::Client` is injected at
+    /// startup. When `None`, the existing per-request `build_diag_http_client`
+    /// path runs unchanged (the TLS deadlock workaround).
     #[cfg(feature = "portable")]
     http: std::sync::Arc<dyn cascade_engine::portable::HttpClient>,
+    /// Optional injected HTTP client for native builds (pooled-shared mode only).
+    ///
+    /// `None` → default per-request `build_diag_http_client` path (unchanged).
+    /// `Some` → injected shared client; per-request builder is bypassed entirely.
+    #[cfg(not(feature = "portable"))]
+    http_client: Option<std::sync::Arc<dyn cascade_engine::portable::HttpClient>>,
     /// Monotonically increasing request sequence number used in tracing spans
     /// to correlate a wedged request (open span, `before-send` event, no
     /// `after-headers` event) with its URL and method.
@@ -293,16 +360,54 @@ impl DriveClient {
 
     /// Construct a client with custom base URLs — used in integration tests.
     #[must_use]
-    pub const fn with_urls(base_url: String, upload_url: String) -> Self {
+    pub fn with_urls(base_url: String, upload_url: String) -> Self {
         Self {
             rate_limiter: RateLimiter::new(10_000),
             base_url,
             upload_url,
+            http_client: None,
             request_seq: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    /// Build the per-request `reqwest` client.
+    /// Construct a client pointing at the production Google Drive API, with an
+    /// injected shared HTTP client (pooled-shared mode only).
+    ///
+    /// When the daemon is started with `CASCADE_GDRIVE_HTTP_DIAG=pooled-shared`
+    /// it builds a single long-lived pooled `reqwest::Client`, wraps it in
+    /// `cascade_engine::portable::native::ReqwestClient::from_client`, and
+    /// injects it here via this constructor. All Drive API calls and `OAuth2`
+    /// refreshes route through the shared client instead of building a fresh
+    /// per-request client.
+    #[must_use]
+    pub fn new_with_http_client_native(
+        http: std::sync::Arc<dyn cascade_engine::portable::HttpClient>,
+    ) -> Self {
+        Self::with_urls_and_http_client_native(
+            "https://www.googleapis.com/drive/v3".to_string(),
+            "https://www.googleapis.com/upload/drive/v3".to_string(),
+            http,
+        )
+    }
+
+    /// Construct a client with custom base URLs and an injected shared HTTP
+    /// client (pooled-shared mode / integration tests).
+    #[must_use]
+    pub fn with_urls_and_http_client_native(
+        base_url: String,
+        upload_url: String,
+        http: std::sync::Arc<dyn cascade_engine::portable::HttpClient>,
+    ) -> Self {
+        Self {
+            rate_limiter: RateLimiter::new(10_000),
+            base_url,
+            upload_url,
+            http_client: Some(http),
+            request_seq: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Build the per-request `reqwest` client (default path only).
     ///
     /// By default this produces the production-safe workaround client: pooling
     /// disabled, HTTP/1.1 forced (`build_unpooled_http1_client`). Set the
@@ -319,27 +424,60 @@ impl DriveClient {
     ///
     /// The builder error is propagated, never swallowed; falling back to the
     /// default client would silently re-enable pooling and HTTP/2.
-    fn http() -> reqwest::Result<reqwest::Client> {
+    ///
+    /// **Never call this in pooled-shared mode.** In that mode the injected
+    /// `http_client` field is `Some` and the caller must use it instead.
+    fn build_per_request_client() -> anyhow::Result<reqwest::Client> {
         const DRIVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
         build_diag_http_client(DRIVE_REQUEST_TIMEOUT)
     }
 
     /// Issue an authenticated GET and return the response, rate-limited.
     /// Returns `Err` for any 4xx/5xx status.
+    ///
+    /// Dispatches through the injected shared client when `self.http_client` is
+    /// `Some` (pooled-shared mode), or builds a fresh per-request client
+    /// otherwise (the default TLS deadlock workaround).
     pub(crate) async fn authenticated_get(
         &self,
         path: &str,
         token: &str,
         query: &[(&str, &str)],
     ) -> anyhow::Result<DriveHttpResponse> {
+        use cascade_engine::portable::HeaderMap;
+
         self.rate_limiter.acquire().await;
         let url = build_query_url(&format!("{}/{path}", self.base_url), query);
+
+        if let Some(http) = &self.http_client {
+            // Pooled-shared mode: route through the injected shared client.
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", format!("Bearer {token}").as_str());
+            let resp = http
+                .get(&url, headers)
+                .await
+                .map_err(|e| anyhow::anyhow!("Drive GET failed: {e}"))?;
+            if resp.status >= 400 {
+                let body_str = String::from_utf8_lossy(&resp.body).into_owned();
+                return Err(drive_api_error("Drive API error", resp.status, body_str));
+            }
+            return Ok(DriveHttpResponse {
+                status: resp.status,
+                body: resp.body,
+            });
+        }
+
+        // Default path: per-request client (TLS deadlock workaround).
         let seq = self.request_seq.fetch_add(1, Ordering::Relaxed);
         // Log before-send and drop the span guard before `.await` — `EnteredSpan`
         // is not `Send` and must not be held across async yield points.
         tracing::debug_span!("drive_request", method = "GET", %url, seq)
             .in_scope(|| tracing::debug!(seq, method = "GET", %url, "before-send"));
-        let resp = Self::http()?.get(&url).bearer_auth(token).send().await?;
+        let resp = Self::build_per_request_client()?
+            .get(&url)
+            .bearer_auth(token)
+            .send()
+            .await?;
         tracing::debug!(seq, method = "GET", %url, "after-headers");
 
         let status = resp.status().as_u16();
@@ -355,6 +493,10 @@ impl DriveClient {
     /// Issue a request with a body (POST, PATCH, PUT) and return the response.
     /// `url` is the full request URL including any embedded query parameters;
     /// `extra_query` is appended via `build_query_url`.
+    ///
+    /// Dispatches through the injected shared client when `self.http_client` is
+    /// `Some` (pooled-shared mode), or builds a fresh per-request client
+    /// otherwise (the default TLS deadlock workaround).
     pub(crate) async fn authenticated_write(
         &self,
         method: &str,
@@ -364,15 +506,51 @@ impl DriveClient {
         body: Vec<u8>,
         content_type: &str,
     ) -> anyhow::Result<DriveHttpResponse> {
+        use cascade_engine::portable::HeaderMap;
+
         self.rate_limiter.acquire().await;
         let full_url = build_query_url(url, extra_query);
+
+        if let Some(http) = &self.http_client {
+            // Pooled-shared mode: route through the injected shared client.
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", format!("Bearer {token}").as_str());
+            headers.insert("content-type", content_type);
+            let resp = match method {
+                "POST" => http
+                    .post(&full_url, headers, body)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Drive POST failed: {e}"))?,
+                "PATCH" => http
+                    .patch(&full_url, headers, body)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Drive PATCH failed: {e}"))?,
+                "PUT" => http
+                    .put(&full_url, headers, body)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Drive PUT failed: {e}"))?,
+                other => anyhow::bail!(
+                    "unsupported write method for Drive native (injected) backend: {other}"
+                ),
+            };
+            if resp.status >= 400 {
+                let body_str = String::from_utf8_lossy(&resp.body).into_owned();
+                return Err(drive_api_error("Drive API error", resp.status, body_str));
+            }
+            return Ok(DriveHttpResponse {
+                status: resp.status,
+                body: resp.body,
+            });
+        }
+
+        // Default path: per-request client (TLS deadlock workaround).
         let seq = self.request_seq.fetch_add(1, Ordering::Relaxed);
         // Log before-send and drop the span guard before `.await` — `EnteredSpan`
         // is not `Send` and must not be held across async yield points.
         tracing::debug_span!("drive_request", method = %method, url = %full_url, seq)
             .in_scope(|| tracing::debug!(seq, method = %method, url = %full_url, "before-send"));
         let m = method.parse::<reqwest::Method>()?;
-        let resp = Self::http()?
+        let resp = Self::build_per_request_client()?
             .request(m, &full_url)
             .bearer_auth(token)
             .header("content-type", content_type)
@@ -396,6 +574,10 @@ impl DriveClient {
 
     /// Issue a GET with an HTTP `Range` header, returning the raw response
     /// **without** error-checking the status (callers handle 416 specially).
+    ///
+    /// Dispatches through the injected shared client when `self.http_client` is
+    /// `Some` (pooled-shared mode), or builds a fresh per-request client
+    /// otherwise (the default TLS deadlock workaround).
     pub(crate) async fn authenticated_get_range(
         &self,
         url: &str,
@@ -403,15 +585,36 @@ impl DriveClient {
         range: &str,
         query: &[(&str, &str)],
     ) -> anyhow::Result<DriveHttpResponse> {
+        use cascade_engine::portable::HeaderMap;
+
         self.rate_limiter.acquire().await;
         let full_url = build_query_url(url, query);
+
+        if let Some(http) = &self.http_client {
+            // Pooled-shared mode: route through the injected shared client.
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", format!("Bearer {token}").as_str());
+            if !range.is_empty() {
+                headers.insert("range", range);
+            }
+            let resp = http
+                .get(&full_url, headers)
+                .await
+                .map_err(|e| anyhow::anyhow!("Drive range GET failed: {e}"))?;
+            return Ok(DriveHttpResponse {
+                status: resp.status,
+                body: resp.body,
+            });
+        }
+
+        // Default path: per-request client (TLS deadlock workaround).
         let seq = self.request_seq.fetch_add(1, Ordering::Relaxed);
         // Log before-send and drop the span guard before `.await` — `EnteredSpan`
         // is not `Send` and must not be held across async yield points.
         tracing::debug_span!("drive_request", method = "GET-range", %full_url, seq).in_scope(
             || tracing::debug!(seq, method = "GET-range", %full_url, range, "before-send"),
         );
-        let resp = Self::http()?
+        let resp = Self::build_per_request_client()?
             .get(&full_url)
             .bearer_auth(token)
             .header(reqwest::header::RANGE, range)

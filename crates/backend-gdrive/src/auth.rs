@@ -454,6 +454,59 @@ pub async fn refresh_access_token(
     })
 }
 
+/// Refresh an access token via the portable `HttpClient` trait (native builds,
+/// pooled-shared mode).
+///
+/// This overload is distinct from the reqwest-based `refresh_access_token` and
+/// from the portable-feature version. It is used by `GdriveBackend::access_token`
+/// when the daemon has injected a shared `Arc<dyn HttpClient>` (i.e. when
+/// `CASCADE_GDRIVE_HTTP_DIAG=pooled-shared` is set) so the refresh call routes
+/// through the same long-lived pooled client as Drive API calls instead of
+/// building a fresh per-request `reqwest::Client`.
+///
+/// The body is `application/x-www-form-urlencoded`, identical to the portable
+/// version, so the two can be kept in sync trivially.
+#[cfg(not(feature = "portable"))]
+pub async fn refresh_access_token_with_http_client(
+    http: &dyn cascade_engine::portable::HttpClient,
+    config: &OAuthConfig,
+    refresh_token: &str,
+) -> anyhow::Result<AuthTokens> {
+    use cascade_engine::portable::HeaderMap;
+
+    let form_body = format!(
+        "client_id={}&client_secret={}&refresh_token={}&grant_type=refresh_token",
+        urlencoding::encode(&config.client_id),
+        urlencoding::encode(&config.client_secret),
+        urlencoding::encode(refresh_token),
+    );
+
+    let mut headers = HeaderMap::new();
+    headers.insert("content-type", "application/x-www-form-urlencoded");
+
+    let resp = http
+        .post(&config.token_url, headers, form_body.into_bytes())
+        .await
+        .map_err(|e| anyhow::anyhow!("Token refresh request failed: {e}"))?;
+
+    if resp.status < 200 || resp.status >= 300 {
+        let body = String::from_utf8_lossy(&resp.body).into_owned();
+        anyhow::bail!("Token refresh failed (HTTP {}): {body}", resp.status);
+    }
+
+    let token_resp: TokenResponse = serde_json::from_slice(&resp.body)?;
+    let secs = i64::try_from(token_resp.expires_in).unwrap_or(i64::MAX);
+    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(secs);
+
+    Ok(AuthTokens {
+        access_token: token_resp.access_token,
+        refresh_token: token_resp
+            .refresh_token
+            .unwrap_or_else(|| refresh_token.to_string()),
+        expires_at,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Token persistence
 // ---------------------------------------------------------------------------
