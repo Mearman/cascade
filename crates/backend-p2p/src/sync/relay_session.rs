@@ -393,7 +393,7 @@ impl SyncEngine {
     /// repeat call for the same device ID overwrites the recorded
     /// address with the latest one — that matches the realistic case
     /// of a peer reconnecting from a new IP. The contact time is
-    /// stamped via [`PeerBook::mark_seen`] so subsequent gossip
+    /// stamped via [`PeerBook::mark_seen`](cascade_p2p::wan::PeerBook::mark_seen) so subsequent gossip
     /// broadcasts can carry an accurate per-peer `last_seen` instead of
     /// falling back to the broadcast time.
     pub(crate) async fn record_peer(&self, device_id: &str, address: SocketAddr) {
@@ -1034,8 +1034,9 @@ impl SyncEngine {
     /// [`ManageErrorKind::Unauthorised`] before any grant is consulted; otherwise
     /// a party who could open a tunnel could spoof a granted manager's device id.
     ///
-    /// A verified request is dispatched through the injected [`ManageDispatch`]
-    /// port, which resolves the caller's grants, authorises, audits BEFORE
+    /// A verified request is dispatched through the injected
+    /// [`ManageDispatch`](cascade_engine::manage::ManageDispatch) port, which
+    /// resolves the caller's grants, authorises, audits BEFORE
     /// applying any side effect, and runs the same command handlers the local
     /// CLI drives. When no dispatch port is configured the node is not accepting
     /// remote administration, so the request is refused with a typed
