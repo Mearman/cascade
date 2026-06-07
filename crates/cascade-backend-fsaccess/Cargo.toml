@@ -24,5 +24,19 @@ wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
 js-sys.workspace = true
 
+# wasm-bindgen-test is only useful on wasm32; including it in dev-dependencies
+# unconditionally would cause a build failure on native targets because it
+# links JS glue that doesn't exist there.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+wasm-bindgen-futures.workspace = true
+
+[features]
+# Swap the production TypeScript module for a plain .js stub so that
+# `wasm-pack test --node` can load the wasm-bindgen glue without a TypeScript
+# transpiler or browser globals.  The stub (tests/js/fsaccess_stub.js) mirrors
+# the production exports exactly.  Never enabled in a production wasm build.
+js-test-stub = []
+
 [lints]
 workspace = true

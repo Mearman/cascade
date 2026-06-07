@@ -344,6 +344,7 @@ dependencies = [
  "thiserror",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-bindgen-test",
 ]
 
 [[package]]
@@ -528,6 +529,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "wasm-bindgen",
+ "wasm-bindgen-test",
 ]
 
 [[package]]

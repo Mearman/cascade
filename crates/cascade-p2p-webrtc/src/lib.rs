@@ -29,6 +29,13 @@
 //! cargo check -p cascade-p2p-webrtc --target wasm32-unknown-unknown
 //! ```
 //!
+//! Run the wasm-bindgen-test suite (exercises the Rust marshalling paths
+//! against a JS stub module):
+//!
+//! ```text
+//! wasm-pack test --node crates/cascade-p2p-webrtc -- --features js-test-stub
+//! ```
+//!
 //! ## Why not `cascade_p2p::transport::Transport`
 //!
 //! The existing `Transport` trait in `cascade-p2p` is built on `tokio` IO and a
@@ -56,3 +63,12 @@ pub use config::{WebRtcConfig, WebRtcError};
 // Wasm-only re-exports: the live transport is wasm32-only.
 #[cfg(target_arch = "wasm32")]
 pub use transport::{WebRtcTransport, create_transport, supported};
+
+// wasm-bindgen-test suite: bridge exercises against the JS stub.
+// The `test` gate ensures the module is only compiled as part of a `cargo test`
+// invocation (where dev-dependencies like `wasm-bindgen-test` are available),
+// never into the production lib. The `js-test-stub` feature gate ensures the
+// stub-specific extern block and inspector API are present. The `wasm32` gate
+// keeps it invisible to native `cargo test`.
+#[cfg(all(test, target_arch = "wasm32", feature = "js-test-stub"))]
+mod wasm_tests;

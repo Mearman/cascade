@@ -271,7 +271,10 @@ mod tests {
     }
 
     // ── FsAccessBackend accessors ────────────────────────────────────────────
+    // These tests use NativeOpaqueHandle which is only available on non-wasm32
+    // targets. The wasm32 equivalents live in src/wasm_tests.rs.
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn backend_accessors() {
         let backend = FsAccessBackend {
@@ -284,6 +287,7 @@ mod tests {
         assert_eq!(backend.display_name(), "Local directory (browser)");
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn backend_debug_does_not_panic() {
         let backend = FsAccessBackend {

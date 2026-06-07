@@ -33,6 +33,13 @@
 //! cargo check -p cascade-backend-fsaccess --target wasm32-unknown-unknown
 //! ```
 //!
+//! Run the wasm-bindgen-test suite (exercises the Rust decode paths against a
+//! JS stub module):
+//!
+//! ```text
+//! wasm-pack test --node crates/cascade-backend-fsaccess -- --features js-test-stub
+//! ```
+//!
 //! ## Why not `cascade_engine::backend::Backend`
 //!
 //! The engine's `Backend` trait lives in `cascade-engine`, which depends on
@@ -53,3 +60,12 @@ mod js;
 pub use backend::create_backend;
 #[cfg(any(target_arch = "wasm32", test))]
 pub use backend::{DirectoryChanges, FsAccessBackend, FsAccessError};
+
+// wasm-bindgen-test suite: bridge exercises against the JS stub.
+// The `test` gate ensures the module is only compiled as part of a `cargo test`
+// invocation (where dev-dependencies like `wasm-bindgen-test` are available),
+// never into the production lib. The `js-test-stub` feature gate ensures the
+// stub-specific extern block and inspector API are present. The `wasm32` gate
+// keeps it invisible to native `cargo test`.
+#[cfg(all(test, target_arch = "wasm32", feature = "js-test-stub"))]
+mod wasm_tests;
