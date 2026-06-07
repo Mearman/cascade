@@ -361,15 +361,16 @@ impl GdriveBackend {
             // guard is dropped here — mutex released before the HTTP call.
         };
 
-        // Perform the token refresh. Under native the refresh uses a fresh
-        // unpooled HTTP/1.1-only client (the confirmed TLS deadlock workaround;
-        // see `DriveClient::http` in client.rs). Under portable the injected
-        // HttpClient is used instead.
+        // Perform the token refresh. Under native the refresh uses the
+        // diagnostic-mode client builder, which defaults to the confirmed TLS
+        // deadlock workaround (unpooled, HTTP/1.1 only). The same env-var
+        // switch that gates diagnostic pooling on API calls also applies here.
+        // See `DriveClient::http` and `build_diag_http_client` in client.rs.
         #[cfg(not(feature = "portable"))]
         let refreshed = {
             /// Per-request timeout for the `OAuth2` token-refresh call.
             const REFRESH_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-            let http = client::build_unpooled_http1_client(REFRESH_REQUEST_TIMEOUT)?;
+            let http = client::build_diag_http_client(REFRESH_REQUEST_TIMEOUT)?;
             auth::refresh_access_token(&http, &self.oauth, &refresh_token).await?
         };
         #[cfg(feature = "portable")]

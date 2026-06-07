@@ -1,5 +1,6 @@
 //! HTTP client, rate limiting, retry for Google Drive API.
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
@@ -148,6 +149,92 @@ pub fn build_unpooled_http1_client(timeout: Duration) -> reqwest::Result<reqwest
         .build()
 }
 
+/// Opt-in diagnostic HTTP-client selector, controlled at runtime by
+/// `CASCADE_GDRIVE_HTTP_DIAG`.
+///
+/// The env var is read once (at first use) and determines which `reqwest::Client`
+/// is built for every Drive API call and `OAuth2` refresh.
+///
+/// Recognised values:
+/// - absent / `"unpooled-http1"` (default): the production workaround —
+///   pooling disabled, HTTP/1.1 forced. **This is the only value that is
+///   safe to use against the real Drive endpoint in production.**
+/// - `"pooled"`: connection pooling re-enabled, HTTP/1.1 forced. This is
+///   the suspected-bad configuration. Use it only in a controlled diagnostic
+///   session to attempt to reproduce the hang.
+/// - `"pooled-http2"`: connection pooling re-enabled, HTTP/2 allowed. This
+///   re-enables all the mechanisms disabled by the workaround.
+///
+/// Any other value is silently treated as `"unpooled-http1"` (safe default).
+///
+/// **Never use `"pooled"` or `"pooled-http2"` in production.** Those modes
+/// re-introduce the known-bad configuration and will likely reproduce the hang
+/// against the real googleapis.com TLS endpoint.
+#[cfg(not(feature = "portable"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagHttpMode {
+    /// Production workaround: no pooling, HTTP/1.1 only. This is always the default.
+    UnpooledHttp1,
+    /// Diagnostic only: pooling re-enabled, HTTP/1.1 forced.
+    Pooled,
+    /// Diagnostic only: pooling re-enabled, HTTP/2 allowed.
+    PooledHttp2,
+}
+
+/// Global diagnostic mode, read once from `CASCADE_GDRIVE_HTTP_DIAG` on first call.
+#[cfg(not(feature = "portable"))]
+static DIAG_HTTP_MODE: OnceLock<DiagHttpMode> = OnceLock::new();
+
+/// Read the diagnostic mode from the environment, initialising the global on first call.
+#[cfg(not(feature = "portable"))]
+fn diag_http_mode() -> DiagHttpMode {
+    *DIAG_HTTP_MODE.get_or_init(|| {
+        match std::env::var("CASCADE_GDRIVE_HTTP_DIAG")
+            .as_deref()
+            .unwrap_or("")
+        {
+            "pooled" => {
+                tracing::warn!(
+                    "CASCADE_GDRIVE_HTTP_DIAG=pooled: Drive HTTP client is using pooled \
+                     connections. This re-introduces the known-bad configuration and may \
+                     reproduce the TLS hang. Diagnostic use only."
+                );
+                DiagHttpMode::Pooled
+            }
+            "pooled-http2" => {
+                tracing::warn!(
+                    "CASCADE_GDRIVE_HTTP_DIAG=pooled-http2: Drive HTTP client has pooling \
+                     and HTTP/2 re-enabled. This re-introduces all mechanisms disabled by \
+                     the TLS deadlock workaround. Diagnostic use only."
+                );
+                DiagHttpMode::PooledHttp2
+            }
+            _ => DiagHttpMode::UnpooledHttp1,
+        }
+    })
+}
+
+/// Build a `reqwest` client according to the current diagnostic mode.
+///
+/// In `UnpooledHttp1` mode (the default and only production-safe value) this
+/// delegates to `build_unpooled_http1_client`. In diagnostic modes it builds
+/// a pooled client so the suspected-bad configuration is reachable against the
+/// real TLS endpoint.
+///
+/// This function is the single call site that must replace every direct call
+/// to `reqwest::Client::builder()` inside this crate's native path.
+#[cfg(not(feature = "portable"))]
+pub fn build_diag_http_client(timeout: Duration) -> reqwest::Result<reqwest::Client> {
+    match diag_http_mode() {
+        DiagHttpMode::UnpooledHttp1 => build_unpooled_http1_client(timeout),
+        DiagHttpMode::Pooled => reqwest::Client::builder()
+            .timeout(timeout)
+            .http1_only()
+            .build(),
+        DiagHttpMode::PooledHttp2 => reqwest::Client::builder().timeout(timeout).build(),
+    }
+}
+
 // ── DriveClient struct ────────────────────────────────────────────────────────
 
 /// Google Drive API HTTP client.
@@ -161,6 +248,11 @@ pub struct DriveClient {
     /// `reqwest::Client` per request instead (the TLS deadlock workaround).
     #[cfg(feature = "portable")]
     http: std::sync::Arc<dyn cascade_engine::portable::HttpClient>,
+    /// Monotonically increasing request sequence number used in tracing spans
+    /// to correlate a wedged request (open span, `before-send` event, no
+    /// `after-headers` event) with its URL and method.
+    #[cfg(not(feature = "portable"))]
+    request_seq: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for DriveClient {
@@ -186,16 +278,22 @@ impl DriveClient {
 
     /// Construct a client with custom base URLs — used in integration tests.
     #[must_use]
-    #[allow(clippy::missing_const_for_fn)]
-    pub fn with_urls(base_url: String, upload_url: String) -> Self {
+    pub const fn with_urls(base_url: String, upload_url: String) -> Self {
         Self {
             rate_limiter: RateLimiter::new(10_000),
             base_url,
             upload_url,
+            request_seq: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
     /// Build the per-request `reqwest` client.
+    ///
+    /// By default this produces the production-safe workaround client: pooling
+    /// disabled, HTTP/1.1 forced (`build_unpooled_http1_client`). Set the
+    /// environment variable `CASCADE_GDRIVE_HTTP_DIAG` to `"pooled"` or
+    /// `"pooled-http2"` to opt into a diagnostic mode that re-enables
+    /// pooling/HTTP2 against the real Drive endpoint.
     ///
     /// A fresh client per request with connection pooling disabled and
     /// HTTP/1.1 only is a deliberate workaround for a hang first seen on the
@@ -208,7 +306,7 @@ impl DriveClient {
     /// default client would silently re-enable pooling and HTTP/2.
     fn http() -> reqwest::Result<reqwest::Client> {
         const DRIVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-        build_unpooled_http1_client(DRIVE_REQUEST_TIMEOUT)
+        build_diag_http_client(DRIVE_REQUEST_TIMEOUT)
     }
 
     /// Issue an authenticated GET and return the response, rate-limited.
@@ -221,7 +319,13 @@ impl DriveClient {
     ) -> anyhow::Result<DriveHttpResponse> {
         self.rate_limiter.acquire().await;
         let url = build_query_url(&format!("{}/{path}", self.base_url), query);
+        let seq = self.request_seq.fetch_add(1, Ordering::Relaxed);
+        // Log before-send and drop the span guard before `.await` — `EnteredSpan`
+        // is not `Send` and must not be held across async yield points.
+        tracing::debug_span!("drive_request", method = "GET", %url, seq)
+            .in_scope(|| tracing::debug!(seq, method = "GET", %url, "before-send"));
         let resp = Self::http()?.get(&url).bearer_auth(token).send().await?;
+        tracing::debug!(seq, method = "GET", %url, "after-headers");
 
         let status = resp.status().as_u16();
         let body = resp.bytes().await?.to_vec();
@@ -247,6 +351,11 @@ impl DriveClient {
     ) -> anyhow::Result<DriveHttpResponse> {
         self.rate_limiter.acquire().await;
         let full_url = build_query_url(url, extra_query);
+        let seq = self.request_seq.fetch_add(1, Ordering::Relaxed);
+        // Log before-send and drop the span guard before `.await` — `EnteredSpan`
+        // is not `Send` and must not be held across async yield points.
+        tracing::debug_span!("drive_request", method = %method, url = %full_url, seq)
+            .in_scope(|| tracing::debug!(seq, method = %method, url = %full_url, "before-send"));
         let m = method.parse::<reqwest::Method>()?;
         let resp = Self::http()?
             .request(m, &full_url)
@@ -255,6 +364,7 @@ impl DriveClient {
             .body(body)
             .send()
             .await?;
+        tracing::debug!(seq, method = %method, url = %full_url, "after-headers");
 
         let status = resp.status().as_u16();
         let resp_body = resp.bytes().await?.to_vec();
@@ -280,12 +390,19 @@ impl DriveClient {
     ) -> anyhow::Result<DriveHttpResponse> {
         self.rate_limiter.acquire().await;
         let full_url = build_query_url(url, query);
+        let seq = self.request_seq.fetch_add(1, Ordering::Relaxed);
+        // Log before-send and drop the span guard before `.await` — `EnteredSpan`
+        // is not `Send` and must not be held across async yield points.
+        tracing::debug_span!("drive_request", method = "GET-range", %full_url, seq).in_scope(
+            || tracing::debug!(seq, method = "GET-range", %full_url, range, "before-send"),
+        );
         let resp = Self::http()?
             .get(&full_url)
             .bearer_auth(token)
             .header(reqwest::header::RANGE, range)
             .send()
             .await?;
+        tracing::debug!(seq, method = "GET-range", %full_url, "after-headers");
 
         let status = resp.status().as_u16();
         let body = resp.bytes().await?.to_vec();
