@@ -171,8 +171,11 @@ pub fn build_unpooled_http1_client(timeout: Duration) -> reqwest::Result<reqwest
 /// - `"pooled"`: connection pooling re-enabled, HTTP/1.1 forced. This is
 ///   the suspected-bad configuration. Use it only in a controlled diagnostic
 ///   session to attempt to reproduce the hang.
-/// - `"pooled-http2"`: connection pooling re-enabled, HTTP/2 allowed. This
-///   re-enables all the mechanisms disabled by the workaround.
+/// - `"pooled-http2"`: connection pooling re-enabled and `http1_only()`
+///   dropped to allow HTTP/2. In practice this is identical to `"pooled"`:
+///   the workspace `reqwest` is built without the `http2` feature, so the
+///   client cannot negotiate HTTP/2 regardless. The mode is kept for if/when
+///   that feature is enabled.
 ///
 /// Any other value is silently treated as `"unpooled-http1"` (safe default).
 ///
@@ -186,7 +189,9 @@ pub enum DiagHttpMode {
     UnpooledHttp1,
     /// Diagnostic only: pooling re-enabled, HTTP/1.1 forced.
     Pooled,
-    /// Diagnostic only: pooling re-enabled, HTTP/2 allowed.
+    /// Diagnostic only: pooling re-enabled and `http1_only()` dropped. Cannot
+    /// actually negotiate HTTP/2 (reqwest is built without the `http2`
+    /// feature), so it behaves like [`Pooled`](Self::Pooled) today.
     PooledHttp2,
 }
 
@@ -212,9 +217,10 @@ fn diag_http_mode() -> DiagHttpMode {
             }
             "pooled-http2" => {
                 tracing::warn!(
-                    "CASCADE_GDRIVE_HTTP_DIAG=pooled-http2: Drive HTTP client has pooling \
-                     and HTTP/2 re-enabled. This re-introduces all mechanisms disabled by \
-                     the TLS deadlock workaround. Diagnostic use only."
+                    "CASCADE_GDRIVE_HTTP_DIAG=pooled-http2: Drive HTTP client is using pooled \
+                     connections with http1_only dropped. HTTP/2 cannot actually be negotiated \
+                     (reqwest is built without the http2 feature), so this behaves like 'pooled'. \
+                     Diagnostic use only."
                 );
                 DiagHttpMode::PooledHttp2
             }
