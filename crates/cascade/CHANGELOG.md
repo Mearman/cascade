@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.110](https://github.com/Mearman/cascade/compare/cascade-v0.1.109...cascade-v0.1.110) - 2026-06-08
+
+### Other
+
+- *(engine)* cover the DataAuthority P2P data-plane access gate
+
 ## [0.1.109](https://github.com/Mearman/cascade/compare/cascade-v0.1.108...cascade-v0.1.109) - 2026-06-08
 
 ### Other
