@@ -698,7 +698,7 @@ mod tests {
     fn make_native_runner(
         db: Arc<StateDb>,
         backends: Vec<Arc<dyn Backend>>,
-        presenter: Arc<MockPresenter>,
+        presenter: Arc<dyn VfsPresenter>,
         config: Arc<ConfigResolver>,
     ) -> SyncRunner<TokioRuntimeHandle> {
         let runtime = TokioRuntimeHandle::new(tokio::runtime::Handle::current());
@@ -899,5 +899,781 @@ mod tests {
 
         // File should still be dirty — upload failed.
         assert_eq!(db.is_dirty(&file_id).unwrap(), Some(true));
+    }
+
+    // ── Scripted backend for orchestration tests ──
+
+    /// A backend whose `changes`, `poll_interval`, and error behaviour are
+    /// scripted by the test. Records how many times `changes` was called so a
+    /// test can assert that an empty change set still drove exactly one poll.
+    struct ScriptedBackend {
+        id: String,
+        /// Batches handed out on successive `changes` calls. The last batch is
+        /// reused once the script is exhausted so the polling loop keeps a
+        /// stable steady state.
+        batches: std::sync::Mutex<std::collections::VecDeque<Vec<Change>>>,
+        /// When `true`, `changes` returns an error instead of a batch.
+        fail_changes: bool,
+        /// Reported poll interval, if any.
+        poll_interval: Option<Duration>,
+        /// Number of times `changes` has been invoked.
+        changes_calls: std::sync::atomic::AtomicUsize,
+        /// Cursor seen on the most recent `changes` call.
+        last_cursor: std::sync::Mutex<Option<crate::types::Cursor>>,
+    }
+
+    impl ScriptedBackend {
+        fn new(id: impl Into<String>) -> Self {
+            Self {
+                id: id.into(),
+                batches: std::sync::Mutex::new(std::collections::VecDeque::new()),
+                fail_changes: false,
+                poll_interval: None,
+                changes_calls: std::sync::atomic::AtomicUsize::new(0),
+                last_cursor: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn with_batch(self, batch: Vec<Change>) -> Self {
+            self.batches.lock().unwrap().push_back(batch);
+            self
+        }
+
+        const fn failing(mut self) -> Self {
+            self.fail_changes = true;
+            self
+        }
+
+        const fn with_poll_interval(mut self, interval: Duration) -> Self {
+            self.poll_interval = Some(interval);
+            self
+        }
+
+        fn changes_call_count(&self) -> usize {
+            self.changes_calls
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait]
+    impl Backend for ScriptedBackend {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn display_name(&self) -> &'static str {
+            "Scripted"
+        }
+
+        async fn quota(&self) -> anyhow::Result<Option<crate::types::Quota>> {
+            Ok(None)
+        }
+
+        async fn changes(
+            &self,
+            cursor: Option<&crate::types::Cursor>,
+        ) -> anyhow::Result<(Vec<Change>, crate::types::Cursor)> {
+            self.changes_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            *self.last_cursor.lock().unwrap() = cursor.cloned();
+            if self.fail_changes {
+                anyhow::bail!("scripted changes failure");
+            }
+            let mut batches = self.batches.lock().unwrap();
+            // Hand out the next batch; keep the last one for the steady state.
+            let batch = if batches.len() > 1 {
+                batches.pop_front().unwrap_or_default()
+            } else {
+                batches.front().cloned().unwrap_or_default()
+            };
+            Ok((batch, crate::types::Cursor(format!("{}-cursor", self.id))))
+        }
+
+        async fn metadata(
+            &self,
+            _path: &std::path::Path,
+        ) -> anyhow::Result<crate::types::FileEntry> {
+            anyhow::bail!("not implemented")
+        }
+
+        async fn download(&self, _file: &crate::types::FileEntry) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("not implemented")
+        }
+
+        async fn upload(
+            &self,
+            path: &std::path::Path,
+            _data: &[u8],
+            parent_id: &crate::types::FileId,
+        ) -> anyhow::Result<crate::types::FileEntry> {
+            Ok(crate::types::FileEntry::file(
+                crate::types::ItemId::new(&self.id, "uploaded"),
+                crate::types::ItemId::new(&self.id, parent_id.0.as_str()),
+                path.to_string_lossy().to_string(),
+            ))
+        }
+
+        async fn update(
+            &self,
+            _file_id: &crate::types::FileId,
+            _data: &[u8],
+        ) -> anyhow::Result<crate::types::FileEntry> {
+            anyhow::bail!("not implemented")
+        }
+
+        async fn create_dir(
+            &self,
+            _path: &std::path::Path,
+        ) -> anyhow::Result<crate::types::FileEntry> {
+            anyhow::bail!("not implemented")
+        }
+
+        async fn delete(&self, _file: &crate::types::FileEntry) -> anyhow::Result<()> {
+            anyhow::bail!("not implemented")
+        }
+
+        async fn move_entry(
+            &self,
+            _src: &std::path::Path,
+            _dst: &std::path::Path,
+        ) -> anyhow::Result<crate::types::FileEntry> {
+            anyhow::bail!("not implemented")
+        }
+
+        async fn poll_interval(&self) -> Option<Duration> {
+            self.poll_interval
+        }
+    }
+
+    /// A presenter whose `upsert_item` always fails, used to confirm that a
+    /// presenter error propagates out of `apply_changes` rather than being
+    /// swallowed.
+    #[derive(Default)]
+    struct FailingPresenter;
+
+    #[async_trait]
+    impl VfsPresenter for FailingPresenter {
+        async fn upsert_item(&self, _item: VfsItem) -> anyhow::Result<()> {
+            anyhow::bail!("presenter upsert failed")
+        }
+        async fn delete_item(&self, _id: &ItemId) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn update_state(
+            &self,
+            _id: &ItemId,
+            _state: crate::types::CacheState,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn fetch_contents(&self, _id: &ItemId) -> anyhow::Result<PathBuf> {
+            anyhow::bail!("not implemented")
+        }
+        async fn evict_item(&self, _id: &ItemId) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn start(&self, _mount_point: &Path) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn stop(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Assert that an optional `Cursor` carries the expected inner payload.
+    /// `Cursor` deliberately does not implement `PartialEq` (it is an opaque
+    /// wire type), so tests compare the inner string instead.
+    fn assert_cursor(actual: Option<crate::types::Cursor>, expected: Option<&str>) {
+        assert_eq!(actual.map(|c| c.0).as_deref(), expected);
+    }
+
+    /// Build a `Created` change for a backend-scoped file under `<backend>:root`.
+    fn created(backend: &str, native_id: &str, name: &str) -> Change {
+        let entry = FileEntry::file(
+            ItemId::new(backend, native_id),
+            ItemId::new(backend, "root"),
+            name.to_string(),
+        );
+        Change::Created(entry)
+    }
+
+    #[tokio::test]
+    async fn apply_changes_handles_each_variant() {
+        let db = Arc::new(StateDb::open_in_memory().unwrap());
+        db.register_backend("scr", "scripted", "Scripted", None, None)
+            .unwrap();
+        let presenter = Arc::new(MockPresenter::default());
+        let config = Arc::new(ConfigResolver::new(PathBuf::from("/tmp/apply")));
+        let runner = make_native_runner(db.clone(), vec![], presenter.clone(), config);
+
+        // Pre-existing entry so the Updated/Deleted/Moved variants act on a row.
+        let updated_old = FileEntry::file(
+            ItemId::new("scr", "u1"),
+            ItemId::new("scr", "root"),
+            "old-name.txt".into(),
+        );
+        let removed = FileEntry::file(
+            ItemId::new("scr", "d1"),
+            ItemId::new("scr", "root"),
+            "gone.txt".into(),
+        );
+        db.upsert_file(&updated_old).unwrap();
+        db.upsert_file(&removed).unwrap();
+
+        let updated_new = FileEntry::file(
+            ItemId::new("scr", "u1"),
+            ItemId::new("scr", "root"),
+            "new-name.txt".into(),
+        );
+        let moved_from = FileEntry::file(
+            ItemId::new("scr", "m1"),
+            ItemId::new("scr", "root"),
+            "before.txt".into(),
+        );
+        let moved_to = FileEntry::file(
+            ItemId::new("scr", "m1"),
+            ItemId::new("scr", "sub"),
+            "after.txt".into(),
+        );
+
+        let changes = vec![
+            created("scr", "c1", "fresh.txt"),
+            Change::Updated {
+                old: updated_old,
+                new: updated_new.clone(),
+            },
+            Change::Deleted(removed.clone()),
+            Change::Moved {
+                from: moved_from,
+                to: moved_to.clone(),
+            },
+        ];
+
+        let applied = runner.apply_changes("scr", &changes).await.unwrap();
+
+        // Every variant survived (none ignored, none oversized).
+        assert_eq!(applied.len(), changes.len());
+
+        // Created and Moved/Updated targets are in the DB; the deleted one is gone.
+        assert!(db.get_file(&ItemId::new("scr", "c1")).unwrap().is_some());
+        assert_eq!(
+            db.get_file(&ItemId::new("scr", "u1"))
+                .unwrap()
+                .unwrap()
+                .name,
+            "new-name.txt"
+        );
+        assert!(db.get_file(&ItemId::new("scr", "d1")).unwrap().is_none());
+        assert_eq!(
+            db.get_file(&ItemId::new("scr", "m1"))
+                .unwrap()
+                .unwrap()
+                .name,
+            "after.txt"
+        );
+
+        // Presenter saw three upserts (created, updated, moved) and one delete.
+        let upserts = presenter.upserts.lock().unwrap();
+        assert_eq!(upserts.len(), 3);
+        assert!(upserts.contains(&"fresh.txt".to_string()));
+        assert!(upserts.contains(&"new-name.txt".to_string()));
+        assert!(upserts.contains(&"after.txt".to_string()));
+        let deletes = presenter.deletes.lock().unwrap();
+        assert_eq!(deletes.as_slice(), &["scr:d1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn apply_changes_empty_set_is_noop() {
+        let db = Arc::new(StateDb::open_in_memory().unwrap());
+        db.register_backend("scr", "scripted", "Scripted", None, None)
+            .unwrap();
+        let presenter = Arc::new(MockPresenter::default());
+        let config = Arc::new(ConfigResolver::new(PathBuf::from("/tmp/empty")));
+        let runner = make_native_runner(db.clone(), vec![], presenter.clone(), config);
+
+        let applied = runner.apply_changes("scr", &[]).await.unwrap();
+
+        assert!(applied.is_empty());
+        assert!(presenter.upserts.lock().unwrap().is_empty());
+        assert!(presenter.deletes.lock().unwrap().is_empty());
+        assert!(db.list_all_files().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sync_backend_empty_changes_polls_once_and_persists_cursor() {
+        let db = Arc::new(StateDb::open_in_memory().unwrap());
+        db.register_backend("scr", "scripted", "Scripted", None, None)
+            .unwrap();
+        let presenter = Arc::new(MockPresenter::default());
+        let config = Arc::new(ConfigResolver::new(PathBuf::from("/tmp/sb-empty")));
+        let backend = Arc::new(ScriptedBackend::new("scr").with_batch(vec![]));
+        let backend_dyn: Arc<dyn Backend> = backend.clone();
+        let runner = make_native_runner(db.clone(), vec![], presenter.clone(), config);
+
+        let count = runner.sync_backend(&backend_dyn).await.unwrap();
+
+        assert_eq!(count, 0);
+        assert_eq!(backend.changes_call_count(), 1);
+        assert!(presenter.upserts.lock().unwrap().is_empty());
+        // The new cursor was persisted even though no changes were applied.
+        assert_cursor(db.get_cursor("scr").unwrap(), Some("scr-cursor"));
+    }
+
+    #[tokio::test]
+    async fn sync_backend_passes_stored_cursor_and_advances_it() {
+        let db = Arc::new(StateDb::open_in_memory().unwrap());
+        db.register_backend("scr", "scripted", "Scripted", None, None)
+            .unwrap();
+        // Seed an existing cursor so we can confirm the backend receives it.
+        db.set_cursor("scr", &crate::types::Cursor("start".into()))
+            .unwrap();
+        let presenter = Arc::new(MockPresenter::default());
+        let config = Arc::new(ConfigResolver::new(PathBuf::from("/tmp/sb-cursor")));
+        let backend =
+            Arc::new(ScriptedBackend::new("scr").with_batch(vec![created("scr", "c1", "x.txt")]));
+        let backend_dyn: Arc<dyn Backend> = backend.clone();
+        let runner = make_native_runner(db.clone(), vec![], presenter, config);
+
+        let count = runner.sync_backend(&backend_dyn).await.unwrap();
+
+        assert_eq!(count, 1);
+        // Backend was handed the previously-stored cursor.
+        assert_cursor(backend.last_cursor.lock().unwrap().clone(), Some("start"));
+        // And the cursor advanced to the backend's returned value.
+        assert_cursor(db.get_cursor("scr").unwrap(), Some("scr-cursor"));
+    }
+
+    #[tokio::test]
+    async fn sync_backend_surfaces_changes_error() {
+        let db = Arc::new(StateDb::open_in_memory().unwrap());
+        db.register_backend("scr", "scripted", "Scripted", None, None)
+            .unwrap();
+        let presenter = Arc::new(MockPresenter::default());
+        let config = Arc::new(ConfigResolver::new(PathBuf::from("/tmp/sb-err")));
+        let backend = Arc::new(ScriptedBackend::new("scr").failing());
+        let backend_dyn: Arc<dyn Backend> = backend;
+        let runner = make_native_runner(db.clone(), vec![], presenter, config);
+
+        let result = runner.sync_backend(&backend_dyn).await;
+
+        // The backend error is surfaced, not swallowed.
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("scripted changes failure"));
+        // No cursor was persisted because the error short-circuited before set_cursor.
+        assert!(db.get_cursor("scr").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn sync_backend_propagates_presenter_failure() {
+        let db = Arc::new(StateDb::open_in_memory().unwrap());
+        db.register_backend("scr", "scripted", "Scripted", None, None)
+            .unwrap();
+        let presenter = Arc::new(FailingPresenter);
+        let config = Arc::new(ConfigResolver::new(PathBuf::from("/tmp/sb-presenter")));
+        let backend =
+            Arc::new(ScriptedBackend::new("scr").with_batch(vec![created("scr", "c1", "x.txt")]));
+        let backend_dyn: Arc<dyn Backend> = backend;
+        let runner = make_native_runner(db.clone(), vec![], presenter, config);
+
+        let result = runner.sync_backend(&backend_dyn).await;
+
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("presenter upsert failed"));
+        // The cursor must not advance when applying the batch failed mid-way.
+        assert!(db.get_cursor("scr").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn run_continues_past_failing_backend_in_initial_sync() {
+        let db = Arc::new(StateDb::open_in_memory().unwrap());
+        db.register_backend("bad", "scripted", "Bad", None, None)
+            .unwrap();
+        db.register_backend("good", "scripted", "Good", None, None)
+            .unwrap();
+        let presenter = Arc::new(MockPresenter::default());
+        let config = Arc::new(ConfigResolver::new(PathBuf::from("/tmp/run-mixed")));
+
+        let bad: Arc<dyn Backend> = Arc::new(ScriptedBackend::new("bad").failing());
+        // A short poll interval keeps the polling-loop sleep tiny so the test
+        // does not wait the 60s default before observing the cancel flag.
+        let good_backend = Arc::new(
+            ScriptedBackend::new("good")
+                .with_poll_interval(Duration::from_millis(5))
+                .with_batch(vec![created("good", "g1", "ok.txt")]),
+        );
+        let good: Arc<dyn Backend> = good_backend.clone();
+
+        // cancel=false so run() does the initial sync, hydrate, then enters the
+        // polling loop. We trip cancel after the good backend has polled once.
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_watch = cancel.clone();
+        let good_watch = good_backend.clone();
+        let watcher = tokio::spawn(async move {
+            // Wait until the good backend has been polled at least once (initial
+            // sync), then cancel so run() returns from the polling loop.
+            loop {
+                if good_watch.changes_call_count() >= 1 {
+                    cancel_watch.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let runner = make_native_runner(db.clone(), vec![bad, good], presenter, config);
+        let result = runner.run(cancel).await;
+        watcher.await.unwrap();
+
+        // The bad backend's error did not abort the run; the good backend's
+        // change still landed in the DB.
+        assert!(result.is_ok());
+        assert!(db.get_file(&ItemId::new("good", "g1")).unwrap().is_some());
+        // Cursor advanced only for the good backend; the failing one never set one.
+        assert!(db.get_cursor("bad").unwrap().is_none());
+        assert_cursor(db.get_cursor("good").unwrap(), Some("good-cursor"));
+    }
+
+    #[tokio::test]
+    async fn apply_changes_skips_ignored_entry() {
+        // A real .cascade file in the mount root marks *.tmp as ignored.
+        // `is_ignored_entry` resolves config for the entry name's parent dir,
+        // so the entry names are full paths under the mount root and the walk
+        // loads the root `.cascade`.
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join(".cascade"), b"*.tmp\n")
+            .await
+            .unwrap();
+        let keep_name = tmp.path().join("keep.txt").to_string_lossy().into_owned();
+        let skip_name = tmp
+            .path()
+            .join("scratch.tmp")
+            .to_string_lossy()
+            .into_owned();
+
+        let db = Arc::new(StateDb::open_in_memory().unwrap());
+        db.register_backend("scr", "scripted", "Scripted", None, None)
+            .unwrap();
+        let presenter = Arc::new(MockPresenter::default());
+        let config = Arc::new(ConfigResolver::new(tmp.path().to_path_buf()));
+        let runner = make_native_runner(db.clone(), vec![], presenter.clone(), config);
+
+        let changes = vec![
+            Change::Created(FileEntry::file(
+                ItemId::new("scr", "keep"),
+                ItemId::new("scr", "root"),
+                keep_name.clone(),
+            )),
+            Change::Created(FileEntry::file(
+                ItemId::new("scr", "skip"),
+                ItemId::new("scr", "root"),
+                skip_name,
+            )),
+        ];
+        let applied = runner.apply_changes("scr", &changes).await.unwrap();
+
+        // Only the non-ignored entry was applied.
+        assert_eq!(applied.len(), 1);
+        assert!(db.get_file(&ItemId::new("scr", "keep")).unwrap().is_some());
+        assert!(db.get_file(&ItemId::new("scr", "skip")).unwrap().is_none());
+        let upserts = presenter.upserts.lock().unwrap();
+        assert_eq!(upserts.as_slice(), &[keep_name]);
+    }
+
+    #[tokio::test]
+    async fn apply_changes_skips_entry_exceeding_max_file_length() {
+        let db = Arc::new(StateDb::open_in_memory().unwrap());
+        db.register_backend("scr", "scripted", "Scripted", None, None)
+            .unwrap();
+        // Rule: anything matching *.bin must not exceed `max_bytes`.
+        let max_bytes = 10u64;
+        db.add_max_file_length_rule("*.bin", max_bytes, 0, None)
+            .unwrap();
+        let presenter = Arc::new(MockPresenter::default());
+        let config = Arc::new(ConfigResolver::new(PathBuf::from("/tmp/maxlen")));
+        let runner = make_native_runner(db.clone(), vec![], presenter.clone(), config);
+
+        let too_big = Change::Created(
+            FileEntry::file(
+                ItemId::new("scr", "big"),
+                ItemId::new("scr", "root"),
+                "blob.bin".into(),
+            )
+            .with_size(Some(max_bytes + 1)),
+        );
+        let within = Change::Created(
+            FileEntry::file(
+                ItemId::new("scr", "small"),
+                ItemId::new("scr", "root"),
+                "tiny.bin".into(),
+            )
+            .with_size(Some(max_bytes)),
+        );
+
+        let applied = runner
+            .apply_changes("scr", &[too_big, within])
+            .await
+            .unwrap();
+
+        // The oversized file is skipped; the one at the limit is applied.
+        assert_eq!(applied.len(), 1);
+        assert!(db.get_file(&ItemId::new("scr", "big")).unwrap().is_none());
+        assert!(db.get_file(&ItemId::new("scr", "small")).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn apply_changes_auto_pins_matching_created_entry() {
+        let db = Arc::new(StateDb::open_in_memory().unwrap());
+        db.register_backend("scr", "scripted", "Scripted", None, None)
+            .unwrap();
+        // Pin rule matching the created file's name.
+        db.add_pin_rule("pinme.txt", false, None).unwrap();
+        let presenter = Arc::new(MockPresenter::default());
+        let config = Arc::new(ConfigResolver::new(PathBuf::from("/tmp/pin")));
+        let runner = make_native_runner(db.clone(), vec![], presenter, config);
+
+        let changes = vec![
+            created("scr", "p1", "pinme.txt"),
+            created("scr", "p2", "ordinary.txt"),
+        ];
+        let applied = runner.apply_changes("scr", &changes).await.unwrap();
+        assert_eq!(applied.len(), 2);
+
+        // The matching entry was auto-pinned; the other stays Online.
+        assert_eq!(
+            db.get_cache_state(&ItemId::new("scr", "p1")).unwrap(),
+            Some(CacheState::Pinned)
+        );
+        assert_eq!(
+            db.get_cache_state(&ItemId::new("scr", "p2")).unwrap(),
+            Some(CacheState::Online)
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrate_presenter_loads_root_children() {
+        let db = Arc::new(StateDb::open_in_memory().unwrap());
+        db.register_backend("scr", "scripted", "Scripted", None, None)
+            .unwrap();
+        // Two root-level children under "scr:root" plus a grandchild that must
+        // NOT be hydrated (only root children are loaded eagerly).
+        let child_a = FileEntry::dir(
+            ItemId::new("scr", "a"),
+            ItemId::new("scr", "root"),
+            "folder-a".into(),
+        );
+        let child_b = FileEntry::file(
+            ItemId::new("scr", "b"),
+            ItemId::new("scr", "root"),
+            "file-b.txt".into(),
+        );
+        let grandchild = FileEntry::file(
+            ItemId::new("scr", "c"),
+            ItemId::new("scr", "a"),
+            "nested.txt".into(),
+        );
+        db.upsert_file(&child_a).unwrap();
+        db.upsert_file(&child_b).unwrap();
+        db.upsert_file(&grandchild).unwrap();
+
+        let presenter = Arc::new(MockPresenter::default());
+        let config = Arc::new(ConfigResolver::new(PathBuf::from("/tmp/hydrate")));
+        let runner = make_native_runner(db.clone(), vec![], presenter.clone(), config);
+
+        runner.hydrate_presenter().await.unwrap();
+
+        let upserts = presenter.upserts.lock().unwrap();
+        assert_eq!(upserts.len(), 2);
+        assert!(upserts.contains(&"folder-a".to_string()));
+        assert!(upserts.contains(&"file-b.txt".to_string()));
+        assert!(!upserts.contains(&"nested.txt".to_string()));
+    }
+
+    #[tokio::test]
+    async fn effective_poll_interval_picks_shortest() {
+        let db = Arc::new(StateDb::open_in_memory().unwrap());
+        let presenter = Arc::new(MockPresenter::default());
+        let config = Arc::new(ConfigResolver::new(PathBuf::from("/tmp/poll")));
+
+        let short = Duration::from_secs(5);
+        let long = Duration::from_secs(30);
+        let fast: Arc<dyn Backend> =
+            Arc::new(ScriptedBackend::new("fast").with_poll_interval(short));
+        let slow: Arc<dyn Backend> =
+            Arc::new(ScriptedBackend::new("slow").with_poll_interval(long));
+        let runner = make_native_runner(db, vec![slow, fast], presenter, config);
+
+        // The shortest reported interval wins.
+        assert_eq!(runner.effective_poll_interval().await, short);
+    }
+
+    #[tokio::test]
+    async fn effective_poll_interval_defaults_when_none_reported() {
+        let db = Arc::new(StateDb::open_in_memory().unwrap());
+        let presenter = Arc::new(MockPresenter::default());
+        let config = Arc::new(ConfigResolver::new(PathBuf::from("/tmp/poll-default")));
+
+        // ScriptedBackend with no interval reports None; NullBackend also None.
+        let a: Arc<dyn Backend> = Arc::new(ScriptedBackend::new("a"));
+        let b: Arc<dyn Backend> = Arc::new(NullBackend::new("b"));
+        let runner = make_native_runner(db, vec![a, b], presenter, config);
+
+        assert_eq!(
+            runner.effective_poll_interval().await,
+            DEFAULT_POLL_INTERVAL
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_dirty_files_skips_unknown_backend() {
+        let db = Arc::new(StateDb::open_in_memory().unwrap());
+        db.register_backend("mock", "mock", "Mock", None, None)
+            .unwrap();
+        // The dirty file's backend is registered in the DB (so the file row's
+        // FK holds) but is NOT given to the runner, modelling a backend that
+        // was removed from the live set while a dirty file still references it.
+        db.register_backend("ghost", "mock", "Ghost", None, None)
+            .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let local_file = tmp.path().join("orphan.txt");
+        tokio::fs::write(&local_file, b"data").await.unwrap();
+
+        // Dirty file owned by a backend the runner does not have in its set.
+        let file_id = ItemId::new("ghost", "f1");
+        let entry = FileEntry::file(
+            file_id.clone(),
+            ItemId::new("ghost", "root"),
+            "orphan.txt".into(),
+        );
+        db.upsert_file(&entry).unwrap();
+        db.mark_dirty(&file_id).unwrap();
+        db.set_file_paths(&file_id, "orphan.txt", &local_file.to_string_lossy())
+            .unwrap();
+
+        // Runner only knows about the "mock" backend, not "ghost".
+        let mock_backend = Arc::new(MockBackend::new("mock"));
+        let presenter = Arc::new(MockPresenter::default());
+        let config = Arc::new(ConfigResolver::new(PathBuf::from("/tmp/orphan")));
+        let runner = make_native_runner(db.clone(), vec![mock_backend.clone()], presenter, config);
+
+        let flushed = runner.flush_dirty_files().await;
+
+        assert_eq!(flushed, 0);
+        assert!(mock_backend.uploads.lock().unwrap().is_empty());
+        // Still dirty — nothing could flush it.
+        assert_eq!(db.is_dirty(&file_id).unwrap(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn flush_dirty_files_skips_missing_disk_file() {
+        let db = Arc::new(StateDb::open_in_memory().unwrap());
+        db.register_backend("mock", "mock", "Mock", None, None)
+            .unwrap();
+
+        // Point local_path at a file that does not exist.
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("never-written.txt");
+
+        let file_id = ItemId::new("mock", "f1");
+        let entry = FileEntry::file(file_id.clone(), ItemId::new("mock", "root"), "x.txt".into());
+        db.upsert_file(&entry).unwrap();
+        db.mark_dirty(&file_id).unwrap();
+        db.set_file_paths(&file_id, "x.txt", &missing.to_string_lossy())
+            .unwrap();
+
+        let mock_backend = Arc::new(MockBackend::new("mock"));
+        let presenter = Arc::new(MockPresenter::default());
+        let config = Arc::new(ConfigResolver::new(PathBuf::from("/tmp/missing")));
+        let runner = make_native_runner(db.clone(), vec![mock_backend.clone()], presenter, config);
+
+        let flushed = runner.flush_dirty_files().await;
+
+        assert_eq!(flushed, 0);
+        assert!(mock_backend.uploads.lock().unwrap().is_empty());
+        assert_eq!(db.is_dirty(&file_id).unwrap(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn flush_dirty_files_flushes_multiple_and_isolates_failures() {
+        let db = Arc::new(StateDb::open_in_memory().unwrap());
+        db.register_backend("mock", "mock", "Mock", None, None)
+            .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Two flushable files plus one whose disk content is missing. The
+        // missing one must not stop the other two from flushing.
+        let good1 = tmp.path().join("g1.txt");
+        let good2 = tmp.path().join("g2.txt");
+        tokio::fs::write(&good1, b"one").await.unwrap();
+        tokio::fs::write(&good2, b"two").await.unwrap();
+        let missing = tmp.path().join("absent.txt");
+
+        let id1 = ItemId::new("mock", "g1");
+        let id2 = ItemId::new("mock", "g2");
+        let id3 = ItemId::new("mock", "absent");
+        for (id, name) in [(&id1, "g1.txt"), (&id2, "g2.txt"), (&id3, "absent.txt")] {
+            let entry = FileEntry::file(id.clone(), ItemId::new("mock", "root"), name.to_string());
+            db.upsert_file(&entry).unwrap();
+            db.mark_dirty(id).unwrap();
+        }
+        db.set_file_paths(&id1, "g1.txt", &good1.to_string_lossy())
+            .unwrap();
+        db.set_file_paths(&id2, "g2.txt", &good2.to_string_lossy())
+            .unwrap();
+        db.set_file_paths(&id3, "absent.txt", &missing.to_string_lossy())
+            .unwrap();
+
+        let mock_backend = Arc::new(MockBackend::new("mock"));
+        let presenter = Arc::new(MockPresenter::default());
+        let config = Arc::new(ConfigResolver::new(PathBuf::from("/tmp/multi")));
+        let runner = make_native_runner(db.clone(), vec![mock_backend.clone()], presenter, config);
+
+        let flushed = runner.flush_dirty_files().await;
+
+        // Both readable files flushed; the missing one did not.
+        assert_eq!(flushed, 2);
+        assert_eq!(mock_backend.uploads.lock().unwrap().len(), 2);
+        assert_eq!(db.is_dirty(&id1).unwrap(), Some(false));
+        assert_eq!(db.is_dirty(&id2).unwrap(), Some(false));
+        assert_eq!(db.is_dirty(&id3).unwrap(), Some(true));
+    }
+
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn sync_backend_records_applied_changes_into_change_feed() {
+        use crate::changefeed::{ChangeFeed, ChangeQueryResult};
+
+        let db = Arc::new(StateDb::open_in_memory().unwrap());
+        db.register_backend("scr", "scripted", "Scripted", None, None)
+            .unwrap();
+        let presenter = Arc::new(MockPresenter::default());
+        let config = Arc::new(ConfigResolver::new(PathBuf::from("/tmp/feed")));
+        let backend = Arc::new(
+            ScriptedBackend::new("scr").with_batch(vec![created("scr", "c1", "feed.txt")]),
+        );
+        let backend_dyn: Arc<dyn Backend> = backend;
+
+        let feed = Arc::new(ChangeFeed::new());
+        let runner = make_native_runner(db.clone(), vec![], presenter, config)
+            .with_change_feed(feed.clone());
+
+        let count = runner.sync_backend(&backend_dyn).await.unwrap();
+        assert_eq!(count, 1);
+
+        // The applied change is queryable from the feed under its parent.
+        let result = feed
+            .parent_changes_since("scr", &ItemId::new("scr", "root"), None)
+            .await;
+        match result {
+            ChangeQueryResult::Delta { events, .. } => {
+                assert_eq!(events.len(), 1);
+                match &events[0] {
+                    Change::Created(entry) => assert_eq!(entry.name, "feed.txt"),
+                    other => panic!("unexpected change variant: {other:?}"),
+                }
+            }
+            other => panic!("expected Delta, got {other:?}"),
+        }
     }
 }
