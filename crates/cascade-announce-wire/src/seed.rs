@@ -157,4 +157,38 @@ mod tests {
             signing.verifying_key().to_bytes()
         );
     }
+
+    #[test]
+    fn seed_derivation_is_collision_resistant_across_many_ids() {
+        // Derive seeds for a large set of distinct device ids and confirm that
+        // all seeds are unique.  The probability of any collision under SHA-256
+        // is negligible; a collision here would indicate a derivation bug rather
+        // than a birthday-paradox event.
+        use std::collections::HashSet;
+        let count = 1000usize;
+        let seeds: HashSet<[u8; DHT_KEY_LEN]> = (0..count)
+            .map(|i| *DhtKey::from_device_id(&format!("DEVICE-{i}")).as_bytes())
+            .collect();
+        assert_eq!(
+            seeds.len(),
+            count,
+            "expected {count} distinct seeds, got collisions"
+        );
+    }
+
+    #[test]
+    fn seed_domain_separation_does_not_collide_with_raw_id_hash() {
+        // The derivation mixes in a domain prefix before hashing. The seed
+        // must therefore differ from a plain SHA-256 of the device id bytes,
+        // confirming that the prefix is actually participating in the digest.
+        use sha2::{Digest, Sha256};
+        let id = "DEVICE-A";
+        let seed = DhtKey::from_device_id(id);
+        let raw_hash: [u8; 32] = Sha256::digest(id.as_bytes()).into();
+        assert_ne!(
+            seed.as_bytes(),
+            &raw_hash,
+            "seed should differ from the raw SHA-256 of the id (domain prefix must participate)"
+        );
+    }
 }

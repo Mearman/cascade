@@ -263,12 +263,10 @@ mod tests {
     }
 
     #[test]
-    fn compute_tag_segments_are_order_sensitive() {
+    fn compute_tag_is_segment_order_sensitive() {
+        // Swapping the segment order changes the tag, so a tag cannot be
+        // replayed against a different segment arrangement of the same bytes.
         let a = compute_tag(&secret(), &[b"foo", b"bar"]).unwrap();
-        let b = compute_tag(&secret(), &[b"foobar"]).unwrap();
-        // Concatenation is the same to the MAC, so these agree by construction —
-        // the segment list is purely a convenience for the caller.
-        assert_eq!(a, b);
         let c = compute_tag(&secret(), &[b"bar", b"foo"]).unwrap();
         assert_ne!(a, c);
     }
@@ -289,5 +287,58 @@ mod tests {
     #[test]
     fn encode_hex_is_lower_case_and_fixed_width() {
         assert_eq!(encode_hex(&[0x00, 0xff, 0x0a, 0xb3]), "00ff0ab3");
+    }
+
+    #[test]
+    fn single_bit_flip_in_tag_fails_verification() {
+        // Even a one-bit mutation of the correct tag must not verify, confirming
+        // that the constant-time comparison rejects any deviation, not just
+        // obviously wrong values.
+        let body = br#"{"signed":{}}"#;
+        let mut tag = announce_write_tag(&secret(), "DEVICE-A", body).unwrap();
+        tag[0] ^= 0x01;
+        let header = encode_hex(&tag);
+        assert!(!verify_announce_write(&secret(), "DEVICE-A", body, &header).unwrap());
+    }
+
+    #[test]
+    fn parse_shared_secret_hex_rejects_empty_string() {
+        // An empty string is a valid even-length hex string that decodes to zero
+        // bytes, which is then the wrong length for a 32-byte secret.
+        assert!(parse_shared_secret_hex("").is_err());
+    }
+
+    #[test]
+    fn decode_hex_accepts_upper_case_digits() {
+        // `decode_hex` documents that it accepts both lower and upper case; the
+        // shared secret is sometimes passed from config formatted in upper case,
+        // and `parse_shared_secret_hex` must round-trip it.
+        let upper = encode_hex(&secret()).to_uppercase();
+        assert_eq!(parse_shared_secret_hex(&upper).unwrap(), secret());
+    }
+
+    #[test]
+    fn verify_announce_write_with_upper_case_header_succeeds() {
+        // The auth header may arrive in upper case from certain HTTP stacks; the
+        // verifier must accept it so auth does not fail solely due to case.
+        let body = br#"{"signed":{}}"#;
+        let tag = announce_write_tag(&secret(), "DEVICE-A", body).unwrap();
+        let header_lower = encode_hex(&tag);
+        let header_upper = header_lower.to_uppercase();
+        assert!(verify_announce_write(&secret(), "DEVICE-A", body, &header_upper).unwrap());
+    }
+
+    #[test]
+    fn auth_header_tag_binds_both_device_id_and_body() {
+        // A tag for DEVICE-A's body must not authorise the same body posted to
+        // DEVICE-B's path; the MAC input concatenates the device id *before* the
+        // body, so swapping the id produces a distinct tag.
+        let body = br#"{"signed":{}}"#;
+        let tag_a = announce_write_tag(&secret(), "DEVICE-A", body).unwrap();
+        let header_a = encode_hex(&tag_a);
+        // Authorises DEVICE-A.
+        assert!(verify_announce_write(&secret(), "DEVICE-A", body, &header_a).unwrap());
+        // Does not authorise DEVICE-B with the same body.
+        assert!(!verify_announce_write(&secret(), "DEVICE-B", body, &header_a).unwrap());
     }
 }

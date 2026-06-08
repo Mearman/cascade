@@ -659,4 +659,127 @@ mod tests {
         .await;
         assert!(matches!(outcome, Outcome::LookupBody(_)));
     }
+
+    #[tokio::test]
+    async fn body_at_exact_size_limit_is_accepted() {
+        // A body of exactly `MAX_ANNOUNCE_REQUEST_BYTES` must not be rejected by
+        // the coarse size guard — the boundary is inclusive from below.  The body
+        // itself need not be valid JSON for this test because we are only
+        // checking the size gate; an invalid JSON body that passes the size gate
+        // returns `Unauthorized` (no auth header), not `PayloadTooLarge`.
+        let store = MemStore::default();
+        let body = vec![0u8; MAX_ANNOUNCE_REQUEST_BYTES];
+        let outcome = handle(
+            &store,
+            Method::Post,
+            "DEVICE-A",
+            None,
+            &body,
+            &secret(),
+            TTL_SECONDS,
+        )
+        .await;
+        // Size is exactly at the limit, so the size check passes; the missing
+        // auth header then fires.
+        assert_eq!(outcome, Outcome::Unauthorized);
+    }
+
+    #[tokio::test]
+    async fn auth_fires_before_json_parsing() {
+        // A request with a malformed JSON body but a valid HMAC must return
+        // `BadRequest`, not `Unauthorized` — the parser only runs after auth
+        // succeeds, so if auth passes the JSON error is exposed.  Conversely, a
+        // malformed JSON body with no auth must return `Unauthorized`, proving
+        // auth runs before the parser.
+        let store = MemStore::default();
+        let body = b"not valid json".to_vec();
+
+        // No auth header: returns Unauthorized (parser never reached).
+        let no_auth = handle(
+            &store,
+            Method::Post,
+            "DEVICE-A",
+            None,
+            &body,
+            &secret(),
+            TTL_SECONDS,
+        )
+        .await;
+        assert_eq!(no_auth, Outcome::Unauthorized);
+
+        // Valid HMAC over the malformed body: auth passes, parser runs, returns
+        // BadRequest.
+        let tag = announce_write_tag(&secret(), "DEVICE-A", &body).unwrap();
+        let with_auth = handle(
+            &store,
+            Method::Post,
+            "DEVICE-A",
+            Some(&encode_hex(&tag)),
+            &body,
+            &secret(),
+            TTL_SECONDS,
+        )
+        .await;
+        assert!(matches!(with_auth, Outcome::BadRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn tag_for_one_device_does_not_authorise_post_to_another_device() {
+        // The HMAC binds both the device id (from the path) and the body bytes.
+        // A tag computed for DEVICE-A's body must not authorise the same body
+        // when posted to DEVICE-B's path — verifying that the device id is part
+        // of the MAC input.
+        let store = MemStore::default();
+        let (body, header_a) = signed_request("DEVICE-A", &[22000]);
+        // Post DEVICE-A's body+tag to the DEVICE-B path.
+        let outcome = handle(
+            &store,
+            Method::Post,
+            "DEVICE-B",
+            Some(&header_a),
+            &body,
+            &secret(),
+            TTL_SECONDS,
+        )
+        .await;
+        assert_eq!(outcome, Outcome::Unauthorized);
+        assert!(store.entries.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_candidate_set_registers_and_round_trips() {
+        // A device with zero current candidates must be accepted (a valid signed
+        // envelope with an empty list is a meaningful "I am here but unreachable
+        // directly").
+        let store = MemStore::default();
+        let (body, header) = signed_request("DEVICE-A", &[]);
+        let registered = handle(
+            &store,
+            Method::Post,
+            "DEVICE-A",
+            Some(&header),
+            &body,
+            &secret(),
+            TTL_SECONDS,
+        )
+        .await;
+        assert_eq!(registered, Outcome::Registered);
+
+        let lookup = handle(
+            &store,
+            Method::Get,
+            "DEVICE-A",
+            None,
+            &[],
+            &secret(),
+            TTL_SECONDS,
+        )
+        .await;
+        let Outcome::LookupBody(json) = lookup else {
+            panic!("expected a lookup body, got {lookup:?}");
+        };
+        let response: crate::wire::LookupResponse = serde_json::from_slice(&json).unwrap();
+        let signed = response.signed.expect("registered id must return its blob");
+        assert_eq!(signed.candidates.len(), 0);
+    }
 }

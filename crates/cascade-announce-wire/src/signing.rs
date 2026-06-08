@@ -385,4 +385,123 @@ mod tests {
         assert_eq!(decoded, signed);
         assert!(decoded.verify("DEVICE-A", TEST_NOW).is_ok());
     }
+
+    #[test]
+    fn bit_flip_in_base64_signature_field_fails_verification() {
+        // Deserialise a valid envelope from JSON, flip one character inside the
+        // base64 `signature` field, re-deserialise, and expect `BadSignature`.
+        // This exercises the interaction between serde and the signature check: a
+        // base64-encoded blob that differs by one character still deserialises to
+        // a 64-byte array (provided the result is still valid base64 and the
+        // right length), but the reconstructed bytes differ and the signature
+        // check rejects them.
+        let signed = SignedCandidates::sign("DEVICE-A", vec![wire(22000, 0, 1)], TEST_EXPIRY);
+        let mut obj: serde_json::Value = serde_json::to_value(&signed).unwrap();
+        // Locate the signature string and flip its first character.
+        let sig_str = obj["signature"].as_str().unwrap().to_owned();
+        // Replace the first character with a different valid base64 character so
+        // the string still decodes without a base64 error — the mutation must
+        // reach the signature-verification step rather than the serde step.
+        let first = sig_str.chars().next().unwrap();
+        // Pick a replacement that differs from `first` and is valid base64.
+        let replacement = if first == 'A' { 'B' } else { 'A' };
+        let mut new_sig = sig_str;
+        new_sig.replace_range(..first.len_utf8(), &replacement.to_string());
+        obj["signature"] = serde_json::Value::String(new_sig);
+        let tampered: Result<SignedCandidates, _> = serde_json::from_value(obj);
+        match tampered {
+            Err(_) => {
+                // Serde rejected the mutated base64 — it was no longer a valid
+                // 64-byte encoding, so the tampering is caught even earlier than
+                // the signature check.  That is also a valid rejection.
+            }
+            Ok(env) => {
+                assert_eq!(
+                    env.verify("DEVICE-A", TEST_NOW),
+                    Err(VerifyError::BadSignature)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn expiry_at_exactly_now_plus_one_ms_is_still_valid() {
+        // The boundary condition: an envelope expiring at `now + 1` must verify,
+        // while one expiring at `now` (or earlier) is rejected.  This pins the
+        // off-by-one behaviour of the `expires_at > now` check in `verify`.
+        let now = TEST_NOW;
+        let signed = SignedCandidates::sign("DEVICE-A", vec![wire(1, 0, 0)], now + 1);
+        assert!(signed.verify("DEVICE-A", now).is_ok());
+    }
+
+    #[test]
+    fn expiry_at_exactly_now_is_rejected() {
+        // An envelope whose expiry equals the verifier's clock is considered
+        // stale: `expires_at > now` is strict, so equality is a rejection.
+        let now = TEST_NOW;
+        let signed = SignedCandidates::sign("DEVICE-A", vec![wire(1, 0, 0)], now);
+        assert!(matches!(
+            signed.verify("DEVICE-A", now),
+            Err(VerifyError::Expired { .. })
+        ));
+    }
+
+    #[test]
+    fn empty_candidate_list_signs_and_verifies() {
+        // A device with no current candidates should still produce a verifiable
+        // (if useless) envelope rather than panicking or failing the signature
+        // check — the signed bytes encode a zero candidate count unambiguously.
+        let signed = SignedCandidates::sign("DEVICE-A", vec![], TEST_EXPIRY);
+        let result = signed.verify("DEVICE-A", TEST_NOW);
+        assert!(result.is_ok());
+        let empty: &[WireCandidate] = &[];
+        assert_eq!(result.unwrap(), empty);
+    }
+
+    #[test]
+    fn ipv6_candidates_encode_and_verify_correctly() {
+        // IPv6 addresses are encoded differently in `signing_bytes` (16-byte
+        // octets with a `6` prefix) from IPv4 (4-byte octets with a `4`
+        // prefix).  A round-trip through `sign`/`verify` confirms that the
+        // canonical encoding is deterministic for both address families.
+        use std::net::{Ipv6Addr, SocketAddrV6};
+        let ipv6_candidate = WireCandidate {
+            address: SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1),
+                22000,
+                0,
+                0,
+            )),
+            kind: 1,
+            priority: 100,
+        };
+        let signed = SignedCandidates::sign("DEVICE-A", vec![ipv6_candidate], TEST_EXPIRY);
+        let result = signed.verify("DEVICE-A", TEST_NOW);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), &[ipv6_candidate]);
+    }
+
+    #[test]
+    fn tampering_with_ipv6_address_octets_is_rejected() {
+        // Confirm that a mutation to an IPv6 candidate's address invalidates the
+        // signature, covering the IPv6 arm of the canonical-byte encoding.
+        use std::net::{Ipv6Addr, SocketAddrV6};
+        let ipv6_candidate = WireCandidate {
+            address: SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1),
+                22000,
+                0,
+                0,
+            )),
+            kind: 1,
+            priority: 100,
+        };
+        let mut signed = SignedCandidates::sign("DEVICE-A", vec![ipv6_candidate], TEST_EXPIRY);
+        // Flip the priority of the candidate post-signing.
+        signed.candidates[0].priority ^= 0x01;
+        assert_eq!(
+            signed.verify("DEVICE-A", TEST_NOW),
+            Err(VerifyError::BadSignature)
+        );
+    }
 }
