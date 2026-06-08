@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.109](https://github.com/Mearman/cascade/compare/cascade-v0.1.108...cascade-v0.1.109) - 2026-06-08
+
+### Other
+
+- *(cache)* cover CacheManager eviction-sweep orchestration
+
 ## [0.1.108](https://github.com/Mearman/cascade/compare/cascade-v0.1.107...cascade-v0.1.108) - 2026-06-07
 
 ### Other
