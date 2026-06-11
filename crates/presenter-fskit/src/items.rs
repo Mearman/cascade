@@ -73,6 +73,7 @@ mod tests {
             id: ItemId::new("gdrive", "file1"),
             parent_id: ItemId::new("gdrive", "root"),
             name: "report.pdf".to_string(),
+            path: "report.pdf".to_string(),
             is_dir: false,
             size: Some(4096),
             mod_time: Some(Utc.with_ymd_and_hms(2026, 5, 28, 6, 20, 0).unwrap()),
