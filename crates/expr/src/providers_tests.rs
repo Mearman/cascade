@@ -5,7 +5,12 @@
 //! edge case in `DiskProvider`, and the `for_file` convenience constructor.
 
 use crate::context::{FileContext, FileFlags, NetworkType, PeerContext, PowerSource};
-use crate::providers::{DeviceProvider, DiskProvider, NetworkProvider, PowerProvider, for_file};
+use crate::providers::{DeviceProvider, NetworkProvider, PowerProvider, for_file};
+// `DiskProvider`'s real implementation (and the tests exercising it) are
+// unix-only — statfs has no Windows equivalent here — so the import is gated to
+// match, avoiding an unused-import error on Windows.
+#[cfg(unix)]
+use crate::providers::DiskProvider;
 
 // ── FileContext helpers ──────────────────────────────────────────────────────
 
