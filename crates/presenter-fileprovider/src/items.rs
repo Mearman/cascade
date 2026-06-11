@@ -68,6 +68,8 @@ mod tests {
         VfsItem {
             id: ItemId::new("gdrive", "file1"),
             parent_id: ItemId::new("gdrive", "root"),
+            // The sync runner writes the mount-prefixed path.
+            path: "gdrive/report.pdf".to_string(),
             name: "report.pdf".to_string(),
             is_dir: false,
             size: Some(4096),

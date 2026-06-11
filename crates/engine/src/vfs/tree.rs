@@ -162,6 +162,47 @@ impl VfsTree {
             .map(|(_, backend)| backend)
     }
 
+    /// Find the backend that owns a VFS path by longest-prefix match.
+    ///
+    /// The `path` argument is a VFS-absolute path without a leading slash
+    /// (e.g. `personal/Documents/report.txt`). This mirrors the storage
+    /// representation in `files.path` and `VfsItem.path`.
+    ///
+    /// - A backend mounted at the empty prefix (i.e. at "/") matches every
+    ///   path, so it is tried last after all explicit mounts.
+    /// - An explicit child mount matches when `path` starts with its prefix
+    ///   followed by either a `/` or the end of the string (so `Work` does
+    ///   not match `Workbench`).
+    /// - When no child mount matches, the root backend is returned.
+    ///
+    /// Returns the matching backend and the remaining backend-relative path.
+    #[must_use]
+    pub fn backend_for_path<'a>(&'a self, path: &'a str) -> (&'a Arc<dyn Backend>, &'a str) {
+        for (prefix, backend) in &self.children {
+            let prefix_str = prefix.to_string_lossy();
+            if prefix_str.is_empty() {
+                // Empty-prefix mount (at-root backend) — only returned as a
+                // fallback after all explicit prefix mounts are exhausted.
+                continue;
+            }
+            if path == prefix_str.as_ref() {
+                // Exact match: path IS the mount directory.
+                return (backend, "");
+            }
+            let with_slash = format!("{prefix_str}/");
+            if let Some(rest) = path.strip_prefix(with_slash.as_str()) {
+                return (backend, rest);
+            }
+        }
+        // Fall back to the root backend. Check for an at-root (empty-prefix)
+        // child mount first; if present it covers everything the explicit
+        // mounts didn't claim.
+        if let Some((_, at_root)) = self.children.iter().find(|(p, _)| p.as_os_str().is_empty()) {
+            return (at_root, path);
+        }
+        (&self.root, path)
+    }
+
     /// List the immediate children of a directory identified by its `ItemId`.
     ///
     /// Routes to the owning backend via `backend_id`, then calls
@@ -906,5 +947,93 @@ mod tests {
 
         let err = tree.current_sync_cursor(&parent).await.unwrap_err();
         assert!(err.to_string().contains("ghost"));
+    }
+
+    // --- backend_for_path tests -----------------------------------------
+
+    #[test]
+    fn backend_for_path_falls_back_to_root() {
+        let tree = make_tree();
+        let (backend, rest) = tree.backend_for_path("Documents/notes.txt");
+        assert_eq!(backend.id(), "root");
+        assert_eq!(rest, "Documents/notes.txt");
+    }
+
+    #[test]
+    fn backend_for_path_matches_child_mount() {
+        let mut tree = make_tree();
+        tree.mount(PathBuf::from("Work"), Arc::new(NullBackend::new("work")));
+        let (backend, rest) = tree.backend_for_path("Work/Projects/code.rs");
+        assert_eq!(backend.id(), "work");
+        assert_eq!(rest, "Projects/code.rs");
+    }
+
+    #[test]
+    fn backend_for_path_exact_mount_name() {
+        let mut tree = make_tree();
+        tree.mount(PathBuf::from("Work"), Arc::new(NullBackend::new("work")));
+        // Exact match — the path IS the mount point directory.
+        let (backend, rest) = tree.backend_for_path("Work");
+        assert_eq!(backend.id(), "work");
+        assert_eq!(rest, "");
+    }
+
+    #[test]
+    fn backend_for_path_no_partial_prefix_confusion() {
+        let mut tree = make_tree();
+        tree.mount(PathBuf::from("Work"), Arc::new(NullBackend::new("work")));
+        tree.mount(
+            PathBuf::from("Workbench"),
+            Arc::new(NullBackend::new("bench")),
+        );
+        // "Work" must not match "Workbench/tool".
+        let (backend, rest) = tree.backend_for_path("Workbench/tool");
+        assert_eq!(backend.id(), "bench");
+        assert_eq!(rest, "tool");
+    }
+
+    #[test]
+    fn backend_for_path_nested_mount_longest_prefix() {
+        let mut tree = make_tree();
+        tree.mount(PathBuf::from("Work"), Arc::new(NullBackend::new("work")));
+        tree.mount(
+            PathBuf::from("Work/Assets"),
+            Arc::new(NullBackend::new("assets")),
+        );
+        // Nested: Work/Assets/logo.png routes to assets.
+        let (backend, rest) = tree.backend_for_path("Work/Assets/logo.png");
+        assert_eq!(backend.id(), "assets");
+        assert_eq!(rest, "logo.png");
+
+        // Non-nested: Work/report.txt routes to work.
+        let (backend, rest) = tree.backend_for_path("Work/report.txt");
+        assert_eq!(backend.id(), "work");
+        assert_eq!(rest, "report.txt");
+    }
+
+    #[test]
+    fn backend_for_path_at_root_mount_covers_all() {
+        let mut tree = make_tree();
+        // Empty-prefix = mounted at "/".
+        tree.mount(PathBuf::from(""), Arc::new(NullBackend::new("gdrive")));
+        let (backend, rest) = tree.backend_for_path("Documents/notes.txt");
+        assert_eq!(backend.id(), "gdrive");
+        assert_eq!(rest, "Documents/notes.txt");
+    }
+
+    #[test]
+    fn backend_for_path_explicit_mount_wins_over_at_root() {
+        let mut tree = make_tree();
+        // Explicit mount should win over at-root backend.
+        tree.mount(PathBuf::from(""), Arc::new(NullBackend::new("gdrive")));
+        tree.mount(PathBuf::from("Work"), Arc::new(NullBackend::new("work")));
+        let (backend, rest) = tree.backend_for_path("Work/file.txt");
+        assert_eq!(backend.id(), "work");
+        assert_eq!(rest, "file.txt");
+
+        // Unmatched path falls back to at-root gdrive.
+        let (backend, rest) = tree.backend_for_path("Personal/notes.txt");
+        assert_eq!(backend.id(), "gdrive");
+        assert_eq!(rest, "Personal/notes.txt");
     }
 }

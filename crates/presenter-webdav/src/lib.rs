@@ -53,8 +53,14 @@ pub struct WebDavPresenter {
     items: Arc<RwLock<HashMap<String, VfsItem>>>,
     /// Running server handle (set after start).
     pub server: Arc<tokio::sync::Mutex<Option<WebDavServer>>>,
-    /// Backends for on-demand directory expansion.
+    /// Backends for on-demand directory expansion (by ID).
     backends: Arc<tokio::sync::RwLock<Vec<Arc<dyn Backend>>>>,
+    /// Mount table: `(prefix, backend)` pairs, longest-prefix first.
+    ///
+    /// Passed to the HTTP server so write handlers route by VFS mount
+    /// path rather than by treating the first path segment as a
+    /// `backend_id`. Set via [`Self::with_mounts`].
+    mounts: Arc<tokio::sync::RwLock<Vec<(PathBuf, Arc<dyn Backend>)>>>,
     /// State DB for persisting expanded items.
     db: Option<Arc<StateDb>>,
 }
@@ -78,6 +84,7 @@ impl WebDavPresenter {
             items: Arc::new(RwLock::new(HashMap::new())),
             server: Arc::new(tokio::sync::Mutex::new(None)),
             backends: Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            mounts: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             db: None,
         }
     }
@@ -97,6 +104,17 @@ impl WebDavPresenter {
     /// Set the backends for on-demand directory expansion.
     pub async fn with_backends(&self, backends: Vec<Arc<dyn Backend>>) {
         *self.backends.write().await = backends;
+    }
+
+    /// Set the mount table for VFS-path routing in write handlers.
+    ///
+    /// Should be called with the same `(prefix, backend)` pairs that the
+    /// engine's `VfsTree` carries, in longest-prefix-first order. The table is
+    /// used by `PUT`, `MKCOL`, and `MOVE` to route a request path to the
+    /// correct backend without treating the first path segment as a
+    /// `backend_id`.
+    pub async fn with_mounts(&self, mounts: Vec<(PathBuf, Arc<dyn Backend>)>) {
+        *self.mounts.write().await = mounts;
     }
 
     /// Set the state DB for persisting expanded items.
@@ -197,6 +215,7 @@ impl VfsPresenter for WebDavPresenter {
             self.items.clone(),
             self.cache_dir.clone(),
             self.backends.clone(),
+            self.mounts.clone(),
             self.db.clone(),
         )
         .await?;
@@ -233,6 +252,9 @@ mod tests {
         let item = VfsItem {
             id: ItemId::new("gdrive", "root"),
             parent_id: ItemId::new("gdrive", "parent"),
+            // The sync runner writes the mount-prefixed path; for a backend
+            // mounted at "gdrive" the path is "gdrive/root".
+            path: "gdrive/root".to_string(),
             name: "root".to_string(),
             is_dir: true,
             size: None,
@@ -249,6 +271,7 @@ mod tests {
         let item = VfsItem {
             id: ItemId::new("gdrive", "root"),
             parent_id: ItemId::new("gdrive", ""),
+            path: "gdrive/root".to_string(),
             name: "root".to_string(),
             is_dir: true,
             size: None,
@@ -268,6 +291,7 @@ mod tests {
         let item = VfsItem {
             id: id.clone(),
             parent_id: ItemId::new("gdrive", ""),
+            path: "gdrive/root".to_string(),
             name: "root".to_string(),
             is_dir: true,
             size: None,
@@ -288,6 +312,7 @@ mod tests {
         let item = VfsItem {
             id: id.clone(),
             parent_id: ItemId::new("gdrive", ""),
+            path: "gdrive/file1".to_string(),
             name: "file1".to_string(),
             is_dir: false,
             size: None,

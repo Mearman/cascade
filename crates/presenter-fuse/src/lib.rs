@@ -392,6 +392,7 @@ mod tests {
         let item = VfsItem {
             id: ItemId::new("gdrive", "file1"),
             parent_id: ItemId::new("gdrive", "root"),
+            path: "gdrive/test.txt".to_string(),
             name: "test.txt".to_string(),
             is_dir: false,
             size: Some(100),
@@ -418,6 +419,7 @@ mod tests {
         let item = VfsItem {
             id: id.clone(),
             parent_id: ItemId::new("gdrive", "root"),
+            path: "gdrive/test.txt".to_string(),
             name: "test.txt".to_string(),
             is_dir: false,
             size: Some(100),

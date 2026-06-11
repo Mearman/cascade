@@ -205,13 +205,17 @@ impl VfsPresenter for NfsPresenter {
 }
 
 /// Build a VFS path string from a `VfsItem`'s id.
-/// Uses the item's own id as a path key — this matches the convention
-/// where `ItemId` encodes the backend path.
+/// Produce the server-absolute VFS path for an item.
+///
+/// Returns `item.path` prefixed with `/`. The `path` field carries the full
+/// mount-prefixed VFS path (no leading slash) written by the sync runner, so
+/// no derivation from the `ItemId` is needed and the NFS presenter renders
+/// by mount PATH rather than by backend ID.
 fn format_vfs_path(item: &VfsItem) -> String {
-    if item.id.0.starts_with('/') {
-        item.id.0.clone()
+    if item.path.starts_with('/') {
+        item.path.clone()
     } else {
-        format!("/{}", item.id.0.replace(':', "/"))
+        format!("/{}", item.path)
     }
 }
 
@@ -239,6 +243,9 @@ mod tests {
         let item = VfsItem {
             id: ItemId::new("gdrive", "root"),
             parent_id: ItemId::new("gdrive", "parent"),
+            // The sync runner writes the mount-prefixed path; for a backend
+            // mounted at "gdrive" the path is "gdrive/root".
+            path: "gdrive/root".to_string(),
             name: "root".to_string(),
             is_dir: true,
             size: None,
@@ -255,6 +262,7 @@ mod tests {
         let item = VfsItem {
             id: ItemId::new("gdrive", "root"),
             parent_id: ItemId::new("gdrive", ""),
+            path: "gdrive/root".to_string(),
             name: "root".to_string(),
             is_dir: true,
             size: None,
@@ -278,6 +286,7 @@ mod tests {
         let item = VfsItem {
             id: id.clone(),
             parent_id: ItemId::new("gdrive", ""),
+            path: "gdrive/root".to_string(),
             name: "root".to_string(),
             is_dir: true,
             size: None,

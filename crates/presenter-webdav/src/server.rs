@@ -75,8 +75,16 @@ pub struct AppState {
     pub items: Arc<RwLock<HashMap<String, VfsItem>>>,
     /// On-disk cache directory.
     pub cache_dir: PathBuf,
-    /// Backends for on-demand directory expansion.
+    /// Backends for on-demand directory expansion, kept for backward
+    /// compatibility with ID-based dispatch (e.g. `populate_cache`).
     pub backends: Arc<tokio::sync::RwLock<Vec<Arc<dyn cascade_engine::backend::Backend>>>>,
+    /// Mount table: `(mount_prefix, backend)` pairs, longest-prefix first.
+    ///
+    /// Used by write handlers (`PUT`, `MKCOL`, `MOVE`) to route a
+    /// VFS path to the correct backend without treating the first path
+    /// segment as a `backend_id`. The root PROPFIND reads the prefixes
+    /// to enumerate the top-level mount directories it should present.
+    pub mounts: Arc<tokio::sync::RwLock<Vec<(PathBuf, Arc<dyn cascade_engine::backend::Backend>)>>>,
     /// State DB for persisting expanded items.
     pub db: Option<Arc<cascade_engine::db::StateDb>>,
     /// Directories already expanded (by `ItemId` string), to avoid
@@ -105,6 +113,11 @@ impl WebDavServer {
     ///
     /// The address should typically be `127.0.0.1:0` for an OS-assigned port.
     ///
+    /// `mounts` is the ordered mount table (longest-prefix first) that maps
+    /// VFS path prefixes to backends. It drives root-directory listing and
+    /// write-path routing. Pass an empty vec when no mounts are configured
+    /// (e.g. in unit tests).
+    ///
     /// # Errors
     ///
     /// Returns an error if the TCP listener cannot bind.
@@ -113,6 +126,7 @@ impl WebDavServer {
         items: Arc<RwLock<HashMap<String, VfsItem>>>,
         cache_dir: PathBuf,
         backends: Arc<tokio::sync::RwLock<Vec<Arc<dyn cascade_engine::backend::Backend>>>>,
+        mounts: Arc<tokio::sync::RwLock<Vec<(PathBuf, Arc<dyn cascade_engine::backend::Backend>)>>>,
         db: Option<Arc<cascade_engine::db::StateDb>>,
     ) -> anyhow::Result<Self> {
         let listener = TcpListener::bind(bind_addr).await?;
@@ -122,6 +136,7 @@ impl WebDavServer {
             items,
             cache_dir,
             backends,
+            mounts,
             db,
             expanded: Arc::new(RwLock::new(std::collections::HashSet::new())),
             expand_sem: Arc::new(tokio::sync::Semaphore::new(4)),
@@ -288,17 +303,45 @@ async fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> R
 
     let normalised = normalise_path(path);
 
-    // Root listing: show each backend as a top-level directory.
+    // Root listing: show each mount as a top-level directory, using the
+    // configured mount name rather than the backend ID. For an at-root
+    // backend (empty prefix) we skip the synthetic directory — its items
+    // appear directly under "/".
     if normalised == "/" {
-        let items = read_items(&state.items).await;
-        let mut backends: Vec<String> = items
-            .values()
-            .filter_map(|item| item.id.0.split(':').next().map(String::from))
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-        backends.sort();
-        let xml = build_root_response(&backends);
+        let mount_names: Vec<String> = {
+            let mounts = state.mounts.read().await;
+            let mut names: Vec<String> = mounts
+                .iter()
+                .filter_map(|(prefix, _)| {
+                    let s = prefix.to_string_lossy();
+                    if s.is_empty() {
+                        None
+                    } else {
+                        Some(s.into_owned())
+                    }
+                })
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+            names.sort();
+            names
+        };
+        // Fall back to the old backend-ID approach when no mounts are
+        // configured (e.g. unit tests that construct AppState directly).
+        let effective_names = if mount_names.is_empty() {
+            let items = read_items(&state.items).await;
+            let mut backends: Vec<String> = items
+                .values()
+                .filter_map(|item| item.id.0.split(':').next().map(String::from))
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+            backends.sort();
+            backends
+        } else {
+            mount_names
+        };
+        let xml = build_root_response(&effective_names);
         return (
             StatusCode::MULTI_STATUS,
             [(header::CONTENT_TYPE, "application/xml; charset=utf-8")],
@@ -361,11 +404,23 @@ async fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> R
             .cloned()
             .collect()
     } else {
-        // target is None and the path is a top-level backend root (the
+        // target is None and the path is a top-level mount path (the
         // multi-component guard above already returned 404 for anything
-        // deeper). Expand root-level children for this backend.
-        let backend_prefix = normalised.trim_start_matches('/').trim_end_matches('/');
-        let root_id = format!("{backend_prefix}:root");
+        // deeper). Expand root-level children for the backend mounted here.
+        let mount_name = normalised.trim_start_matches('/').trim_end_matches('/');
+
+        // Resolve the backend for this mount name from the mount table, then
+        // fall back to the old backend-ID approach for unit tests that do not
+        // configure a mount table.
+        let backend_id = {
+            let mounts = state.mounts.read().await;
+            mounts
+                .iter()
+                .find(|(prefix, _)| prefix.to_string_lossy() == mount_name)
+                .map(|(_, backend)| backend.id().to_string())
+        };
+        let backend_id = backend_id.unwrap_or_else(|| mount_name.to_string());
+        let root_id = format!("{backend_id}:root");
 
         // Expand the root on first access. expand_root normalises every
         // root-level item's parent_id to the alias, so a simple alias
@@ -373,7 +428,7 @@ async fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> R
         // what the backend API returned as the native parent ID.
         let is_expanded = state.expanded.read().await.contains(&root_id);
         if !is_expanded {
-            expand_root(state, backend_prefix).await;
+            expand_root(state, &backend_id).await;
         }
 
         // After expansion all root children use the alias. If the store
@@ -691,28 +746,25 @@ async fn handle_put(state: &AppState, path: &str, req: Request) -> Response {
         return empty_response(StatusCode::FORBIDDEN);
     }
 
-    // Parse backend prefix and relative path.
-    let parts: Vec<&str> = normalised.trim_start_matches('/').split('/').collect();
-    let Some((&backend_id, relative)) = parts.split_first() else {
-        return empty_response(StatusCode::BAD_REQUEST);
-    };
-    let relative_path = relative.join("/");
-    let relative_path = Path::new(&relative_path);
-
-    // Find the backend.
-    let backend = {
-        let backends = state.backends.read().await;
-        backends.iter().find(|b| b.id() == backend_id).cloned()
-    };
+    // Resolve the backend by mount path and extract the backend-relative path.
+    // The VFS path (without leading '/') is looked up in the mount table with
+    // longest-prefix-first semantics so nested mounts route correctly.
+    let vfs_path = normalised.trim_start_matches('/');
+    let (backend, relative_str) = backend_for_path(state, vfs_path).await;
     let Some(backend) = backend else {
         return empty_response(StatusCode::NOT_FOUND);
     };
+    let relative_parts: Vec<&str> = relative_str.split('/').filter(|s| !s.is_empty()).collect();
+    let relative_path_str = relative_parts.join("/");
+    let relative_path = Path::new(&relative_path_str);
+    let backend_id = backend.id().to_string();
 
     let bytes = axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024)
         .await
         .unwrap_or_default();
 
     // Resolve the parent directory's native ID.
+    let relative = relative_parts.as_slice();
     let parent_id = if relative.is_empty() {
         cascade_engine::types::FileId(format!("{backend_id}:root"))
     } else {
@@ -954,22 +1006,17 @@ async fn handle_mkcol(state: &AppState, path: &str) -> Response {
         }
     }
 
-    // Parse backend prefix and relative path.
-    let parts: Vec<&str> = normalised.trim_start_matches('/').split('/').collect();
-    let Some((&backend_id, relative)) = parts.split_first() else {
-        return empty_response(StatusCode::BAD_REQUEST);
-    };
-    let relative_path = relative.join("/");
-    let relative_path = Path::new(&relative_path);
-
-    // Find the backend.
-    let backend = {
-        let backends = state.backends.read().await;
-        backends.iter().find(|b| b.id() == backend_id).cloned()
-    };
+    // Resolve the backend by mount path.
+    let vfs_path = normalised.trim_start_matches('/');
+    let (backend, relative_str) = backend_for_path(state, vfs_path).await;
     let Some(backend) = backend else {
         return empty_response(StatusCode::NOT_FOUND);
     };
+    let relative_parts: Vec<&str> = relative_str.split('/').filter(|s| !s.is_empty()).collect();
+    let relative_path_str = relative_parts.join("/");
+    let relative_path = Path::new(&relative_path_str);
+    let backend_id = backend.id().to_string();
+    let relative = relative_parts.as_slice();
 
     // Resolve the parent directory ID from the in-memory store if possible.
     // This avoids a Drive API round-trip that would fail for freshly created
@@ -1320,18 +1367,70 @@ fn xml_escape(s: &str) -> String {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Compute a display path for a VFS item.
-/// Converts the `ItemId` to a slash-separated path.
+/// Compute the `WebDAV` `href` path for a VFS item.
+///
+/// Returns the full VFS path with a leading `/`. The path is read directly
+/// from `item.path` (the mount-prefixed VFS-absolute path stored by the sync
+/// runner) rather than re-derived from the `ItemId`, so the presenter renders
+/// by mount PATH and not by backend ID.
 #[must_use]
 pub fn item_path(item: &VfsItem) -> String {
-    let id = &item.id.0;
-    if id.starts_with('/') {
-        id.clone()
-    } else if let Some((backend, _file_id)) = id.split_once(':') {
-        format!("/{backend}/{}", item.name)
+    if item.path.starts_with('/') {
+        item.path.clone()
     } else {
-        format!("/{}", item.name)
+        format!("/{}", item.path)
     }
+}
+
+/// Resolve a VFS path to its owning backend using the mount table.
+///
+/// `vfs_path` is the path without a leading `/` (matching the
+/// `VfsItem.path` / `files.path` representation). Longest-prefix match:
+/// the first mount whose prefix is a leading component of `vfs_path` wins.
+/// An at-root backend (empty prefix) is tried after all explicit prefixes.
+///
+/// Returns `(Some(backend), backend_relative_path)` on a match, or
+/// `(None, vfs_path)` when no backend is found for this path.
+async fn backend_for_path<'a>(
+    state: &'a AppState,
+    vfs_path: &'a str,
+) -> (Option<Arc<dyn cascade_engine::backend::Backend>>, &'a str) {
+    let mounts = state.mounts.read().await;
+    let mut at_root_backend: Option<Arc<dyn cascade_engine::backend::Backend>> = None;
+
+    for (prefix, backend) in mounts.iter() {
+        let prefix_str = prefix.to_string_lossy();
+        if prefix_str.is_empty() {
+            // At-root backend is the final fallback; record it and keep going.
+            at_root_backend = Some(backend.clone());
+            continue;
+        }
+        if vfs_path == prefix_str.as_ref() {
+            return (Some(backend.clone()), "");
+        }
+        let with_slash = format!("{prefix_str}/");
+        if let Some(rest) = vfs_path.strip_prefix(with_slash.as_str()) {
+            return (Some(backend.clone()), rest);
+        }
+    }
+
+    if let Some(b) = at_root_backend {
+        return (Some(b), vfs_path);
+    }
+
+    // No mount table configured (e.g. tests) — fall back to treating the
+    // first path segment as a backend ID and looking up by ID.
+    drop(mounts);
+    let first_segment = vfs_path.split('/').next().unwrap_or("");
+    let rest = vfs_path
+        .strip_prefix(first_segment)
+        .and_then(|s| s.strip_prefix('/'))
+        .unwrap_or("");
+    let backend = {
+        let backends = state.backends.read().await;
+        backends.iter().find(|b| b.id() == first_segment).cloned()
+    };
+    (backend, rest)
 }
 
 /// Try to populate children from the state database.
@@ -1355,37 +1454,20 @@ async fn hydrate_children_from_db(state: &AppState, parent_id: &str) -> usize {
     count
 }
 
-/// Resolve the full path for an item by walking its parent chain.
-/// Produces paths like `/gdrive/huggingface_hub/cli/command.py`
-/// instead of the flat `/gdrive/command.py`.
-fn resolve_full_path(item: &VfsItem, items: &std::collections::HashMap<String, VfsItem>) -> String {
-    let mut parts = vec![item.name.clone()];
-    let mut current_parent = item.parent_id.0.clone();
-
-    // Walk up the parent chain until we hit a root-level item
-    // (one whose parent_id is just the backend prefix like "gdrive:root"
-    // or whose parent_id has no ":" separator).
-    let mut seen = std::collections::HashSet::new();
-    while let Some(parent) = items.get(&current_parent) {
-        if !seen.insert(current_parent.clone()) {
-            break; // cycle detected
-        }
-        parts.push(parent.name.clone());
-        current_parent = parent.parent_id.0.clone();
-    }
-
-    // The remaining current_parent should be like "gdrive:root" or "gdrive:".
-    // Extract the backend prefix.
-    let backend = current_parent
-        .split_once(':')
-        .map_or("", |(prefix, _)| prefix);
-
-    parts.reverse();
-    if backend.is_empty() {
-        format!("/{}", parts.join("/"))
-    } else {
-        format!("/{backend}/{}", parts.join("/"))
-    }
+/// Resolve the `WebDAV` `href` path for a VFS item.
+///
+/// The `VfsItem.path` field carries the full mount-prefixed VFS-absolute path
+/// (no leading slash) as written by the sync runner. This function prepends a
+/// `/` to produce the `href` used in `PROPFIND` responses and route matching.
+///
+/// The `items` parameter is retained for API compatibility but is no longer
+/// consulted — the path is complete in `item.path` so parent-chain walking is
+/// unnecessary.
+fn resolve_full_path(
+    item: &VfsItem,
+    _items: &std::collections::HashMap<String, VfsItem>,
+) -> String {
+    item_path(item)
 }
 
 /// Normalise a URL path for consistent matching.
@@ -1609,6 +1691,8 @@ mod tests {
         VfsItem {
             id: ItemId::new("gdrive", name),
             parent_id: ItemId::new("gdrive", ""),
+            // In tests the mount is "gdrive", so the path is "gdrive/<name>".
+            path: format!("gdrive/{name}"),
             name: name.to_string(),
             is_dir,
             size: None,
@@ -1708,6 +1792,7 @@ mod tests {
             items,
             cache_dir.path().to_path_buf(),
             Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            Arc::new(tokio::sync::RwLock::new(Vec::new())),
             None,
         )
         .await
@@ -1724,6 +1809,7 @@ mod tests {
             "127.0.0.1:0",
             items.clone(),
             cache_dir.path().to_path_buf(),
+            Arc::new(tokio::sync::RwLock::new(Vec::new())),
             Arc::new(tokio::sync::RwLock::new(Vec::new())),
             None,
         )
@@ -1759,6 +1845,7 @@ mod tests {
             items,
             cache_dir.path().to_path_buf(),
             Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            Arc::new(tokio::sync::RwLock::new(Vec::new())),
             None,
         )
         .await
@@ -1785,6 +1872,7 @@ mod tests {
             "127.0.0.1:0",
             items,
             cache_dir.path().to_path_buf(),
+            Arc::new(tokio::sync::RwLock::new(Vec::new())),
             Arc::new(tokio::sync::RwLock::new(Vec::new())),
             None,
         )
@@ -1826,6 +1914,7 @@ mod tests {
             items.clone(),
             cache_dir.path().to_path_buf(),
             Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            Arc::new(tokio::sync::RwLock::new(Vec::new())),
             None,
         )
         .await
@@ -1864,6 +1953,7 @@ mod tests {
             items.clone(),
             cache_dir.path().to_path_buf(),
             Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            Arc::new(tokio::sync::RwLock::new(Vec::new())),
             None,
         )
         .await
@@ -1899,6 +1989,7 @@ mod tests {
             "127.0.0.1:0",
             items,
             cache_dir.path().to_path_buf(),
+            Arc::new(tokio::sync::RwLock::new(Vec::new())),
             Arc::new(tokio::sync::RwLock::new(Vec::new())),
             None,
         )

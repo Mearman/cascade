@@ -108,6 +108,7 @@ fn sample_vfs_item() -> VfsItem {
     VfsItem {
         id: ItemId::new("gdrive", "file123"),
         parent_id: ItemId::new("gdrive", "root"),
+        path: "gdrive/report.pdf".to_string(),
         name: "report.pdf".to_string(),
         is_dir: false,
         size: Some(8192),
@@ -153,6 +154,7 @@ fn directory_vfs_item_round_trips() {
     let dir_item = VfsItem {
         id: ItemId::new("local", "photos"),
         parent_id: ItemId::new("local", "/"),
+        path: "local/photos".to_string(),
         name: "photos".to_string(),
         is_dir: true,
         size: None,
@@ -362,6 +364,7 @@ mod proptests {
             let item = VfsItem {
                 id: ItemId::new(&backend_id, &native_id),
                 parent_id: ItemId::new(&backend_id, "root"),
+                path: format!("{backend_id}/{name}"),
                 name,
                 is_dir,
                 size,

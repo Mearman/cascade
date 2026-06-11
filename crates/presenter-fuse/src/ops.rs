@@ -624,6 +624,7 @@ mod tests {
         let item = VfsItem {
             id: ItemId::new("gdrive", "file1"),
             parent_id: ItemId::new("gdrive", "root"),
+            path: "gdrive/test.txt".to_string(),
             name: "test.txt".to_string(),
             is_dir: false,
             size: Some(2048),
@@ -642,6 +643,7 @@ mod tests {
         let item = VfsItem {
             id: ItemId::new("gdrive", "docs"),
             parent_id: ItemId::new("gdrive", "root"),
+            path: "gdrive/Documents".to_string(),
             name: "Documents".to_string(),
             is_dir: true,
             size: None,
