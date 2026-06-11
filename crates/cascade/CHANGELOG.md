@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.115](https://github.com/Mearman/cascade/compare/cascade-v0.1.114...cascade-v0.1.115) - 2026-06-11
+
+### Added
+
+- *(presenter-fuse)* path-aware inode model with child-mount injection
+
 ## [0.1.114](https://github.com/Mearman/cascade/compare/cascade-v0.1.113...cascade-v0.1.114) - 2026-06-11
 
 ### Other
