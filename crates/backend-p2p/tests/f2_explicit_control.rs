@@ -41,7 +41,7 @@ use std::sync::Arc;
 
 use cascade_backend_p2p::index::FolderIndex;
 use cascade_backend_p2p::sync::SyncEngine;
-use cascade_engine::backend::NullBackend;
+use cascade_engine::backend::{MountedBackend, NullBackend};
 use cascade_engine::db::StateDb;
 use cascade_engine::engine::{Engine, EngineConfig};
 use cascade_engine::manage::{
@@ -87,7 +87,9 @@ fn make_engine_with_real_device_id(
         Engine::new(EngineConfig {
             db_path: db_path.clone(),
             mount_point: PathBuf::from("/tmp/f2-mount"),
-            backends: vec![Arc::new(NullBackend::new("p2p-only"))],
+            backends: vec![MountedBackend::at_default(Arc::new(NullBackend::new(
+                "p2p-only",
+            )))],
             cache_dir: None,
             enable_p2p: true,
             p2p_data_dir: Some(p2p_dir),

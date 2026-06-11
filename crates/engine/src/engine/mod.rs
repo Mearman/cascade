@@ -25,7 +25,7 @@ use std::sync::{Arc, RwLock};
 use anyhow::Result;
 use tracing::info;
 
-use crate::backend::{Backend, BackendFactory};
+use crate::backend::{Backend, BackendFactory, MountedBackend, NullBackend};
 use crate::cache::manager::{CacheManager, CacheManagerConfig};
 use crate::changefeed::ChangeFeed;
 use crate::config::ConfigResolver;
@@ -41,15 +41,26 @@ use crate::presenter::VfsPresenter;
 use crate::sync::runner::SyncRunner;
 use crate::vfs::VfsTree;
 
+/// Backend id of the neutral VFS root.
+///
+/// The root is a synthetic [`NullBackend`] that owns no content; it exists only
+/// as the container the configured backends mount beneath. It is never
+/// registered in the state database and never appears in `list_backends`.
+const NEUTRAL_ROOT_ID: &str = "__cascade_root__";
+
 /// Configuration for creating an Engine instance.
 pub struct EngineConfig {
     /// Path to the `SQLite` state database file.
     pub db_path: PathBuf,
     /// Mount point for the VFS.
     pub mount_point: PathBuf,
-    /// Backend instances. The first is the root; subsequent ones are mounted
-    /// at their configured prefixes.
-    pub backends: Vec<Arc<dyn Backend>>,
+    /// Backend instances paired with their configured mount paths. Each mounts
+    /// under the neutral virtual root at its resolved prefix (the configured
+    /// mount, or the backend id when unset; an explicit `"/"` mounts at the
+    /// root). On restart the persisted `backends.mount_path` in the database
+    /// overrides the configured mount, so a runtime-added backend reclaims its
+    /// place rather than being lost.
+    pub backends: Vec<MountedBackend>,
     /// Cache directory override. `None` uses the default.
     pub cache_dir: Option<PathBuf>,
     /// Whether to enable P2P block sharing.
@@ -160,6 +171,25 @@ impl fmt::Debug for Engine {
 }
 
 impl Engine {
+    /// Resolve a backend's effective mount, preferring the persisted value.
+    ///
+    /// The database's `backends.mount_path` is the source of truth on restart:
+    /// a runtime-added backend recorded its mount there, so re-reading it lets
+    /// the backend reclaim its placement rather than reverting to the default
+    /// derived from its id. When no row exists yet (first run for that backend)
+    /// the configured mount on the [`MountedBackend`] is used. A persisted row
+    /// whose `mount_path` is `NULL` means "default to the backend id", which is
+    /// represented as a `None` mount.
+    fn resolve_mount(db: &StateDb, mounted: &MountedBackend) -> Result<MountedBackend> {
+        let effective_mount = db
+            .get_backend_mount(mounted.backend.id())?
+            .unwrap_or_else(|| mounted.mount.clone());
+        Ok(MountedBackend::new(
+            effective_mount,
+            mounted.backend.clone(),
+        ))
+    }
+
     /// Create and initialise a new engine.
     ///
     /// Opens the state database, creates the VFS tree, registers backends,
@@ -175,19 +205,49 @@ impl Engine {
         let db = Arc::new(StateDb::open(&config.db_path)?);
         info!(path = %config.db_path.display(), "state database opened");
 
-        // Register all backends in the DB and build the VFS tree.
-        // Safety: we checked `backends.is_empty()` above, so first() is always Some here.
-        let root = backends
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("backend list is empty"))?
-            .clone();
-        db.register_backend(root.id(), "unknown", root.display_name(), None, None)?;
+        // The VFS root is a neutral container that owns no content of its own;
+        // `VfsTree::read_dir` injects the mounted child directories. Every
+        // configured backend mounts beneath it as a child — including a backend
+        // at the empty prefix (the `"/"` case), which routes as the catch-all
+        // fallback and so reproduces the single-backend-at-root path shape.
+        let mut vfs_tree = VfsTree::new(Arc::new(NullBackend::new(NEUTRAL_ROOT_ID)));
 
-        let mut vfs_tree = VfsTree::new(root);
-        for backend in backends.get(1..).unwrap_or(&[]) {
-            db.register_backend(backend.id(), "unknown", backend.display_name(), None, None)?;
-            // Use the backend ID as the mount prefix for non-root backends.
-            vfs_tree.mount(PathBuf::from(backend.id()), (*backend).clone());
+        // Reject duplicate mount prefixes loudly: two backends at the same
+        // prefix would shadow each other and silently misroute. The empty
+        // prefix (a backend at `"/"`) is a single slot like any other.
+        let mut claimed: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        for mounted in &backends {
+            // On restart, the persisted mount in the database is the source of
+            // truth — a runtime-added backend recorded its mount there, and a
+            // fresh `EngineConfig` would otherwise default it back to its id and
+            // lose the placement. Fall back to the configured mount when the
+            // backend has no persisted row yet (first run for that backend).
+            let resolved = Self::resolve_mount(&db, mounted)?;
+            let prefix = resolved.resolve_prefix();
+            if !claimed.insert(prefix.clone()) {
+                // An empty prefix is the at-root case; name it so the message is
+                // not a bare, confusing empty path.
+                let shown = if prefix.as_os_str().is_empty() {
+                    "/ (root)".to_owned()
+                } else {
+                    prefix.display().to_string()
+                };
+                anyhow::bail!(
+                    "duplicate mount path {shown}: backend {} collides with another mount",
+                    mounted.backend.id(),
+                );
+            }
+            // Persist the mount for every backend so a later restart hydrates the
+            // same placement from the database.
+            let persisted_mount = resolved.mount.as_deref();
+            db.register_backend(
+                mounted.backend.id(),
+                "unknown",
+                mounted.backend.display_name(),
+                persisted_mount,
+                None,
+            )?;
+            vfs_tree.mount(prefix, mounted.backend.clone());
         }
         let vfs = Arc::new(RwLock::new(vfs_tree));
         info!(backends = backends.len(), "VFS tree initialised");
@@ -304,16 +364,17 @@ impl Engine {
     pub async fn wire_manage_dispatch(self: &Arc<Self>) {
         let dispatch: Arc<dyn ManageDispatch> = self.clone();
         let authority: Arc<dyn DataAuthority> = self.clone();
+        // The neutral root is synthetic and serves no transport, so only the
+        // mounted child backends are wired.
         let backends: Vec<Arc<dyn Backend>> = {
             let tree = self
                 .vfs
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut backends = vec![tree.root().clone()];
-            for (_, backend) in tree.children() {
-                backends.push(backend.clone());
-            }
-            backends
+            tree.children()
+                .iter()
+                .map(|(_, backend)| backend.clone())
+                .collect()
         };
         for backend in backends {
             backend.set_manage_dispatch(dispatch.clone()).await;
@@ -334,15 +395,18 @@ impl Engine {
         &self,
         presenter: Arc<dyn VfsPresenter>,
     ) -> SyncRunner<TokioRuntimeHandle> {
-        // Collect all backends from the VFS tree.
+        // Collect the mounted child backends from the VFS tree. The neutral
+        // root is synthetic and owns no content, so it is not polled for
+        // changes.
         let tree = self
             .vfs
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut backends = vec![tree.root().clone()];
-        for (_, backend) in tree.children() {
-            backends.push(backend.clone());
-        }
+        let backends: Vec<Arc<dyn Backend>> = tree
+            .children()
+            .iter()
+            .map(|(_, backend)| backend.clone())
+            .collect();
         drop(tree);
 
         SyncRunner::new(

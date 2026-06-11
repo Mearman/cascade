@@ -382,6 +382,10 @@ fn create_backend_by_name(name: &str, config: &toml::Value) -> Result<Box<dyn Ba
 
 The VFS composes multiple backends into a single tree. Backends are bound to path prefixes. Operations are routed by longest-prefix match.
 
+The tree root is a neutral container — an internal `NullBackend` that owns no content of its own and is never registered in the state database. Every configured backend mounts beneath it as a child at a named prefix, defaulting to the backend's id when no explicit mount is configured. A backend may instead be mounted at `"/"`, which resolves to the empty prefix: it then routes as the catch-all fallback and its content appears directly at the root, reproducing the single-backend-at-root layout. Each backend's mount is persisted in `backends.mount_path` and re-read on restart as the source of truth, so a runtime-added backend reclaims its placement rather than reverting to a config default. A mount prefix is unique per tree; two backends configured at the same prefix are rejected at construction rather than silently shadowing each other.
+
+**Pre-1.0 path-shape note.** Because each backend now mounts at its name under the neutral root, a single configured backend appears at `/{name}/` rather than at the bare root. To keep the previous single-backend-at-root shape, mount that backend explicitly at `"/"`. This is a deliberate, pre-1.0 uniform-mount change.
+
 ```rust
 struct VfsTree {
     /// The root node — handles paths not covered by any child.

@@ -30,6 +30,7 @@ fn make_item(name: &str, is_dir: bool) -> VfsItem {
         id: ItemId::new("test-backend", name),
         parent_id: ItemId::new("test-backend", "root"),
         name: name.to_string(),
+        path: name.to_string(),
         is_dir,
         size: if is_dir { None } else { Some(256) },
         mod_time: None,

@@ -210,6 +210,90 @@ pub trait Backend: Send + Sync {
     }
 }
 
+/// A backend paired with the VFS mount path it is configured to mount at.
+///
+/// The [`Engine`](crate::engine::Engine) consumes a list of these to build the
+/// VFS tree: each backend mounts at its `mount` path under the neutral virtual
+/// root, defaulting to the backend's [`id`](Backend::id) when `mount` is `None`.
+/// A backend whose `mount` is `Some("/")` mounts at the empty prefix — the
+/// at-root case that preserves the single-backend path shape.
+#[derive(Clone)]
+pub struct MountedBackend {
+    /// The configured mount path, or `None` to default to the backend id.
+    ///
+    /// The literal `"/"` is interpreted as "mount at the neutral root" (the
+    /// empty prefix), not as a child directory named `/`.
+    pub mount: Option<String>,
+    /// The backend to mount.
+    pub backend: Arc<dyn Backend>,
+}
+
+impl MountedBackend {
+    /// Pair a backend with its configured mount path.
+    #[must_use]
+    pub fn new(mount: Option<String>, backend: Arc<dyn Backend>) -> Self {
+        Self { mount, backend }
+    }
+
+    /// Pair a backend with no explicit mount, defaulting to the backend id.
+    #[must_use]
+    pub fn at_default(backend: Arc<dyn Backend>) -> Self {
+        Self {
+            mount: None,
+            backend,
+        }
+    }
+
+    /// Pair every backend with no explicit mount, each defaulting to its id.
+    ///
+    /// A convenience for callers that hold a plain backend list and want the
+    /// default placement; the engine still prefers each backend's persisted
+    /// `backends.mount_path` over the default on restart.
+    #[must_use]
+    pub fn all_at_default(backends: Vec<Arc<dyn Backend>>) -> Vec<Self> {
+        backends.into_iter().map(Self::at_default).collect()
+    }
+
+    /// Resolve the configured mount to a concrete VFS prefix.
+    ///
+    /// Returns the empty path when the backend mounts at the neutral root
+    /// (an explicit `"/"`), otherwise the configured mount or — when no mount
+    /// is configured — the backend id. The returned [`PathBuf`](std::path::PathBuf) is the prefix
+    /// the backend binds to in the VFS tree.
+    #[must_use]
+    pub fn resolve_prefix(&self) -> std::path::PathBuf {
+        self.mount.as_deref().map_or_else(
+            || std::path::PathBuf::from(self.backend.id()),
+            mount_prefix_from_str,
+        )
+    }
+}
+
+/// Map an explicit mount-path string to the VFS prefix it binds to.
+///
+/// The literal `"/"` maps to the empty prefix — the neutral root, the at-root
+/// case that preserves the single-backend path shape. Any other value maps to
+/// itself. Shared by [`MountedBackend::resolve_prefix`] and the runtime
+/// backend-removal path so the mapping cannot diverge between mounting and
+/// unmounting.
+#[must_use]
+pub fn mount_prefix_from_str(mount: &str) -> std::path::PathBuf {
+    if mount == "/" {
+        std::path::PathBuf::new()
+    } else {
+        std::path::PathBuf::from(mount)
+    }
+}
+
+impl std::fmt::Debug for MountedBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MountedBackend")
+            .field("mount", &self.mount)
+            .field("backend_id", &self.backend.id())
+            .finish()
+    }
+}
+
 /// A null backend used for P2P-only folders with no cloud storage.
 #[derive(Debug)]
 pub struct NullBackend {

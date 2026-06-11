@@ -24,7 +24,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use cascade_engine::backend::NullBackend;
+use cascade_engine::backend::{MountedBackend, NullBackend};
 use cascade_engine::engine::{Engine, EngineConfig};
 use cascade_engine::manage::token::CapabilityToken;
 use cascade_engine::manage::{Capability, DataAccess, DataAuthority, DeviceId, Grant, Scope};
@@ -74,7 +74,9 @@ fn make_engine() -> (tempfile::TempDir, Arc<Engine>, DeviceIdentity) {
         Engine::new(EngineConfig {
             db_path,
             mount_point: PathBuf::from("/tmp/data-authority-mount"),
-            backends: vec![Arc::new(NullBackend::new("p2p-only"))],
+            backends: vec![MountedBackend::at_default(Arc::new(NullBackend::new(
+                "p2p-only",
+            )))],
             cache_dir: None,
             enable_p2p: true,
             p2p_data_dir: Some(p2p_dir),

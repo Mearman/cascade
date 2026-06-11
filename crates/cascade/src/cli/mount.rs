@@ -746,7 +746,7 @@ async fn try_fskit(
     let engine_config = EngineConfig {
         db_path: ctx.db_path.clone(),
         mount_point: mount_path.to_path_buf(),
-        backends,
+        backends: cascade_engine::backend::MountedBackend::all_at_default(backends),
         cache_dir: None,
         enable_p2p: p2p.enable_p2p,
         p2p_data_dir: None,
@@ -916,7 +916,7 @@ async fn try_fileprovider(
     let engine_config = EngineConfig {
         db_path: ctx.db_path.clone(),
         mount_point: mount_path.to_path_buf(),
-        backends,
+        backends: cascade_engine::backend::MountedBackend::all_at_default(backends),
         cache_dir: None,
         enable_p2p: p2p.enable_p2p,
         p2p_data_dir: None,
@@ -1057,7 +1057,7 @@ async fn try_projfs(
     let engine_config = EngineConfig {
         db_path: ctx.db_path.clone(),
         mount_point: mount_path.to_path_buf(),
-        backends,
+        backends: cascade_engine::backend::MountedBackend::all_at_default(backends),
         cache_dir: None,
         enable_p2p: p2p.enable_p2p,
         p2p_data_dir: None,
@@ -1203,7 +1203,7 @@ async fn try_webdav(
     let engine_config = EngineConfig {
         db_path: ctx.db_path.clone(),
         mount_point: mount_path.to_path_buf(),
-        backends,
+        backends: cascade_engine::backend::MountedBackend::all_at_default(backends),
         cache_dir: None,
         enable_p2p: p2p.enable_p2p,
         p2p_data_dir: None,
@@ -1228,17 +1228,17 @@ async fn try_webdav(
         presenter = presenter.with_bind_addr(bind);
     }
 
-    // Pass backends and DB for on-demand directory expansion.
+    // Pass the mounted child backends and DB for on-demand directory expansion;
+    // the neutral root is synthetic and owns no content.
     let all_backends: Vec<Arc<dyn cascade_engine::backend::Backend>> = {
         let vfs = engine
             .vfs()
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut bs: Vec<Arc<dyn cascade_engine::backend::Backend>> = vec![vfs.root().clone()];
-        for (_, backend) in vfs.children() {
-            bs.push(backend.clone());
-        }
-        bs
+        vfs.children()
+            .iter()
+            .map(|(_, backend)| backend.clone())
+            .collect()
     };
     presenter.with_backends(all_backends).await;
     presenter.with_db(engine.db().clone());
@@ -1347,7 +1347,7 @@ async fn try_fuse(
     let engine_config = EngineConfig {
         db_path: ctx.db_path.clone(),
         mount_point: mount_path.to_path_buf(),
-        backends,
+        backends: cascade_engine::backend::MountedBackend::all_at_default(backends),
         cache_dir: None,
         enable_p2p: p2p.enable_p2p,
         p2p_data_dir: None,
@@ -1445,7 +1445,7 @@ async fn try_nfs(
     let engine_config = EngineConfig {
         db_path: ctx.db_path.clone(),
         mount_point: mount_path.to_path_buf(),
-        backends,
+        backends: cascade_engine::backend::MountedBackend::all_at_default(backends),
         cache_dir: None,
         enable_p2p: p2p.enable_p2p,
         p2p_data_dir: None,

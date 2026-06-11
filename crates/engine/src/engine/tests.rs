@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::*;
-use crate::backend::NullBackend;
+use crate::backend::{MountedBackend, NullBackend};
 #[cfg(feature = "p2p")]
 use crate::manage::Capability;
 use crate::manage::{DeviceId, Grant, Scope};
@@ -17,7 +17,9 @@ fn make_test_engine() -> Engine {
     let config = EngineConfig {
         db_path,
         mount_point: PathBuf::from("/tmp/test-mount"),
-        backends: vec![Arc::new(NullBackend::new("test"))],
+        backends: vec![MountedBackend::at_default(Arc::new(NullBackend::new(
+            "test",
+        )))],
         cache_dir: None,
         backend_factory: None,
         #[cfg(feature = "p2p")]
@@ -50,16 +52,21 @@ async fn engine_new_with_null_backend() {
 async fn engine_mount_unmount_backend() {
     let engine = make_test_engine();
 
+    // The test engine already mounts its single backend as a child of the
+    // neutral root, so the count starts at one.
+    let baseline = engine.vfs().read().unwrap().children().len();
+    assert_eq!(baseline, 1);
+
     engine.mount_backend(PathBuf::from("Work"), Arc::new(NullBackend::new("work")));
 
     let tree = engine.vfs().read().unwrap();
-    assert_eq!(tree.children().len(), 1);
+    assert_eq!(tree.children().len(), baseline + 1);
     drop(tree);
 
     engine.unmount_backend(Path::new("Work"));
 
     let tree = engine.vfs().read().unwrap();
-    assert!(tree.children().is_empty());
+    assert_eq!(tree.children().len(), baseline);
 }
 
 #[tokio::test]
@@ -135,14 +142,223 @@ async fn engine_new_requires_at_least_one_backend() {
 }
 
 #[tokio::test]
+async fn engine_at_root_mount_uses_empty_prefix() {
+    // A backend explicitly mounted at "/" must bind to the empty prefix —
+    // the at-root case that preserves the single-backend path shape — rather
+    // than a child directory literally named "/".
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(EngineConfig {
+        db_path: dir.path().join("state.db"),
+        mount_point: PathBuf::from("/tmp/test-mount"),
+        backends: vec![MountedBackend::new(
+            Some("/".to_owned()),
+            Arc::new(NullBackend::new("solo")),
+        )],
+        cache_dir: None,
+        backend_factory: None,
+        #[cfg(feature = "p2p")]
+        enable_p2p: false,
+        #[cfg(feature = "p2p")]
+        p2p_data_dir: None,
+        #[cfg(feature = "p2p")]
+        p2p_posture: None,
+        #[cfg(feature = "p2p")]
+        p2p_relay_endpoints: Vec::new(),
+        #[cfg(feature = "p2p")]
+        p2p_relay_shared_secret: None,
+    })
+    .unwrap();
+
+    let tree = engine.vfs().read().unwrap();
+    // One child mount, bound to the empty prefix.
+    assert_eq!(tree.children().len(), 1);
+    let (prefix, backend) = tree.children().first().expect("one mount");
+    assert_eq!(prefix.as_os_str(), "");
+    assert_eq!(backend.id(), "solo");
+    // The empty prefix routes every path to the single backend, the same
+    // shape a single backend at the old root had.
+    let (resolved, rest) = tree.resolve(Path::new("Documents/report.txt"));
+    assert_eq!(resolved.id(), "solo");
+    assert_eq!(rest, Path::new("Documents/report.txt"));
+}
+
+#[tokio::test]
+async fn engine_named_mount_binds_at_configured_prefix() {
+    // A backend with an explicit mount name binds at that prefix as a child
+    // of the neutral root, and a path under that prefix routes to it.
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(EngineConfig {
+        db_path: dir.path().join("state.db"),
+        mount_point: PathBuf::from("/tmp/test-mount"),
+        backends: vec![MountedBackend::new(
+            Some("personal".to_owned()),
+            Arc::new(NullBackend::new("gdrive-personal")),
+        )],
+        cache_dir: None,
+        backend_factory: None,
+        #[cfg(feature = "p2p")]
+        enable_p2p: false,
+        #[cfg(feature = "p2p")]
+        p2p_data_dir: None,
+        #[cfg(feature = "p2p")]
+        p2p_posture: None,
+        #[cfg(feature = "p2p")]
+        p2p_relay_endpoints: Vec::new(),
+        #[cfg(feature = "p2p")]
+        p2p_relay_shared_secret: None,
+    })
+    .unwrap();
+
+    let tree = engine.vfs().read().unwrap();
+    let (resolved, rest) = tree.resolve(Path::new("personal/Documents/report.txt"));
+    assert_eq!(resolved.id(), "gdrive-personal");
+    assert_eq!(rest, Path::new("Documents/report.txt"));
+}
+
+#[tokio::test]
+async fn engine_defaults_mount_to_backend_id_when_unset() {
+    // With no explicit mount, the backend mounts at a prefix equal to its id.
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::new(EngineConfig {
+        db_path: dir.path().join("state.db"),
+        mount_point: PathBuf::from("/tmp/test-mount"),
+        backends: vec![MountedBackend::at_default(Arc::new(NullBackend::new(
+            "work",
+        )))],
+        cache_dir: None,
+        backend_factory: None,
+        #[cfg(feature = "p2p")]
+        enable_p2p: false,
+        #[cfg(feature = "p2p")]
+        p2p_data_dir: None,
+        #[cfg(feature = "p2p")]
+        p2p_posture: None,
+        #[cfg(feature = "p2p")]
+        p2p_relay_endpoints: Vec::new(),
+        #[cfg(feature = "p2p")]
+        p2p_relay_shared_secret: None,
+    })
+    .unwrap();
+
+    let tree = engine.vfs().read().unwrap();
+    let (prefix, backend) = tree.children().first().expect("one mount");
+    assert_eq!(prefix.as_os_str(), "work");
+    assert_eq!(backend.id(), "work");
+}
+
+#[tokio::test]
+async fn engine_rejects_duplicate_mount_paths() {
+    // Two backends configured at the same mount must be refused loudly rather
+    // than silently shadowing each other.
+    let dir = tempfile::tempdir().unwrap();
+    let result = Engine::new(EngineConfig {
+        db_path: dir.path().join("state.db"),
+        mount_point: PathBuf::from("/tmp/test-mount"),
+        backends: vec![
+            MountedBackend::new(Some("shared".to_owned()), Arc::new(NullBackend::new("a"))),
+            MountedBackend::new(Some("shared".to_owned()), Arc::new(NullBackend::new("b"))),
+        ],
+        cache_dir: None,
+        backend_factory: None,
+        #[cfg(feature = "p2p")]
+        enable_p2p: false,
+        #[cfg(feature = "p2p")]
+        p2p_data_dir: None,
+        #[cfg(feature = "p2p")]
+        p2p_posture: None,
+        #[cfg(feature = "p2p")]
+        p2p_relay_endpoints: Vec::new(),
+        #[cfg(feature = "p2p")]
+        p2p_relay_shared_secret: None,
+    });
+
+    let err = result.expect_err("duplicate mount paths must be rejected");
+    assert!(
+        err.to_string().contains("duplicate mount path"),
+        "error should name the collision, got {err}",
+    );
+}
+
+#[tokio::test]
+async fn engine_hydrates_mount_from_db_on_restart() {
+    // The persisted backends.mount_path is the source of truth on restart.
+    // A backend registered at "personal" in the database must re-mount there
+    // even when a fresh EngineConfig defaults it back to its id.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("state.db");
+
+    // First boot: configure the backend at an explicit "personal" mount. This
+    // persists mount_path = "personal".
+    {
+        let engine = Engine::new(EngineConfig {
+            db_path: db_path.clone(),
+            mount_point: PathBuf::from("/tmp/test-mount"),
+            backends: vec![MountedBackend::new(
+                Some("personal".to_owned()),
+                Arc::new(NullBackend::new("gdrive")),
+            )],
+            cache_dir: None,
+            backend_factory: None,
+            #[cfg(feature = "p2p")]
+            enable_p2p: false,
+            #[cfg(feature = "p2p")]
+            p2p_data_dir: None,
+            #[cfg(feature = "p2p")]
+            p2p_posture: None,
+            #[cfg(feature = "p2p")]
+            p2p_relay_endpoints: Vec::new(),
+            #[cfg(feature = "p2p")]
+            p2p_relay_shared_secret: None,
+        })
+        .unwrap();
+        let tree = engine.vfs().read().unwrap();
+        let (prefix, _) = tree.children().first().expect("one mount");
+        assert_eq!(prefix.as_os_str(), "personal");
+    }
+
+    // Second boot against the same database, but the config now omits the
+    // mount (would default to the backend id "gdrive"). The persisted
+    // "personal" mount must win.
+    let engine = Engine::new(EngineConfig {
+        db_path,
+        mount_point: PathBuf::from("/tmp/test-mount"),
+        backends: vec![MountedBackend::at_default(Arc::new(NullBackend::new(
+            "gdrive",
+        )))],
+        cache_dir: None,
+        backend_factory: None,
+        #[cfg(feature = "p2p")]
+        enable_p2p: false,
+        #[cfg(feature = "p2p")]
+        p2p_data_dir: None,
+        #[cfg(feature = "p2p")]
+        p2p_posture: None,
+        #[cfg(feature = "p2p")]
+        p2p_relay_endpoints: Vec::new(),
+        #[cfg(feature = "p2p")]
+        p2p_relay_shared_secret: None,
+    })
+    .unwrap();
+
+    let tree = engine.vfs().read().unwrap();
+    let (prefix, backend) = tree.children().first().expect("one mount");
+    assert_eq!(
+        prefix.as_os_str(),
+        "personal",
+        "persisted mount must override the config default",
+    );
+    assert_eq!(backend.id(), "gdrive");
+}
+
+#[tokio::test]
 async fn engine_with_multiple_backends() {
     let dir = tempfile::tempdir().unwrap();
     let engine = Engine::new(EngineConfig {
         db_path: dir.path().join("state.db"),
         mount_point: PathBuf::from("/tmp/test-mount"),
         backends: vec![
-            Arc::new(NullBackend::new("root")),
-            Arc::new(NullBackend::new("work")),
+            MountedBackend::at_default(Arc::new(NullBackend::new("root"))),
+            MountedBackend::at_default(Arc::new(NullBackend::new("work"))),
         ],
         cache_dir: None,
         backend_factory: None,
@@ -160,7 +376,9 @@ async fn engine_with_multiple_backends() {
     .unwrap();
 
     let tree = engine.vfs().read().unwrap();
-    assert_eq!(tree.children().len(), 1);
+    // Both backends now mount as children of the neutral root (the old model
+    // special-cased the first as the tree root).
+    assert_eq!(tree.children().len(), 2);
     drop(tree);
 
     let status = engine.status();

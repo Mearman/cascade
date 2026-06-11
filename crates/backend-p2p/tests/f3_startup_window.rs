@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cascade_backend_p2p::{P2pBackend, P2pBackendConfig};
-use cascade_engine::backend::Backend;
+use cascade_engine::backend::{Backend, MountedBackend};
 use cascade_engine::engine::{Engine, EngineConfig};
 use tempfile::TempDir;
 use tokio::io::AsyncReadExt;
@@ -142,7 +142,7 @@ async fn f3_inbound_after_wire_manage_dispatch_is_served() {
     // Build the engine around the backend so `wire_manage_dispatch` has
     // something to wire.
     let engine_db = node_data.path().join("state.db");
-    let backends: Vec<Arc<dyn Backend>> = vec![node_backend_dyn];
+    let backends: Vec<MountedBackend> = vec![MountedBackend::at_default(node_backend_dyn)];
     let engine = Arc::new(
         Engine::new(EngineConfig {
             db_path: engine_db,
@@ -211,7 +211,7 @@ async fn f3_data_plane_ready_bit_transitions_on_wire_manage_dispatch() {
     let node_backend_arc: Arc<P2pBackend> = Arc::new(node_backend_concrete);
     let node_backend_dyn: Arc<dyn Backend> = node_backend_arc.clone();
     let engine_db = data.path().join("state.db");
-    let backends: Vec<Arc<dyn Backend>> = vec![node_backend_dyn];
+    let backends: Vec<MountedBackend> = vec![MountedBackend::at_default(node_backend_dyn)];
     let engine = Arc::new(
         Engine::new(EngineConfig {
             db_path: engine_db,

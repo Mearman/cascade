@@ -5,8 +5,6 @@
 //! lifecycle. Extracted from the monolithic engine so the core struct stays
 //! focused on wiring and lifecycle.
 
-use std::path::PathBuf;
-
 use anyhow::Result;
 
 use super::Engine;
@@ -93,6 +91,9 @@ pub(super) fn backend_add(
         anyhow::anyhow!("this node cannot add backends: no backend factory is configured")
     })?;
     let backend = factory.create(name, backend_type, config_toml)?;
+    // Persist the mount as the source of truth so a restart re-mounts the
+    // backend at the same place, then mount it live at the resolved prefix
+    // (an explicit `"/"` resolves to the empty prefix — the at-root case).
     engine.db.register_backend(
         name,
         backend_type,
@@ -100,7 +101,8 @@ pub(super) fn backend_add(
         Some(mount_path),
         Some(config_toml),
     )?;
-    engine.mount_backend(PathBuf::from(mount_path), backend);
+    let prefix = crate::backend::mount_prefix_from_str(mount_path);
+    engine.mount_backend(prefix, backend);
     Ok(format!(
         "backend {name} ({backend_type}) added at {mount_path}",
     ))
@@ -108,7 +110,9 @@ pub(super) fn backend_add(
 
 /// Unmount and deregister a backend by name.
 pub(super) fn backend_remove(engine: &Engine, name: &str, mount_path: &str) -> Result<String> {
-    engine.unmount_backend(std::path::Path::new(mount_path));
+    // Resolve through the shared mapping so a backend mounted at `"/"` (the
+    // empty prefix) is unmounted by the same prefix it was mounted under.
+    engine.unmount_backend(&crate::backend::mount_prefix_from_str(mount_path));
     let removed = engine.db.remove_backend(name)?;
     Ok(if removed {
         format!("backend {name} removed from {mount_path}")

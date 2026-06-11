@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use cascade_engine::backend::NullBackend;
+use cascade_engine::backend::{MountedBackend, NullBackend};
 use cascade_engine::engine::{Engine, EngineConfig};
 
 fn make_engine_with_backends(backends: Vec<Arc<dyn cascade_engine::backend::Backend>>) -> Engine {
@@ -17,7 +17,10 @@ fn make_engine_with_backends(backends: Vec<Arc<dyn cascade_engine::backend::Back
     Engine::new(EngineConfig {
         db_path: dir.path().join("state.db"),
         mount_point: PathBuf::from("/tmp/test-mount"),
-        backends,
+        backends: backends
+            .into_iter()
+            .map(MountedBackend::at_default)
+            .collect(),
         cache_dir: None,
         enable_p2p: false,
         p2p_data_dir: None,
@@ -64,9 +67,9 @@ async fn engine_with_two_backends() {
     let status = engine.status();
     assert_eq!(status.backends.len(), 2);
 
-    // VFS should have one child mount (the second backend).
+    // Both backends mount as children of the neutral root.
     let tree = engine.vfs().read().unwrap();
-    assert_eq!(tree.children().len(), 1);
+    assert_eq!(tree.children().len(), 2);
     drop(tree);
 }
 
@@ -104,6 +107,10 @@ async fn engine_pin_unpin_affects_status() {
 async fn engine_mount_unmount_during_runtime() {
     let engine = make_engine_with_backends(vec![Arc::new(NullBackend::new("root"))]);
 
+    // The configured backend already mounts as a child of the neutral root.
+    let baseline = engine.vfs().read().unwrap().children().len();
+    assert_eq!(baseline, 1);
+
     // Mount a second backend.
     engine.mount_backend(
         PathBuf::from("Projects"),
@@ -111,12 +118,12 @@ async fn engine_mount_unmount_during_runtime() {
     );
 
     let tree = engine.vfs().read().unwrap();
-    assert_eq!(tree.children().len(), 1);
+    assert_eq!(tree.children().len(), baseline + 1);
     drop(tree);
 
     // Unmount it.
     engine.unmount_backend(Path::new("Projects"));
 
     let tree = engine.vfs().read().unwrap();
-    assert!(tree.children().is_empty());
+    assert_eq!(tree.children().len(), baseline);
 }

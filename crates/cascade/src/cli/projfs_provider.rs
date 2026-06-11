@@ -290,6 +290,7 @@ mod tests {
         FileEntry {
             id: ItemId::new(backend_id, "f"),
             parent_id: ItemId::new(backend_id, "root"),
+            path: "f.bin".to_string(),
             name: "f.bin".to_string(),
             is_dir: false,
             size: Some(11),

@@ -43,7 +43,9 @@ impl Harness {
         let engine = Engine::new(EngineConfig {
             db_path: dir.path().join("state.db"),
             mount_point: dir.path().join("mount"),
-            backends: vec![Arc::new(cascade_engine::backend::NullBackend::new("root"))],
+            backends: vec![cascade_engine::backend::MountedBackend::at_default(
+                Arc::new(cascade_engine::backend::NullBackend::new("root")),
+            )],
             cache_dir: None,
             enable_p2p: true,
             p2p_data_dir: Some(dir.path().join("p2p")),

@@ -216,12 +216,18 @@ impl StateDb {
             .conn
             .lock()
             .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
-        let result = conn
-            .query_row("SELECT path FROM files WHERE id = ?1", [&id.0], |row| {
-                row.get::<_, String>(0)
-            })
-            .ok();
-        Ok(result)
+        let result = conn.query_row("SELECT path FROM files WHERE id = ?1", [&id.0], |row| {
+            row.get::<_, String>(0)
+        });
+        // Distinguish a genuine absence (no such row) from a real SQL or lock
+        // error. Collapsing both into `None` would let a failed lookup masquerade
+        // as a missing parent and silently misroute the path assembly, so the
+        // error case propagates loudly.
+        match result {
+            Ok(path) => Ok(Some(path)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Delete a file entry by ID.
@@ -338,6 +344,30 @@ impl StateDb {
             (id, backend_type, display_name, mount_path, config),
         )?;
         Ok(())
+    }
+
+    /// Look up the persisted mount path for a backend by its id.
+    ///
+    /// Returns `Ok(None)` when no backend row exists yet (first run for that
+    /// backend) and `Ok(Some(None))` when the row exists but its `mount_path`
+    /// is `NULL`. A genuine SQL or lock error propagates loudly rather than
+    /// collapsing into an absence, so a failed lookup cannot masquerade as an
+    /// unregistered backend and silently re-default its mount.
+    pub fn get_backend_mount(&self, id: &str) -> Result<Option<Option<String>>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let result = conn.query_row(
+            "SELECT mount_path FROM backends WHERE id = ?1",
+            [id],
+            |row| row.get::<_, Option<String>>(0),
+        );
+        match result {
+            Ok(mount) => Ok(Some(mount)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Remove a registered backend by ID. Returns `true` if a row was deleted.

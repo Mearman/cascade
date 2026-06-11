@@ -15,6 +15,7 @@ fn make_entry(name: &str, id: &str, is_dir: bool) -> FileEntry {
     FileEntry {
         id: ItemId::new("test", id),
         parent_id: ItemId::new("test", "root"),
+        path: name.to_string(),
         name: name.to_string(),
         is_dir,
         size: if is_dir { None } else { Some(1024) },

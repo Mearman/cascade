@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use cascade_backend_p2p::sync::{Peer, SyncEngine};
 use cascade_backend_p2p::{ConfiguredPeer, P2pBackend, P2pBackendConfig};
-use cascade_engine::backend::Backend;
+use cascade_engine::backend::MountedBackend;
 use cascade_engine::engine::{Engine, EngineConfig};
 use cascade_engine::manage::{Capability, DeviceId, Grant, Scope};
 use cascade_p2p::identity::DeviceIdentity;
@@ -123,7 +123,7 @@ async fn daemon_wired_node_accepts_authorised_management_over_the_wire() {
 
     // ── Engine around the node backend, with a grant for the manager ──
     let engine_db = node_data.path().join("state.db");
-    let backends: Vec<Arc<dyn Backend>> = vec![Arc::new(node_backend)];
+    let backends: Vec<MountedBackend> = vec![MountedBackend::at_default(Arc::new(node_backend))];
     let engine = Arc::new(
         Engine::new(EngineConfig {
             db_path: engine_db,
