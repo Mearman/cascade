@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.111](https://github.com/Mearman/cascade/compare/cascade-v0.1.110...cascade-v0.1.111) - 2026-06-11
+
+### Added
+
+- *(cli)* add BackendConfig.mount, deterministic rebuild_backends, consistent init/backend-add
+- *(engine)* assemble mount-prefixed VFS paths in the sync runner
+- *(engine)* mount backends uniformly under a neutral VFS root
+
+### Fixed
+
+- *(webdav)* wire the engine mount table into the presenter
+
 ## [0.1.110](https://github.com/Mearman/cascade/compare/cascade-v0.1.109...cascade-v0.1.110) - 2026-06-08
 
 ### Other
