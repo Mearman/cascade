@@ -44,6 +44,10 @@ pub struct FusePresenter {
     vfs: Arc<RwLock<VfsTree>>,
     /// Base directory for cached files.
     cache_dir: PathBuf,
+    /// State DB used to resolve an `ItemId` to its `FileEntry` for on-demand
+    /// content fetch. Without it `fetch_contents` cannot recover the entry that
+    /// a non-root mount needs to route to its owning backend.
+    db: Option<Arc<cascade_engine::db::StateDb>>,
     /// Active FUSE background session. Populated by `start()`, cleared by `stop()`.
     /// Dropping the session unmounts the filesystem and joins the FUSE thread.
     #[cfg(target_os = "linux")]
@@ -61,9 +65,18 @@ impl FusePresenter {
             vfs,
             inode_map,
             cache_dir,
+            db: None,
             #[cfg(target_os = "linux")]
             session: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// Attach the state DB used to resolve an `ItemId` to its `FileEntry`
+    /// during on-demand content fetch.
+    #[must_use]
+    pub fn with_db(mut self, db: Arc<cascade_engine::db::StateDb>) -> Self {
+        self.db = Some(db);
+        self
     }
 
     /// Create a new FUSE presenter for the given root `ItemId`.
@@ -159,19 +172,28 @@ impl VfsPresenter for FusePresenter {
             return Ok(cache_path);
         }
 
-        // Resolve the item through the VFS to get metadata and a backend.
-        let (entry, backend): (cascade_engine::types::FileEntry, Arc<dyn Backend>) = {
-            let (backend, relative) = {
-                let vfs = self
-                    .vfs
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let (backend, relative) = vfs.resolve(Path::new(&id.0));
-                (Arc::clone(backend), relative)
-            };
-            // Lock is dropped before the await.
-            let entry = backend.metadata(&relative).await?;
-            (entry, backend)
+        // `id` is an `ItemId` (`backend_id:native_id`), not a VFS path: route
+        // by its backend id rather than feeding it to `vfs.resolve`, which does
+        // longest-prefix matching on mount paths and would misroute any item
+        // under a non-root mount to the neutral root. Look the entry up by
+        // `ItemId` in the DB, then dispatch to the owning backend — mirroring
+        // the File Provider handler.
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("FUSE presenter has no state DB for content fetch"))?;
+        let entry = db
+            .get_file(id)?
+            .ok_or_else(|| anyhow::anyhow!("item not found in state DB: {id}"))?;
+        let backend: Arc<dyn Backend> = {
+            let vfs = self
+                .vfs
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let backend = vfs.backend_by_id(id.backend_id()).ok_or_else(|| {
+                anyhow::anyhow!("no backend registered for id {}", id.backend_id())
+            })?;
+            Arc::clone(backend)
         };
 
         // Download to a temp file in the cache directory, then persist.
@@ -486,6 +508,112 @@ mod tests {
         // fetch_contents should return the existing cached path.
         let result = presenter.fetch_contents(&id).await?;
         assert_eq!(result, cache_path);
+        Ok(())
+    }
+
+    /// Backend whose `download` returns a fixed body tagged with its own id, so
+    /// a test can prove `fetch_contents` routed to the owning backend.
+    #[derive(Debug)]
+    struct FixedBackend {
+        id: String,
+    }
+
+    #[async_trait]
+    impl Backend for FixedBackend {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        fn display_name(&self) -> &'static str {
+            "Fixed"
+        }
+        async fn quota(&self) -> anyhow::Result<Option<cascade_engine::types::Quota>> {
+            Ok(None)
+        }
+        async fn changes(
+            &self,
+            _cursor: Option<&cascade_engine::types::Cursor>,
+        ) -> anyhow::Result<(
+            Vec<cascade_engine::types::Change>,
+            cascade_engine::types::Cursor,
+        )> {
+            Ok((vec![], cascade_engine::types::Cursor("fixed".to_string())))
+        }
+        async fn metadata(&self, _path: &Path) -> anyhow::Result<cascade_engine::types::FileEntry> {
+            anyhow::bail!("metadata must not be called: fetch_contents routes by ItemId")
+        }
+        async fn download(
+            &self,
+            _file: &cascade_engine::types::FileEntry,
+        ) -> anyhow::Result<Vec<u8>> {
+            Ok(format!("content-from-{}", self.id).into_bytes())
+        }
+        async fn upload(
+            &self,
+            _path: &Path,
+            _data: &[u8],
+            _parent_id: &cascade_engine::types::FileId,
+        ) -> anyhow::Result<cascade_engine::types::FileEntry> {
+            anyhow::bail!("no upload")
+        }
+        async fn update(
+            &self,
+            _file_id: &cascade_engine::types::FileId,
+            _data: &[u8],
+        ) -> anyhow::Result<cascade_engine::types::FileEntry> {
+            anyhow::bail!("no update")
+        }
+        async fn create_dir(
+            &self,
+            _path: &Path,
+        ) -> anyhow::Result<cascade_engine::types::FileEntry> {
+            anyhow::bail!("no create_dir")
+        }
+        async fn delete(&self, _file: &cascade_engine::types::FileEntry) -> anyhow::Result<()> {
+            anyhow::bail!("no delete")
+        }
+        async fn move_entry(
+            &self,
+            _src: &Path,
+            _dst: &Path,
+        ) -> anyhow::Result<cascade_engine::types::FileEntry> {
+            anyhow::bail!("no move")
+        }
+        async fn poll_interval(&self) -> Option<std::time::Duration> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_contents_routes_by_item_id_under_non_root_mount() -> anyhow::Result<()> {
+        // The item id `personalb:abc` is NOT a VFS path; feeding it to
+        // vfs.resolve would misroute to the neutral root. fetch_contents must
+        // look the entry up by ItemId and dispatch via backend_by_id.
+        let backend: Arc<dyn Backend> = Arc::new(FixedBackend {
+            id: "personalb".to_string(),
+        });
+        let mut tree = VfsTree::new(Arc::new(NullBackend::new("__neutral_root")));
+        tree.mount(PathBuf::from("personal"), backend);
+        let vfs = Arc::new(RwLock::new(tree));
+
+        let db = Arc::new(cascade_engine::db::StateDb::open_in_memory()?);
+        db.register_backend("personalb", "fixed", "Fixed", Some("personal"), None)?;
+        let id = ItemId::new("personalb", "abc");
+        let entry = cascade_engine::types::FileEntry::file(
+            id.clone(),
+            ItemId::new("personalb", "root"),
+            "report.txt".to_string(),
+        )
+        .with_path("personal/report.txt".to_string());
+        db.upsert_file(&entry)?;
+
+        let tmp = tempfile::tempdir()?;
+        let presenter = FusePresenter::with_vfs(ItemId::new("vfs", "root"), vfs)
+            .with_db(db)
+            .with_cache_dir(tmp.path());
+
+        let path = presenter.fetch_contents(&id).await?;
+        let body = tokio::fs::read(&path).await?;
+        assert_eq!(body, b"content-from-personalb");
         Ok(())
     }
 }

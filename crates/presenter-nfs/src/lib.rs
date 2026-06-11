@@ -36,6 +36,10 @@ pub struct NfsPresenter {
     context: Arc<NfsContext>,
     /// Base directory for cached files (defaults to ~/.config/cascade/cache).
     cache_dir: PathBuf,
+    /// State DB used to resolve an `ItemId` to its `FileEntry` for on-demand
+    /// content fetch. Without it `fetch_contents` cannot recover the entry that
+    /// a non-root mount needs to route to its owning backend.
+    db: Option<Arc<cascade_engine::db::StateDb>>,
 }
 
 impl NfsPresenter {
@@ -52,6 +56,7 @@ impl NfsPresenter {
             nfs_port: 0,
             context,
             cache_dir,
+            db: None,
         }
     }
 
@@ -67,12 +72,30 @@ impl NfsPresenter {
                 )),
             )))),
             cache_dir: dirs_cache_dir(),
+            db: None,
         }
     }
 
     #[must_use]
     pub const fn with_port(mut self, port: u16) -> Self {
         self.nfs_port = port;
+        self
+    }
+
+    /// Attach the state DB used to resolve an `ItemId` to its `FileEntry`
+    /// during on-demand content fetch.
+    #[must_use]
+    pub fn with_db(mut self, db: Arc<cascade_engine::db::StateDb>) -> Self {
+        self.db = Some(db);
+        self
+    }
+
+    /// Override the cache directory. Mainly used by tests so each test gets a
+    /// unique tempdir and they don't race on the shared system cache path
+    /// (which the running daemon also writes to).
+    #[must_use]
+    pub fn with_cache_dir(mut self, path: impl Into<PathBuf>) -> Self {
+        self.cache_dir = path.into();
         self
     }
 
@@ -145,25 +168,29 @@ impl VfsPresenter for NfsPresenter {
             return Ok(cache_path);
         }
 
-        // Resolve the item through the VFS to get metadata and a backend.
-        let (entry, backend): (
-            cascade_engine::types::FileEntry,
-            Arc<dyn cascade_engine::backend::Backend>,
-        ) = {
-            let (backend, relative) = {
-                let vfs = self
-                    .context
-                    .vfs()
-                    .read()
-                    .map_err(|e| anyhow::anyhow!("vfs RwLock poisoned: {e}"))?;
-                let (backend, relative) = vfs.resolve(std::path::Path::new(&id.0));
-                let result = (Arc::clone(backend), relative);
-                drop(vfs);
-                result
-            };
-            // Lock is dropped here, before the await.
-            let entry = backend.metadata(&relative).await?;
-            (entry, backend)
+        // `id` is an `ItemId` (`backend_id:native_id`), not a VFS path: route
+        // by its backend id rather than feeding it to `vfs.resolve`, which does
+        // longest-prefix matching on mount paths and would misroute any item
+        // under a non-root mount to the neutral root. Look the entry up by
+        // `ItemId` in the DB, then dispatch to the owning backend — mirroring
+        // the File Provider handler.
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("NFS presenter has no state DB for content fetch"))?;
+        let entry = db
+            .get_file(id)?
+            .ok_or_else(|| anyhow::anyhow!("item not found in state DB: {id}"))?;
+        let backend: Arc<dyn cascade_engine::backend::Backend> = {
+            let vfs = self
+                .context
+                .vfs()
+                .read()
+                .map_err(|e| anyhow::anyhow!("vfs RwLock poisoned: {e}"))?;
+            let backend = vfs.backend_by_id(id.backend_id()).ok_or_else(|| {
+                anyhow::anyhow!("no backend registered for id {}", id.backend_id())
+            })?;
+            Arc::clone(backend)
         };
 
         // Download to a temp file in the cache directory, then persist.
@@ -222,14 +249,103 @@ fn format_vfs_path(item: &VfsItem) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cascade_engine::backend::NullBackend;
-    use cascade_engine::types::{ItemId, VfsItem};
+    use cascade_engine::backend::{Backend, NullBackend};
+    use cascade_engine::types::{Change, Cursor, FileEntry, FileId, ItemId, Quota, VfsItem};
     use cascade_engine::vfs::VfsTree;
+    use std::path::Path as StdPath;
+    use std::time::Duration;
 
     fn test_vfs() -> Arc<RwLock<VfsTree>> {
         Arc::new(RwLock::new(VfsTree::new(Arc::new(NullBackend::new(
             "test-backend",
         )))))
+    }
+
+    /// Backend whose `download` returns a fixed body tagged with its own id, so
+    /// a test can prove `fetch_contents` routed to the owning backend.
+    #[derive(Debug)]
+    struct FixedBackend {
+        id: String,
+    }
+
+    #[async_trait]
+    impl Backend for FixedBackend {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        fn display_name(&self) -> &'static str {
+            "Fixed"
+        }
+        async fn quota(&self) -> anyhow::Result<Option<Quota>> {
+            Ok(None)
+        }
+        async fn changes(&self, _cursor: Option<&Cursor>) -> anyhow::Result<(Vec<Change>, Cursor)> {
+            Ok((vec![], Cursor("fixed".to_string())))
+        }
+        async fn metadata(&self, _path: &StdPath) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("metadata must not be called: fetch_contents routes by ItemId")
+        }
+        async fn download(&self, _file: &FileEntry) -> anyhow::Result<Vec<u8>> {
+            Ok(format!("content-from-{}", self.id).into_bytes())
+        }
+        async fn upload(
+            &self,
+            _path: &StdPath,
+            _data: &[u8],
+            _parent_id: &FileId,
+        ) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("no upload")
+        }
+        async fn update(&self, _file_id: &FileId, _data: &[u8]) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("no update")
+        }
+        async fn create_dir(&self, _path: &StdPath) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("no create_dir")
+        }
+        async fn delete(&self, _file: &FileEntry) -> anyhow::Result<()> {
+            anyhow::bail!("no delete")
+        }
+        async fn move_entry(&self, _src: &StdPath, _dst: &StdPath) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("no move")
+        }
+        async fn poll_interval(&self) -> Option<Duration> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_contents_routes_by_item_id_under_non_root_mount() {
+        // A backend mounted at a non-root prefix. The item id `personalb:abc`
+        // is NOT a VFS path: feeding it to vfs.resolve would misroute to the
+        // neutral root. fetch_contents must look the entry up by ItemId and
+        // dispatch via backend_by_id, reaching the owning backend.
+        let backend: Arc<dyn Backend> = Arc::new(FixedBackend {
+            id: "personalb".to_string(),
+        });
+        let mut tree = VfsTree::new(Arc::new(NullBackend::new("__neutral_root")));
+        tree.mount(std::path::PathBuf::from("personal"), backend);
+        let vfs = Arc::new(RwLock::new(tree));
+
+        let db = Arc::new(cascade_engine::db::StateDb::open_in_memory().unwrap());
+        db.register_backend("personalb", "fixed", "Fixed", Some("personal"), None)
+            .unwrap();
+        let id = ItemId::new("personalb", "abc");
+        let entry = FileEntry::file(
+            id.clone(),
+            ItemId::new("personalb", "root"),
+            "report.txt".to_string(),
+        )
+        .with_path("personal/report.txt".to_string());
+        db.upsert_file(&entry).unwrap();
+
+        let cache = tempfile::tempdir().unwrap();
+        let presenter = NfsPresenter::with_vfs("/mnt/test", vfs)
+            .with_db(db)
+            .with_cache_dir(cache.path());
+
+        let path = presenter.fetch_contents(&id).await.unwrap();
+        let body = tokio::fs::read(&path).await.unwrap();
+        assert_eq!(body, b"content-from-personalb");
     }
 
     #[test]
