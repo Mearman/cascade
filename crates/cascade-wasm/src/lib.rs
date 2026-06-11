@@ -109,6 +109,9 @@ impl FileInput {
             id: cascade_engine::types::ItemId::new(backend_id, &self.id),
             parent_id: cascade_engine::types::ItemId::new(backend_id, &self.parent_id),
             name: self.name.clone(),
+            // Basename default, matching FileEntry::file: the sync runner
+            // reassembles the full mount-prefixed VFS path on the way in.
+            path: self.name.clone(),
             is_dir: self.is_dir,
             size: self.size,
             mod_time: None,
