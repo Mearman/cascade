@@ -3,12 +3,61 @@
 //! On Linux, translates FUSE callbacks into VFS queries via the engine protocol.
 //! On other platforms, provides compile-time stubs.
 
-use cascade_engine::types::{ItemId, VfsItem};
+use cascade_engine::types::{DirEntry, ItemId, VfsItem};
 use cascade_engine::vfs::VfsTree;
 
-use crate::inode::InodeMap;
+use crate::inode::{InodeMap, ROOT_PATH};
 
 use std::sync::{Arc, RwLock};
+
+/// Translate an inode's stored VFS path into the form the `VfsTree` expects.
+///
+/// The inode map stores the neutral root as `"/"` for readability, but the
+/// `VfsTree` addresses paths without a leading slash and treats the root as the
+/// empty string (e.g. `work/report.txt`, root = `""`). This maps `"/"` to `""`
+/// and strips a single leading slash from any other path so the two layers
+/// agree. Kept outside the Linux `Filesystem` impl so it is unit-testable on
+/// every host.
+#[must_use]
+pub fn vfs_query_path(stored_path: &str) -> String {
+    if stored_path == ROOT_PATH {
+        return String::new();
+    }
+    stored_path
+        .strip_prefix('/')
+        .unwrap_or(stored_path)
+        .to_owned()
+}
+
+/// Build the VFS path of a child from its parent's stored path and name.
+///
+/// The result is in the inode map's stored form (no leading slash for non-root
+/// paths; a child of the neutral root `"/"` becomes a bare name). Kept outside
+/// the Linux `Filesystem` impl so the join rule is unit-testable on every host.
+#[must_use]
+pub fn child_vfs_path(parent_stored_path: &str, name: &str) -> String {
+    let parent = vfs_query_path(parent_stored_path);
+    if parent.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
+/// Split a stored VFS path into its parent's stored path and final segment.
+///
+/// The parent of a top-level path is the neutral root `"/"`. Used by `getattr`
+/// to look an entry up in its parent's listing — which recognises injected
+/// synthetic mount directories. Kept outside the Linux `Filesystem` impl so it
+/// is unit-testable on every host.
+#[must_use]
+pub fn split_vfs_path(stored_path: &str) -> (String, String) {
+    let query = vfs_query_path(stored_path);
+    match query.rsplit_once('/') {
+        Some((parent, name)) => (parent.to_owned(), name.to_owned()),
+        None => (ROOT_PATH.to_owned(), query),
+    }
+}
 
 /// Internal file attribute representation, independent of platform-specific FUSE types.
 #[derive(Debug, Clone, Copy)]
@@ -153,67 +202,49 @@ impl FuseOps {
         }
     }
 
-    /// Synchronously resolve a path through the VFS tree and get metadata.
+    /// Synchronously list a directory's entries by its stored VFS path.
+    ///
+    /// Routes through `VfsTree::read_dir`, which fetches the owning backend's
+    /// immediate children for the resolved sub-path and injects child-mount
+    /// directories (applying the first-segment, skip-empty-prefix, and
+    /// shadow-dedup rules) — so the FUSE listing inherits the same behaviour as
+    /// the `WebDAV` and `NFS` presenters with no duplicated injection logic.
     #[allow(dead_code)] // Used in #[cfg(target_os = "linux")] Filesystem impl
-    fn metadata_sync(
-        &self,
-        path: &std::path::Path,
-    ) -> anyhow::Result<cascade_engine::types::FileEntry> {
+    fn read_dir_sync(&self, stored_path: &str) -> anyhow::Result<Vec<DirEntry>> {
+        let query = vfs_query_path(stored_path);
         let rt = tokio::runtime::Handle::current();
         rt.block_on(async {
-            let (backend, relative) = {
+            // Resolve routing and the injected child-mount names under the lock,
+            // clone the owning backend `Arc`, then drop the guard before the
+            // await — `VfsTree::resolve_listing` returns owned data so the
+            // `RwLockReadGuard` is never held across the await point.
+            let (backend, backend_path, mount_names) = {
                 let vfs = self
                     .vfs
                     .read()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let (backend, relative) = vfs.resolve(path);
-                (Arc::clone(backend), relative)
+                vfs.resolve_listing(std::path::Path::new(&query))?
             };
-            backend.metadata(&relative).await
+            let children = backend.list_children(&backend_path).await?;
+            Ok(cascade_engine::vfs::merge_listing(children, &mount_names))
         })
     }
 
-    /// Synchronously list the immediate children of a directory by its `ItemId`.
-    ///
-    /// Inodes are allocated lazily and idempotently — every child receives a
-    /// stable inode number before the kernel sees the directory entry, so that
-    /// a subsequent `lookup()` on the same name resolves to the same inode.
+    /// Synchronously read file data by its stored VFS path.
     #[allow(dead_code)] // Used in #[cfg(target_os = "linux")] Filesystem impl
-    fn list_children_sync(
-        &self,
-        id: &cascade_engine::types::ItemId,
-    ) -> anyhow::Result<Vec<cascade_engine::types::FileEntry>> {
-        // Clone the backend `Arc` while holding the read lock, then drop the
-        // lock before the async call. This avoids holding a `RwLockReadGuard`
-        // across an await point, which would trigger the `await_holding_lock`
-        // lint and risk a deadlock if any other code tries to write the tree.
-        let backend = {
-            let vfs = self
-                .vfs
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            vfs.backend_by_id(id.backend_id())
-                .ok_or_else(|| {
-                    anyhow::anyhow!("no backend registered for item id {}", id.backend_id())
-                })
-                .map(Arc::clone)
-        }?;
-        let native_id = id.native_id().to_owned();
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(async move { backend.list_children(&native_id).await })
-    }
-
-    /// Synchronously read file data from the backend.
-    #[allow(dead_code)] // Used in #[cfg(target_os = "linux")] Filesystem impl
-    fn read_sync(&self, path: &std::path::Path, offset: u64, size: u32) -> anyhow::Result<Vec<u8>> {
+    fn read_sync(&self, stored_path: &str, offset: u64, size: u32) -> anyhow::Result<Vec<u8>> {
+        let query = vfs_query_path(stored_path);
         let rt = tokio::runtime::Handle::current();
         rt.block_on(async {
+            // Clone the backend `Arc` while holding the read lock, then drop the
+            // lock before the await. Holding a `RwLockReadGuard` across an await
+            // point would trigger `await_holding_lock` and risk a deadlock.
             let (backend, relative) = {
                 let vfs = self
                     .vfs
                     .read()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let (backend, relative) = vfs.resolve(path);
+                let (backend, relative) = vfs.resolve(std::path::Path::new(&query));
                 (Arc::clone(backend), relative)
             };
             let entry = backend.metadata(&relative).await?;
@@ -229,6 +260,27 @@ impl FuseOps {
                 .min(remaining.len());
             Ok(remaining.get(..end).unwrap_or_default().to_vec())
         })
+    }
+
+    /// Synchronously resolve a file's size by its stored VFS path. Returns the
+    /// `size` reported by the owning backend's `metadata`, or `None` if the
+    /// entry has no recorded size or cannot be resolved.
+    #[allow(dead_code)] // Used in #[cfg(target_os = "linux")] Filesystem impl
+    fn metadata_size_sync(&self, stored_path: &str) -> Option<u64> {
+        let query = vfs_query_path(stored_path);
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(async {
+            let (backend, relative) = {
+                let vfs = self
+                    .vfs
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let (backend, relative) = vfs.resolve(std::path::Path::new(&query));
+                (Arc::clone(backend), relative)
+            };
+            backend.metadata(&relative).await.ok()
+        })
+        .and_then(|entry| entry.size)
     }
 }
 
@@ -288,51 +340,58 @@ mod linux {
             let parent_u64 = u64::from(parent);
             tracing::debug!(parent = parent_u64, name = %name_str, "lookup");
 
-            // Resolve parent ItemId from inode.
-            let parent_id = {
+            // Resolve the parent inode to its stored VFS path.
+            let parent_path = {
                 let map = self
                     .inode_map
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                map.get_id(parent_u64).cloned()
+                map.path_for(parent_u64).map(ToOwned::to_owned)
             };
 
-            let Some(parent_id) = parent_id else {
+            let Some(parent_path) = parent_path else {
                 reply.error(Errno::ENOENT);
                 return;
             };
 
-            // Build child path and try to resolve it.
-            let child_path = format!("{}/{}", parent_id.0, name_str);
-            match self.metadata_sync(std::path::Path::new(&child_path)) {
-                Ok(entry) => {
-                    let mut map = self
-                        .inode_map
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let child_id = entry.id.clone();
-                    let inode = map.allocate(child_id);
-                    let attr = if entry.is_dir {
-                        FileAttr::directory(inode)
-                    } else {
-                        FileAttr::file(inode, entry.size.unwrap_or(0))
-                    };
-                    let fuse_attr: FuseFileAttr = attr.into();
-                    reply.entry(&Duration::from_secs(1), &fuse_attr, Generation(0));
-                }
-                Err(_) => {
-                    reply.error(Errno::ENOENT);
-                }
-            }
+            // List the parent through the VFS — this merges backend children
+            // with injected child-mount directories — and find the named entry.
+            // Using the listing (rather than a metadata probe) means an injected
+            // synthetic mount directory resolves correctly even though it has no
+            // backing `FileEntry`.
+            let Ok(entries) = self.read_dir_sync(&parent_path) else {
+                reply.error(Errno::ENOENT);
+                return;
+            };
+            let Some(entry) = entries.iter().find(|e| e.name == name_str) else {
+                reply.error(Errno::ENOENT);
+                return;
+            };
+
+            let child_path = super::child_vfs_path(&parent_path, &name_str);
+            let inode = {
+                let mut map = self
+                    .inode_map
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                map.allocate_path(&child_path)
+            };
+            // A directory's size is reported as zero; a file's size is fetched
+            // lazily on read, so report zero here too — the kernel re-queries
+            // via getattr/read.
+            let attr = if entry.is_dir {
+                FileAttr::directory(inode)
+            } else {
+                FileAttr::file(inode, 0)
+            };
+            let fuse_attr: FuseFileAttr = attr.into();
+            reply.entry(&Duration::from_secs(1), &fuse_attr, Generation(0));
         }
 
         fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
             let ino_u64 = u64::from(ino);
-            let map = self
-                .inode_map
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
 
+            // The neutral root is always a directory.
             if ino_u64 == crate::inode::ROOT_INODE {
                 let attr = FileAttr::directory(ino_u64);
                 let fuse_attr: FuseFileAttr = attr.into();
@@ -340,28 +399,41 @@ mod linux {
                 return;
             }
 
-            let Some(id) = map.get_id(ino_u64) else {
-                drop(map);
+            // Resolve the inode to its stored VFS path. An unknown inode is
+            // ENOENT.
+            let path = {
+                let map = self
+                    .inode_map
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                map.path_for(ino_u64).map(ToOwned::to_owned)
+            };
+            let Some(path) = path else {
                 reply.error(Errno::ENOENT);
                 return;
             };
-            let id_str = id.0.clone();
-            drop(map);
 
-            match self.metadata_sync(std::path::Path::new(&id_str)) {
-                Ok(entry) => {
-                    let attr = if entry.is_dir {
-                        FileAttr::directory(ino_u64)
-                    } else {
-                        FileAttr::file(ino_u64, entry.size.unwrap_or(0))
-                    };
-                    let fuse_attr: FuseFileAttr = attr.into();
-                    reply.attr(&Duration::from_secs(1), &fuse_attr);
-                }
-                Err(_) => {
-                    reply.error(Errno::ENOENT);
-                }
+            // Determine whether the path is a directory by listing its parent
+            // through the VFS — this recognises injected synthetic mount
+            // directories, which have no backing `FileEntry`. Fall back to a
+            // direct metadata probe for the file size.
+            let (parent_path, name) = super::split_vfs_path(&path);
+            if let Ok(entries) = self.read_dir_sync(&parent_path)
+                && let Some(entry) = entries.iter().find(|e| e.name == name)
+            {
+                let attr = if entry.is_dir {
+                    FileAttr::directory(ino_u64)
+                } else {
+                    // Resolve the concrete size via the owning backend.
+                    let size = self.metadata_size_sync(&path).unwrap_or(0);
+                    FileAttr::file(ino_u64, size)
+                };
+                let fuse_attr: FuseFileAttr = attr.into();
+                reply.attr(&Duration::from_secs(1), &fuse_attr);
+                return;
             }
+
+            reply.error(Errno::ENOENT);
         }
 
         fn readdir(
@@ -374,44 +446,44 @@ mod linux {
         ) {
             let ino_u64 = u64::from(ino);
 
-            // Resolve the ItemId for this inode. Any inode — root or nested —
-            // is eligible; ENOENT is the correct response for an unknown inode.
-            let id = {
+            // Resolve the inode to its stored VFS path. Any inode — root or
+            // nested — is eligible; ENOENT is correct for an unknown inode.
+            let dir_path = {
                 let map = self
                     .inode_map
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                map.get_id(ino_u64).cloned()
+                map.path_for(ino_u64).map(ToOwned::to_owned)
             };
 
-            let Some(id) = id else {
+            let Some(dir_path) = dir_path else {
                 reply.error(Errno::ENOENT);
                 return;
             };
 
-            // Ask the VFS whether this item has children. A non-directory
-            // (file) will return an empty vec or an error; treat both as
-            // ENOTDIR so the kernel receives the expected error code.
-            let Ok(children) = self.list_children_sync(&id) else {
-                // If the item is a file or the backend is unavailable,
-                // report ENOTDIR — the kernel treats readdir on a
-                // non-directory as ENOTDIR regardless of the underlying
-                // cause.
+            // List the directory through the VFS. `read_dir` already merges
+            // backend children with injected, deduped child-mount directories.
+            // A non-directory (file) yields an error from the backend; treat it
+            // as ENOTDIR, the code the kernel expects for readdir on a file.
+            let Ok(entries) = self.read_dir_sync(&dir_path) else {
                 reply.error(Errno::ENOTDIR);
                 return;
             };
 
-            // Allocate stable inodes for every child before emitting any
-            // directory entries. This ensures that a kernel lookup() on a
-            // name seen in readdir always resolves to the same inode.
-            let child_inodes: Vec<(u64, &cascade_engine::types::FileEntry)> = {
+            // Allocate a stable inode for each child path before emitting any
+            // directory entry, so a later lookup() on a seen name resolves to
+            // the same inode.
+            let child_inodes: Vec<(u64, &DirEntry)> = {
                 let mut map = self
                     .inode_map
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                children
+                entries
                     .iter()
-                    .map(|entry| (map.allocate(entry.id.clone()), entry))
+                    .map(|entry| {
+                        let child_path = super::child_vfs_path(&dir_path, &entry.name);
+                        (map.allocate_path(&child_path), entry)
+                    })
                     .collect()
             };
 
@@ -467,7 +539,7 @@ mod linux {
                     .inode_map
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                map.get_id(ino_u64).map(|id| id.0.clone())
+                map.path_for(ino_u64).map(ToOwned::to_owned)
             };
 
             let Some(path) = path else {
@@ -475,7 +547,7 @@ mod linux {
                 return;
             };
 
-            match self.read_sync(std::path::Path::new(&path), offset, size) {
+            match self.read_sync(&path, offset, size) {
                 Ok(data) => reply.data(&data),
                 Err(_) => reply.error(Errno::EIO),
             }
@@ -671,8 +743,8 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Nested directory traversal — drive FuseOps::list_children_sync
-    // directly (no kernel / FUSE mount required).
+    // Nested directory traversal — drive the VFS listing the readdir handler
+    // wraps directly (no kernel / FUSE mount required).
     // -----------------------------------------------------------------------
 
     /// In-memory backend for tests. Stores `FileEntry` records indexed by
@@ -773,6 +845,14 @@ mod tests {
                 &self,
                 parent_native_id: &str,
             ) -> anyhow::Result<Vec<FileEntry>> {
+                // The VFS root sub-path is the empty string; for this backend
+                // that denotes its `root` container, mirroring how a real
+                // backend treats an empty relative path as its own root.
+                let parent_native_id = if parent_native_id.is_empty() {
+                    "root"
+                } else {
+                    parent_native_id
+                };
                 let parent_full = ItemId::new(&self.id, parent_native_id).0;
                 let entries = self
                     .entries
@@ -826,12 +906,12 @@ mod tests {
         FuseOps::new_with_vfs(root_id, vfs)
     }
 
-    /// Helper: call `list_children_by_id` via the `VfsTree` directly.
+    /// Helper: list a directory's children via the owning backend directly.
     ///
-    /// The tests below exercise the VFS → backend path that `list_children_sync`
+    /// The tests below exercise the VFS → backend path that `read_dir_sync`
     /// wraps. Using an async helper here avoids the "cannot `block_on` inside a
-    /// Tokio runtime" panic that would occur if `list_children_sync` were called
-    /// from within a `#[tokio::test]` context.
+    /// Tokio runtime" panic that the synchronous `read_dir_sync` would hit if
+    /// called from within a `#[tokio::test]` context.
     ///
     /// The `Arc<dyn Backend>` is cloned while holding the read lock so that the
     /// guard is dropped before the async `list_children` call, preventing an
@@ -911,38 +991,48 @@ mod tests {
         Ok(())
     }
 
-    /// Inode allocation is idempotent: querying the same `ItemId` twice always
-    /// yields the same inode number.
+    /// Build a standalone `VfsTree` (not behind a lock) with the nested
+    /// `FakeBackend` shape, so tests can `await read_dir` without holding a
+    /// `RwLockReadGuard` across the await point.
+    fn make_nested_tree() -> VfsTree {
+        use cascade_engine::types::FileEntry;
+        use fake_backend::FakeBackend;
+
+        let backend = std::sync::Arc::new(FakeBackend::new("fake"));
+        let root_id = ItemId::new("fake", "root");
+        let dir_id = ItemId::new("fake", "dir");
+        let subdir_id = ItemId::new("fake", "subdir");
+        let file_id = ItemId::new("fake", "file");
+
+        backend.insert(FileEntry::dir(dir_id.clone(), root_id, "dir".to_string()));
+        backend.insert(FileEntry::dir(
+            subdir_id.clone(),
+            dir_id,
+            "subdir".to_string(),
+        ));
+        backend.insert(FileEntry::file(file_id, subdir_id, "file.txt".to_string()));
+        VfsTree::new(backend)
+    }
+
+    /// Inode allocation by VFS path is idempotent: allocating the same child
+    /// path twice always yields the same inode number. Drives the same VFS
+    /// `read_dir` call the readdir handler uses, then the `child_vfs_path` +
+    /// `allocate_path` handoff.
     #[tokio::test]
     async fn inode_allocation_is_idempotent_across_list_calls() -> anyhow::Result<()> {
-        let ops = make_nested_ops();
-        let root_id = ItemId::new("fake", "root");
+        let tree = make_nested_tree();
+        let mut map = InodeMap::new(ItemId::new("fake", "root"));
 
-        // First call — allocates.
-        let first = list_children(&ops, &root_id).await?;
-        let first_id = first
+        let children = tree.read_dir(std::path::Path::new("")).await?;
+        let first_name = children
             .into_iter()
             .next()
             .ok_or_else(|| anyhow::anyhow!("expected at least one child"))?
-            .id;
-        let inode_first = ops
-            .inode_map
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .allocate(first_id.clone());
+            .name;
+        let child_path = child_vfs_path("/", &first_name);
 
-        // Second call — same ItemId must yield the same inode.
-        let second = list_children(&ops, &root_id).await?;
-        let second_id = second
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("expected at least one child"))?
-            .id;
-        let inode_second = ops
-            .inode_map
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .allocate(second_id);
+        let inode_first = map.allocate_path(&child_path);
+        let inode_second = map.allocate_path(&child_path);
 
         assert_eq!(
             inode_first, inode_second,
@@ -959,22 +1049,81 @@ mod tests {
     /// A child inode must differ from root.
     #[tokio::test]
     async fn child_inodes_are_distinct_from_root() -> anyhow::Result<()> {
-        let ops = make_nested_ops();
-        let root_id = ItemId::new("fake", "root");
-        let children = list_children(&ops, &root_id).await?;
+        let tree = make_nested_tree();
+        let mut map = InodeMap::new(ItemId::new("fake", "root"));
 
-        let child_id = children
+        let children = tree.read_dir(std::path::Path::new("")).await?;
+        let first_name = children
             .into_iter()
             .next()
             .ok_or_else(|| anyhow::anyhow!("expected at least one child"))?
-            .id;
-        let child_inode = ops
-            .inode_map
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .allocate(child_id);
+            .name;
+        let child_path = child_vfs_path("/", &first_name);
+        let child_inode = map.allocate_path(&child_path);
 
         assert_ne!(child_inode, crate::inode::ROOT_INODE);
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Path-derivation helpers — pure functions, host-compilable on every OS.
+    // These mirror the WebDAV `child_mount_dir_names` first-segment + dedup
+    // expectations at the VFS-path level the FUSE inode model uses.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn vfs_query_path_maps_root_to_empty() {
+        assert_eq!(vfs_query_path("/"), "");
+    }
+
+    #[test]
+    fn vfs_query_path_strips_leading_slash() {
+        assert_eq!(vfs_query_path("/work"), "work");
+        assert_eq!(vfs_query_path("/work/projects"), "work/projects");
+    }
+
+    #[test]
+    fn vfs_query_path_passes_through_unprefixed() {
+        // A path already in VFS form (no leading slash) is returned verbatim.
+        assert_eq!(vfs_query_path("work/projects"), "work/projects");
+    }
+
+    #[test]
+    fn child_vfs_path_of_root_is_bare_name() {
+        // A child of the neutral root has no parent segment.
+        assert_eq!(child_vfs_path("/", "work"), "work");
+    }
+
+    #[test]
+    fn child_vfs_path_joins_parent_and_name() {
+        assert_eq!(child_vfs_path("/work", "projects"), "work/projects");
+        assert_eq!(
+            child_vfs_path("work/projects", "file.txt"),
+            "work/projects/file.txt"
+        );
+    }
+
+    #[test]
+    fn split_vfs_path_top_level_parent_is_root() {
+        let (parent, name) = split_vfs_path("work");
+        assert_eq!(parent, "/");
+        assert_eq!(name, "work");
+    }
+
+    #[test]
+    fn split_vfs_path_nested() {
+        let (parent, name) = split_vfs_path("/work/projects/file.txt");
+        assert_eq!(parent, "work/projects");
+        assert_eq!(name, "file.txt");
+    }
+
+    /// Round-trip: splitting a child path then rejoining it reproduces the
+    /// original VFS-form path. This guards the parent/child path arithmetic the
+    /// readdir → lookup handoff relies on.
+    #[test]
+    fn child_then_split_roundtrip() {
+        let child = child_vfs_path("/work", "projects");
+        let (parent, name) = split_vfs_path(&child);
+        assert_eq!(child_vfs_path(&parent, &name), child);
     }
 }

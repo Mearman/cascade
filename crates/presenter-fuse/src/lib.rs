@@ -134,7 +134,9 @@ impl VfsPresenter for FusePresenter {
             .inode_map
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.allocate(item.id);
+        // Bind the item's `ItemId` to its VFS path in one allocation so the
+        // sync bookkeeping view and the path-keyed read view share an inode.
+        map.allocate_id_with_path(item.id, &item.path);
         Ok(())
     }
 

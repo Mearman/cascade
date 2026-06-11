@@ -103,51 +103,61 @@ impl VfsTree {
         (&self.root, path.to_path_buf())
     }
 
+    /// Resolve `path` to the owning backend, its backend-relative sub-path, and
+    /// the synthetic child-mount directory names to inject under it.
+    ///
+    /// This is the synchronous half of [`Self::read_dir`], split out so a
+    /// presenter holding the tree behind a synchronous lock can compute the
+    /// routing and injection set, release the lock, and then await
+    /// `Backend::list_children` without holding the guard across the await
+    /// point. The returned backend `Arc` is cloned so it outlives the lock.
+    ///
+    /// The injected names follow the shared `WebDAV`/`NFS` rule: any child mount
+    /// whose prefix has `path` as its direct parent contributes its final path
+    /// segment as a directory name. Non-UTF-8 paths are rejected explicitly
+    /// rather than silently listing the wrong directory.
+    pub fn resolve_listing(
+        &self,
+        path: &Path,
+    ) -> anyhow::Result<(Arc<dyn Backend>, String, Vec<String>)> {
+        let (backend, backend_path) = self.resolve(path);
+        let backend_path_str = backend_path
+            .to_str()
+            .ok_or_else(|| {
+                anyhow::anyhow!("path contains non-UTF-8 bytes: {}", backend_path.display())
+            })?
+            .to_owned();
+
+        let mut mount_names = Vec::new();
+        for (child_prefix, _) in &self.children {
+            if child_prefix.parent() == Some(path)
+                && let Some(mount_dir_name) = child_prefix.file_name()
+            {
+                mount_names.push(mount_dir_name.to_string_lossy().into_owned());
+            }
+        }
+
+        Ok((Arc::clone(backend), backend_path_str, mount_names))
+    }
+
     /// List directory entries, merging backend content with child mount points.
     ///
     /// Resolves `path` to the owning backend and backend-relative sub-path, then
     /// calls `Backend::list_children` with that sub-path so only the immediate
     /// children of the requested directory are fetched, not the entire backend
-    /// tree. The child-mount injection loop below is unchanged from the shared
-    /// `WebDAV`/`NFS` pattern: any child mount whose prefix has `path` as its
+    /// tree. The injected child-mount directories follow the shared
+    /// `WebDAV`/`NFS` shadow rule: any child mount whose prefix has `path` as its
     /// direct parent is injected as a synthetic directory entry, shadowing a
     /// same-named real entry if one exists.
+    ///
+    /// The routing and injection set are computed by [`Self::resolve_listing`]
+    /// and merged by the free [`merge_listing`] function, so a presenter that
+    /// must release a synchronous lock before awaiting can reproduce this exact
+    /// behaviour without duplicating the merge logic.
     pub async fn read_dir(&self, path: &Path) -> anyhow::Result<Vec<DirEntry>> {
-        let mut entries = Vec::new();
-
-        // Resolve the requested path to its owning backend and the
-        // backend-relative sub-path.  Non-UTF-8 paths are rejected
-        // explicitly rather than silently substituting an empty string,
-        // which would silently list the wrong directory.
-        let (backend, backend_path) = self.resolve(path);
-        let backend_path_str = backend_path.to_str().ok_or_else(|| {
-            anyhow::anyhow!("path contains non-UTF-8 bytes: {}", backend_path.display())
-        })?;
-
-        // Fetch immediate children from the owning backend, scoped to the
-        // resolved backend-relative directory.
-        let children = backend.list_children(backend_path_str).await?;
-        for entry in children {
-            entries.push(DirEntry {
-                name: entry.name,
-                is_dir: entry.is_dir,
-            });
-        }
-
-        // Inject child mount point directories if this path is their parent.
-        // (Byte-identical to the WebDAV/NFS shadow rule.)
-        for (child_prefix, _) in &self.children {
-            if child_prefix.parent() == Some(path)
-                && let Some(mount_dir_name) = child_prefix.file_name()
-            {
-                let mount_dir_name = mount_dir_name.to_string_lossy();
-                if !entries.iter().any(|e| e.name == mount_dir_name) {
-                    entries.push(DirEntry::dir(mount_dir_name.to_string()));
-                }
-            }
-        }
-
-        Ok(entries)
+        let (backend, backend_path, mount_names) = self.resolve_listing(path)?;
+        let children = backend.list_children(&backend_path).await?;
+        Ok(merge_listing(children, &mount_names))
     }
 
     /// Move a file, handling cross-backend transfers.
@@ -280,6 +290,37 @@ impl VfsTree {
             .clone();
         derive_sync_cursor(backend.as_ref(), parent_id.native_id()).await
     }
+}
+
+/// Merge a backend's immediate children with injected child-mount directory
+/// names, applying the shadow rule.
+///
+/// `backend_children` are the real entries returned by `Backend::list_children`;
+/// `mount_names` are the synthetic child-mount directory names from
+/// [`VfsTree::resolve_listing`]. Each mount name is appended as a directory
+/// entry only if no real entry already carries that name, so an injected mount
+/// directory shadows (rather than duplicates) a same-named backend entry.
+///
+/// Free function (rather than a `VfsTree` method) so a presenter that releases a
+/// synchronous lock before awaiting `list_children` can produce a listing
+/// identical to [`VfsTree::read_dir`] without re-implementing the merge.
+#[must_use]
+pub fn merge_listing(backend_children: Vec<FileEntry>, mount_names: &[String]) -> Vec<DirEntry> {
+    let mut entries: Vec<DirEntry> = backend_children
+        .into_iter()
+        .map(|entry| DirEntry {
+            name: entry.name,
+            is_dir: entry.is_dir,
+        })
+        .collect();
+
+    for mount_dir_name in mount_names {
+        if !entries.iter().any(|e| &e.name == mount_dir_name) {
+            entries.push(DirEntry::dir(mount_dir_name.clone()));
+        }
+    }
+
+    entries
 }
 
 /// Compute the cursor for a backend's view of a parent directory.
