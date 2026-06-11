@@ -596,6 +596,67 @@ async fn propfind_root_lists_custom_mount_directory() {
     server.stop().unwrap();
 }
 
+/// A backend mounted *inside* another backend's subtree (e.g. `work/projects`)
+/// must appear when listing the parent directory (`/work`) — the nested-mount
+/// shadowing the design promises, now wired through the `WebDAV` `PROPFIND`
+/// path (previously only `NFS` injected child mount dirs).
+#[tokio::test]
+async fn propfind_lists_nested_mount_in_parent_directory() {
+    let root_be: Arc<dyn Backend> = Arc::new(RecordingBackend::new("root-be"));
+    let proj_be: Arc<dyn Backend> = Arc::new(RecordingBackend::new("proj-be"));
+    let mounts = mount_table(vec![
+        (PathBuf::from("work/projects"), proj_be.clone()),
+        (PathBuf::new(), root_be.clone()),
+    ]);
+
+    // Seed the at-root backend's "work" directory at its VFS path so PROPFIND
+    // /work finds a real target whose listing the mount dir is injected into.
+    let work = VfsItem {
+        id: ItemId::new("root-be", "work"),
+        parent_id: ItemId::new("root-be", "root"),
+        name: "work".to_string(),
+        path: "work".to_string(),
+        is_dir: true,
+        size: None,
+        mod_time: None,
+        cache_state: CacheState::Online,
+        mime_type: None,
+    };
+    let mut seed = HashMap::new();
+    seed.insert(work.id.0.clone(), work);
+
+    let server = WebDavServer::start(
+        "127.0.0.1:0",
+        Arc::new(RwLock::new(seed)),
+        tempfile::tempdir().unwrap().path().to_path_buf(),
+        backend_list(vec![root_be.clone(), proj_be.clone()]),
+        mounts,
+        None,
+    )
+    .await
+    .unwrap();
+    let port = server.port();
+
+    let body = reqwest::Client::new()
+        .request(
+            reqwest::Method::from_bytes(b"PROPFIND").unwrap(),
+            format!("http://127.0.0.1:{port}/work"),
+        )
+        .header("Depth", "1")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    assert!(
+        body.contains("/work/projects"),
+        "nested mount 'projects' must appear under /work; body: {body}"
+    );
+    server.stop().unwrap();
+}
+
 #[tokio::test]
 async fn propfind_root_lists_at_root_children_inline() {
     // An at-root backend's root children appear directly under "/", with no

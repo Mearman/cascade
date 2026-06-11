@@ -296,6 +296,37 @@ fn uuid_v4() -> String {
 }
 
 /// Handle `PROPFIND` — return `WebDAV` XML metadata for a resource.
+/// Immediate child directory names contributed by mount points under `dir`
+/// (a normalised VFS path — `"/"` or `"/work"`).
+///
+/// A mount at `work/projects` yields `work` when listing `/` and `projects`
+/// when listing `/work`, so a nested mount appears in its parent's directory
+/// listing at the correct level (matching `VfsTree::read_dir`'s injection on the
+/// NFS path). The empty-prefix at-root backend contributes no synthetic name.
+fn child_mount_dir_names(
+    dir: &str,
+    mounts: &[(PathBuf, Arc<dyn cascade_engine::backend::Backend>)],
+) -> Vec<String> {
+    let mut names = std::collections::BTreeSet::new();
+    for (prefix, _) in mounts {
+        let p = prefix.to_string_lossy();
+        let p = p.trim_start_matches('/').trim_end_matches('/');
+        if p.is_empty() {
+            continue;
+        }
+        let full = format!("/{p}");
+        let rest = if dir == "/" {
+            Some(full.trim_start_matches('/'))
+        } else {
+            full.strip_prefix(&format!("{dir}/"))
+        };
+        if let Some(seg) = rest.and_then(|r| r.split('/').find(|s| !s.is_empty())) {
+            names.insert(seg.to_string());
+        }
+    }
+    names.into_iter().collect()
+}
+
 async fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> Response {
     let depth = headers
         .get("Depth")
@@ -314,20 +345,9 @@ async fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> R
         // directories) from the at-root backend (its children listed inline).
         let (mount_names, at_root_backend_id) = {
             let mounts = state.mounts.read().await;
-            let mut names: Vec<String> = mounts
-                .iter()
-                .filter_map(|(prefix, _)| {
-                    let s = prefix.to_string_lossy();
-                    if s.is_empty() {
-                        None
-                    } else {
-                        Some(s.into_owned())
-                    }
-                })
-                .collect::<std::collections::HashSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>();
-            names.sort();
+            // First-segment names, so a nested mount (work/projects) shows as
+            // "work" here and "projects" only when listing "/work".
+            let names = child_mount_dir_names("/", &mounts);
             let at_root = mounts
                 .iter()
                 .find(|(prefix, _)| prefix.as_os_str().is_empty())
@@ -437,7 +457,7 @@ async fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> R
     // items while the DB has hundreds. Use `state.expanded` as the
     // authoritative "this directory's children are fully cached"
     // signal, populating from DB or API on first access per session.
-    let children: Vec<VfsItem> = if depth == "0" {
+    let mut children: Vec<VfsItem> = if depth == "0" {
         Vec::new()
     } else if let Some(ref t) = target {
         let target_id = t.id.0.clone();
@@ -509,6 +529,38 @@ async fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> R
             cached
         }
     };
+
+    // Inject immediate child mount-point directories so a nested mount appears
+    // in its parent's listing. A real child of the same name is shadowed by the
+    // mount (one entry suffices for the listing; routing resolves the owner).
+    if depth != "0" {
+        let names = {
+            let mounts = state.mounts.read().await;
+            child_mount_dir_names(&normalised, &mounts)
+        };
+        if !names.is_empty() {
+            let existing: std::collections::HashSet<String> =
+                children.iter().map(|c| c.name.clone()).collect();
+            let base = normalised.trim_start_matches('/').trim_end_matches('/');
+            for name in names {
+                if existing.contains(&name) {
+                    continue;
+                }
+                let vfs_path = format!("{base}/{name}");
+                children.push(VfsItem {
+                    id: ItemId(format!("__mount__:{vfs_path}")),
+                    parent_id: ItemId(format!("__mount__:{base}")),
+                    name,
+                    path: vfs_path,
+                    is_dir: true,
+                    size: None,
+                    mod_time: None,
+                    cache_state: cascade_engine::types::CacheState::Online,
+                    mime_type: None,
+                });
+            }
+        }
+    }
 
     // Build response. Hide any macOS metadata files that slipped into
     // the cache from before the upload guard existed; Finder will neither
