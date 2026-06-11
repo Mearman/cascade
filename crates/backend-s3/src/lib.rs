@@ -839,6 +839,14 @@ impl Backend for S3Backend {
         &self.config.bucket
     }
 
+    /// S3 objects hang off a synthetic `/` root parent (object keys are
+    /// flat), so the backend's top-level entries parent to
+    /// `ItemId::new(self.id(), "/")` rather than the conventional `root`
+    /// sentinel.
+    fn root_native_id(&self) -> &'static str {
+        "/"
+    }
+
     async fn quota(&self) -> anyhow::Result<Option<Quota>> {
         Ok(None)
     }

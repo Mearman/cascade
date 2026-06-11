@@ -39,14 +39,7 @@ use crate::portable::native::{SqliteStorage, StdFileSystem, TokioRuntimeHandle};
 use crate::portable::{FileSystem, StateStorage};
 use crate::presenter::VfsPresenter;
 use crate::sync::runner::{MountedRunnerBackend, SyncRunner};
-use crate::vfs::VfsTree;
-
-/// Backend id of the neutral VFS root.
-///
-/// The root is a synthetic [`NullBackend`] that owns no content; it exists only
-/// as the container the configured backends mount beneath. It is never
-/// registered in the state database and never appears in `list_backends`.
-const NEUTRAL_ROOT_ID: &str = "__cascade_root__";
+use crate::vfs::{NEUTRAL_ROOT_ID, VfsTree};
 
 /// Configuration for creating an Engine instance.
 pub struct EngineConfig {

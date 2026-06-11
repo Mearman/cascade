@@ -8,6 +8,28 @@ use sha2::{Digest, Sha256};
 use crate::backend::Backend;
 use crate::types::{Change, DirEntry, FileEntry, FileId, ItemId, SyncCursor};
 
+/// Backend id of the neutral VFS root.
+///
+/// The root is a synthetic [`NullBackend`](crate::backend::NullBackend) that
+/// owns no content; it exists only as the container the configured backends
+/// mount beneath. It is never registered in the state database and never
+/// appears in `list_backends`. The engine constructs the tree's root with this
+/// id, and the sync runner stamps it as the `parent_id` of the synthetic
+/// mount-point directories it hydrates into the presenter, so both halves agree
+/// on a single neutral-root identity.
+pub const NEUTRAL_ROOT_ID: &str = "__cascade_root__";
+
+/// The [`ItemId`] of the neutral root's synthetic container.
+///
+/// Top-level mount-point directories (a backend mounted directly under the
+/// neutral root) carry this as their `parent_id`, marking them as the neutral
+/// root's children. The native id half is the conventional `root` sentinel the
+/// default `Backend::is_root_native_id` recognises.
+#[must_use]
+pub fn neutral_root_item_id() -> ItemId {
+    ItemId::new(NEUTRAL_ROOT_ID, "root")
+}
+
 /// VFS tree that routes operations to the correct backend by longest-prefix match.
 pub struct VfsTree {
     /// The root backend — handles paths not covered by any child.

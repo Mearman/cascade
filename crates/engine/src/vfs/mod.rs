@@ -2,4 +2,4 @@
 
 pub mod tree;
 
-pub use tree::{VfsTree, derive_sync_cursor};
+pub use tree::{NEUTRAL_ROOT_ID, VfsTree, derive_sync_cursor, neutral_root_item_id};

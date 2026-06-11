@@ -15,7 +15,7 @@ use crate::portable::{FileSystem, RuntimeHandle, StateStorage};
 use crate::presenter::VfsPresenter;
 use crate::sync::conflict::{ConflictCheck, check_conflict, conflict_name};
 use crate::sync::mount_path::{apply_mount_prefix, strip_mount_prefix};
-use crate::types::{CacheState, Change, FileEntry, FileId, VfsItem};
+use crate::types::{CacheState, Change, FileEntry, FileId, ItemId, VfsItem};
 
 /// Default poll interval when the backend doesn't specify one.
 #[allow(unknown_lints, clippy::duration_suboptimal_units)]
@@ -259,7 +259,7 @@ impl<R: RuntimeHandle> SyncRunner<R> {
     /// byte-identical to the pre-refactor mount-relative path.
     ///
     /// `Deleted` carries no surviving entry to re-path: deletion is keyed on
-    /// the stable [`ItemId`](crate::types::ItemId), which the mount prefix never
+    /// the stable [`ItemId`], which the mount prefix never
     /// touches.
     async fn apply_changes(
         &self,
@@ -657,51 +657,45 @@ impl<R: RuntimeHandle> SyncRunner<R> {
         flushed
     }
 
-    /// Hydrate the presenter with all existing items from the state DB.
-    /// Called once after initial sync so the presenter has a complete
-    /// view even when no new changes were detected.
+    /// Hydrate the presenter with the existing mount layout from the state DB.
+    ///
+    /// Called once after the initial sync so a cold restart shows the same view
+    /// the lazy `read_dir`/`PROPFIND` path would build, without waiting for a new
+    /// change to arrive. Two things are surfaced for each configured mount:
+    ///
+    /// 1. The mount's top-level entries — the immediate children of the backend's
+    ///    declared root container ([`Backend::root_native_id`]), each carrying its
+    ///    already-stored, mount-prefixed [`FileEntry::path`]. There is no
+    ///    `{backend}:root` literal or most-common-parent heuristic: the backend
+    ///    names its own root container.
+    /// 2. The neutral root's own child — the synthetic mount-point directory for
+    ///    a backend mounted directly beneath the neutral root (a single-segment
+    ///    mount prefix), mirroring the directory [`VfsTree::read_dir`](crate::vfs::VfsTree::read_dir) injects
+    ///    lazily so the mount point is visible from a cold start even when the
+    ///    backend holds no files yet. A backend mounted at `/` (the empty prefix)
+    ///    is the root itself and injects no mount-point directory; a nested mount
+    ///    (a multi-segment prefix) is the child of another backend's subtree, not
+    ///    of the neutral root, so `read_dir` injects it lazily and hydration
+    ///    leaves it alone.
+    ///
+    /// Deeper directories stay lazy — presenters expand them on demand.
+    ///
+    /// The mount table ([`Self::backends`]) is the single source of truth for the
+    /// prefix and root id, the same table the router resolves on, so hydration
+    /// cannot disagree with routing about where a backend lives.
     async fn hydrate_presenter(&self) -> anyhow::Result<()> {
-        // Only hydrate root-level children for each backend.
-        // Deeper directories are loaded on demand by the presenter
-        // when PROPFIND requests them.
-        let backends = self
-            .storage
-            .list_backends()
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut total = 0;
-        for backend in &backends {
-            let root_id = format!("{}:root", backend.id);
-            // Try the "root" alias first, then discover the real root ID.
-            let mut entries = self
+        for mounted in &self.backends {
+            let backend = mounted.backend.as_ref();
+            let root_id = ItemId::new(backend.id(), backend.root_native_id());
+
+            // The mount's top-level entries: direct children of the backend's
+            // root container, already stored at their full mount-prefixed paths.
+            let entries = self
                 .storage
-                .list_children(&root_id)
+                .list_children(&root_id.0)
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            if entries.is_empty() {
-                // The backend may use a real folder ID instead of "root".
-                // Find it by looking for the most common parent_id.
-                let all = self
-                    .storage
-                    .list_all_files()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-                let prefix = format!("{}:", backend.id);
-                let mut counts: std::collections::HashMap<String, usize> =
-                    std::collections::HashMap::new();
-                for entry in &all {
-                    if entry.id.0.starts_with(&prefix) && entry.parent_id.0.starts_with(&prefix) {
-                        *counts.entry(entry.parent_id.0.clone()).or_insert(0) += 1;
-                    }
-                }
-                if let Some((real_root, _)) = counts.into_iter().max_by_key(|(_, c)| *c) {
-                    entries = self
-                        .storage
-                        .list_children(&real_root)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
-                }
-            }
             for entry in &entries {
                 let item: VfsItem = entry.clone().into();
                 if let Err(e) = self.presenter.upsert_item(item).await {
@@ -709,10 +703,60 @@ impl<R: RuntimeHandle> SyncRunner<R> {
                 }
             }
             total += entries.len();
+
+            // The neutral root's child: the synthetic mount-point directory.
+            // Inject it exactly once per top-level mount so the mount point shows
+            // on a cold start regardless of content.
+            if let Some(mount_dir) = mount_point_item(&mounted.mount_prefix, &root_id) {
+                if let Err(e) = self.presenter.upsert_item(mount_dir).await {
+                    tracing::debug!(prefix = %mounted.mount_prefix.display(), error = %e, "failed to hydrate mount point");
+                } else {
+                    total += 1;
+                }
+            }
         }
         tracing::info!(count = total, "presenter hydrated from DB");
         Ok(())
     }
+}
+
+/// Build the synthetic mount-point directory a top-level mount contributes to
+/// the neutral root, or `None` when the mount contributes no such directory.
+///
+/// A mount-point directory exists only for a backend mounted directly beneath
+/// the neutral root — a single-segment prefix such as `personal`. Its
+/// `parent_id` is the neutral root's container so presenters list it under the
+/// absolute root; its `id` is the backend's root container so a request that
+/// descends into it routes straight to the owning backend; and its `path` is the
+/// mount prefix itself.
+///
+/// Returns `None` for:
+/// - the empty prefix (a backend mounted at `/`), which *is* the root rather
+///   than a directory under it, so it injects nothing; and
+/// - a multi-segment prefix (a nested mount), whose mount-point directory is a
+///   child of another backend's subtree — [`VfsTree::read_dir`](crate::vfs::VfsTree::read_dir) injects that one
+///   lazily into the parent backend's listing, so eager hydration must not also
+///   surface it under the neutral root.
+fn mount_point_item(prefix: &Path, root_id: &ItemId) -> Option<VfsItem> {
+    let mut components = prefix.components();
+    let first = components.next()?;
+    // A nested mount has a further component beyond the first; its mount-point
+    // directory belongs to the parent backend's subtree, not the neutral root.
+    if components.next().is_some() {
+        return None;
+    }
+    let name = first.as_os_str().to_string_lossy().into_owned();
+    Some(VfsItem {
+        id: root_id.clone(),
+        parent_id: crate::vfs::neutral_root_item_id(),
+        name,
+        path: prefix.to_string_lossy().into_owned(),
+        is_dir: true,
+        size: None,
+        mod_time: None,
+        cache_state: CacheState::Online,
+        mime_type: None,
+    })
 }
 
 /// Match a glob pattern against a path string.
@@ -815,16 +859,22 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     /// A presenter that records calls for testing.
+    ///
+    /// `upserts` keeps only the item names for the many existing assertions that
+    /// match on name; `upsert_items` keeps the whole [`VfsItem`] so tests that
+    /// need the assembled path, parent, or id can inspect it.
     #[derive(Default)]
     struct MockPresenter {
         upserts: std::sync::Mutex<Vec<String>>,
+        upsert_items: std::sync::Mutex<Vec<VfsItem>>,
         deletes: std::sync::Mutex<Vec<String>>,
     }
 
     #[async_trait]
     impl VfsPresenter for MockPresenter {
         async fn upsert_item(&self, item: VfsItem) -> anyhow::Result<()> {
-            self.upserts.lock().unwrap().push(item.name);
+            self.upserts.lock().unwrap().push(item.name.clone());
+            self.upsert_items.lock().unwrap().push(item);
             Ok(())
         }
         async fn delete_item(&self, id: &ItemId) -> anyhow::Result<()> {
@@ -1702,7 +1752,10 @@ mod tests {
 
         let presenter = Arc::new(MockPresenter::default());
         let config = Arc::new(ConfigResolver::new(PathBuf::from("/tmp/hydrate")));
-        let runner = make_native_runner(db.clone(), vec![], presenter.clone(), config);
+        // The backend is mounted at `/` (empty prefix), so no mount-point
+        // directory is injected — the at-root backend *is* the root.
+        let runner =
+            make_native_runner_mounted(db.clone(), vec![scr_mount()], presenter.clone(), config);
 
         runner.hydrate_presenter().await.unwrap();
 
@@ -1711,6 +1764,163 @@ mod tests {
         assert!(upserts.contains(&"folder-a".to_string()));
         assert!(upserts.contains(&"file-b.txt".to_string()));
         assert!(!upserts.contains(&"nested.txt".to_string()));
+    }
+
+    /// A backend mounted at a single-segment prefix surfaces its root children at
+    /// their stored mount-prefixed paths AND a synthetic mount-point directory
+    /// for the neutral root — injected exactly once, parented to the neutral
+    /// root, with the backend's root container as its id so a descent routes
+    /// straight to the backend.
+    #[tokio::test]
+    async fn hydrate_presenter_injects_top_level_mount_directory() {
+        let db = Arc::new(StateDb::open_in_memory().unwrap());
+        db.register_backend("scr", "scripted", "Scripted", Some("personal"), None)
+            .unwrap();
+        // A root child stored at its full mount-prefixed path, exactly as the
+        // sync runner's path assembly would have written it.
+        let child = FileEntry::file(
+            ItemId::new("scr", "f"),
+            ItemId::new("scr", "root"),
+            "report.txt".into(),
+        )
+        .with_path("personal/report.txt".into());
+        db.upsert_file(&child).unwrap();
+
+        let presenter = Arc::new(MockPresenter::default());
+        let config = Arc::new(ConfigResolver::new(PathBuf::from("/tmp/hydrate-mount")));
+        let runner = make_native_runner_mounted(
+            db.clone(),
+            vec![scr_mount_at("personal")],
+            presenter.clone(),
+            config,
+        );
+
+        runner.hydrate_presenter().await.unwrap();
+
+        let items = presenter.upsert_items.lock().unwrap();
+        // The root child carries its stored mount-prefixed path verbatim.
+        let report = items
+            .iter()
+            .find(|i| i.name == "report.txt")
+            .expect("root child hydrated");
+        assert_eq!(report.path, "personal/report.txt");
+
+        // Exactly one synthetic mount-point directory, parented to the neutral
+        // root, named and pathed by the mount prefix, ided by the backend root.
+        let mount_dirs: Vec<&VfsItem> = items
+            .iter()
+            .filter(|i| i.parent_id == crate::vfs::neutral_root_item_id())
+            .collect();
+        assert_eq!(mount_dirs.len(), 1, "exactly one mount-point directory");
+        let mount_dir = mount_dirs[0];
+        assert_eq!(mount_dir.name, "personal");
+        assert_eq!(mount_dir.path, "personal");
+        assert!(mount_dir.is_dir);
+        assert_eq!(mount_dir.id, ItemId::new("scr", "root"));
+    }
+
+    /// A nested mount (multi-segment prefix) is a child of another backend's
+    /// subtree, so `VfsTree::read_dir` injects its mount-point directory lazily.
+    /// Hydration must not also surface it under the neutral root.
+    #[tokio::test]
+    async fn hydrate_presenter_skips_nested_mount_directory() {
+        let db = Arc::new(StateDb::open_in_memory().unwrap());
+        db.register_backend("scr", "scripted", "Scripted", Some("personal/Nested"), None)
+            .unwrap();
+        let presenter = Arc::new(MockPresenter::default());
+        let config = Arc::new(ConfigResolver::new(PathBuf::from("/tmp/hydrate-nested")));
+        let runner = make_native_runner_mounted(
+            db.clone(),
+            vec![scr_mount_at("personal/Nested")],
+            presenter.clone(),
+            config,
+        );
+
+        runner.hydrate_presenter().await.unwrap();
+
+        let items = presenter.upsert_items.lock().unwrap();
+        assert!(
+            !items
+                .iter()
+                .any(|i| i.parent_id == crate::vfs::neutral_root_item_id()),
+            "nested mount must not inject a neutral-root directory"
+        );
+    }
+
+    /// End-to-end cold restart over a shared state DB: a first runner applies a
+    /// backend's changes (stamping mount-prefixed paths into the DB), then a
+    /// fresh runner over the same DB hydrates a brand-new presenter. The cold
+    /// presenter must show the mount-point directory under the neutral root and
+    /// the backend's root children at their stored mount-prefixed paths — no new
+    /// change had to arrive for the view to reappear.
+    #[tokio::test]
+    async fn restart_hydrates_mount_dir_and_root_children_at_stored_paths() {
+        let db = Arc::new(StateDb::open_in_memory().unwrap());
+        db.register_backend("scr", "scripted", "Scripted", Some("personal"), None)
+            .unwrap();
+
+        // First boot: a runner applies the backend's initial changes. The path
+        // assembly writes the full mount-prefixed paths into the DB.
+        let first_presenter = Arc::new(MockPresenter::default());
+        let first_config = Arc::new(ConfigResolver::new(PathBuf::from("/tmp/restart")));
+        let first = make_native_runner_mounted(
+            db.clone(),
+            vec![scr_mount_at("personal")],
+            first_presenter,
+            first_config,
+        );
+        let dir = FileEntry::dir(
+            ItemId::new("scr", "d"),
+            ItemId::new("scr", "root"),
+            "Documents".into(),
+        );
+        let file = FileEntry::file(
+            ItemId::new("scr", "f"),
+            ItemId::new("scr", "d"),
+            "report.txt".into(),
+        );
+        first
+            .apply_changes(
+                &scr_mount_at("personal"),
+                &[Change::Created(dir), Change::Created(file)],
+            )
+            .await
+            .unwrap();
+        drop(first);
+
+        // Cold restart: a fresh runner over the same DB hydrates a fresh
+        // presenter from the stored paths alone.
+        let cold_presenter = Arc::new(MockPresenter::default());
+        let cold_config = Arc::new(ConfigResolver::new(PathBuf::from("/tmp/restart")));
+        let cold = make_native_runner_mounted(
+            db.clone(),
+            vec![scr_mount_at("personal")],
+            cold_presenter.clone(),
+            cold_config,
+        );
+        cold.hydrate_presenter().await.unwrap();
+
+        let items = cold_presenter.upsert_items.lock().unwrap();
+
+        // The neutral-root mount-point directory is present.
+        let mount_dir = items
+            .iter()
+            .find(|i| i.parent_id == crate::vfs::neutral_root_item_id())
+            .expect("mount-point directory hydrated on restart");
+        assert_eq!(mount_dir.name, "personal");
+        assert_eq!(mount_dir.path, "personal");
+
+        // The backend's root child (the `Documents` directory) is present at its
+        // stored mount-prefixed path. The grandchild `report.txt` stays lazy.
+        let documents = items
+            .iter()
+            .find(|i| i.name == "Documents")
+            .expect("root child hydrated on restart");
+        assert_eq!(documents.path, "personal/Documents");
+        assert!(
+            !items.iter().any(|i| i.name == "report.txt"),
+            "grandchild must not be eagerly hydrated"
+        );
     }
 
     #[tokio::test]

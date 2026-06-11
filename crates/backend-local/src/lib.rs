@@ -216,6 +216,13 @@ impl Backend for LocalBackend {
         &self.display_name
     }
 
+    /// The local backend roots its tree at the filesystem root marker `/`, so
+    /// its top-level entries parent to `ItemId::new(self.id(), "/")` rather than
+    /// the conventional `root` sentinel.
+    fn root_native_id(&self) -> &'static str {
+        "/"
+    }
+
     async fn quota(&self) -> anyhow::Result<Option<Quota>> {
         // Report local disk usage for the root path.
         let available = fs2::available_space(&self.root)?;

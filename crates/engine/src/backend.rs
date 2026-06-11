@@ -189,6 +189,25 @@ pub trait Backend: Send + Sync {
         native_id == "root" || native_id == "/" || native_id.starts_with("__")
     }
 
+    /// The native id of this backend's primary root container — the single
+    /// directory whose immediate children are the backend's top-level entries.
+    ///
+    /// The sync runner uses this when cold-starting the presenter: it lists the
+    /// children of `ItemId::new(self.id(), self.root_native_id())` to hydrate the
+    /// mount's top level, and stamps the same id onto the synthetic mount-point
+    /// directory it injects under the neutral root. Using the backend's declared
+    /// root id keeps hydration free of any `{backend}:root` literal or
+    /// most-common-parent heuristic.
+    ///
+    /// The default is the conventional `root` sentinel, which the cloud backends
+    /// and the in-memory scripted backend parent their top-level entries to. A
+    /// backend whose root container has a different id (the local-filesystem
+    /// backend roots at `/`) overrides this. The returned id must satisfy
+    /// [`Backend::is_root_native_id`].
+    fn root_native_id(&self) -> &'static str {
+        "root"
+    }
+
     /// Recommended poll interval for this backend. Returns `None` if the
     /// backend doesn't support polling (use fixed interval from config).
     async fn poll_interval(&self) -> Option<Duration>;
