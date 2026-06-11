@@ -408,6 +408,8 @@ vfs_path(entry) = join(mount_prefix, parent_vfs_path(entry.parent_id), entry.nam
 
 On the write path (`flush_dirty_files`), the VFS path is stripped back to the native, mount-relative path before calling `backend.upload`. The two helpers `apply_mount_prefix` and `strip_mount_prefix` are strict inverses and the only places the prefix is applied or removed.
 
+The sync runner is not the only producer of item paths. A backend whose `changes()` returns nothing concrete on initial sync (Google Drive returns only its four virtual root views, with all real content fetched lazily) has its tree populated on demand by the WebDAV presenter's `expand_root` / `expand_directory`, which call `backend.list_children` directly. Those expanded children must carry the same mount-prefixed VFS path the sync runner would have stamped, or the presenter renders an href without the mount segment and every `PROPFIND` / `GET` under a non-root mount 404s while the DB-persisted `files.path` desyncs from the cache-manager glob match. So the expansion applies the mount prefix too: `expand_root` resolves the owning mount from the same mount table and sets each child's path to `apply_mount_prefix(prefix, name)`; `expand_directory` joins each child's basename onto the parent item's already-prefixed path. A backend mounted at `"/"` yields the empty prefix, so expanded paths stay byte-identical to the pre-refactor shape.
+
 ```rust
 struct VfsTree {
     /// The root node — handles paths not covered by any child.
