@@ -296,7 +296,7 @@ mod linux {
         Request,
     };
 
-    use super::{FileAttr, FuseOps};
+    use super::{DirEntry, FileAttr, FuseOps};
 
     impl From<FileAttr> for FuseFileAttr {
         fn from(attr: FileAttr) -> Self {
