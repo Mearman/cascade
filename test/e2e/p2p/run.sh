@@ -35,6 +35,11 @@ write_config() {
     cat > "$DIR/config.toml" <<EOF
 [backends.shared]
 type = "p2p"
+# Single-backend node: mount the shared folder at the neutral root so its
+# content appears directly at "/" (uniform-backend-mounts default would place
+# it at "/p2p-shared/"). Serving a single backend at non-root via WebDAV is a
+# tracked follow-up; this test exercises P2P sync, not the mount layout.
+mount = "/"
 
 [mount]
 point = "/data/mount"
@@ -107,7 +112,7 @@ phase5_test_propagation() {
     curl -fsS -X PROPFIND -H "Depth: 1" "$NODE_A_URL/" | head -c 2000
     printf '\n'
 
-    local REMOTE_PATH="/p2p-shared/probe.txt"
+    local REMOTE_PATH="/probe.txt"
     log "phase 5: PUT to node-a$REMOTE_PATH"
     curl -fsS -X PUT \
         -H "Content-Type: text/plain" \
