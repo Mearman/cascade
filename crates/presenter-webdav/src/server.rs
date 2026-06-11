@@ -830,12 +830,14 @@ async fn handle_put(state: &AppState, path: &str, req: Request) -> Response {
         } else {
             vec![]
         };
-        let parent_normalised = if parent_segments.is_empty() {
-            format!("/{backend_id}/")
-        } else {
-            format!("/{backend_id}/{}", parent_segments.join("/"))
-        };
-        let parent_normalised = normalise_path(&parent_normalised);
+        // The parent's full VFS path is the parent of the request path itself,
+        // which already carries the mount prefix. Reconstructing it from
+        // `backend_id` (the old model) breaks whenever a backend's mount name
+        // differs from its id, and matches `item_path` (mount-prefixed) only by
+        // coincidence when they happen to be equal.
+        let parent_normalised = Path::new(&normalised)
+            .parent()
+            .map_or_else(|| "/".to_string(), |p| normalise_path(&p.to_string_lossy()));
 
         // Try in-memory store first.
         let found_in_items = {
@@ -1084,8 +1086,11 @@ async fn handle_mkcol(state: &AppState, path: &str) -> Response {
         // Parent is the backend root.
         Some(cascade_engine::types::FileId(format!("{backend_id}:root")))
     } else {
-        let parent_normalised =
-            normalise_path(&format!("/{backend_id}/{}", parent_segments.join("/")));
+        // Parent of the request path (already mount-prefixed); reconstructing
+        // from `backend_id` breaks when the mount name differs from the id.
+        let parent_normalised = Path::new(&normalised)
+            .parent()
+            .map_or_else(|| "/".to_string(), |p| normalise_path(&p.to_string_lossy()));
         let items = state.items.read().await;
         items
             .values()

@@ -392,6 +392,10 @@ use std::time::Duration;
 struct RecordingBackend {
     id: String,
     uploads: Arc<StdMutex<Vec<String>>>,
+    /// Native id of the parent each `upload` was routed to, so a test can
+    /// assert parent resolution (e.g. a nested file lands under its directory,
+    /// not the backend root).
+    upload_parents: Arc<StdMutex<Vec<String>>>,
     children: HashMap<String, Vec<FileEntry>>,
 }
 
@@ -400,6 +404,7 @@ impl RecordingBackend {
         Self {
             id: id.to_string(),
             uploads: Arc::new(StdMutex::new(Vec::new())),
+            upload_parents: Arc::new(StdMutex::new(Vec::new())),
             children: HashMap::new(),
         }
     }
@@ -448,6 +453,10 @@ impl Backend for RecordingBackend {
             .lock()
             .unwrap()
             .push(path.to_string_lossy().into_owned());
+        self.upload_parents
+            .lock()
+            .unwrap()
+            .push(parent_id.0.clone());
         let name = path
             .file_name()
             .map_or_else(|| "file".to_string(), |n| n.to_string_lossy().into_owned());
@@ -666,6 +675,65 @@ async fn put_routes_to_custom_mount_backend() {
     // stripped (backend-relative path).
     let recorded = uploads.lock().unwrap().clone();
     assert_eq!(recorded, vec!["report.txt".to_string()]);
+    server.stop().unwrap();
+}
+
+/// A PUT into a nested directory under a custom-named mount must resolve the
+/// parent from the mount-prefixed item path, not by reconstructing
+/// `/{backend_id}/...`. With the backend id (`gdrive-personal`) differing from
+/// the mount name (`personal`), the old reconstruction missed the seeded
+/// directory item and fell back to the backend root; this pins it to the
+/// directory.
+#[tokio::test]
+async fn put_nested_under_custom_mount_resolves_parent_not_root() {
+    let backend = Arc::new(RecordingBackend::new("gdrive-personal"));
+    let parents = backend.upload_parents.clone();
+    let backend_dyn: Arc<dyn Backend> = backend;
+    let mounts = mount_table(vec![(PathBuf::from("personal"), backend_dyn.clone())]);
+
+    // Seed a Documents directory at its full mount-prefixed VFS path.
+    let docs = VfsItem {
+        id: ItemId::new("gdrive-personal", "docs"),
+        parent_id: ItemId::new("gdrive-personal", "root"),
+        name: "Documents".to_string(),
+        path: "personal/Documents".to_string(),
+        is_dir: true,
+        size: None,
+        mod_time: None,
+        cache_state: CacheState::Online,
+        mime_type: None,
+    };
+    let mut seed = HashMap::new();
+    seed.insert(docs.id.0.clone(), docs);
+
+    let server = WebDavServer::start(
+        "127.0.0.1:0",
+        Arc::new(RwLock::new(seed)),
+        tempfile::tempdir().unwrap().path().to_path_buf(),
+        backend_list(vec![backend_dyn.clone()]),
+        mounts,
+        None,
+    )
+    .await
+    .unwrap();
+    let port = server.port();
+
+    let resp = reqwest::Client::new()
+        .put(format!(
+            "http://127.0.0.1:{port}/personal/Documents/report.txt"
+        ))
+        .body(b"hi".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+
+    let recorded = parents.lock().unwrap().clone();
+    assert_eq!(
+        recorded,
+        vec!["gdrive-personal:docs".to_string()],
+        "nested PUT must be parented to the Documents dir, not the backend root"
+    );
     server.stop().unwrap();
 }
 
