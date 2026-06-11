@@ -12,7 +12,7 @@ use cascade_engine::cache::manager::{CacheManager, CacheManagerConfig};
 use cascade_engine::db::StateDb;
 use cascade_engine::p2p_bridge::P2pBridge;
 use cascade_engine::portable::native::{SqliteStorage, StdFileSystem, TokioRuntimeHandle};
-use cascade_engine::sync::runner::SyncRunner;
+use cascade_engine::sync::runner::{MountedRunnerBackend, SyncRunner};
 use cascade_engine::types::{CacheState, FileEntry, ItemId};
 use cascade_p2p::P2pEngine;
 use std::sync::Arc;
@@ -110,11 +110,15 @@ async fn sync_runner_with_p2p_bridge() {
 
     let runtime = TokioRuntimeHandle::current();
     let storage = SqliteStorage::new(db.clone(), runtime.clone());
+    // Mount the test backend at the root (empty) prefix.
     let runner = SyncRunner::new(
         Arc::new(storage),
         Arc::new(StdFileSystem),
         runtime,
-        vec![backend],
+        vec![MountedRunnerBackend::new(
+            std::path::PathBuf::new(),
+            backend,
+        )],
         presenter,
         config,
     )

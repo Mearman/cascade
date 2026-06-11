@@ -1,6 +1,6 @@
 //! Sync runner — orchestrates change polling across all backends.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,11 +14,48 @@ use crate::p2p_bridge::P2pBridge;
 use crate::portable::{FileSystem, RuntimeHandle, StateStorage};
 use crate::presenter::VfsPresenter;
 use crate::sync::conflict::{ConflictCheck, check_conflict, conflict_name};
-use crate::types::{CacheState, Change, FileId, VfsItem};
+use crate::sync::mount_path::{apply_mount_prefix, strip_mount_prefix};
+use crate::types::{CacheState, Change, FileEntry, FileId, VfsItem};
 
 /// Default poll interval when the backend doesn't specify one.
 #[allow(unknown_lints, clippy::duration_suboptimal_units)]
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(60);
+
+/// A backend paired with the VFS mount prefix it is mounted at in the tree.
+///
+/// The runner sources both halves from the same `VfsTree` mount table the
+/// router uses ([`VfsTree::children`](crate::vfs::VfsTree::children)), so the
+/// prefix the runner stamps into each item's path cannot drift from the prefix
+/// the router resolves on. A backend mounted at `/` carries the empty prefix,
+/// for which [`apply_mount_prefix`]/[`strip_mount_prefix`] are no-ops and the
+/// VFS path is byte-identical to the backend-relative path.
+#[derive(Clone)]
+pub struct MountedRunnerBackend {
+    /// The VFS prefix the backend is mounted at (empty for a backend at `/`).
+    pub mount_prefix: PathBuf,
+    /// The backend instance.
+    pub backend: Arc<dyn Backend>,
+}
+
+impl MountedRunnerBackend {
+    /// Pair a backend with its VFS mount prefix.
+    #[must_use]
+    pub fn new(mount_prefix: PathBuf, backend: Arc<dyn Backend>) -> Self {
+        Self {
+            mount_prefix,
+            backend,
+        }
+    }
+}
+
+impl std::fmt::Debug for MountedRunnerBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MountedRunnerBackend")
+            .field("mount_prefix", &self.mount_prefix)
+            .field("backend_id", &self.backend.id())
+            .finish()
+    }
+}
 
 /// Orchestrates change polling across all registered backends.
 ///
@@ -32,7 +69,7 @@ pub struct SyncRunner<R: RuntimeHandle> {
     storage: Arc<dyn StateStorage>,
     fs: Arc<dyn FileSystem>,
     runtime: R,
-    backends: Vec<Arc<dyn Backend>>,
+    backends: Vec<MountedRunnerBackend>,
     presenter: Arc<dyn VfsPresenter>,
     config: Arc<ConfigResolver>,
     #[cfg(feature = "p2p")]
@@ -64,7 +101,7 @@ impl<R: RuntimeHandle> SyncRunner<R> {
         storage: Arc<dyn StateStorage>,
         fs: Arc<dyn FileSystem>,
         runtime: R,
-        backends: Vec<Arc<dyn Backend>>,
+        backends: Vec<MountedRunnerBackend>,
         presenter: Arc<dyn VfsPresenter>,
         config: Arc<ConfigResolver>,
     ) -> Self {
@@ -113,18 +150,18 @@ impl<R: RuntimeHandle> SyncRunner<R> {
         use std::sync::atomic::Ordering;
 
         // Initial sync — get full snapshot for each backend.
-        for backend in &self.backends {
+        for mounted in &self.backends {
             if cancel.load(Ordering::Relaxed) {
-                tracing::info!(backend = %backend.id(), "sync cancelled during initial sync");
+                tracing::info!(backend = %mounted.backend.id(), "sync cancelled during initial sync");
                 return Ok(());
             }
 
-            match self.sync_backend(backend).await {
+            match self.sync_backend(mounted).await {
                 Ok(count) => {
-                    tracing::info!(backend = %backend.id(), changes = count, "initial sync complete");
+                    tracing::info!(backend = %mounted.backend.id(), changes = count, "initial sync complete");
                 }
                 Err(e) => {
-                    tracing::error!(backend = %backend.id(), error = %e, "initial sync failed");
+                    tracing::error!(backend = %mounted.backend.id(), error = %e, "initial sync failed");
                 }
             }
         }
@@ -150,18 +187,18 @@ impl<R: RuntimeHandle> SyncRunner<R> {
                 return Ok(());
             }
 
-            for backend in &self.backends {
+            for mounted in &self.backends {
                 if cancel.load(Ordering::Relaxed) {
                     return Ok(());
                 }
 
-                match self.sync_backend(backend).await {
+                match self.sync_backend(mounted).await {
                     Ok(count) if count > 0 => {
-                        tracing::debug!(backend = %backend.id(), changes = count, "sync cycle");
+                        tracing::debug!(backend = %mounted.backend.id(), changes = count, "sync cycle");
                     }
                     Ok(_) => {}
                     Err(e) => {
-                        tracing::warn!(backend = %backend.id(), error = %e, "sync cycle failed");
+                        tracing::warn!(backend = %mounted.backend.id(), error = %e, "sync cycle failed");
                     }
                 }
             }
@@ -174,7 +211,8 @@ impl<R: RuntimeHandle> SyncRunner<R> {
 
     /// Sync a single backend: fetch changes, apply to DB, notify presenter.
     /// Returns the number of changes applied.
-    async fn sync_backend(&self, backend: &Arc<dyn Backend>) -> anyhow::Result<usize> {
+    async fn sync_backend(&self, mounted: &MountedRunnerBackend) -> anyhow::Result<usize> {
+        let backend = &mounted.backend;
         let backend_id = backend.id();
         let cursor = self
             .storage
@@ -183,7 +221,7 @@ impl<R: RuntimeHandle> SyncRunner<R> {
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let (changes, new_cursor) = backend.changes(cursor.as_ref()).await?;
 
-        let applied = self.apply_changes(backend_id, &changes).await?;
+        let applied = self.apply_changes(mounted, &changes).await?;
 
         self.storage
             .set_cursor(backend_id, &new_cursor)
@@ -207,22 +245,68 @@ impl<R: RuntimeHandle> SyncRunner<R> {
     /// Returns the changes that were actually applied (i.e. survived the
     /// `.cascade` ignore filter), in application order, so the caller can
     /// file the same set into the change feed.
+    ///
+    /// # Path assembly
+    ///
+    /// For every `Created`, `Updated`, and `Moved` entry the runner assembles
+    /// the item's full, mount-prefixed VFS path *once, on the way in*, before
+    /// any of the four downstream consumers see it (`upsert_file`,
+    /// `presenter.upsert_item`, and the `is_ignored_entry` / `is_pinned_entry`
+    /// / `exceeds_max_file_length` rule checks). The assembled path is the
+    /// mount prefix joined with the parent's already-stored VFS path joined
+    /// with the entry's basename — see [`Self::repath_entry`]. A backend
+    /// mounted at `/` carries the empty prefix, so its assembled path is
+    /// byte-identical to the pre-refactor mount-relative path.
+    ///
+    /// `Deleted` carries no surviving entry to re-path: deletion is keyed on
+    /// the stable [`ItemId`](crate::types::ItemId), which the mount prefix never
+    /// touches.
     async fn apply_changes(
         &self,
-        _backend_id: &str,
+        mounted: &MountedRunnerBackend,
         changes: &[Change],
     ) -> anyhow::Result<Vec<Change>> {
+        let prefix = &mounted.mount_prefix;
+        let backend = &mounted.backend;
         let mut applied = Vec::new();
 
         for change in changes {
-            match change {
+            // Re-assemble the surviving entry of each variant with its full,
+            // mount-prefixed VFS path stamped into `entry.path`. The applied
+            // change pushed onto the result carries the re-pathed entry so the
+            // change feed and any later consumer observe the same VFS path.
+            let repathed: Option<Change> = match change {
+                Change::Created(entry) => {
+                    let entry = self.repath_entry(prefix, backend.as_ref(), entry).await?;
+                    Some(Change::Created(entry))
+                }
+                Change::Updated { old, new } => {
+                    let new = self.repath_entry(prefix, backend.as_ref(), new).await?;
+                    Some(Change::Updated {
+                        old: old.clone(),
+                        new,
+                    })
+                }
+                Change::Moved { from, to } => {
+                    let to = self.repath_entry(prefix, backend.as_ref(), to).await?;
+                    Some(Change::Moved {
+                        from: from.clone(),
+                        to,
+                    })
+                }
+                // Deletion is keyed on the stable ItemId; there is no path to
+                // assemble.
+                Change::Deleted(_) => None,
+            };
+
+            match repathed.as_ref().unwrap_or(change) {
                 Change::Created(entry) => {
                     if self.is_ignored_entry(entry) {
                         continue;
                     }
                     if self.exceeds_max_file_length(entry).await {
                         tracing::warn!(
-                            file = %entry.name,
+                            path = %entry.path,
                             "file exceeds max file length rule — skipped"
                         );
                         continue;
@@ -242,17 +326,16 @@ impl<R: RuntimeHandle> SyncRunner<R> {
                     #[cfg(feature = "p2p")]
                     if let Some(bridge) = &self.p2p
                         && entry.size.is_some_and(|s| s > 0)
-                        && let Err(e) = bridge.index_file(&entry.name, &Vec::new()).await
+                        && let Err(e) = bridge.index_file(&entry.path, &Vec::new()).await
                     {
                         tracing::debug!(
-                            file = %entry.name,
+                            path = %entry.path,
                             error = %e,
                             "P2P indexing skipped for file without local data"
                         );
                     }
                     let item: VfsItem = entry.clone().into();
                     self.presenter.upsert_item(item).await?;
-                    applied.push(change.clone());
                 }
                 Change::Updated { new, .. } => {
                     if self.is_ignored_entry(new) {
@@ -260,7 +343,7 @@ impl<R: RuntimeHandle> SyncRunner<R> {
                     }
                     if self.exceeds_max_file_length(new).await {
                         tracing::warn!(
-                            file = %new.name,
+                            path = %new.path,
                             "file exceeds max file length rule — skipped"
                         );
                         continue;
@@ -297,7 +380,6 @@ impl<R: RuntimeHandle> SyncRunner<R> {
                         .map_err(|e| anyhow::anyhow!("{e}"))?;
                     let item: VfsItem = new.clone().into();
                     self.presenter.upsert_item(item).await?;
-                    applied.push(change.clone());
                 }
                 Change::Deleted(entry) => {
                     self.storage
@@ -305,7 +387,6 @@ impl<R: RuntimeHandle> SyncRunner<R> {
                         .await
                         .map_err(|e| anyhow::anyhow!("{e}"))?;
                     self.presenter.delete_item(&entry.id).await?;
-                    applied.push(change.clone());
                 }
                 Change::Moved { to, .. } => {
                     if self.is_ignored_entry(to) {
@@ -313,7 +394,7 @@ impl<R: RuntimeHandle> SyncRunner<R> {
                     }
                     if self.exceeds_max_file_length(to).await {
                         tracing::warn!(
-                            file = %to.name,
+                            path = %to.path,
                             "file exceeds max file length rule — skipped"
                         );
                         continue;
@@ -324,17 +405,67 @@ impl<R: RuntimeHandle> SyncRunner<R> {
                         .map_err(|e| anyhow::anyhow!("{e}"))?;
                     let item: VfsItem = to.clone().into();
                     self.presenter.upsert_item(item).await?;
-                    applied.push(change.clone());
                 }
             }
+
+            applied.push(repathed.unwrap_or_else(|| change.clone()));
         }
 
         Ok(applied)
     }
 
+    /// Return a clone of `entry` with its full, mount-prefixed VFS path stamped
+    /// into [`FileEntry::path`].
+    ///
+    /// The parent's already-stored VFS path (the full, mount-prefixed
+    /// `files.path` value) is looked up via [`StateStorage::get_file_path`] and
+    /// the entry's basename is joined onto it. Parents precede their children in
+    /// a backend's change stream, so the parent path is present by the time the
+    /// child is processed.
+    ///
+    /// When the parent has no stored path, the parent is either a recognised
+    /// backend root container — in which case the entry sits directly under the
+    /// mount prefix and its path is `apply_mount_prefix(prefix, name)` — or a
+    /// genuine ordering bug (a child arrived before its parent), in which case
+    /// this fails loudly rather than silently falling back to the basename.
+    async fn repath_entry(
+        &self,
+        prefix: &Path,
+        backend: &dyn Backend,
+        entry: &FileEntry,
+    ) -> anyhow::Result<FileEntry> {
+        let vfs_path = match self
+            .storage
+            .get_file_path(&entry.parent_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+        {
+            // The parent's stored path is already the full, mount-prefixed VFS
+            // path; the child sits directly beneath it.
+            Some(parent_path) => format!("{parent_path}/{}", entry.name),
+            // No stored parent: a recognised backend root container places the
+            // entry directly under the mount prefix.
+            None if backend.is_root_native_id(entry.parent_id.native_id()) => {
+                apply_mount_prefix(prefix, &entry.name)
+            }
+            None => anyhow::bail!(
+                "cannot assemble VFS path: parent {:?} has no stored path and is \
+                 not a backend root — child applied before its parent",
+                entry.parent_id,
+            ),
+        };
+        Ok(entry.clone().with_path(vfs_path))
+    }
+
     /// Check if a file entry matches any pin rule.
+    ///
+    /// Pin globs are matched against the entry's full, mount-prefixed VFS path,
+    /// the same path the entry is stored under. For a backend mounted at `/`
+    /// the prefix is empty, so the matched string is byte-identical to the
+    /// pre-refactor mount-relative path and existing pin rules behave
+    /// unchanged.
     async fn is_pinned_entry(&self, entry: &crate::types::FileEntry) -> bool {
-        let path = Path::new(&entry.name);
+        let path = Path::new(&entry.path);
         PinMatcher::load(&*self.storage)
             .await
             .is_ok_and(|matcher| matcher.is_pinned(path))
@@ -361,7 +492,10 @@ impl<R: RuntimeHandle> SyncRunner<R> {
         else {
             return false;
         };
-        let path_str = entry.name.as_str();
+        // Match against the full, mount-prefixed VFS path. At-root backends
+        // carry an empty prefix, so this is byte-identical to the pre-refactor
+        // mount-relative path.
+        let path_str = entry.path.as_str();
         for rule in &rules {
             if glob_matches(&rule.path_glob, path_str) && size > rule.max_bytes {
                 return true;
@@ -371,11 +505,13 @@ impl<R: RuntimeHandle> SyncRunner<R> {
     }
 
     /// Check if a file entry should be ignored based on `.cascade` config.
+    ///
+    /// Ignore rules are matched against the entry's full, mount-prefixed VFS
+    /// path — the same anchoring as the pin and max-file-length checks. For a
+    /// backend mounted at `/` the prefix is empty, so the matched string is
+    /// byte-identical to the pre-refactor mount-relative path.
     fn is_ignored_entry(&self, entry: &crate::types::FileEntry) -> bool {
-        // Build a synthetic path from the entry's parent + name.
-        // Phase 1 uses a flat path; this will be replaced with actual VFS
-        // path resolution once the tree tracks full paths.
-        let path = Path::new(&entry.name);
+        let path = Path::new(&entry.path);
         self.config.is_ignored(path, entry.is_dir)
     }
 
@@ -383,8 +519,8 @@ impl<R: RuntimeHandle> SyncRunner<R> {
     /// reported by any backend, falling back to the default.
     async fn effective_poll_interval(&self) -> Duration {
         let mut interval = DEFAULT_POLL_INTERVAL;
-        for backend in &self.backends {
-            if let Some(backend_interval) = backend.poll_interval().await
+        for mounted in &self.backends {
+            if let Some(backend_interval) = mounted.backend.poll_interval().await
                 && backend_interval < interval
             {
                 interval = backend_interval;
@@ -422,7 +558,11 @@ impl<R: RuntimeHandle> SyncRunner<R> {
         let mut flushed = 0;
 
         for record in &dirty_files {
-            let Some(backend) = self.backends.iter().find(|b| b.id() == record.backend_id) else {
+            let Some(mounted) = self
+                .backends
+                .iter()
+                .find(|m| m.backend.id() == record.backend_id)
+            else {
                 tracing::warn!(
                     file = %record.id,
                     backend_id = %record.backend_id,
@@ -430,6 +570,7 @@ impl<R: RuntimeHandle> SyncRunner<R> {
                 );
                 continue;
             };
+            let backend = &mounted.backend;
 
             let Some(local_path_str) = &record.local_path else {
                 tracing::warn!(
@@ -467,10 +608,26 @@ impl<R: RuntimeHandle> SyncRunner<R> {
                 }
             };
 
-            let upload_path = Path::new(&record.path);
+            // The stored `record.path` is the full, mount-prefixed VFS path.
+            // The backend understands only its own native, mount-relative paths,
+            // so strip the mount prefix on the way out — the exact inverse of
+            // the assembly the runner performed on the way in. A backend mounted
+            // at `/` carries the empty prefix, so this is a no-op and the path
+            // is byte-identical to the pre-refactor value.
+            let Some(native_path) = strip_mount_prefix(&mounted.mount_prefix, &record.path) else {
+                tracing::error!(
+                    file = %record.id,
+                    path = %record.path,
+                    mount_prefix = %mounted.mount_prefix.display(),
+                    "dirty file path does not lie under its backend's mount prefix \
+                     — routing bug, skipping"
+                );
+                continue;
+            };
+            let upload_path = PathBuf::from(native_path);
             let parent_file_id = FileId(record.parent_id.native_id().to_string());
 
-            match backend.upload(upload_path, &data, &parent_file_id).await {
+            match backend.upload(&upload_path, &data, &parent_file_id).await {
                 Ok(_updated_entry) => {
                     if let Err(e) = self.storage.clear_dirty(&record.id).await {
                         tracing::error!(
@@ -695,9 +852,54 @@ mod tests {
         }
     }
 
+    /// Wrap a plain backend at the empty (at-root) mount prefix. Existing
+    /// behaviour-preserving tests mount their single backend at `/`, so the
+    /// assembled VFS path equals the mount-relative path and remains
+    /// byte-identical to the pre-refactor model.
+    fn at_root(backend: Arc<dyn Backend>) -> MountedRunnerBackend {
+        MountedRunnerBackend::new(PathBuf::new(), backend)
+    }
+
+    /// Wrap a plain backend at an explicit, non-empty mount prefix.
+    fn at(prefix: &str, backend: Arc<dyn Backend>) -> MountedRunnerBackend {
+        MountedRunnerBackend::new(PathBuf::from(prefix), backend)
+    }
+
+    /// Build a runner from plain backends, each mounted at the root (empty)
+    /// prefix. The behaviour-preserving default for tests that do not exercise
+    /// nested mount paths.
     fn make_native_runner(
         db: Arc<StateDb>,
         backends: Vec<Arc<dyn Backend>>,
+        presenter: Arc<dyn VfsPresenter>,
+        config: Arc<ConfigResolver>,
+    ) -> SyncRunner<TokioRuntimeHandle> {
+        make_native_runner_mounted(
+            db,
+            backends.into_iter().map(at_root).collect(),
+            presenter,
+            config,
+        )
+    }
+
+    /// A root-mounted `MountedRunnerBackend` for backend id `scr`, used by the
+    /// `apply_changes` tests that drive the method directly (the runner itself
+    /// holds no backends in those tests). The backend's default
+    /// `is_root_native_id` recognises the `root` sentinel the test entries
+    /// parent to.
+    fn scr_mount() -> MountedRunnerBackend {
+        at_root(Arc::new(ScriptedBackend::new("scr")))
+    }
+
+    /// Like [`scr_mount`] but at an explicit, non-empty mount prefix.
+    fn scr_mount_at(prefix: &str) -> MountedRunnerBackend {
+        at(prefix, Arc::new(ScriptedBackend::new("scr")))
+    }
+
+    /// Build a runner from backends already paired with their mount prefixes.
+    fn make_native_runner_mounted(
+        db: Arc<StateDb>,
+        backends: Vec<MountedRunnerBackend>,
         presenter: Arc<dyn VfsPresenter>,
         config: Arc<ConfigResolver>,
     ) -> SyncRunner<TokioRuntimeHandle> {
@@ -1117,8 +1319,17 @@ mod tests {
             ItemId::new("scr", "root"),
             "gone.txt".into(),
         );
+        // The Moved target lands under a `sub` directory, so that directory must
+        // already exist (parents precede children) for the runner to resolve
+        // the moved file's full VFS path.
+        let sub_dir = FileEntry::dir(
+            ItemId::new("scr", "sub"),
+            ItemId::new("scr", "root"),
+            "sub".into(),
+        );
         db.upsert_file(&updated_old).unwrap();
         db.upsert_file(&removed).unwrap();
+        db.upsert_file(&sub_dir).unwrap();
 
         let updated_new = FileEntry::file(
             ItemId::new("scr", "u1"),
@@ -1149,7 +1360,7 @@ mod tests {
             },
         ];
 
-        let applied = runner.apply_changes("scr", &changes).await.unwrap();
+        let applied = runner.apply_changes(&scr_mount(), &changes).await.unwrap();
 
         // Every variant survived (none ignored, none oversized).
         assert_eq!(applied.len(), changes.len());
@@ -1171,6 +1382,14 @@ mod tests {
                 .name,
             "after.txt"
         );
+        // At the root prefix the moved file's full VFS path is its parent's
+        // path joined with its basename: `sub/after.txt`.
+        assert_eq!(
+            db.get_file_path(&ItemId::new("scr", "m1"))
+                .unwrap()
+                .as_deref(),
+            Some("sub/after.txt")
+        );
 
         // Presenter saw three upserts (created, updated, moved) and one delete.
         let upserts = presenter.upserts.lock().unwrap();
@@ -1191,7 +1410,7 @@ mod tests {
         let config = Arc::new(ConfigResolver::new(PathBuf::from("/tmp/empty")));
         let runner = make_native_runner(db.clone(), vec![], presenter.clone(), config);
 
-        let applied = runner.apply_changes("scr", &[]).await.unwrap();
+        let applied = runner.apply_changes(&scr_mount(), &[]).await.unwrap();
 
         assert!(applied.is_empty());
         assert!(presenter.upserts.lock().unwrap().is_empty());
@@ -1210,7 +1429,10 @@ mod tests {
         let backend_dyn: Arc<dyn Backend> = backend.clone();
         let runner = make_native_runner(db.clone(), vec![], presenter.clone(), config);
 
-        let count = runner.sync_backend(&backend_dyn).await.unwrap();
+        let count = runner
+            .sync_backend(&at_root(backend_dyn.clone()))
+            .await
+            .unwrap();
 
         assert_eq!(count, 0);
         assert_eq!(backend.changes_call_count(), 1);
@@ -1234,7 +1456,10 @@ mod tests {
         let backend_dyn: Arc<dyn Backend> = backend.clone();
         let runner = make_native_runner(db.clone(), vec![], presenter, config);
 
-        let count = runner.sync_backend(&backend_dyn).await.unwrap();
+        let count = runner
+            .sync_backend(&at_root(backend_dyn.clone()))
+            .await
+            .unwrap();
 
         assert_eq!(count, 1);
         // Backend was handed the previously-stored cursor.
@@ -1254,7 +1479,7 @@ mod tests {
         let backend_dyn: Arc<dyn Backend> = backend;
         let runner = make_native_runner(db.clone(), vec![], presenter, config);
 
-        let result = runner.sync_backend(&backend_dyn).await;
+        let result = runner.sync_backend(&at_root(backend_dyn.clone())).await;
 
         // The backend error is surfaced, not swallowed.
         let err = result.unwrap_err();
@@ -1275,7 +1500,7 @@ mod tests {
         let backend_dyn: Arc<dyn Backend> = backend;
         let runner = make_native_runner(db.clone(), vec![], presenter, config);
 
-        let result = runner.sync_backend(&backend_dyn).await;
+        let result = runner.sync_backend(&at_root(backend_dyn.clone())).await;
 
         let err = result.unwrap_err();
         assert!(err.to_string().contains("presenter upsert failed"));
@@ -1369,7 +1594,7 @@ mod tests {
                 skip_name,
             )),
         ];
-        let applied = runner.apply_changes("scr", &changes).await.unwrap();
+        let applied = runner.apply_changes(&scr_mount(), &changes).await.unwrap();
 
         // Only the non-ignored entry was applied.
         assert_eq!(applied.len(), 1);
@@ -1410,7 +1635,7 @@ mod tests {
         );
 
         let applied = runner
-            .apply_changes("scr", &[too_big, within])
+            .apply_changes(&scr_mount(), &[too_big, within])
             .await
             .unwrap();
 
@@ -1435,7 +1660,7 @@ mod tests {
             created("scr", "p1", "pinme.txt"),
             created("scr", "p2", "ordinary.txt"),
         ];
-        let applied = runner.apply_changes("scr", &changes).await.unwrap();
+        let applied = runner.apply_changes(&scr_mount(), &changes).await.unwrap();
         assert_eq!(applied.len(), 2);
 
         // The matching entry was auto-pinned; the other stays Online.
@@ -1658,7 +1883,10 @@ mod tests {
         let runner = make_native_runner(db.clone(), vec![], presenter, config)
             .with_change_feed(feed.clone());
 
-        let count = runner.sync_backend(&backend_dyn).await.unwrap();
+        let count = runner
+            .sync_backend(&at_root(backend_dyn.clone()))
+            .await
+            .unwrap();
         assert_eq!(count, 1);
 
         // The applied change is queryable from the feed under its parent.
@@ -1675,5 +1903,171 @@ mod tests {
             }
             other => panic!("expected Delta, got {other:?}"),
         }
+    }
+
+    // ── mount-prefix path assembly ──
+
+    /// A backend mounted at `/` (empty prefix) produces VFS paths
+    /// byte-identical to the pre-refactor mount-relative paths: a root child is
+    /// stored under its bare name, and a nested child under `parent/child`.
+    #[tokio::test]
+    async fn apply_changes_at_root_paths_are_byte_identical() {
+        let db = Arc::new(StateDb::open_in_memory().unwrap());
+        db.register_backend("scr", "scripted", "Scripted", None, None)
+            .unwrap();
+        let presenter = Arc::new(MockPresenter::default());
+        let config = Arc::new(ConfigResolver::new(PathBuf::from("/tmp/at-root")));
+        let runner = make_native_runner(db.clone(), vec![], presenter, config);
+
+        // A root-level directory, then a file nested inside it.
+        let dir = FileEntry::dir(
+            ItemId::new("scr", "d"),
+            ItemId::new("scr", "root"),
+            "Documents".into(),
+        );
+        let nested = FileEntry::file(
+            ItemId::new("scr", "f"),
+            ItemId::new("scr", "d"),
+            "report.txt".into(),
+        );
+        let changes = vec![Change::Created(dir), Change::Created(nested)];
+
+        runner.apply_changes(&scr_mount(), &changes).await.unwrap();
+
+        // Root child: bare name. Nested child: parent/child, no mount prefix.
+        assert_eq!(
+            db.get_file_path(&ItemId::new("scr", "d"))
+                .unwrap()
+                .as_deref(),
+            Some("Documents")
+        );
+        assert_eq!(
+            db.get_file_path(&ItemId::new("scr", "f"))
+                .unwrap()
+                .as_deref(),
+            Some("Documents/report.txt")
+        );
+    }
+
+    /// A backend mounted at a non-empty prefix stamps that prefix onto every
+    /// VFS path: a root child becomes `mount/child`, a nested child becomes
+    /// `mount/parent/child`.
+    #[tokio::test]
+    async fn apply_changes_nested_mount_prefixes_paths() {
+        let db = Arc::new(StateDb::open_in_memory().unwrap());
+        db.register_backend("scr", "scripted", "Scripted", Some("personal"), None)
+            .unwrap();
+        let presenter = Arc::new(MockPresenter::default());
+        let config = Arc::new(ConfigResolver::new(PathBuf::from("/tmp/nested")));
+        let runner = make_native_runner(db.clone(), vec![], presenter, config);
+
+        let dir = FileEntry::dir(
+            ItemId::new("scr", "d"),
+            ItemId::new("scr", "root"),
+            "Documents".into(),
+        );
+        let nested = FileEntry::file(
+            ItemId::new("scr", "f"),
+            ItemId::new("scr", "d"),
+            "report.txt".into(),
+        );
+        let changes = vec![Change::Created(dir), Change::Created(nested)];
+
+        runner
+            .apply_changes(&scr_mount_at("personal"), &changes)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.get_file_path(&ItemId::new("scr", "d"))
+                .unwrap()
+                .as_deref(),
+            Some("personal/Documents")
+        );
+        assert_eq!(
+            db.get_file_path(&ItemId::new("scr", "f"))
+                .unwrap()
+                .as_deref(),
+            Some("personal/Documents/report.txt")
+        );
+    }
+
+    /// A child whose parent is neither stored nor a recognised backend root is
+    /// a changefeed-ordering bug; the runner fails that change loudly rather
+    /// than silently falling back to the basename.
+    #[tokio::test]
+    async fn apply_changes_missing_non_root_parent_fails_loudly() {
+        let db = Arc::new(StateDb::open_in_memory().unwrap());
+        db.register_backend("scr", "scripted", "Scripted", None, None)
+            .unwrap();
+        let presenter = Arc::new(MockPresenter::default());
+        let config = Arc::new(ConfigResolver::new(PathBuf::from("/tmp/orphan-parent")));
+        let runner = make_native_runner(db.clone(), vec![], presenter, config);
+
+        // Parent `scr:ghost` is neither stored nor a root sentinel.
+        let orphan = FileEntry::file(
+            ItemId::new("scr", "f"),
+            ItemId::new("scr", "ghost"),
+            "lost.txt".into(),
+        );
+        let result = runner
+            .apply_changes(&scr_mount(), &[Change::Created(orphan)])
+            .await;
+
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("no stored path"),
+            "unexpected error: {err}"
+        );
+        // Nothing was written for the orphan.
+        assert!(db.get_file(&ItemId::new("scr", "f")).unwrap().is_none());
+    }
+
+    /// `flush_dirty_files` strips the mount prefix from the stored VFS path
+    /// before handing the path to the backend, so the backend receives a
+    /// native, mount-relative path even for a nested mount.
+    #[tokio::test]
+    async fn flush_dirty_files_strips_mount_prefix_before_upload() {
+        let db = Arc::new(StateDb::open_in_memory().unwrap());
+        db.register_backend("mock", "mock", "Mock", Some("personal"), None)
+            .unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let local_file = tmp.path().join("test.txt");
+        tokio::fs::write(&local_file, b"hello").await.unwrap();
+
+        let file_id = ItemId::new("mock", "file1");
+        let entry = FileEntry::file(
+            file_id.clone(),
+            ItemId::new("mock", "root"),
+            "test.txt".into(),
+        );
+        db.upsert_file(&entry).unwrap();
+        db.mark_dirty(&file_id).unwrap();
+        // The stored path is the full, mount-prefixed VFS path.
+        db.set_file_paths(
+            &file_id,
+            "personal/docs/test.txt",
+            &local_file.to_string_lossy(),
+        )
+        .unwrap();
+
+        let mock_backend = Arc::new(MockBackend::new("mock"));
+        let presenter = Arc::new(MockPresenter::default());
+        let config = Arc::new(ConfigResolver::new(PathBuf::from("/tmp/strip")));
+        let runner = make_native_runner_mounted(
+            db.clone(),
+            vec![at("personal", mock_backend.clone())],
+            presenter,
+            config,
+        );
+
+        let flushed = runner.flush_dirty_files().await;
+        assert_eq!(flushed, 1);
+
+        // The backend received the mount-relative path, prefix stripped.
+        let uploads = mock_backend.uploads.lock().unwrap();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].0, "docs/test.txt");
     }
 }

@@ -643,6 +643,8 @@ Platform implementations:
 
 A single `.cascade` file in any directory controls ignore rules, pinning, lifecycle policies, cache settings, and P2P behaviour. The client walks from mount root to each directory, layering configs with child-overrides-parent precedence — identical mental model to `.gitignore`.
 
+**Glob anchoring.** Ignore, pin, and max-file-length globs match against an item's full, VFS-absolute, mount-prefixed path — the same `files.path` value the item is stored under (e.g. `personal/Documents/report.txt` for a backend mounted at `personal`). This is the one canonical path the sync runner assembles on the way in, before any rule check sees the item, so the same glob anchoring holds across every backend regardless of where it is mounted. For a backend mounted at `"/"` the prefix is empty, so the matched string is byte-identical to the pre-refactor mount-relative path and existing rules behave unchanged.
+
 ### Four formats, one type
 
 | File | Parser |

@@ -38,7 +38,7 @@ use crate::p2p_bridge::P2pBridge;
 use crate::portable::native::{SqliteStorage, StdFileSystem, TokioRuntimeHandle};
 use crate::portable::{FileSystem, StateStorage};
 use crate::presenter::VfsPresenter;
-use crate::sync::runner::SyncRunner;
+use crate::sync::runner::{MountedRunnerBackend, SyncRunner};
 use crate::vfs::VfsTree;
 
 /// Backend id of the neutral VFS root.
@@ -395,17 +395,20 @@ impl Engine {
         &self,
         presenter: Arc<dyn VfsPresenter>,
     ) -> SyncRunner<TokioRuntimeHandle> {
-        // Collect the mounted child backends from the VFS tree. The neutral
-        // root is synthetic and owns no content, so it is not polled for
+        // Collect the mounted child backends from the VFS tree, each paired with
+        // the mount prefix it is mounted at. Sourcing both halves from the same
+        // mount table the router resolves on means the prefix the runner stamps
+        // into item paths cannot drift from the prefix the router walks. The
+        // neutral root is synthetic and owns no content, so it is not polled for
         // changes.
         let tree = self
             .vfs
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let backends: Vec<Arc<dyn Backend>> = tree
+        let backends: Vec<MountedRunnerBackend> = tree
             .children()
             .iter()
-            .map(|(_, backend)| backend.clone())
+            .map(|(prefix, backend)| MountedRunnerBackend::new(prefix.clone(), backend.clone()))
             .collect();
         drop(tree);
 

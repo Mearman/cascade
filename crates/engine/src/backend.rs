@@ -167,6 +167,28 @@ pub trait Backend: Send + Sync {
         Ok(vec![])
     }
 
+    /// Whether `native_id` names one of this backend's top-level root
+    /// containers — the synthetic parent under which the backend's
+    /// outermost entries are filed.
+    ///
+    /// The sync runner uses this to assemble each item's full VFS path. A
+    /// backend root container is never itself emitted as a stored file row, so
+    /// when an entry's parent has no stored path the runner consults this
+    /// predicate: a recognised root maps to the mount root (empty parent path,
+    /// so the entry sits directly under the backend's mount prefix), whereas an
+    /// unrecognised, unstored parent is a genuine ordering bug (a child arrived
+    /// before its parent) and the runner fails that change loudly rather than
+    /// guessing.
+    ///
+    /// The default recognises the conventional sentinels used across the
+    /// shipped backends: the generic `root` alias, the local-filesystem root
+    /// `/`, and the double-underscore-prefixed virtual views (`__mydrive`,
+    /// `__shared_drives`, `__shared_with_me`, `__trash`). A backend whose root
+    /// container ids do not follow these conventions overrides this.
+    fn is_root_native_id(&self, native_id: &str) -> bool {
+        native_id == "root" || native_id == "/" || native_id.starts_with("__")
+    }
+
     /// Recommended poll interval for this backend. Returns `None` if the
     /// backend doesn't support polling (use fixed interval from config).
     async fn poll_interval(&self) -> Option<Duration>;
