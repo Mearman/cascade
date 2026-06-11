@@ -1352,7 +1352,7 @@ async fn try_fuse(
     // presenter is confirmed up, so a failed attempt never binds the port.
     let engine_for_web = engine.clone();
 
-    let root_id = cascade_engine::types::ItemId::new("vfs", "root");
+    let root_id = cascade_engine::vfs::neutral_root_item_id();
     let presenter = Arc::new(
         cascade_presenter_fuse::FusePresenter::with_vfs(root_id, engine.vfs().clone())
             .with_mount_point(mount_path)
