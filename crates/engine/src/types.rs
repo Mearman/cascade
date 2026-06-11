@@ -125,11 +125,20 @@ impl<'de> Deserialize<'de> for SyncCursor {
 }
 
 /// A file or directory in the VFS.
+///
+/// The `path` field carries the full, VFS-absolute, mount-prefixed path of the
+/// item from the neutral root (e.g. `personal/Documents/report.txt`, no leading
+/// slash). For a backend mounted at `/`, the path is byte-identical to the
+/// backend-relative path. At this phase `path` is populated from `name` as a
+/// baseline; future phases assemble it from the mount prefix and parent path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileEntry {
     pub id: ItemId,
     pub parent_id: ItemId,
     pub name: String,
+    /// Full VFS-absolute path from the neutral root, with no leading slash.
+    /// Populated by the sync runner; defaults to `name` when not yet resolved.
+    pub path: String,
     pub is_dir: bool,
     pub size: Option<u64>,
     pub mod_time: Option<DateTime<Utc>>,
@@ -139,9 +148,13 @@ pub struct FileEntry {
 
 impl FileEntry {
     /// Create a file entry.
+    ///
+    /// The `path` field defaults to a copy of `name`. Use
+    /// [`FileEntry::with_path`] to override it once the VFS path is known.
     #[must_use]
-    pub const fn file(id: ItemId, parent_id: ItemId, name: String) -> Self {
+    pub fn file(id: ItemId, parent_id: ItemId, name: String) -> Self {
         Self {
+            path: name.clone(),
             id,
             parent_id,
             name,
@@ -154,9 +167,13 @@ impl FileEntry {
     }
 
     /// Create a directory entry.
+    ///
+    /// The `path` field defaults to a copy of `name`. Use
+    /// [`FileEntry::with_path`] to override it once the VFS path is known.
     #[must_use]
-    pub const fn dir(id: ItemId, parent_id: ItemId, name: String) -> Self {
+    pub fn dir(id: ItemId, parent_id: ItemId, name: String) -> Self {
         Self {
+            path: name.clone(),
             id,
             parent_id,
             name,
@@ -166,6 +183,13 @@ impl FileEntry {
             mime_type: None,
             hash: None,
         }
+    }
+
+    /// Set the full VFS path.
+    #[must_use]
+    pub fn with_path(mut self, path: String) -> Self {
+        self.path = path;
+        self
     }
 
     /// Set the file size.
@@ -267,11 +291,18 @@ impl fmt::Display for Provenance {
 }
 
 /// An item as presented to the platform layer.
+///
+/// The `path` field carries the same full VFS-absolute, mount-prefixed path as
+/// [`FileEntry::path`]. Presenters use this to route requests and to build
+/// protocol-level paths (e.g. the `WebDAV` `href`) without re-deriving the path
+/// from the [`ItemId`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VfsItem {
     pub id: ItemId,
     pub parent_id: ItemId,
     pub name: String,
+    /// Full VFS-absolute path from the neutral root, with no leading slash.
+    pub path: String,
     pub is_dir: bool,
     pub size: Option<u64>,
     pub mod_time: Option<DateTime<Utc>>,
@@ -285,6 +316,7 @@ impl From<FileEntry> for VfsItem {
             id: entry.id,
             parent_id: entry.parent_id,
             name: entry.name,
+            path: entry.path,
             is_dir: entry.is_dir,
             size: entry.size,
             mod_time: entry.mod_time,
@@ -300,6 +332,7 @@ impl From<&VfsItem> for FileEntry {
             id: item.id.clone(),
             parent_id: item.parent_id.clone(),
             name: item.name.clone(),
+            path: item.path.clone(),
             is_dir: item.is_dir,
             size: item.size,
             mod_time: item.mod_time,
@@ -417,6 +450,7 @@ mod tests {
             id: ItemId::new("gdrive", "root"),
             parent_id: ItemId::new("gdrive", "parent"),
             name: "test.txt".to_string(),
+            path: "test.txt".to_string(),
             is_dir: false,
             size: Some(1024),
             mod_time: None,
@@ -425,6 +459,7 @@ mod tests {
         };
         let item: VfsItem = entry.into();
         assert_eq!(item.name, "test.txt");
+        assert_eq!(item.path, "test.txt");
         assert_eq!(item.cache_state, CacheState::Online);
     }
 }

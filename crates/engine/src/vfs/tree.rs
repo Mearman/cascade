@@ -333,6 +333,7 @@ mod tests {
         FileEntry {
             id: ItemId::new(backend, native),
             parent_id: ItemId::new(backend, parent_native),
+            path: name.to_string(),
             name: name.to_string(),
             is_dir: false,
             size: Some(name.len() as u64),
@@ -431,6 +432,7 @@ mod tests {
             let entry = FileEntry {
                 id: ItemId::new(&self.id, native_id),
                 parent_id: ItemId::new(&self.id, parent),
+                path: name.to_owned(),
                 name: name.to_owned(),
                 is_dir: false,
                 size: Some(data.len() as u64),
@@ -518,13 +520,15 @@ mod tests {
             parent_id: &FileId,
         ) -> anyhow::Result<FileEntry> {
             let native = path.to_string_lossy().to_string();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map_or_else(String::new, ToOwned::to_owned);
             let entry = FileEntry {
                 id: ItemId::new(&self.id, &native),
                 parent_id: ItemId::new(&self.id, &parent_id.0),
-                name: path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map_or_else(String::new, ToOwned::to_owned),
+                path: name.clone(),
+                name,
                 is_dir: false,
                 size: Some(data.len() as u64),
                 mod_time: None,

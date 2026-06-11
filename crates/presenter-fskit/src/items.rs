@@ -50,6 +50,9 @@ impl TryFrom<FSKitItem> for VfsItem {
         Ok(Self {
             id: ItemId(item.id),
             parent_id: ItemId(item.parent_id),
+            // Path defaults to name at this phase; later phases thread the
+            // mount-prefixed VFS path through the FSKit item.
+            path: item.filename.clone(),
             name: item.filename,
             is_dir: item.is_directory,
             size: item.size,

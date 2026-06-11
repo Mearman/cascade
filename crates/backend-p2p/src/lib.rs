@@ -912,6 +912,9 @@ impl P2pBackend {
         FileEntry {
             id: ItemId::new(&self.cfg.instance_id, &entry.path),
             parent_id: ItemId::new(&self.cfg.instance_id, &parent_native),
+            // Path defaults to name at this phase; later phases thread the
+            // mount-prefixed VFS path through the P2P backend entry.
+            path: name.clone(),
             name,
             is_dir: entry.is_dir,
             size: if entry.is_dir { None } else { Some(entry.size) },

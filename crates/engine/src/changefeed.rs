@@ -330,6 +330,7 @@ mod tests {
         FileEntry {
             id: ItemId::new(backend, native_id),
             parent_id: ItemId::new(backend, parent_native),
+            path: name.to_string(),
             name: name.to_string(),
             is_dir: false,
             size: Some(1),
@@ -503,6 +504,7 @@ mod tests {
             id: from.id.clone(),
             parent_id: ItemId::new("scripted", "new"),
             name: "x.txt".to_string(),
+            path: "x.txt".to_string(),
             is_dir: false,
             size: Some(1),
             mod_time: Some(Utc::now()),

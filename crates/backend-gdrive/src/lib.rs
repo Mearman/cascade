@@ -321,6 +321,9 @@ impl GdriveBackend {
         FileEntry {
             id: ItemId::new(backend_id, native_id),
             parent_id: ItemId::new(backend_id, parent_native_id),
+            // Path defaults to name at this phase; later phases thread the
+            // mount-prefixed VFS path through the synthetic directory entry.
+            path: name.to_string(),
             name: name.to_string(),
             is_dir: true,
             size: None,
@@ -608,11 +611,15 @@ impl Backend for GdriveBackend {
                             all_changes.push(Change::Deleted(entry));
                         }
                     } else if let Some(file_id) = change.file_id {
-                        // Minimal FileEntry for the deleted file.
+                        // Minimal FileEntry for the deleted file. The name and
+                        // path are empty because the Drive API does not return
+                        // metadata for a deletion-only change record; the
+                        // caller uses only the id to remove the DB row.
                         let entry = FileEntry {
                             id: ItemId::new(&self.instance_id, &file_id),
                             parent_id: ItemId::new(&self.instance_id, "unknown"),
                             name: String::new(),
+                            path: String::new(),
                             is_dir: false,
                             size: None,
                             mod_time: None,

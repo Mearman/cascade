@@ -132,11 +132,23 @@ impl StateDb {
     // ── File operations ──
 
     /// Upsert a file entry into the database.
+    ///
+    /// The `files.path` column is set to `entry.path` if non-empty, or falls
+    /// back to `entry.name`. At this phase the two are always equal; future
+    /// phases assemble a mount-prefixed VFS path and store it here.
     pub fn upsert_file(&self, entry: &FileEntry) -> Result<()> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        // Use the explicit VFS path when available; fall back to the bare name
+        // for entries whose path has not yet been resolved (backwards-compatible
+        // during the transition phases).
+        let vfs_path = if entry.path.is_empty() {
+            &entry.name
+        } else {
+            &entry.path
+        };
         conn.execute(
             "INSERT OR REPLACE INTO files (
                 id, backend_id, path, parent_id, name, is_dir, size,
@@ -145,7 +157,7 @@ impl StateDb {
             (
                 &entry.id.0,
                 entry.id.backend_id(),
-                &entry.name, // path derived from file name
+                vfs_path,
                 &entry.parent_id.0,
                 &entry.name,
                 entry.is_dir,
@@ -167,7 +179,7 @@ impl StateDb {
             .lock()
             .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
         let mut stmt = conn.prepare(
-            "SELECT id, parent_id, name, is_dir, size, mime_type, mod_time, remote_hash
+            "SELECT id, parent_id, name, path, is_dir, size, mime_type, mod_time, remote_hash
              FROM files WHERE id = ?1",
         )?;
 
@@ -176,13 +188,14 @@ impl StateDb {
                 id: ItemId(row.get(0)?),
                 parent_id: ItemId(row.get(1)?),
                 name: row.get(2)?,
-                is_dir: row.get(3)?,
-                size: size_from_row(row, 4)?,
-                mime_type: row.get(5)?,
+                path: row.get(3)?,
+                is_dir: row.get(4)?,
+                size: size_from_row(row, 5)?,
+                mime_type: row.get(6)?,
                 mod_time: row
-                    .get::<_, Option<i64>>(6)?
+                    .get::<_, Option<i64>>(7)?
                     .map(|ts| chrono::DateTime::from_timestamp(ts, 0).unwrap_or_default()),
-                hash: row.get(7)?,
+                hash: row.get(8)?,
             })
         });
 
@@ -191,6 +204,24 @@ impl StateDb {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Look up the stored VFS path for a file by its [`ItemId`].
+    ///
+    /// Returns `None` when the file is not in the database. The returned string
+    /// is the `files.path` column value — the full VFS-absolute, mount-prefixed
+    /// path assembled by the sync runner.
+    pub fn get_file_path(&self, id: &ItemId) -> Result<Option<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let result = conn
+            .query_row("SELECT path FROM files WHERE id = ?1", [&id.0], |row| {
+                row.get::<_, String>(0)
+            })
+            .ok();
+        Ok(result)
     }
 
     /// Delete a file entry by ID.
@@ -461,7 +492,7 @@ impl StateDb {
             .lock()
             .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
         let mut stmt = conn.prepare(
-            "SELECT id, parent_id, name, is_dir, size, mime_type, mod_time, remote_hash
+            "SELECT id, parent_id, name, path, is_dir, size, mime_type, mod_time, remote_hash
              FROM files WHERE cache_state = ?1",
         )?;
         let entries = stmt
@@ -470,13 +501,14 @@ impl StateDb {
                     id: ItemId(row.get(0)?),
                     parent_id: ItemId(row.get(1)?),
                     name: row.get(2)?,
-                    is_dir: row.get(3)?,
-                    size: size_from_row(row, 4)?,
-                    mime_type: row.get(5)?,
+                    path: row.get(3)?,
+                    is_dir: row.get(4)?,
+                    size: size_from_row(row, 5)?,
+                    mime_type: row.get(6)?,
                     mod_time: row
-                        .get::<_, Option<i64>>(6)?
+                        .get::<_, Option<i64>>(7)?
                         .map(|ts| chrono::DateTime::from_timestamp(ts, 0).unwrap_or_default()),
-                    hash: row.get(7)?,
+                    hash: row.get(8)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -490,7 +522,7 @@ impl StateDb {
             .lock()
             .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
         let mut stmt = conn.prepare(
-            "SELECT id, parent_id, name, is_dir, size, mime_type, mod_time, remote_hash
+            "SELECT id, parent_id, name, path, is_dir, size, mime_type, mod_time, remote_hash
              FROM files",
         )?;
         let entries = stmt
@@ -499,27 +531,28 @@ impl StateDb {
                     id: ItemId(row.get(0)?),
                     parent_id: ItemId(row.get(1)?),
                     name: row.get(2)?,
-                    is_dir: row.get(3)?,
-                    size: size_from_row(row, 4)?,
-                    mime_type: row.get(5)?,
+                    path: row.get(3)?,
+                    is_dir: row.get(4)?,
+                    size: size_from_row(row, 5)?,
+                    mime_type: row.get(6)?,
                     mod_time: row
-                        .get::<_, Option<i64>>(6)?
+                        .get::<_, Option<i64>>(7)?
                         .map(|ts| chrono::DateTime::from_timestamp(ts, 0).unwrap_or_default()),
-                    hash: row.get(7)?,
+                    hash: row.get(8)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(entries)
     }
 
-    /// List all file entries whose parent matches the given `ItemId` string.
+    /// List all file entries whose parent matches the given [`ItemId`] string.
     pub fn list_children(&self, parent_id: &str) -> Result<Vec<FileEntry>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
         let mut stmt = conn.prepare(
-            "SELECT id, parent_id, name, is_dir, size, mime_type, mod_time, remote_hash
+            "SELECT id, parent_id, name, path, is_dir, size, mime_type, mod_time, remote_hash
              FROM files WHERE parent_id = ?1",
         )?;
         let entries = stmt
@@ -528,13 +561,14 @@ impl StateDb {
                     id: ItemId(row.get(0)?),
                     parent_id: ItemId(row.get(1)?),
                     name: row.get(2)?,
-                    is_dir: row.get(3)?,
-                    size: size_from_row(row, 4)?,
-                    mime_type: row.get(5)?,
+                    path: row.get(3)?,
+                    is_dir: row.get(4)?,
+                    size: size_from_row(row, 5)?,
+                    mime_type: row.get(6)?,
                     mod_time: row
-                        .get::<_, Option<i64>>(6)?
+                        .get::<_, Option<i64>>(7)?
                         .map(|ts| chrono::DateTime::from_timestamp(ts, 0).unwrap_or_default()),
-                    hash: row.get(7)?,
+                    hash: row.get(8)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -648,7 +682,7 @@ impl StateDb {
             .lock()
             .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
         let mut stmt = conn.prepare(
-            "SELECT id, parent_id, name, is_dir, size, mime_type, mod_time, remote_hash
+            "SELECT id, parent_id, name, path, is_dir, size, mime_type, mod_time, remote_hash
              FROM files
              WHERE cache_state = 'cached' AND dirty = FALSE
              ORDER BY last_access ASC
@@ -660,13 +694,14 @@ impl StateDb {
                     id: ItemId(row.get(0)?),
                     parent_id: ItemId(row.get(1)?),
                     name: row.get(2)?,
-                    is_dir: row.get(3)?,
-                    size: size_from_row(row, 4)?,
-                    mime_type: row.get(5)?,
+                    path: row.get(3)?,
+                    is_dir: row.get(4)?,
+                    size: size_from_row(row, 5)?,
+                    mime_type: row.get(6)?,
                     mod_time: row
-                        .get::<_, Option<i64>>(6)?
+                        .get::<_, Option<i64>>(7)?
                         .map(|ts| chrono::DateTime::from_timestamp(ts, 0).unwrap_or_default()),
-                    hash: row.get(7)?,
+                    hash: row.get(8)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

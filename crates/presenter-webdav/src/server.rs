@@ -1155,6 +1155,9 @@ async fn handle_copy(state: &AppState, src_path: &str, headers: &HeaderMap) -> R
     let copy = VfsItem {
         id: cascade_engine::types::ItemId::new("webdav", &new_id_str),
         parent_id: src_item.parent_id,
+        // The path for a WebDAV COPY destination derives from the
+        // destination URL; it defaults to the name at this phase.
+        path: new_name.clone(),
         name: new_name,
         is_dir: src_item.is_dir,
         size: src_item.size,

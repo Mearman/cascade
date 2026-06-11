@@ -383,6 +383,14 @@ impl StateStorage for WasmStateStorage {
         Ok(inner.files.get(&id.0).cloned())
     }
 
+    async fn get_file_path(&self, id: &ItemId) -> Result<Option<String>, StorageError> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::Unavailable(e.to_string()))?;
+        Ok(inner.files.get(&id.0).map(|f| f.path.clone()))
+    }
+
     async fn delete_file(&self, id: &ItemId) -> Result<(), StorageError> {
         let mut inner = self
             .inner

@@ -168,6 +168,11 @@ impl<R: RuntimeHandle> StateStorage for SqliteStorage<R> {
         self.run(move |db| db.get_file(&id)).await
     }
 
+    async fn get_file_path(&self, id: &ItemId) -> Result<Option<String>, StorageError> {
+        let id = id.clone();
+        self.run(move |db| db.get_file_path(&id)).await
+    }
+
     async fn delete_file(&self, id: &ItemId) -> Result<(), StorageError> {
         let id = id.clone();
         self.run(move |db| db.delete_file(&id)).await

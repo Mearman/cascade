@@ -364,6 +364,7 @@ mod tests {
             id: ItemId::new("fixed", "f"),
             parent_id: ItemId::new("fixed", "root"),
             name: "f.bin".to_string(),
+            path: "f.bin".to_string(),
             is_dir: false,
             size: Some(11),
             mod_time: None,

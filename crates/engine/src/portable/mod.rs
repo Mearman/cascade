@@ -191,6 +191,13 @@ pub trait StateStorage: Send + Sync {
     /// Fetch a file entry by id, or `None` if absent.
     async fn get_file(&self, id: &ItemId) -> Result<Option<FileEntry>, StorageError>;
 
+    /// Look up the stored VFS path for a file by its [`ItemId`].
+    ///
+    /// Returns `None` when the file is not in the database. This is the
+    /// parent-path lookup used by the sync runner to assemble child VFS paths
+    /// without loading the full [`FileEntry`] for every parent.
+    async fn get_file_path(&self, id: &ItemId) -> Result<Option<String>, StorageError>;
+
     /// Delete a file entry by id.
     async fn delete_file(&self, id: &ItemId) -> Result<(), StorageError>;
 

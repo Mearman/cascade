@@ -84,6 +84,9 @@ impl DriveFile {
         FileEntry {
             id: ItemId::new(backend_id, &self.id),
             parent_id,
+            // Path defaults to name at this phase; later phases thread the
+            // mount-prefixed VFS path through the Google Drive entry.
+            path: self.name.clone(),
             name: self.name.clone(),
             is_dir: self.mime_type == "application/vnd.google-apps.folder",
             size: self.size.as_ref().and_then(|s| s.parse::<u64>().ok()),
@@ -151,6 +154,9 @@ impl SharedDrive {
         FileEntry {
             id: ItemId::new(backend_id, &self.id),
             parent_id: ItemId::new(backend_id, "__shared_drives"),
+            // Path defaults to name at this phase; later phases thread the
+            // mount-prefixed VFS path through the shared-drive entry.
+            path: self.name.clone(),
             name: self.name.clone(),
             is_dir: true,
             size: None,

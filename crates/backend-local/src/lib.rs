@@ -468,6 +468,9 @@ impl Backend for LocalBackend {
         Ok(FileEntry {
             id: ItemId::new(&self.id, relative),
             parent_id,
+            // Path defaults to name at this phase; later phases thread the
+            // mount-prefixed VFS path through the local backend entry.
+            path: name.clone(),
             name,
             is_dir: false,
             size: Some(size),
