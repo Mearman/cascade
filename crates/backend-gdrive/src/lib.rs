@@ -34,6 +34,20 @@ use client::{DriveClient, ListQuery};
 use token_store::PlatformTokenStore;
 use token_store::TokenStore;
 
+/// The synthetic virtual top-level directories Google Drive presents:
+/// `My Drive`, `Shared drives`, `Shared with me`, and `Bin`. These are the
+/// only `__`-prefixed native ids the backend uses, and they are root
+/// containers — the parents of the backend's outermost real entries. The
+/// `is_root_native_id` override below recognises exactly this set rather than
+/// any `__`-prefixed id, so a genuine Drive item that happened to carry a
+/// `__`-prefixed id would never be misclassified as a root.
+const VIRTUAL_ROOT_IDS: [&str; 4] = [
+    "__mydrive",
+    "__shared_drives",
+    "__shared_with_me",
+    "__trash",
+];
+
 /// Create a Google Drive backend from config (native build).
 ///
 /// Config keys expected:
@@ -337,10 +351,10 @@ impl GdriveBackend {
     /// for the initial sync snapshot. No Drive API call is needed.
     fn virtual_root_entries(&self) -> Vec<Change> {
         [
-            ("__mydrive", "My Drive"),
-            ("__shared_drives", "Shared drives"),
-            ("__shared_with_me", "Shared with me"),
-            ("__trash", "Bin"),
+            (VIRTUAL_ROOT_IDS[0], "My Drive"),
+            (VIRTUAL_ROOT_IDS[1], "Shared drives"),
+            (VIRTUAL_ROOT_IDS[2], "Shared with me"),
+            (VIRTUAL_ROOT_IDS[3], "Bin"),
         ]
         .iter()
         .map(|(id, name)| {
@@ -561,6 +575,16 @@ impl Backend for GdriveBackend {
 
     fn display_name(&self) -> &'static str {
         "Google Drive"
+    }
+
+    /// Recognise exactly Google Drive's root containers: the generic `root`
+    /// alias and the four `__`-prefixed virtual top-level directories. This
+    /// overrides the default's blanket `starts_with("__")` rule so that only
+    /// these known ids count as roots — a real Drive node is never assigned a
+    /// `__`-prefixed id, but were one to appear it would no longer be
+    /// misclassified.
+    fn is_root_native_id(&self, native_id: &str) -> bool {
+        native_id == "root" || VIRTUAL_ROOT_IDS.contains(&native_id)
     }
 
     async fn quota(&self) -> anyhow::Result<Option<Quota>> {
@@ -1263,5 +1287,27 @@ mod tests {
         };
         let backend = create_backend(&config.into()).unwrap();
         assert_eq!(backend.id(), "gdrive-test-account");
+    }
+
+    #[test]
+    fn is_root_native_id_recognises_only_known_roots() {
+        let config = toml::toml! {
+            client_id = "test-id"
+            client_secret = "test-secret"
+            account = "test-account"
+        };
+        let backend = create_backend(&config.into()).unwrap();
+
+        // The generic alias and the four virtual views are roots.
+        assert!(backend.is_root_native_id("root"));
+        for id in VIRTUAL_ROOT_IDS {
+            assert!(backend.is_root_native_id(id), "{id} should be a root");
+        }
+
+        // A genuine content id that merely starts with "__" is NOT a root, so
+        // it is never mis-pathed directly under the mount prefix. This is the
+        // case the blanket `starts_with("__")` default would have misclassified.
+        assert!(!backend.is_root_native_id("__user_file_123"));
+        assert!(!backend.is_root_native_id("1AbCdEf"));
     }
 }

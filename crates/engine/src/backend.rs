@@ -180,13 +180,16 @@ pub trait Backend: Send + Sync {
     /// before its parent) and the runner fails that change loudly rather than
     /// guessing.
     ///
-    /// The default recognises the conventional sentinels used across the
-    /// shipped backends: the generic `root` alias, the local-filesystem root
-    /// `/`, and the double-underscore-prefixed virtual views (`__mydrive`,
-    /// `__shared_drives`, `__shared_with_me`, `__trash`). A backend whose root
-    /// container ids do not follow these conventions overrides this.
+    /// The default recognises only the two unambiguous sentinels shared across
+    /// the shipped backends: the generic `root` alias and the local-filesystem
+    /// root `/`. A backend with additional root containers overrides this to
+    /// name them explicitly — for example the Google Drive backend recognises
+    /// its four `__`-prefixed virtual views. The default deliberately does not
+    /// treat every `__`-prefixed id as a root: a backend whose genuine content
+    /// ids happen to begin with `__` would otherwise be misclassified and
+    /// mis-pathed directly under its mount prefix.
     fn is_root_native_id(&self, native_id: &str) -> bool {
-        native_id == "root" || native_id == "/" || native_id.starts_with("__")
+        native_id == "root" || native_id == "/"
     }
 
     /// The native id of this backend's primary root container — the single
@@ -525,5 +528,18 @@ mod tests {
         assert!(backend.read_range(&e, 1000, 10).await.unwrap().is_empty());
         // Zero length -> empty.
         assert!(backend.read_range(&e, 0, 0).await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn default_is_root_native_id_recognises_only_root_and_slash() {
+        let backend = FixedBackend { content: vec![] };
+        assert!(backend.is_root_native_id("root"));
+        assert!(backend.is_root_native_id("/"));
+        // The default no longer treats every "__"-prefixed id as a root, so a
+        // backend whose genuine content ids begin with "__" is not misclassified
+        // and mis-pathed directly under its mount prefix.
+        assert!(!backend.is_root_native_id("__mydrive"));
+        assert!(!backend.is_root_native_id("__user_file"));
+        assert!(!backend.is_root_native_id("abc123"));
     }
 }
