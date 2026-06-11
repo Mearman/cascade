@@ -67,12 +67,93 @@ pub fn verify_to_candidates(
 mod tests {
     use super::*;
     use std::net::SocketAddr;
+    use std::time::Instant;
 
     use crate::candidate::{Candidate, CandidateKind};
     use cascade_announce_wire::WireCandidate;
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    /// A [`Clock`] whose wall clock returns a caller-chosen fixed value, so the
+    /// clock-stamped expiry helpers can be exercised deterministically across
+    /// the whole `u64` range — including the saturation edges the production
+    /// [`crate::traversal::SystemClock`] can never reach.
+    struct FixedClock {
+        unix_ms: u64,
+    }
+
+    impl Clock for FixedClock {
+        fn now(&self) -> Instant {
+            // The monotonic clock is unused by the expiry helpers; return a
+            // live instant so the contract is honoured without affecting the
+            // wall-clock paths under test.
+            Instant::now()
+        }
+
+        fn now_unix_ms(&self) -> u64 {
+            self.unix_ms
+        }
+    }
+
+    /// A representative in-range wall-clock value, well below the `i64` ceiling.
+    const IN_RANGE_NOW_MS: u64 = 1_700_000_000_000;
+    /// A one-hour TTL in milliseconds, matching the announce and DHT windows.
+    const ONE_HOUR_MS: i64 = 3_600_000;
+
+    #[test]
+    fn now_unix_ms_reads_the_clocks_wall_time_as_signed() {
+        // A wall-clock value comfortably inside the `i64` range maps across
+        // unchanged: the helper only diverges from the raw clock at the
+        // saturation edge.
+        let clock = FixedClock {
+            unix_ms: IN_RANGE_NOW_MS,
+        };
+        assert_eq!(now_unix_ms(&clock), i64::try_from(IN_RANGE_NOW_MS).unwrap());
+    }
+
+    #[test]
+    fn now_unix_ms_saturates_at_i64_max_for_an_out_of_range_clock() {
+        // A clock reporting a value above `i64::MAX` cannot be represented as a
+        // signed timestamp; the documented behaviour is to saturate at
+        // `i64::MAX` rather than wrap or panic. `u64::MAX` is the extreme of
+        // that range.
+        let clock = FixedClock { unix_ms: u64::MAX };
+        assert_eq!(now_unix_ms(&clock), i64::MAX);
+    }
+
+    #[test]
+    fn expiry_from_now_adds_the_ttl_to_the_current_wall_time() {
+        let clock = FixedClock {
+            unix_ms: IN_RANGE_NOW_MS,
+        };
+        let expiry = expiry_from_now(&clock, Duration::from_hours(1));
+        assert_eq!(
+            expiry,
+            i64::try_from(IN_RANGE_NOW_MS).unwrap() + ONE_HOUR_MS,
+        );
+    }
+
+    #[test]
+    fn expiry_from_now_saturates_rather_than_overflowing() {
+        // With the wall clock already at the signed ceiling, adding any TTL
+        // must saturate at `i64::MAX` rather than wrap to a negative (past)
+        // instant — an expiry that wrapped would reject every freshly-signed
+        // set the moment it was produced.
+        let clock = FixedClock { unix_ms: u64::MAX };
+        let expiry = expiry_from_now(&clock, Duration::from_hours(1));
+        assert_eq!(expiry, i64::MAX);
+    }
+
+    #[test]
+    fn expiry_from_now_saturates_on_an_oversized_ttl() {
+        // A TTL larger than `i64::MAX` milliseconds is itself clamped before
+        // the add, so even from a zero wall clock the result saturates rather
+        // than wrapping. [`Duration::MAX`] is the extreme such TTL.
+        let clock = FixedClock { unix_ms: 0 };
+        let expiry = expiry_from_now(&clock, Duration::MAX);
+        assert_eq!(expiry, i64::MAX);
     }
 
     fn wire(port: u16, kind: CandidateKind, pref: u16) -> WireCandidate {

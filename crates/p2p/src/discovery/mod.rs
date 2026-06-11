@@ -222,6 +222,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn announce_on_an_empty_service_is_a_harmless_no_op() {
+        // Announcing before any source is registered (the freshly-constructed
+        // service, or a posture under which no source self-activated) must
+        // simply fan out to nothing rather than panicking on an empty source
+        // list — the `join_all` over zero futures resolves immediately.
+        let service = DiscoveryService::new();
+        let candidate = Candidate::new(addr(22000), CandidateKind::Host, 0);
+        service.announce("SELF", &[candidate]).await;
+        assert!(service.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_drops_a_source_that_returns_nothing_and_keeps_the_rest() {
+        // One source comes up empty (the normal "this source cannot place the
+        // peer" ending) while another returns a candidate. The empty source
+        // must contribute nothing without suppressing the productive one, so
+        // the union is exactly the non-empty source's output.
+        let found = Candidate::new(addr(22000), CandidateKind::Host, 100);
+        let mut service = DiscoveryService::new();
+        service.register(Box::new(StubSource::new(vec![])));
+        service.register(Box::new(StubSource::new(vec![found])));
+
+        let resolved = service.resolve("DEVICE-A").await;
+        assert_eq!(resolved, vec![found]);
+    }
+
+    #[tokio::test]
     async fn resolve_unions_candidates_from_all_sources() {
         let a = Candidate::new(addr(22000), CandidateKind::Host, 100);
         let b = Candidate::new(addr(22001), CandidateKind::ServerReflexive, 0);

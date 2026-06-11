@@ -124,6 +124,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn announce_is_a_no_op_and_leaves_the_peer_book_untouched() {
+        // Gossip publishes through the `BepMessage::Gossip` frame the sync
+        // engine drives, not through this trait, so `announce` here must change
+        // nothing: it must neither register the announcing device nor record
+        // its candidates. A regression that made it write through the trait
+        // would duplicate the gossip path and silently alter gossip semantics.
+        let book = Arc::new(RwLock::new(PeerBook::new()));
+        let source = GossipDiscovery::new(book.clone());
+
+        let candidate = Candidate::new(addr(22000), CandidateKind::Host, 0);
+        source.announce("SELF", &[candidate]).await;
+
+        let book = book.read().await;
+        assert!(
+            book.is_empty(),
+            "announce must not register the announcing device",
+        );
+        assert!(
+            book.remote_candidates("SELF").is_none(),
+            "announce must not record candidates for the announcing device",
+        );
+    }
+
+    #[tokio::test]
     async fn resolve_falls_back_when_punch_negotiated_without_candidate_exchange() {
         use crate::traversal::SyncPunchAgreement;
 
