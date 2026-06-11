@@ -330,6 +330,7 @@ async fn presenter_operations_fail_outside_macos() {
         id: id.clone(),
         parent_id: ItemId::new("gdrive", "root"),
         name: "test.txt".to_string(),
+        path: "test.txt".to_string(),
         is_dir: false,
         size: Some(100),
         mod_time: None,
