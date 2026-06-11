@@ -68,6 +68,47 @@ pub fn conflict_name(original_name: &str, device_name: &str) -> String {
     )
 }
 
+/// Derive the full VFS path for the conflict copy of a file.
+///
+/// The conflict copy lives in the same directory as the original. The parent
+/// directory is extracted from `original_vfs_path` by dropping the final
+/// `/`-delimited segment, then the [`conflict_name`] is appended.
+///
+/// When `original_vfs_path` has no `/` separator (the file sits directly at
+/// the VFS root, or the backend is mounted at `"/"`), the conflict copy path
+/// is just the conflict filename with no parent component.
+///
+/// # Examples
+///
+/// ```
+/// # use cascade_engine::sync::conflict::conflict_vfs_path;
+/// let p = conflict_vfs_path("personal/Documents/report.pdf", "laptop");
+/// assert!(p.starts_with("personal/Documents/"));
+/// assert!(p.ends_with(".conflict.pdf"));
+///
+/// // File at root (no parent segment).
+/// let q = conflict_vfs_path("README", "server");
+/// assert!(q.starts_with("README (server "));
+/// assert!(q.ends_with(".conflict"));
+/// ```
+#[must_use]
+pub fn conflict_vfs_path(original_vfs_path: &str, device_name: &str) -> String {
+    // Split on the last `/` to obtain the parent directory and the basename.
+    original_vfs_path.rfind('/').map_or_else(
+        // No parent segment — the file sits directly at the VFS root.
+        || conflict_name(original_vfs_path, device_name),
+        |slash_pos| {
+            let parent = original_vfs_path
+                .get(..slash_pos)
+                .unwrap_or(original_vfs_path);
+            let name = original_vfs_path
+                .get(slash_pos + 1..)
+                .unwrap_or(original_vfs_path);
+            format!("{}/{}", parent, conflict_name(name, device_name))
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,5 +171,48 @@ mod tests {
         let name = conflict_name("archive.tar.gz", "desktop");
         assert!(name.starts_with("archive.tar (desktop 2"));
         assert!(name.ends_with(".conflict.gz"));
+    }
+
+    // ── conflict_vfs_path ──
+
+    #[test]
+    fn conflict_vfs_path_preserves_parent_directory() {
+        let p = conflict_vfs_path("personal/Documents/report.pdf", "laptop");
+        assert!(
+            p.starts_with("personal/Documents/"),
+            "parent dir must be preserved: {p}"
+        );
+        assert!(p.ends_with(".conflict.pdf"), "extension preserved: {p}");
+        assert!(
+            p.contains("report (laptop "),
+            "conflict name must embed device: {p}"
+        );
+    }
+
+    #[test]
+    fn conflict_vfs_path_nested_mount() {
+        // A backend mounted at a two-segment prefix.
+        let p = conflict_vfs_path("work/projects/plan.md", "dev-box");
+        assert!(p.starts_with("work/projects/"), "parent preserved: {p}");
+        assert!(p.ends_with(".conflict.md"), "extension: {p}");
+    }
+
+    #[test]
+    fn conflict_vfs_path_no_parent_segment() {
+        // File directly at the VFS root (backend mounted at "/").
+        let p = conflict_vfs_path("README", "server");
+        assert!(!p.contains('/'), "no slash for root-level file: {p}");
+        assert!(p.starts_with("README (server "), "conflict name: {p}");
+        assert!(p.ends_with(".conflict"), "no extension: {p}");
+    }
+
+    #[test]
+    fn conflict_vfs_path_is_consistent_with_conflict_name() {
+        // `conflict_vfs_path` on a path with a single parent segment must
+        // produce exactly `<parent>/<conflict_name(<basename>)>`.
+        let vfs_path = "Archive/report.pdf";
+        let cp = conflict_vfs_path(vfs_path, "laptop");
+        let cn = conflict_name("report.pdf", "laptop");
+        assert_eq!(cp, format!("Archive/{cn}"));
     }
 }

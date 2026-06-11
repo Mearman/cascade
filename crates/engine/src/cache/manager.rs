@@ -146,7 +146,11 @@ impl<R: RuntimeHandle> CacheManager<R> {
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         for file in &cached_files {
-            let path = Path::new(&file.name);
+            // Match against the full, mount-prefixed VFS path — the same string
+            // stored in `files.path` and used by the sync runner and pin rules.
+            // Using only the basename (`file.name`) would fail to match any policy
+            // glob anchored to a mount prefix (e.g. `personal/Documents/**`).
+            let path = Path::new(&file.path);
             if lifecycle.should_evict(file, path) != EvictionDecision::Keep {
                 self.storage
                     .update_cache_state(&file.id, CacheState::Online)
@@ -304,5 +308,117 @@ impl EvictionReport {
     #[must_use]
     pub const fn total_evicted(&self) -> usize {
         self.lifecycle_evicted + self.size_evicted
+    }
+}
+
+#[cfg(all(test, feature = "native"))]
+mod tests {
+    #![allow(clippy::pedantic, clippy::nursery)]
+
+    use super::*;
+    use crate::db::StateDb;
+    use crate::portable::native::{SqliteStorage, TokioRuntimeHandle};
+    use crate::types::{FileEntry, ItemId};
+    use std::sync::Arc;
+
+    fn make_manager(db: Arc<StateDb>) -> CacheManager<TokioRuntimeHandle> {
+        let runtime = TokioRuntimeHandle::current();
+        let storage = SqliteStorage::new(db, runtime.clone());
+        CacheManager::new(Arc::new(storage), runtime, CacheManagerConfig::default())
+    }
+
+    /// Insert a file record with the given VFS path and size, then mark it as
+    /// `Cached` so the eviction sweep considers it.
+    fn insert_cached(db: &StateDb, id: &ItemId, vfs_path: &str, name: &str, size: u64) {
+        let entry = FileEntry::file(id.clone(), ItemId::new("test", "root"), name.to_string())
+            .with_path(vfs_path.to_string())
+            .with_size(Some(size));
+        db.upsert_file(&entry).unwrap();
+        db.update_cache_state(id, CacheState::Cached).unwrap();
+    }
+
+    /// Lifecycle eviction must match policies against the full, mount-prefixed
+    /// VFS path (`file.path`), not just the basename (`file.name`).
+    ///
+    /// Here the policy is `personal/Documents/**` (a max-size rule). The file
+    /// lives at `personal/Documents/large.bin` with size above the limit. If the
+    /// eviction sweep incorrectly used the basename (`large.bin`) instead of the
+    /// VFS path it would fail to match the prefix-anchored glob and the file
+    /// would not be evicted.
+    #[tokio::test]
+    async fn evict_uses_vfs_path_for_lifecycle_matching() {
+        let db = Arc::new(StateDb::open_in_memory().unwrap());
+        db.register_backend("test", "local", "Test", Some("personal"), None)
+            .unwrap();
+
+        // Policy: evict anything under `personal/Documents/**` exceeding 1 KiB.
+        let max_bytes: i64 = 1024;
+        db.add_lifecycle_policy("personal/Documents/**", None, Some(max_bytes), 0, None)
+            .unwrap();
+
+        let big_id = ItemId::new("test", "big");
+        let small_id = ItemId::new("test", "small");
+        // Both files have the same *basename* `report.bin`; only their VFS path
+        // distinguishes them from the policy's point of view.
+        insert_cached(
+            &db,
+            &big_id,
+            "personal/Documents/report.bin",
+            "report.bin",
+            2048,
+        );
+        insert_cached(&db, &small_id, "other/report.bin", "report.bin", 2048);
+
+        let manager = make_manager(db.clone());
+        let report = manager.evict().await.unwrap();
+
+        assert_eq!(
+            report.lifecycle_evicted, 1,
+            "exactly the file under personal/Documents must be evicted"
+        );
+
+        // The file under personal/Documents was evicted (back to Online).
+        assert_eq!(
+            db.get_cache_state(&big_id).unwrap(),
+            Some(CacheState::Online),
+            "personal/Documents file must be evicted"
+        );
+        // The file whose basename matches but VFS path doesn't must be kept.
+        assert_eq!(
+            db.get_cache_state(&small_id).unwrap(),
+            Some(CacheState::Cached),
+            "other/report.bin must NOT be evicted (outside policy path)"
+        );
+    }
+
+    /// A lifecycle policy using a bare directory name (no `**` glob) must
+    /// still match files whose VFS path starts with `<policy>/`.
+    #[tokio::test]
+    async fn evict_bare_dir_policy_matches_prefix() {
+        let db = Arc::new(StateDb::open_in_memory().unwrap());
+        db.register_backend("test", "local", "Test", None, None)
+            .unwrap();
+
+        // Policy: anything under `Cache` (no glob, max-size 0 — evict everything).
+        db.add_lifecycle_policy("Cache", None, Some(0), 0, None)
+            .unwrap();
+
+        let in_cache = ItemId::new("test", "c1");
+        let not_cache = ItemId::new("test", "nc1");
+        insert_cached(&db, &in_cache, "Cache/tmp.bin", "tmp.bin", 100);
+        insert_cached(&db, &not_cache, "Documents/tmp.bin", "tmp.bin", 100);
+
+        let manager = make_manager(db.clone());
+        let report = manager.evict().await.unwrap();
+
+        assert_eq!(report.lifecycle_evicted, 1);
+        assert_eq!(
+            db.get_cache_state(&in_cache).unwrap(),
+            Some(CacheState::Online)
+        );
+        assert_eq!(
+            db.get_cache_state(&not_cache).unwrap(),
+            Some(CacheState::Cached)
+        );
     }
 }

@@ -847,6 +847,53 @@ mod tests {
         assert_eq!(downloaded, b"hello".to_vec());
     }
 
+    /// Cross-backend rename: the source receives the mount-relative (not the
+    /// full VFS) path on `metadata`, the destination receives the mount-relative
+    /// path on `upload`, and the source's entry is deleted.
+    ///
+    /// This verifies that `VfsTree::resolve` correctly strips each backend's
+    /// mount prefix so the backends always operate on their native paths,
+    /// regardless of where they are mounted in the VFS tree.
+    #[tokio::test]
+    async fn rename_across_mounts_uses_backend_relative_paths() {
+        let src = Arc::new(MemBackend::new("src"));
+        let dst = Arc::new(MemBackend::new("dst"));
+
+        // Source has a file at `file.txt` (native), mounted under `Personal`.
+        src.put("n1", "root", "file.txt", b"cross-backend".to_vec());
+
+        let mut tree = VfsTree::new(Arc::new(MemBackend::new("root")));
+        tree.mount(PathBuf::from("Personal"), src.clone());
+        tree.mount(PathBuf::from("Shared"), dst.clone());
+
+        // Move `Personal/file.txt` (full VFS path) → `Shared/moved.txt`.
+        tree.rename(
+            Path::new("Personal/file.txt"),
+            Path::new("Shared/moved.txt"),
+        )
+        .await
+        .expect("cross-mount rename");
+
+        // Source entry was deleted.
+        assert_eq!(src.deleted(), vec!["n1".to_owned()]);
+
+        // Destination received the mount-relative path (`moved.txt`, not
+        // `Shared/moved.txt`) and has the original content.
+        let stored = dst
+            .metadata(Path::new("moved.txt"))
+            .await
+            .expect("destination entry must exist at mount-relative path");
+        let content = dst.download(&stored).await.expect("download");
+        assert_eq!(content, b"cross-backend".to_vec());
+
+        // No entries remain in the source backend.
+        let src_children = src.list_children("root").await.expect("list");
+        assert!(
+            src_children.is_empty(),
+            "source entry must be gone: {src_children:?}"
+        );
+    }
+
     #[tokio::test]
     async fn list_children_by_id_delegates_to_named_backend() {
         let src = Arc::new(MemBackend::new("src"));

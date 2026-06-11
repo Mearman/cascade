@@ -384,7 +384,29 @@ The VFS composes multiple backends into a single tree. Backends are bound to pat
 
 The tree root is a neutral container — an internal `NullBackend` that owns no content of its own and is never registered in the state database. Every configured backend mounts beneath it as a child at a named prefix, defaulting to the backend's id when no explicit mount is configured. A backend may instead be mounted at `"/"`, which resolves to the empty prefix: it then routes as the catch-all fallback and its content appears directly at the root, reproducing the single-backend-at-root layout. Each backend's mount is persisted in `backends.mount_path` and re-read on restart as the source of truth, so a runtime-added backend reclaims its placement rather than reverting to a config default. A mount prefix is unique per tree; two backends configured at the same prefix are rejected at construction rather than silently shadowing each other.
 
-**Pre-1.0 path-shape note.** Because each backend now mounts at its name under the neutral root, a single configured backend appears at `/{name}/` rather than at the bare root. To keep the previous single-backend-at-root shape, mount that backend explicitly at `"/"`. This is a deliberate, pre-1.0 uniform-mount change.
+**Pre-1.0 path-shape change.** Because each backend now mounts at its name under the neutral root, a single configured backend appears at `{name}/…` rather than at the bare root. To keep the previous single-backend-at-root shape, mount that backend explicitly at `"/"`. This is a deliberate, pre-1.0 uniform-mount change. Migration: if you have existing pin rules or lifecycle policies written against bare paths (e.g. `Documents/**`), and the backend is now mounted at `personal`, update the rules to `personal/Documents/**`. An at-root mount (`"/"`) requires no migration — paths are identical to the pre-refactor model.
+
+### Three identifiers, one mount prefix
+
+Three identifiers coexist and must be kept strictly separate:
+
+1. **`ItemId`** — `{backend_id}:{native_id}`. This is the primary key in `files.id`, the changefeed key, the cache key, and the presenter-to-backend dispatch key (`backend_by_id`). The mount prefix is **never** folded into an `ItemId`. Backends emit `ItemId::new(self.id(), native_id)` unchanged.
+
+2. **VFS path** — the `files.path` column and `FileEntry::path` / `VfsItem::path` field. This is the **only** place the mount prefix appears. It is the full, VFS-absolute, mount-prefixed path of the item from the neutral root (e.g. `personal/Documents/report.txt`), with no leading slash. For a backend mounted at `"/"` the prefix is empty, so the VFS path is byte-identical to the pre-refactor mount-relative path.
+
+3. **Mount prefix** — the `PathBuf` the backend is bound at in `VfsTree.children` (empty for a backend at `"/"`). Sourced from exactly one place: the `VfsTree` mount table. The sync runner reads the same table, so the prefix it stamps into item paths cannot drift from the prefix the router resolves on.
+
+### Path assembly
+
+The sync runner assembles the full VFS path once, on the way in, in `repath_entry`:
+
+```
+vfs_path(entry) = join(mount_prefix, parent_vfs_path(entry.parent_id), entry.name)
+```
+
+`parent_vfs_path` is looked up from the already-stored `files.path` row. Backend root containers (e.g. `gdrive:root`) resolve to the mount prefix itself. If a parent path is genuinely absent, path assembly fails loudly — a missing parent is a changefeed-ordering bug, not a default.
+
+On the write path (`flush_dirty_files`), the VFS path is stripped back to the native, mount-relative path before calling `backend.upload`. The two helpers `apply_mount_prefix` and `strip_mount_prefix` are strict inverses and the only places the prefix is applied or removed.
 
 ```rust
 struct VfsTree {
@@ -1174,7 +1196,7 @@ SQLite, stored at `~/.config/cascade/state.db`:
 CREATE TABLE files (
     id            TEXT PRIMARY KEY,        -- ItemId: "{backend_id}:{native_id}"
     backend_id    TEXT NOT NULL,
-    path          TEXT UNIQUE NOT NULL,     -- relative to mount root
+    path          TEXT UNIQUE NOT NULL,     -- full, mount-prefixed VFS path from the neutral root
     parent_id     TEXT,
     name          TEXT NOT NULL,
     is_dir        BOOLEAN NOT NULL,
@@ -1568,7 +1590,7 @@ When the same file is modified in two places simultaneously:
 
 1. **Detect** — compare local hash vs remote hash on sync. If both changed, conflict.
 2. **Resolve** — keep both versions. The losing version gets renamed: `report (work-laptop 2026-05-27).conflict`.
-3. **Log** — record the conflict in the state database with both hashes and timestamps.
+3. **Store** — the conflict copy is upserted into the state database and surfaced in the presenter at the same VFS path as the original, with the conflict filename replacing the basename. The full mount-prefixed VFS path is preserved: a file at `personal/Documents/report.pdf` produces a conflict copy at `personal/Documents/report (cascade 2026-06-11).conflict.pdf`.
 
 Conflict copies are never deleted automatically — the user resolves them manually or via the CLI.
 

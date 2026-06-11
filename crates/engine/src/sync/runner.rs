@@ -13,7 +13,7 @@ use crate::config::ConfigResolver;
 use crate::p2p_bridge::P2pBridge;
 use crate::portable::{FileSystem, RuntimeHandle, StateStorage};
 use crate::presenter::VfsPresenter;
-use crate::sync::conflict::{ConflictCheck, check_conflict, conflict_name};
+use crate::sync::conflict::{ConflictCheck, check_conflict, conflict_name, conflict_vfs_path};
 use crate::sync::mount_path::{apply_mount_prefix, strip_mount_prefix};
 use crate::types::{CacheState, Change, FileEntry, FileId, ItemId, VfsItem};
 
@@ -360,16 +360,54 @@ impl<R: RuntimeHandle> SyncRunner<R> {
                                 local_entry,
                                 remote_entry: _,
                             } => {
-                                // Rename local copy as conflict file.
+                                // The remote version wins. The local version is
+                                // kept as a conflict copy at the same VFS path
+                                // as the original, with a timestamped device
+                                // suffix inserted before the extension.
+                                //
+                                // `conflict_vfs_path` operates on the full,
+                                // mount-prefixed VFS path so the conflict copy
+                                // lands inside the correct directory under the
+                                // mount — not just at the bare basename.
                                 let conflict_file_name =
                                     conflict_name(&local_entry.name, "cascade");
+                                let conflict_path = conflict_vfs_path(&local_entry.path, "cascade");
                                 tracing::warn!(
-                                    original = %local_entry.name,
-                                    conflict = %conflict_file_name,
-                                    "conflict detected — local version renamed"
+                                    original = %local_entry.path,
+                                    conflict = %conflict_path,
+                                    "conflict detected — local version preserved as conflict copy"
                                 );
-                                // Record the conflict. The remote version wins;
-                                // the local version is kept as a conflict copy.
+                                // Synthesise a conflict-copy entry: a new ItemId
+                                // (the native id with a `.conflict` suffix so it
+                                // is distinct in the backend's namespace) stamped
+                                // with the full, mount-prefixed conflict path.
+                                let conflict_id = ItemId::new(
+                                    local_entry.id.backend_id(),
+                                    &format!("{}.conflict", local_entry.id.native_id()),
+                                );
+                                let conflict_entry = FileEntry::file(
+                                    conflict_id,
+                                    local_entry.parent_id.clone(),
+                                    conflict_file_name,
+                                )
+                                .with_path(conflict_path)
+                                .with_size(local_entry.size)
+                                .with_hash(local_entry.hash.clone());
+                                if let Err(e) = self.storage.upsert_file(&conflict_entry).await {
+                                    tracing::warn!(
+                                        error = %e,
+                                        "failed to store conflict copy entry"
+                                    );
+                                } else {
+                                    let conflict_item: VfsItem = conflict_entry.into();
+                                    if let Err(e) = self.presenter.upsert_item(conflict_item).await
+                                    {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "failed to surface conflict copy in presenter"
+                                        );
+                                    }
+                                }
                             }
                             ConflictCheck::NoConflict => {}
                         }
