@@ -436,9 +436,12 @@ async fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> R
 
     // If the path isn't in the VFS, return 404 unless it is a top-level
     // backend path (e.g. `/gdrive-personal`) which is a virtual root with
-    // no corresponding VfsItem. Any deeper path that is absent must return
-    // 404 so that macOS sends MKCOL / PUT rather than treating the missing
-    // path as an existing empty directory.
+    // no corresponding VfsItem, OR a pure-intermediate ancestor of a mount
+    // prefix (e.g. `/work` for a backend mounted only at `work/projects`, with
+    // no backend at `work`). The latter is a navigable synthetic directory
+    // whose only contents are its child mount dirs, so it must not 404. Any
+    // other deeper absent path returns 404 so macOS sends MKCOL / PUT rather
+    // than treating it as an existing empty directory.
     if target.is_none() {
         let component_count = normalised
             .trim_start_matches('/')
@@ -446,7 +449,11 @@ async fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> R
             .split('/')
             .filter(|s| !s.is_empty())
             .count();
-        if component_count != 1 {
+        let is_mount_ancestor = {
+            let mounts = state.mounts.read().await;
+            !child_mount_dir_names(&normalised, &mounts).is_empty()
+        };
+        if component_count != 1 && !is_mount_ancestor {
             return empty_response(StatusCode::NOT_FOUND);
         }
     }

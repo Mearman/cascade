@@ -596,6 +596,64 @@ async fn propfind_root_lists_custom_mount_directory() {
     server.stop().unwrap();
 }
 
+/// A backend mounted deep (`a/b/c`) with no backend at the intermediate paths
+/// produces pure-synthetic ancestor directories. Navigating the deeper one
+/// (`/a/b`) must list its child mount (`c`) rather than 404 — the
+/// pure-intermediate case at depth > 1.
+#[tokio::test]
+async fn propfind_lists_pure_intermediate_mount_ancestor() {
+    let leaf: Arc<dyn Backend> = Arc::new(RecordingBackend::new("leaf-be"));
+    let mounts = mount_table(vec![(PathBuf::from("a/b/c"), leaf.clone())]);
+    let server = WebDavServer::start(
+        "127.0.0.1:0",
+        Arc::new(RwLock::new(HashMap::new())),
+        tempfile::tempdir().unwrap().path().to_path_buf(),
+        backend_list(vec![leaf.clone()]),
+        mounts,
+        None,
+    )
+    .await
+    .unwrap();
+    let port = server.port();
+    let client = reqwest::Client::new();
+
+    let body_ab = client
+        .request(
+            reqwest::Method::from_bytes(b"PROPFIND").unwrap(),
+            format!("http://127.0.0.1:{port}/a/b"),
+        )
+        .header("Depth", "1")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        body_ab.contains("/a/b/c"),
+        "deep intermediate /a/b must list child mount 'c', not 404; body: {body_ab}"
+    );
+
+    // And the shallower intermediate /a lists its child segment 'b'.
+    let body_a = client
+        .request(
+            reqwest::Method::from_bytes(b"PROPFIND").unwrap(),
+            format!("http://127.0.0.1:{port}/a"),
+        )
+        .header("Depth", "1")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        body_a.contains("/a/b"),
+        "intermediate /a must list 'b'; body: {body_a}"
+    );
+    server.stop().unwrap();
+}
+
 /// A backend mounted *inside* another backend's subtree (e.g. `work/projects`)
 /// must appear when listing the parent directory (`/work`) — the nested-mount
 /// shadowing the design promises, now wired through the `WebDAV` `PROPFIND`
