@@ -17,6 +17,11 @@ pub mod context;
 pub mod eval;
 pub mod providers;
 
+#[cfg(test)]
+mod eval_tests;
+#[cfg(test)]
+mod providers_tests;
+
 // Pest generates the parser from grammar.pest at compile time.
 use pest_derive::Parser;
 

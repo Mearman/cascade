@@ -9,7 +9,7 @@ comparison = { operand ~ operator ~ operand }
 operator   = { "matches" | "contains" | "in" | "<=" | ">=" | "!=" | "==" | "<" | ">" }
 
 operand    = { literal | identifier }
-identifier = { ASCII_ALPHA_UPPER ~ (ASCII_ALPHANUMERIC | "." | "_")* }
+identifier = @{ ASCII_ALPHA_UPPER ~ (ASCII_ALPHANUMERIC | "." | "_")* }
 
 literal    = { size_bytes | duration | percentage | boolean | string | integer }
 duration   = { integer ~ ("ms" | "s" | "m" | "h" | "d" | "w" | "M" | "y") }
@@ -17,6 +17,6 @@ percentage = { integer ~ "%" }
 size_bytes = { integer ~ ("B" | "KB" | "MB" | "GB" | "TB") }
 boolean    = { "true" | "false" }
 string     = @{ "\"" ~ (!("\"" | "\\") ~ ANY)* ~ "\"" }
-integer    = { ASCII_DIGIT+ }
+integer    = @{ ASCII_DIGIT+ }
 
 WHITESPACE = _{ " " | "\t" }
