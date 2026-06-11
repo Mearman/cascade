@@ -72,13 +72,33 @@ impl VfsTree {
         Some(self.children.remove(idx).1)
     }
 
-    /// Resolve a path to the correct backend and the remaining path within that backend.
+    /// Resolve a path to the correct backend and the remaining path within that
+    /// backend.
+    ///
+    /// Routing is longest-prefix-first: `children` is kept sorted by descending
+    /// prefix length (see [`Self::mount`]), so the first child whose prefix is a
+    /// leading component of `path` wins and nested mounts route to the innermost
+    /// backend. A backend mounted at `/` carries the empty prefix; because the
+    /// empty prefix has length zero it always sorts last, it is only matched
+    /// once every explicit prefix has been ruled out. That at-root rule is made
+    /// explicit here (mirroring the `WebDAV` presenter's `backend_for_path`)
+    /// rather than relying on `strip_prefix("")` happening to succeed at the end
+    /// of the loop, so the invariant survives any future change to the ordering.
     #[must_use]
     pub fn resolve(&self, path: &Path) -> (&Arc<dyn Backend>, PathBuf) {
+        let mut at_root: Option<&Arc<dyn Backend>> = None;
         for (prefix, backend) in &self.children {
+            if prefix.as_os_str().is_empty() {
+                // At-root child: the final fallback, tried after explicit prefixes.
+                at_root = Some(backend);
+                continue;
+            }
             if let Ok(rest) = path.strip_prefix(prefix) {
                 return (backend, rest.to_path_buf());
             }
+        }
+        if let Some(backend) = at_root {
+            return (backend, path.to_path_buf());
         }
         (&self.root, path.to_path_buf())
     }
@@ -758,6 +778,33 @@ mod tests {
         tree.mount(PathBuf::from("Work"), Arc::new(NullBackend::new("work")));
         let (backend, rest) = tree.resolve(Path::new("Personal/notes.txt"));
         assert_eq!(backend.id(), "root");
+        assert_eq!(rest, Path::new("Personal/notes.txt"));
+    }
+
+    #[test]
+    fn resolve_at_root_child_is_final_fallback_not_a_shadow() {
+        // A backend mounted at the empty prefix (the "/" case) must own only the
+        // paths no explicit prefix claims, never shadow an explicit mount — even
+        // if the at-root child is encountered first in the children list. This
+        // exercises the explicit at-root branch rather than relying on the
+        // length-descending sort placing the empty prefix last.
+        let mut tree = make_tree();
+        // Mount the at-root backend first so it sits ahead of the explicit one
+        // in iteration order before the sort; the sort keeps it last by length,
+        // but the explicit at-root branch guarantees correctness regardless.
+        tree.mount(PathBuf::new(), Arc::new(NullBackend::new("atroot")));
+        tree.mount(PathBuf::from("Work"), Arc::new(NullBackend::new("work")));
+
+        // An explicit-prefix path routes to the explicit backend with the prefix
+        // stripped, not to the at-root backend.
+        let (backend, rest) = tree.resolve(Path::new("Work/report.txt"));
+        assert_eq!(backend.id(), "work");
+        assert_eq!(rest, Path::new("report.txt"));
+
+        // An unclaimed path falls through to the at-root backend with its path
+        // carried verbatim.
+        let (backend, rest) = tree.resolve(Path::new("Personal/notes.txt"));
+        assert_eq!(backend.id(), "atroot");
         assert_eq!(rest, Path::new("Personal/notes.txt"));
     }
 
