@@ -6,7 +6,7 @@ use std::sync::Arc;
 use sha2::{Digest, Sha256};
 
 use crate::backend::Backend;
-use crate::types::{Change, DirEntry, FileEntry, FileId, ItemId, SyncCursor};
+use crate::types::{DirEntry, FileEntry, FileId, ItemId, SyncCursor};
 
 /// Backend id of the neutral VFS root.
 ///
@@ -104,23 +104,38 @@ impl VfsTree {
     }
 
     /// List directory entries, merging backend content with child mount points.
+    ///
+    /// Resolves `path` to the owning backend and backend-relative sub-path, then
+    /// calls `Backend::list_children` with that sub-path so only the immediate
+    /// children of the requested directory are fetched, not the entire backend
+    /// tree. The child-mount injection loop below is unchanged from the shared
+    /// `WebDAV`/`NFS` pattern: any child mount whose prefix has `path` as its
+    /// direct parent is injected as a synthetic directory entry, shadowing a
+    /// same-named real entry if one exists.
     pub async fn read_dir(&self, path: &Path) -> anyhow::Result<Vec<DirEntry>> {
         let mut entries = Vec::new();
 
-        // Get entries from the backend that owns this path
-        let (backend, _backend_path) = self.resolve(path);
-        // For Phase 1 read-only, we query the backend for children
-        let (changes, _) = backend.changes(None).await?;
-        for change in changes {
-            if let Change::Created(entry) = change {
-                entries.push(DirEntry {
-                    name: entry.name,
-                    is_dir: entry.is_dir,
-                });
-            }
+        // Resolve the requested path to its owning backend and the
+        // backend-relative sub-path.  Non-UTF-8 paths are rejected
+        // explicitly rather than silently substituting an empty string,
+        // which would silently list the wrong directory.
+        let (backend, backend_path) = self.resolve(path);
+        let backend_path_str = backend_path.to_str().ok_or_else(|| {
+            anyhow::anyhow!("path contains non-UTF-8 bytes: {}", backend_path.display())
+        })?;
+
+        // Fetch immediate children from the owning backend, scoped to the
+        // resolved backend-relative directory.
+        let children = backend.list_children(backend_path_str).await?;
+        for entry in children {
+            entries.push(DirEntry {
+                name: entry.name,
+                is_dir: entry.is_dir,
+            });
         }
 
-        // Inject child mount point directories if this path is their parent
+        // Inject child mount point directories if this path is their parent.
+        // (Byte-identical to the WebDAV/NFS shadow rule.)
         for (child_prefix, _) in &self.children {
             if child_prefix.parent() == Some(path)
                 && let Some(mount_dir_name) = child_prefix.file_name()
@@ -298,7 +313,7 @@ pub async fn derive_sync_cursor(
 mod tests {
     use super::*;
     use crate::backend::NullBackend;
-    use crate::types::{Cursor, FileEntry, Quota};
+    use crate::types::{Change, Cursor, FileEntry, Quota};
     use async_trait::async_trait;
     use chrono::{TimeZone, Utc};
     use std::collections::HashMap;
@@ -1129,5 +1144,105 @@ mod tests {
         let (backend, rest) = tree.backend_for_path("Personal/notes.txt");
         assert_eq!(backend.id(), "gdrive");
         assert_eq!(rest, "Personal/notes.txt");
+    }
+
+    // --- read_dir list_children scoping tests --------------------------------
+
+    /// `read_dir` must call `list_children` with the backend-relative path
+    /// rather than a full-tree snapshot via `changes(None)`.  The `MemBackend`
+    /// stub ignores the `parent_native_id` parameter and returns all of its
+    /// files, so these tests verify the routing and injection logic rather than
+    /// any per-directory filtering (which is the owning backend's
+    /// responsibility).
+    ///
+    /// At-root (empty-prefix) backend: `read_dir("")` resolves to
+    /// `(at_root_backend, "")`, which is passed to `list_children("")`.
+    /// The resulting entries plus the injected child-mount dir must both appear
+    /// in the output; a same-named real entry is shadowed by the injected one
+    /// (de-duplicated to exactly one occurrence).
+    #[tokio::test]
+    async fn read_dir_at_root_backend_lists_children_and_injects_mounts() {
+        // At-root backend (empty prefix) carrying a single real file.
+        let gdrive = Arc::new(MemBackend::new("gdrive"));
+        gdrive.put("d1", "root", "Documents", b"".to_vec());
+
+        // A second backend mounted under Work.
+        let work = Arc::new(MemBackend::new("work"));
+        work.put("w1", "root", "report.txt", b"x".to_vec());
+
+        let mut tree = VfsTree::new(Arc::new(NullBackend::new("null-root")));
+        tree.mount(PathBuf::new(), gdrive.clone()); // at-root
+        tree.mount(PathBuf::from("Work"), work.clone());
+
+        // read_dir of the VFS root (""): the at-root backend owns this path.
+        let entries = tree.read_dir(Path::new("")).await.expect("read_dir");
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+
+        // Real entry from the at-root backend.
+        assert!(
+            names.contains(&"Documents"),
+            "real entry from at-root backend must appear: {names:?}"
+        );
+        // Injected mount-point dir for the explicit Work mount.
+        assert!(
+            names.contains(&"Work"),
+            "child mount point must be injected: {names:?}"
+        );
+    }
+
+    /// A same-named real entry from the owning backend must not be duplicated
+    /// when the child-mount injection loop encounters the same name.
+    #[tokio::test]
+    async fn read_dir_at_root_backend_shadows_real_entry_with_mount_point() {
+        // At-root backend has a real entry named "Work" — same as a child mount.
+        let gdrive = Arc::new(MemBackend::new("gdrive"));
+        gdrive.put("real-work", "root", "Work", b"".to_vec());
+
+        let work = Arc::new(MemBackend::new("work"));
+        let mut tree = VfsTree::new(Arc::new(NullBackend::new("null-root")));
+        tree.mount(PathBuf::new(), gdrive.clone()); // at-root
+        tree.mount(PathBuf::from("Work"), work);
+
+        let entries = tree.read_dir(Path::new("")).await.expect("read_dir");
+        let work_count = entries.iter().filter(|e| e.name == "Work").count();
+        assert_eq!(
+            work_count, 1,
+            "\"Work\" must appear exactly once even when both the backend and the mount inject it"
+        );
+    }
+
+    /// Explicit-prefix backend: `read_dir("Work")` resolves to
+    /// `(work_backend, "")`, which is passed to `list_children("")`.
+    /// The child-mount injection loop must still inject a grandchild mount
+    /// (e.g. `Work/Assets`) as a dir entry under `Work`.
+    #[tokio::test]
+    async fn read_dir_explicit_prefix_backend_injects_nested_child_mount() {
+        let work = Arc::new(MemBackend::new("work"));
+        work.put("r1", "root", "readme.txt", b"hi".to_vec());
+
+        let assets = Arc::new(MemBackend::new("assets"));
+        let mut tree = VfsTree::new(Arc::new(NullBackend::new("null-root")));
+        tree.mount(PathBuf::from("Work"), work.clone());
+        tree.mount(PathBuf::from("Work/Assets"), assets);
+
+        // Reading the Work directory: owning backend is "work", backend_path is "".
+        let entries = tree.read_dir(Path::new("Work")).await.expect("read_dir");
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+
+        // Real entry from the work backend.
+        assert!(
+            names.contains(&"readme.txt"),
+            "real entry from owning backend must appear: {names:?}"
+        );
+        // The "Work/Assets" mount must inject "Assets" under Work.
+        assert!(
+            names.contains(&"Assets"),
+            "nested child-mount dir must be injected under parent: {names:?}"
+        );
+        let assets_entry = entries.iter().find(|e| e.name == "Assets").expect("Assets");
+        assert!(
+            assets_entry.is_dir,
+            "injected nested mount must be a directory"
+        );
     }
 }

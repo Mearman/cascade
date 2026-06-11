@@ -316,16 +316,26 @@ impl MountedBackend {
 /// Map an explicit mount-path string to the VFS prefix it binds to.
 ///
 /// The literal `"/"` maps to the empty prefix — the neutral root, the at-root
-/// case that preserves the single-backend path shape. Any other value maps to
-/// itself. Shared by [`MountedBackend::resolve_prefix`] and the runtime
+/// case that preserves the single-backend path shape.
+///
+/// Any other value has leading slashes stripped so that `"/work"` and `"work"`
+/// both map to `PathBuf::from("work")`. This normalisation means the config
+/// author can write either form without accidentally producing an absolute
+/// `PathBuf` that would be treated as a filesystem-rooted path rather than a
+/// VFS-relative prefix.
+///
+/// Shared by [`MountedBackend::resolve_prefix`] and the runtime
 /// backend-removal path so the mapping cannot diverge between mounting and
 /// unmounting.
 #[must_use]
 pub fn mount_prefix_from_str(mount: &str) -> std::path::PathBuf {
-    if mount == "/" {
+    // Strip all leading slashes; `"/"` and `"//"` both become the empty prefix.
+    let stripped = mount.trim_start_matches('/');
+    if stripped.is_empty() {
+        // Either the input was `"/"` (or all slashes) → at-root / empty prefix.
         std::path::PathBuf::new()
     } else {
-        std::path::PathBuf::from(mount)
+        std::path::PathBuf::from(stripped)
     }
 }
 
@@ -541,5 +551,67 @@ mod tests {
         assert!(!backend.is_root_native_id("__mydrive"));
         assert!(!backend.is_root_native_id("__user_file"));
         assert!(!backend.is_root_native_id("abc123"));
+    }
+
+    // --- mount_prefix_from_str tests ----------------------------------------
+
+    #[test]
+    fn mount_prefix_slash_yields_empty_prefix() {
+        assert_eq!(
+            mount_prefix_from_str("/"),
+            std::path::PathBuf::new(),
+            r#""/" must map to the empty prefix (at-root backend)"#
+        );
+    }
+
+    #[test]
+    fn mount_prefix_bare_name_yields_relative_path() {
+        assert_eq!(
+            mount_prefix_from_str("work"),
+            std::path::PathBuf::from("work"),
+        );
+    }
+
+    #[test]
+    fn mount_prefix_leading_slash_stripped_to_match_bare_form() {
+        // A leading slash must be stripped so "/work" and "work" both produce
+        // the same VFS prefix — preventing an absolute PathBuf that would be
+        // treated as a filesystem root rather than a VFS-relative mount point.
+        assert_eq!(
+            mount_prefix_from_str("/work"),
+            mount_prefix_from_str("work"),
+            r#""/work" and "work" must map to the same prefix"#
+        );
+        assert_eq!(
+            mount_prefix_from_str("/work"),
+            std::path::PathBuf::from("work"),
+        );
+    }
+
+    #[test]
+    fn mount_prefix_nested_path_leading_slash_stripped() {
+        assert_eq!(
+            mount_prefix_from_str("/work/projects"),
+            mount_prefix_from_str("work/projects"),
+        );
+        assert_eq!(
+            mount_prefix_from_str("/work/projects"),
+            std::path::PathBuf::from("work/projects"),
+        );
+    }
+
+    #[test]
+    fn mount_prefix_multiple_leading_slashes_all_stripped() {
+        // Any number of leading slashes reduces to the same prefix.
+        assert_eq!(
+            mount_prefix_from_str("//work"),
+            std::path::PathBuf::from("work"),
+        );
+    }
+
+    #[test]
+    fn mount_prefix_multiple_slashes_at_root_yield_empty() {
+        // Multiple slashes with no subsequent name → at-root / empty prefix.
+        assert_eq!(mount_prefix_from_str("//"), std::path::PathBuf::new(),);
     }
 }
