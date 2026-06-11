@@ -108,9 +108,16 @@ impl VfsTree {
     ///
     /// This is the synchronous half of [`Self::read_dir`], split out so a
     /// presenter holding the tree behind a synchronous lock can compute the
-    /// routing and injection set, release the lock, and then await
-    /// `Backend::list_children` without holding the guard across the await
-    /// point. The returned backend `Arc` is cloned so it outlives the lock.
+    /// routing and injection set, release the lock, and then await the
+    /// native-id resolution and `Backend::list_children` without holding the
+    /// guard across the await point. The returned backend `Arc` is cloned so it
+    /// outlives the lock.
+    ///
+    /// The returned sub-path is the backend-relative *path*, not the native id
+    /// `Backend::list_children` expects. A presenter reproducing [`Self::read_dir`]
+    /// must resolve it to a native id with the free [`resolve_listing_native_id`]
+    /// function before calling `Backend::list_children`, exactly as `read_dir`
+    /// does.
     ///
     /// The injected names follow the shared `WebDAV`/`NFS` rule: any child mount
     /// whose prefix has `path` as its direct parent contributes its final path
@@ -142,21 +149,25 @@ impl VfsTree {
 
     /// List directory entries, merging backend content with child mount points.
     ///
-    /// Resolves `path` to the owning backend and backend-relative sub-path, then
-    /// calls `Backend::list_children` with that sub-path so only the immediate
-    /// children of the requested directory are fetched, not the entire backend
-    /// tree. The injected child-mount directories follow the shared
+    /// Resolves `path` to the owning backend and backend-relative sub-path,
+    /// resolves that sub-path to the directory's *native id* (the identifier
+    /// `Backend::list_children` actually takes — see [`resolve_listing_native_id`]),
+    /// then calls `Backend::list_children` with that native id so only the
+    /// immediate children of the requested directory are fetched, not the entire
+    /// backend tree. The injected child-mount directories follow the shared
     /// `WebDAV`/`NFS` shadow rule: any child mount whose prefix has `path` as its
     /// direct parent is injected as a synthetic directory entry, shadowing a
     /// same-named real entry if one exists.
     ///
-    /// The routing and injection set are computed by [`Self::resolve_listing`]
-    /// and merged by the free [`merge_listing`] function, so a presenter that
-    /// must release a synchronous lock before awaiting can reproduce this exact
-    /// behaviour without duplicating the merge logic.
+    /// The routing and injection set are computed by [`Self::resolve_listing`],
+    /// the native id by [`resolve_listing_native_id`], and the result merged by
+    /// the free [`merge_listing`] function, so a presenter that must release a
+    /// synchronous lock before awaiting can reproduce this exact behaviour
+    /// without duplicating the merge logic.
     pub async fn read_dir(&self, path: &Path) -> anyhow::Result<Vec<DirEntry>> {
         let (backend, backend_path, mount_names) = self.resolve_listing(path)?;
-        let children = backend.list_children(&backend_path).await?;
+        let native_id = resolve_listing_native_id(backend.as_ref(), &backend_path).await?;
+        let children = backend.list_children(&native_id).await?;
         Ok(merge_listing(children, &mount_names))
     }
 
@@ -290,6 +301,38 @@ impl VfsTree {
             .clone();
         derive_sync_cursor(backend.as_ref(), parent_id.native_id()).await
     }
+}
+
+/// Resolve a backend-relative directory *path* to the *native id* that
+/// `Backend::list_children` expects.
+///
+/// `Backend::list_children` is contracted on a native parent id (the `root`
+/// sentinel, or a backend-specific node id such as a Google Drive folder id),
+/// not on a path. [`VfsTree::resolve_listing`] yields the backend-relative path,
+/// so this function bridges the two before the call.
+///
+/// - The mount root carries the empty `backend_path`; it resolves to the
+///   backend's declared [`Backend::root_native_id`] (the conventional `root`
+///   sentinel for the cloud backends, `/` for the local-filesystem backend),
+///   matching the `{backend_id}:root` `ItemId` the engine and presenters use to
+///   enumerate a mount's top level.
+/// - A non-empty `backend_path` is resolved through [`Backend::metadata`], whose
+///   returned [`FileEntry`] carries the directory's real native id in its
+///   [`ItemId`]; that native id is then handed to `Backend::list_children`.
+///
+/// Free function (rather than a `VfsTree` method) so a presenter that releases a
+/// synchronous lock before awaiting — cloning the owning `Arc<dyn Backend>`
+/// first — can reproduce [`VfsTree::read_dir`] exactly without re-implementing
+/// the path-to-native-id step.
+pub async fn resolve_listing_native_id(
+    backend: &dyn Backend,
+    backend_path: &str,
+) -> anyhow::Result<String> {
+    if backend_path.is_empty() {
+        return Ok(backend.root_native_id().to_owned());
+    }
+    let entry = backend.metadata(Path::new(backend_path)).await?;
+    Ok(entry.id.native_id().to_owned())
 }
 
 /// Merge a backend's immediate children with injected child-mount directory
@@ -871,10 +914,9 @@ mod tests {
         backend.put("b", "root", "beta.txt", b"bb".to_vec());
 
         let tree = VfsTree::new(backend);
-        let entries = tree
-            .read_dir(Path::new("anywhere"))
-            .await
-            .expect("read_dir");
+        // The mount root: an empty backend-relative path resolves to the
+        // backend's root native id without a `metadata` round-trip.
+        let entries = tree.read_dir(Path::new("")).await.expect("read_dir");
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"alpha.txt"));
         assert!(names.contains(&"beta.txt"));
@@ -1285,5 +1327,277 @@ mod tests {
             assets_entry.is_dir,
             "injected nested mount must be a directory"
         );
+    }
+
+    // --- read_dir native-id resolution regression tests ----------------------
+
+    /// Backend that honours the real `Backend::list_children` contract: it
+    /// returns children only when handed the *native id* of a directory it
+    /// knows, and an empty listing for anything else.
+    ///
+    /// This is the inverse of `MemBackend`, whose `list_children` ignores its
+    /// argument entirely and so masks whether the caller passes a path or a
+    /// native id. `NativeIdBackend` exposes the difference: if `read_dir`
+    /// regresses to passing the backend-relative *path*, the requested native id
+    /// never matches and the listing comes back empty, failing these tests.
+    ///
+    /// `children_by_native_id` maps a parent native id to the entries filed
+    /// under it; `path_to_native_id` maps a backend-relative directory path to
+    /// the native id `metadata` resolves it to. `root_native_id` defaults to the
+    /// conventional `root` sentinel that `resolve_listing_native_id` uses for the
+    /// mount root.
+    #[derive(Debug)]
+    struct NativeIdBackend {
+        id: String,
+        children_by_native_id: HashMap<String, Vec<FileEntry>>,
+        path_to_native_id: HashMap<String, String>,
+    }
+
+    impl NativeIdBackend {
+        fn new(id: &str) -> Self {
+            Self {
+                id: id.to_owned(),
+                children_by_native_id: HashMap::new(),
+                path_to_native_id: HashMap::new(),
+            }
+        }
+
+        /// File `child_name` under the directory addressed by `parent_native_id`.
+        fn add_child(&mut self, parent_native_id: &str, child_native: &str, child_name: &str) {
+            let entry = FileEntry {
+                id: ItemId::new(&self.id, child_native),
+                parent_id: ItemId::new(&self.id, parent_native_id),
+                path: child_name.to_owned(),
+                name: child_name.to_owned(),
+                is_dir: false,
+                size: Some(child_name.len() as u64),
+                mod_time: None,
+                mime_type: None,
+                hash: None,
+            };
+            self.children_by_native_id
+                .entry(parent_native_id.to_owned())
+                .or_default()
+                .push(entry);
+        }
+
+        /// Register that the directory at backend-relative `path` has native id
+        /// `native_id`, so `metadata(path)` resolves to it.
+        fn map_path(&mut self, path: &str, native_id: &str) {
+            self.path_to_native_id
+                .insert(path.to_owned(), native_id.to_owned());
+        }
+    }
+
+    #[async_trait]
+    impl Backend for NativeIdBackend {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn display_name(&self) -> &str {
+            &self.id
+        }
+
+        async fn quota(&self) -> anyhow::Result<Option<Quota>> {
+            Ok(None)
+        }
+
+        async fn changes(&self, _cursor: Option<&Cursor>) -> anyhow::Result<(Vec<Change>, Cursor)> {
+            Ok((vec![], Cursor("native".to_owned())))
+        }
+
+        async fn metadata(&self, path: &Path) -> anyhow::Result<FileEntry> {
+            let key = path.to_string_lossy().to_string();
+            let native_id = self
+                .path_to_native_id
+                .get(&key)
+                .ok_or_else(|| anyhow::anyhow!("no entry at path {key}"))?;
+            Ok(FileEntry {
+                id: ItemId::new(&self.id, native_id),
+                parent_id: ItemId::new(&self.id, "root"),
+                path: key.clone(),
+                name: path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map_or_else(String::new, ToOwned::to_owned),
+                is_dir: true,
+                size: None,
+                mod_time: None,
+                mime_type: None,
+                hash: None,
+            })
+        }
+
+        async fn download(&self, _file: &FileEntry) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("download not supported in NativeIdBackend")
+        }
+
+        async fn upload(
+            &self,
+            _path: &Path,
+            _data: &[u8],
+            _parent_id: &FileId,
+        ) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("upload not supported in NativeIdBackend")
+        }
+
+        async fn update(&self, _file_id: &FileId, _data: &[u8]) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("update not supported in NativeIdBackend")
+        }
+
+        async fn create_dir(&self, _path: &Path) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("create_dir not supported in NativeIdBackend")
+        }
+
+        async fn delete(&self, _file: &FileEntry) -> anyhow::Result<()> {
+            anyhow::bail!("delete not supported in NativeIdBackend")
+        }
+
+        async fn move_entry(&self, _src: &Path, _dst: &Path) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("move_entry not supported in NativeIdBackend")
+        }
+
+        async fn list_children(&self, parent_native_id: &str) -> anyhow::Result<Vec<FileEntry>> {
+            // Honour the native-id contract: a path-shaped argument matches no
+            // known native id and yields an empty listing.
+            Ok(self
+                .children_by_native_id
+                .get(parent_native_id)
+                .cloned()
+                .unwrap_or_default())
+        }
+
+        async fn poll_interval(&self) -> Option<Duration> {
+            None
+        }
+    }
+
+    /// At the mount root the backend-relative path is empty, so `read_dir` must
+    /// resolve it to the backend's `root_native_id` (`root`) and list the
+    /// children filed there. The previous path-as-id code passed the empty
+    /// string, which matches no native id and returns nothing — this test would
+    /// fail against that regression.
+    #[tokio::test]
+    async fn read_dir_at_root_resolves_root_native_id_not_empty_path() {
+        let mut gdrive = NativeIdBackend::new("gdrive");
+        gdrive.add_child("root", "n-alpha", "alpha.txt");
+        gdrive.add_child("root", "n-beta", "beta.txt");
+
+        let tree = VfsTree::new(Arc::new(gdrive));
+        let entries = tree.read_dir(Path::new("")).await.expect("read_dir");
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+
+        assert!(
+            names.contains(&"alpha.txt") && names.contains(&"beta.txt"),
+            "root listing must resolve the empty path to the root native id: {names:?}"
+        );
+    }
+
+    /// For a sub-path `read_dir` must resolve the directory's native id via
+    /// `metadata` and list children under that native id — not under the
+    /// path-shaped argument. The previous code passed the sub-path verbatim,
+    /// which matches no native id and returns nothing.
+    #[tokio::test]
+    async fn read_dir_subpath_resolves_metadata_native_id_not_path() {
+        let mut gdrive = NativeIdBackend::new("gdrive");
+        // The directory at backend-relative path "Reports" has native id
+        // "folder-xyz"; its children are filed under that native id.
+        gdrive.map_path("Reports", "folder-xyz");
+        gdrive.add_child("folder-xyz", "n-q1", "q1.pdf");
+        gdrive.add_child("folder-xyz", "n-q2", "q2.pdf");
+        // A red herring keyed by the path itself: if read_dir wrongly passed the
+        // path, it would still find nothing here, proving the native-id route.
+        gdrive.add_child("Reports", "wrong", "should-not-appear.pdf");
+
+        // Mount the backend at-root so "Reports" routes to it with backend_path
+        // "Reports".
+        let mut tree = VfsTree::new(Arc::new(NullBackend::new("null-root")));
+        tree.mount(PathBuf::new(), Arc::new(gdrive));
+
+        let entries = tree.read_dir(Path::new("Reports")).await.expect("read_dir");
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+
+        assert!(
+            names.contains(&"q1.pdf") && names.contains(&"q2.pdf"),
+            "sub-path listing must resolve the metadata native id: {names:?}"
+        );
+        assert!(
+            !names.contains(&"should-not-appear.pdf"),
+            "children must come from the native id, not the path: {names:?}"
+        );
+    }
+
+    /// The native-id resolution must not disturb child-mount injection: the
+    /// at-root case still injects an explicit child mount, and a sub-path case
+    /// still injects a nested mount, exactly as before.
+    #[tokio::test]
+    async fn read_dir_native_id_resolution_preserves_mount_injection() {
+        // At-root: empty path resolves to the root native id, and the explicit
+        // "Work" mount is still injected.
+        let mut gdrive = NativeIdBackend::new("gdrive");
+        gdrive.add_child("root", "n-doc", "Documents");
+
+        let mut tree = VfsTree::new(Arc::new(NullBackend::new("null-root")));
+        tree.mount(PathBuf::new(), Arc::new(gdrive));
+        tree.mount(
+            PathBuf::from("Work"),
+            Arc::new(NativeIdBackend::new("work")),
+        );
+
+        let entries = tree.read_dir(Path::new("")).await.expect("read_dir");
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains(&"Documents"),
+            "real root entry must appear: {names:?}"
+        );
+        assert!(
+            names.contains(&"Work"),
+            "explicit child mount must still be injected at root: {names:?}"
+        );
+
+        // Mount root of an explicit mount: reading "Work" resolves to the work
+        // backend with an empty backend-relative path, which maps to its root
+        // native id; the nested "Work/Assets" mount is still injected under it.
+        let mut work = NativeIdBackend::new("work2");
+        work.add_child("root", "n-readme", "readme.txt");
+
+        let mut tree = VfsTree::new(Arc::new(NullBackend::new("null-root")));
+        tree.mount(PathBuf::from("Work"), Arc::new(work));
+        tree.mount(
+            PathBuf::from("Work/Assets"),
+            Arc::new(NativeIdBackend::new("assets")),
+        );
+
+        let entries = tree.read_dir(Path::new("Work")).await.expect("read_dir");
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains(&"readme.txt"),
+            "real entry under Work must appear: {names:?}"
+        );
+        assert!(
+            names.contains(&"Assets"),
+            "nested child mount must still be injected: {names:?}"
+        );
+    }
+
+    /// `resolve_listing_native_id` is exercised directly: the empty path maps to
+    /// the backend's `root_native_id`, and a registered path maps to the native
+    /// id `metadata` returns.
+    #[tokio::test]
+    async fn resolve_listing_native_id_maps_empty_and_subpath() {
+        let mut gdrive = NativeIdBackend::new("gdrive");
+        gdrive.map_path("Reports", "folder-xyz");
+        let gdrive: Arc<dyn Backend> = Arc::new(gdrive);
+
+        let at_root = resolve_listing_native_id(gdrive.as_ref(), "")
+            .await
+            .expect("root native id");
+        assert_eq!(at_root, "root");
+
+        let nested = resolve_listing_native_id(gdrive.as_ref(), "Reports")
+            .await
+            .expect("metadata native id");
+        assert_eq!(nested, "folder-xyz");
     }
 }

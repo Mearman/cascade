@@ -225,7 +225,13 @@ impl FuseOps {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 vfs.resolve_listing(std::path::Path::new(&query))?
             };
-            let children = backend.list_children(&backend_path).await?;
+            // `list_children` is contracted on the directory's native id, not its
+            // path; resolve the backend-relative path to that native id before the
+            // call, mirroring `VfsTree::read_dir` exactly.
+            let native_id =
+                cascade_engine::vfs::resolve_listing_native_id(backend.as_ref(), &backend_path)
+                    .await?;
+            let children = backend.list_children(&native_id).await?;
             Ok(cascade_engine::vfs::merge_listing(children, &mount_names))
         })
     }
