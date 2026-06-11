@@ -1213,19 +1213,19 @@ async fn try_webdav(
         presenter = presenter.with_bind_addr(bind);
     }
 
-    // Pass the mounted child backends and DB for on-demand directory expansion;
-    // the neutral root is synthetic and owns no content.
-    let all_backends: Vec<Arc<dyn cascade_engine::backend::Backend>> = {
+    // Pass the mount table (the engine's `VfsTree` children, longest-prefix
+    // first) and the child backends so `WebDavServer` routes every method by
+    // VFS mount path, not the first path segment. See `with_mounts`.
+    let mounts = {
         let vfs = engine
             .vfs()
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        vfs.children()
-            .iter()
-            .map(|(_, backend)| backend.clone())
-            .collect()
+        vfs.children().to_vec()
     };
+    let all_backends = mounts.iter().map(|(_, b)| b.clone()).collect();
     presenter.with_backends(all_backends).await;
+    presenter.with_mounts(mounts).await;
     presenter.with_db(engine.db().clone());
 
     let presenter = Arc::new(presenter);
@@ -1355,7 +1355,8 @@ async fn try_fuse(
     let root_id = cascade_engine::types::ItemId::new("vfs", "root");
     let presenter = Arc::new(
         cascade_presenter_fuse::FusePresenter::with_vfs(root_id, engine.vfs().clone())
-            .with_mount_point(mount_path),
+            .with_mount_point(mount_path)
+            .with_db(engine.db().clone()),
     );
 
     let sync_runner = engine.create_sync_runner(presenter.clone());
@@ -1450,10 +1451,10 @@ async fn try_nfs(
     // presenter is confirmed up, so a failed attempt never binds the port.
     let engine_for_web = engine.clone();
 
-    let presenter = Arc::new(cascade_presenter_nfs::NfsPresenter::with_vfs(
-        mount_path,
-        engine.vfs().clone(),
-    ));
+    let presenter = Arc::new(
+        cascade_presenter_nfs::NfsPresenter::with_vfs(mount_path, engine.vfs().clone())
+            .with_db(engine.db().clone()),
+    );
     let nfs_ctx = presenter.context().clone();
 
     let sync_runner = engine.create_sync_runner(presenter);

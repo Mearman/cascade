@@ -303,12 +303,15 @@ async fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> R
 
     let normalised = normalise_path(path);
 
-    // Root listing: show each mount as a top-level directory, using the
-    // configured mount name rather than the backend ID. For an at-root
-    // backend (empty prefix) we skip the synthetic directory — its items
-    // appear directly under "/".
+    // Root listing: show each explicitly-mounted backend as a top-level
+    // directory, using the configured mount name rather than the backend ID.
+    // A backend mounted at the empty prefix (the "/" case) owns no synthetic
+    // directory; its root children appear directly under "/", reproducing the
+    // single-backend-at-root path shape.
     if normalised == "/" {
-        let mount_names: Vec<String> = {
+        // The mount table separates explicit prefixes (synthetic top-level
+        // directories) from the at-root backend (its children listed inline).
+        let (mount_names, at_root_backend_id) = {
             let mounts = state.mounts.read().await;
             let mut names: Vec<String> = mounts
                 .iter()
@@ -322,13 +325,66 @@ async fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> R
                 })
                 .collect::<std::collections::HashSet<_>>()
                 .into_iter()
-                .collect();
+                .collect::<Vec<_>>();
             names.sort();
-            names
+            let at_root = mounts
+                .iter()
+                .find(|(prefix, _)| prefix.as_os_str().is_empty())
+                .map(|(_, backend)| backend.id().to_string());
+            (names, at_root)
         };
-        // Fall back to the old backend-ID approach when no mounts are
-        // configured (e.g. unit tests that construct AppState directly).
-        let effective_names = if mount_names.is_empty() {
+
+        let mount_table_configured = {
+            let mounts = state.mounts.read().await;
+            !mounts.is_empty()
+        };
+
+        if mount_table_configured {
+            // Expand the at-root backend's root so its children are present in
+            // the item store, then list them inline alongside the synthetic
+            // directories of every explicitly-mounted backend.
+            let mut at_root_children: Vec<VfsItem> = Vec::new();
+            if let Some(ref backend_id) = at_root_backend_id {
+                let root_id = format!("{backend_id}:root");
+                let is_expanded = state.expanded.read().await.contains(&root_id);
+                if !is_expanded {
+                    expand_root(state, backend_id).await;
+                }
+                let items = read_items(&state.items).await;
+                at_root_children = items
+                    .values()
+                    .filter(|item| item.parent_id.0 == root_id)
+                    .cloned()
+                    .collect();
+                if at_root_children.is_empty() {
+                    drop(items);
+                    hydrate_children_from_db(state, &root_id).await;
+                    let items = read_items(&state.items).await;
+                    at_root_children = items
+                        .values()
+                        .filter(|item| item.parent_id.0 == root_id)
+                        .cloned()
+                        .collect();
+                }
+            }
+            let items = read_items(&state.items).await;
+            let child_refs: Vec<&VfsItem> = at_root_children
+                .iter()
+                .filter(|c| !is_macos_junk(&c.name))
+                .collect();
+            let xml = build_root_listing(&mount_names, &child_refs, &items);
+            return (
+                StatusCode::MULTI_STATUS,
+                [(header::CONTENT_TYPE, "application/xml; charset=utf-8")],
+                xml,
+            )
+                .into_response();
+        }
+
+        // No mount table configured (e.g. unit tests that construct AppState
+        // directly): fall back to deriving top-level directory names from the
+        // backend-ID prefix of each item.
+        let effective_names = {
             let items = read_items(&state.items).await;
             let mut backends: Vec<String> = items
                 .values()
@@ -338,8 +394,6 @@ async fn handle_propfind(state: &AppState, path: &str, headers: &HeaderMap) -> R
                 .collect();
             backends.sort();
             backends
-        } else {
-            mount_names
         };
         let xml = build_root_response(&effective_names);
         return (
@@ -1261,6 +1315,63 @@ pub fn build_root_response(backends: &[String]) -> String {
     )
 }
 
+/// Build the `PROPFIND` response for the neutral VFS root ("/").
+///
+/// Lists each explicitly-mounted backend as a synthetic top-level collection
+/// (`mount_names`) and, for a backend mounted at the empty prefix (the "/"
+/// case), the backend's own root children (`at_root_children`) inline. Both
+/// sets appear directly under "/", reproducing the single-backend-at-root path
+/// shape when only an at-root backend is configured.
+#[must_use]
+#[allow(clippy::implicit_hasher)]
+pub fn build_root_listing(
+    mount_names: &[String],
+    at_root_children: &[&VfsItem],
+    items: &std::collections::HashMap<String, VfsItem>,
+) -> String {
+    let mut responses = String::new();
+    responses.push_str(
+        "<D:response>\
+         <D:href>/</D:href>\
+         <D:propstat>\
+         <D:prop>\
+         <D:resourcetype><D:collection/></D:resourcetype>\
+         </D:prop>\
+         <D:status>HTTP/1.1 200 OK</D:status>\
+         </D:propstat>\
+         </D:response>",
+    );
+    for name in mount_names {
+        // SAFETY: write! to String is infallible.
+        #[allow(clippy::expect_used)]
+        let _ = write!(
+            responses,
+            "<D:response>\
+             <D:href>/{}/</D:href>\
+             <D:propstat>\
+             <D:prop>\
+             <D:resourcetype><D:collection/></D:resourcetype>\
+             </D:prop>\
+             <D:status>HTTP/1.1 200 OK</D:status>\
+             </D:propstat>\
+             </D:response>",
+            xml_escape(name),
+        );
+    }
+    for child in at_root_children {
+        let child_path = resolve_full_path(child, items);
+        let href_suffix = if child.is_dir { "/" } else { "" };
+        let child_href = xml_escape(&format!("{child_path}{href_suffix}"));
+        responses.push_str(&build_response_element_escaped(&child_href, child));
+    }
+    format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+         <D:multistatus xmlns:D=\"DAV:\">\
+         {responses}\
+         </D:multistatus>"
+    )
+}
+
 #[must_use]
 #[allow(clippy::implicit_hasher)]
 pub fn build_propfind_response(
@@ -2010,6 +2121,314 @@ mod tests {
         let dav_header = resp.headers().get("dav").unwrap();
         assert_eq!(dav_header, "1, 2");
 
+        server.stop().unwrap();
+    }
+
+    // ── Mount-table routing ────────────────────────────────────────────────
+
+    use cascade_engine::backend::Backend;
+    use cascade_engine::types::{Change, Cursor, FileEntry, FileId, Quota};
+    use std::sync::Mutex as StdMutex;
+    use std::time::Duration;
+
+    /// Backend that records the paths it was asked to upload, so a test can
+    /// assert which backend a write routed to. `upload` succeeds and returns a
+    /// file entry under the backend's own root.
+    #[derive(Debug)]
+    struct RecordingBackend {
+        id: String,
+        uploads: Arc<StdMutex<Vec<String>>>,
+    }
+
+    impl RecordingBackend {
+        fn new(id: &str) -> Self {
+            Self {
+                id: id.to_string(),
+                uploads: Arc::new(StdMutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Backend for RecordingBackend {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        fn display_name(&self) -> &'static str {
+            "Recording"
+        }
+        async fn quota(&self) -> anyhow::Result<Option<Quota>> {
+            Ok(None)
+        }
+        async fn changes(&self, _cursor: Option<&Cursor>) -> anyhow::Result<(Vec<Change>, Cursor)> {
+            Ok((vec![], Cursor("rec".to_string())))
+        }
+        async fn metadata(&self, _path: &Path) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("no metadata")
+        }
+        async fn download(&self, _file: &FileEntry) -> anyhow::Result<Vec<u8>> {
+            anyhow::bail!("no download")
+        }
+        async fn upload(
+            &self,
+            path: &Path,
+            _data: &[u8],
+            parent_id: &FileId,
+        ) -> anyhow::Result<FileEntry> {
+            self.uploads
+                .lock()
+                .unwrap()
+                .push(path.to_string_lossy().into_owned());
+            let name = path
+                .file_name()
+                .map_or_else(|| "file".to_string(), |n| n.to_string_lossy().into_owned());
+            Ok(FileEntry::file(
+                ItemId::new(&self.id, "uploaded"),
+                ItemId(parent_id.0.clone()),
+                name,
+            ))
+        }
+        async fn update(&self, _file_id: &FileId, _data: &[u8]) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("no update")
+        }
+        async fn create_dir(&self, _path: &Path) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("no create_dir")
+        }
+        async fn delete(&self, _file: &FileEntry) -> anyhow::Result<()> {
+            anyhow::bail!("no delete")
+        }
+        async fn move_entry(&self, _src: &Path, _dst: &Path) -> anyhow::Result<FileEntry> {
+            anyhow::bail!("no move")
+        }
+        async fn poll_interval(&self) -> Option<Duration> {
+            None
+        }
+    }
+
+    /// Wrap a mount table in the shared-state shape `WebDavServer::start` wants.
+    fn mount_table(
+        pairs: Vec<(PathBuf, Arc<dyn Backend>)>,
+    ) -> Arc<tokio::sync::RwLock<Vec<(PathBuf, Arc<dyn Backend>)>>> {
+        Arc::new(tokio::sync::RwLock::new(pairs))
+    }
+
+    fn backend_list(
+        backends: Vec<Arc<dyn Backend>>,
+    ) -> Arc<tokio::sync::RwLock<Vec<Arc<dyn Backend>>>> {
+        Arc::new(tokio::sync::RwLock::new(backends))
+    }
+
+    fn empty_state(
+        mounts: Arc<tokio::sync::RwLock<Vec<(PathBuf, Arc<dyn Backend>)>>>,
+        backends: Arc<tokio::sync::RwLock<Vec<Arc<dyn Backend>>>>,
+    ) -> AppState {
+        AppState {
+            items: Arc::new(RwLock::new(HashMap::new())),
+            cache_dir: PathBuf::from("/tmp/cascade-test-cache"),
+            backends,
+            mounts,
+            db: None,
+            expanded: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            expand_sem: Arc::new(tokio::sync::Semaphore::new(4)),
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_for_path_routes_custom_named_mount() {
+        // Backend id differs from its mount name: id `gdrive-personal` mounted
+        // at `personal`. A path under `personal/...` must route to it, not be
+        // looked up by the literal first segment as a backend id.
+        let backend: Arc<dyn Backend> = Arc::new(RecordingBackend::new("gdrive-personal"));
+        let mounts = mount_table(vec![(PathBuf::from("personal"), backend.clone())]);
+        let state = empty_state(mounts, backend_list(vec![backend.clone()]));
+
+        let (routed, rest) = backend_for_path(&state, "personal/Documents/report.txt").await;
+        assert_eq!(routed.unwrap().id(), "gdrive-personal");
+        assert_eq!(rest, "Documents/report.txt");
+    }
+
+    #[tokio::test]
+    async fn backend_for_path_routes_at_root_backend() {
+        // A backend mounted at "/" (empty prefix) owns every path, and the
+        // backend-relative path is the whole VFS path unchanged.
+        let backend: Arc<dyn Backend> = Arc::new(RecordingBackend::new("gdrive"));
+        let mounts = mount_table(vec![(PathBuf::new(), backend.clone())]);
+        let state = empty_state(mounts, backend_list(vec![backend.clone()]));
+
+        let (routed, rest) = backend_for_path(&state, "Documents/report.txt").await;
+        assert_eq!(routed.unwrap().id(), "gdrive");
+        assert_eq!(rest, "Documents/report.txt");
+    }
+
+    #[tokio::test]
+    async fn backend_for_path_nested_mount_resolves_deepest() {
+        // `work` mounted under the at-root backend; `work/repo` must reach the
+        // deeper backend, while a sibling path stays with the at-root one.
+        let root: Arc<dyn Backend> = Arc::new(RecordingBackend::new("rootb"));
+        let work: Arc<dyn Backend> = Arc::new(RecordingBackend::new("workb"));
+        // Longest-prefix first, matching VfsTree ordering.
+        let mounts = mount_table(vec![
+            (PathBuf::from("work"), work.clone()),
+            (PathBuf::new(), root.clone()),
+        ]);
+        let state = empty_state(mounts, backend_list(vec![work.clone(), root.clone()]));
+
+        let (routed, rest) = backend_for_path(&state, "work/repo/main.rs").await;
+        assert_eq!(routed.unwrap().id(), "workb");
+        assert_eq!(rest, "repo/main.rs");
+
+        let (routed, rest) = backend_for_path(&state, "Personal/notes.txt").await;
+        assert_eq!(routed.unwrap().id(), "rootb");
+        assert_eq!(rest, "Personal/notes.txt");
+    }
+
+    #[tokio::test]
+    async fn propfind_root_lists_custom_mount_directory() {
+        let backend: Arc<dyn Backend> = Arc::new(RecordingBackend::new("gdrive-personal"));
+        let mounts = mount_table(vec![(PathBuf::from("personal"), backend.clone())]);
+        let server = WebDavServer::start(
+            "127.0.0.1:0",
+            Arc::new(RwLock::new(HashMap::new())),
+            tempfile::tempdir().unwrap().path().to_path_buf(),
+            backend_list(vec![backend.clone()]),
+            mounts,
+            None,
+        )
+        .await
+        .unwrap();
+        let port = server.port();
+
+        let client = reqwest::Client::new();
+        let body = client
+            .request(
+                reqwest::Method::from_bytes(b"PROPFIND").unwrap(),
+                format!("http://127.0.0.1:{port}/"),
+            )
+            .header("Depth", "1")
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+
+        // The mount NAME is listed, not the backend id.
+        assert!(body.contains("/personal/"), "body: {body}");
+        assert!(!body.contains("gdrive-personal"), "body: {body}");
+        server.stop().unwrap();
+    }
+
+    #[tokio::test]
+    async fn propfind_root_lists_at_root_children_inline() {
+        // An at-root backend's root children appear directly under "/", with no
+        // synthetic mount directory.
+        let backend: Arc<dyn Backend> = Arc::new(RecordingBackend::new("gdrive"));
+        let mounts = mount_table(vec![(PathBuf::new(), backend.clone())]);
+        let items = Arc::new(RwLock::new(HashMap::new()));
+        {
+            // Seed a root-level item as the sync runner would: parent is the
+            // backend's `:root` alias, path has no mount prefix.
+            let mut guard = items.write().await;
+            let mut item = make_item("Documents", true);
+            item.id = ItemId::new("gdrive", "doc1");
+            item.parent_id = ItemId::new("gdrive", "root");
+            item.path = "Documents".to_string();
+            guard.insert(item.id.0.clone(), item);
+        }
+        let server = WebDavServer::start(
+            "127.0.0.1:0",
+            items,
+            tempfile::tempdir().unwrap().path().to_path_buf(),
+            backend_list(vec![backend.clone()]),
+            mounts,
+            None,
+        )
+        .await
+        .unwrap();
+        let port = server.port();
+
+        let client = reqwest::Client::new();
+        let body = client
+            .request(
+                reqwest::Method::from_bytes(b"PROPFIND").unwrap(),
+                format!("http://127.0.0.1:{port}/"),
+            )
+            .header("Depth", "1")
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+
+        // The root item is listed directly under "/", not as a "gdrive" dir.
+        assert!(body.contains("/Documents/"), "body: {body}");
+        assert!(!body.contains("/gdrive/"), "body: {body}");
+        server.stop().unwrap();
+    }
+
+    #[tokio::test]
+    async fn put_routes_to_custom_mount_backend() {
+        let backend = Arc::new(RecordingBackend::new("gdrive-personal"));
+        let uploads = backend.uploads.clone();
+        let backend_dyn: Arc<dyn Backend> = backend;
+        let mounts = mount_table(vec![(PathBuf::from("personal"), backend_dyn.clone())]);
+        let server = WebDavServer::start(
+            "127.0.0.1:0",
+            Arc::new(RwLock::new(HashMap::new())),
+            tempfile::tempdir().unwrap().path().to_path_buf(),
+            backend_list(vec![backend_dyn.clone()]),
+            mounts,
+            None,
+        )
+        .await
+        .unwrap();
+        let port = server.port();
+
+        let resp = reqwest::Client::new()
+            .put(format!("http://127.0.0.1:{port}/personal/report.txt"))
+            .body(b"hello".to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+
+        // The upload reached the custom-mount backend with the mount prefix
+        // stripped (backend-relative path).
+        let recorded = uploads.lock().unwrap().clone();
+        assert_eq!(recorded, vec!["report.txt".to_string()]);
+        server.stop().unwrap();
+    }
+
+    #[tokio::test]
+    async fn put_routes_to_at_root_backend() {
+        let backend = Arc::new(RecordingBackend::new("gdrive"));
+        let uploads = backend.uploads.clone();
+        let backend_dyn: Arc<dyn Backend> = backend;
+        let mounts = mount_table(vec![(PathBuf::new(), backend_dyn.clone())]);
+        let server = WebDavServer::start(
+            "127.0.0.1:0",
+            Arc::new(RwLock::new(HashMap::new())),
+            tempfile::tempdir().unwrap().path().to_path_buf(),
+            backend_list(vec![backend_dyn.clone()]),
+            mounts,
+            None,
+        )
+        .await
+        .unwrap();
+        let port = server.port();
+
+        let resp = reqwest::Client::new()
+            .put(format!("http://127.0.0.1:{port}/report.txt"))
+            .body(b"hello".to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+
+        // The at-root backend receives the path verbatim (no prefix to strip).
+        let recorded = uploads.lock().unwrap().clone();
+        assert_eq!(recorded, vec!["report.txt".to_string()]);
         server.stop().unwrap();
     }
 }
