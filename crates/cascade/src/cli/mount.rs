@@ -340,12 +340,9 @@ async fn wait_for_shutdown_signal() -> std::io::Result<()> {
 /// (sync task, presenter, engine background tasks).  This prevents leaked
 /// tasks from an earlier attempt surviving into the next fallback.
 struct PresenterResources {
-    /// The engine instance (dropped last so cancel signals reach tasks).
-    ///
-    /// Held as an `Arc` because the engine is also the management-plane
-    /// dispatcher wired into the P2P backend at startup
-    /// ([`Engine::wire_manage_dispatch`]); that wiring hands a clone of the same
-    /// `Arc` to the backend, so the engine must already live behind one here.
+    /// The engine instance (dropped last so cancel signals reach tasks). Held as
+    /// an `Arc` so the management-plane dispatcher wired into the P2P backend at
+    /// startup ([`Engine::wire_manage_dispatch`]) can share ownership.
     engine: Arc<Engine>,
     /// Join handle for the cache-manager background task.
     engine_handle: cascade_engine::engine::EngineHandle,
@@ -354,12 +351,8 @@ struct PresenterResources {
 }
 
 impl PresenterResources {
-    /// Shut down all components in reverse start order.
-    ///
-    /// 1. Abort the sync runner.
-    /// 2. Signal the engine to cancel (stops the cache manager via the
-    ///    broadcast channel inside `engine.shutdown()`).
-    /// 3. Abort the cache-manager task directly as a safety net.
+    /// Shut down all components in reverse start order: abort the sync runner,
+    /// signal the engine to cancel, then abort the cache-manager task as a safety net.
     fn shutdown(self) {
         self.sync_handle.abort();
         self.engine.shutdown();
@@ -451,13 +444,10 @@ pub async fn start(
     // Read main config.toml written by `cascade init`.
     let main_config = load_main_config(&ctx.config_dir)?;
 
-    // Resolve the optimisation-layer P2P config from the [p2p] table.
-    // Misconfigured posture or relay values are caught here at startup so they
-    // surface before any mount attempt.
+    // Resolve P2P config; misconfigured posture or relay values surface here before any mount attempt.
     let mut p2p_config = resolve_p2p_bridge_config(&main_config.p2p)?;
 
-    // Apply the CLI override for P2P enablement: --p2p / --no-p2p overrides
-    // the [p2p].enabled value from config.toml.
+    // --p2p / --no-p2p overrides the [p2p].enabled value from config.toml.
     if let Some(override_val) = p2p_override {
         p2p_config.enable_p2p = override_val;
     }
@@ -471,9 +461,7 @@ pub async fn start(
     let web_options = resolve_web_options(&main_config.web, &web_flags);
     if web_options.enabled {
         tracing::info!("HTTP API (PWA) enabled");
-        // Fail fast on a misconfigured API before mounting anything, so a bad
-        // bind address or a missing `web` feature never tears down a working
-        // mount during the presenter-fallback chain.
+        // Fail fast on a misconfigured API before mounting anything.
         #[cfg(feature = "web")]
         validated_web_config(&web_options).context("[web] configuration is invalid")?;
         #[cfg(not(feature = "web"))]
@@ -498,12 +486,8 @@ pub async fn start(
         return Ok(());
     }
 
-    // Build the single long-lived pooled reqwest::Client NOW, here on the
-    // daemon's stable main runtime, and wrap it in the portable ReqwestClient
-    // adapter. The connection driver lives on this runtime for the daemon's
-    // lifetime, so it is always polled and never stranded — the architectural
-    // fix for the Drive TLS deadlock. Every `rebuild_backends` call receives the
-    // same `Arc`, so all Drive backends share one pooled client.
+    // Build the single long-lived pooled HTTP client on the daemon's stable
+    // main runtime (the Drive TLS deadlock fix). All Drive backends share it.
     let shared_http: Arc<dyn cascade_engine::portable::HttpClient> =
         Arc::new(cascade_engine::portable::native::ReqwestClient::new());
 
@@ -739,14 +723,14 @@ pub async fn start(
 async fn try_fskit(
     ctx: &CliContext,
     mount_path: &Path,
-    backends: Vec<Arc<dyn cascade_engine::backend::Backend>>,
+    backends: Vec<cascade_engine::backend::MountedBackend>,
     p2p: &ResolvedP2pConfig,
     web: &WebOptions,
 ) -> Result<()> {
     let engine_config = EngineConfig {
         db_path: ctx.db_path.clone(),
         mount_point: mount_path.to_path_buf(),
-        backends: cascade_engine::backend::MountedBackend::all_at_default(backends),
+        backends,
         cache_dir: None,
         enable_p2p: p2p.enable_p2p,
         p2p_data_dir: None,
@@ -905,7 +889,7 @@ impl VfsPresenter for NoopPresenter {
 async fn try_fileprovider(
     ctx: &CliContext,
     mount_path: &Path,
-    backends: Vec<Arc<dyn cascade_engine::backend::Backend>>,
+    backends: Vec<cascade_engine::backend::MountedBackend>,
     _no_mount: bool,
     p2p: &ResolvedP2pConfig,
     web: &WebOptions,
@@ -916,7 +900,7 @@ async fn try_fileprovider(
     let engine_config = EngineConfig {
         db_path: ctx.db_path.clone(),
         mount_point: mount_path.to_path_buf(),
-        backends: cascade_engine::backend::MountedBackend::all_at_default(backends),
+        backends,
         cache_dir: None,
         enable_p2p: p2p.enable_p2p,
         p2p_data_dir: None,
@@ -1045,19 +1029,20 @@ async fn try_fileprovider(
 async fn try_projfs(
     ctx: &CliContext,
     mount_path: &Path,
-    backends: Vec<Arc<dyn cascade_engine::backend::Backend>>,
+    backends: Vec<cascade_engine::backend::MountedBackend>,
     p2p: &ResolvedP2pConfig,
     web: &WebOptions,
 ) -> Result<()> {
-    // The backend list is consumed by EngineConfig, so clone it for the
-    // content provider first. Cloning a `Vec<Arc<dyn Backend>>` is cheap —
+    // Extract the raw backend Arc list for the content provider before the
+    // MountedBackend list is consumed by EngineConfig. Cloning is cheap —
     // just Arc reference-count bumps.
-    let backends_for_provider = backends.clone();
+    let backends_for_provider: Vec<Arc<dyn cascade_engine::backend::Backend>> =
+        backends.iter().map(|mb| mb.backend.clone()).collect();
 
     let engine_config = EngineConfig {
         db_path: ctx.db_path.clone(),
         mount_point: mount_path.to_path_buf(),
-        backends: cascade_engine::backend::MountedBackend::all_at_default(backends),
+        backends,
         cache_dir: None,
         enable_p2p: p2p.enable_p2p,
         p2p_data_dir: None,
@@ -1195,7 +1180,7 @@ async fn try_projfs(
 async fn try_webdav(
     ctx: &CliContext,
     mount_path: &Path,
-    backends: Vec<Arc<dyn cascade_engine::backend::Backend>>,
+    backends: Vec<cascade_engine::backend::MountedBackend>,
     no_mount: bool,
     p2p: &ResolvedP2pConfig,
     web: &WebOptions,
@@ -1203,7 +1188,7 @@ async fn try_webdav(
     let engine_config = EngineConfig {
         db_path: ctx.db_path.clone(),
         mount_point: mount_path.to_path_buf(),
-        backends: cascade_engine::backend::MountedBackend::all_at_default(backends),
+        backends,
         cache_dir: None,
         enable_p2p: p2p.enable_p2p,
         p2p_data_dir: None,
@@ -1340,14 +1325,14 @@ async fn try_webdav(
 async fn try_fuse(
     ctx: &CliContext,
     mount_path: &Path,
-    backends: Vec<Arc<dyn cascade_engine::backend::Backend>>,
+    backends: Vec<cascade_engine::backend::MountedBackend>,
     p2p: &ResolvedP2pConfig,
     web: &WebOptions,
 ) -> Result<()> {
     let engine_config = EngineConfig {
         db_path: ctx.db_path.clone(),
         mount_point: mount_path.to_path_buf(),
-        backends: cascade_engine::backend::MountedBackend::all_at_default(backends),
+        backends,
         cache_dir: None,
         enable_p2p: p2p.enable_p2p,
         p2p_data_dir: None,
@@ -1437,7 +1422,7 @@ async fn try_fuse(
 async fn try_nfs(
     ctx: &CliContext,
     mount_path: &Path,
-    backends: Vec<Arc<dyn cascade_engine::backend::Backend>>,
+    backends: Vec<cascade_engine::backend::MountedBackend>,
     no_mount: bool,
     p2p: &ResolvedP2pConfig,
     web: &WebOptions,
@@ -1445,7 +1430,7 @@ async fn try_nfs(
     let engine_config = EngineConfig {
         db_path: ctx.db_path.clone(),
         mount_point: mount_path.to_path_buf(),
-        backends: cascade_engine::backend::MountedBackend::all_at_default(backends),
+        backends,
         cache_dir: None,
         enable_p2p: p2p.enable_p2p,
         p2p_data_dir: None,
@@ -1650,19 +1635,9 @@ pub fn stop(ctx: &CliContext) -> anyhow::Result<()> {
 
 /// Stop the Cascade daemon (Windows).
 ///
-/// Mirrors the unix implementation: reads the PID file, asks the process
-/// to exit (`taskkill /PID <pid>`), polls for up to 5 seconds, then force
-/// kills (`taskkill /F /PID <pid>`) if it has not exited. The PID file is
-/// removed and any localhost `WebDAV` mounts that match a Cascade pattern
-/// are detached via `unmount_path`.
-///
-/// Windows ships `taskkill` in `System32` so it is always on `PATH`; we
-/// shell out rather than pulling in `windows-sys` for a single API call.
-///
-/// A stale PID file (process already gone) is treated as success — both
-/// `is_process_alive` on Windows always reporting "alive" (lacking a
-/// cheap liveness check) and `taskkill`'s "process not found" stderr
-/// route through this success path so `cascade stop` is idempotent.
+/// Reads the PID file, sends `taskkill /PID`, polls up to 5 s, then
+/// force-kills with `taskkill /F`. Removes the PID file and any Cascade
+/// `WebDAV` mounts. A stale PID file (process already gone) is success.
 #[cfg(windows)]
 pub fn stop(ctx: &CliContext) -> anyhow::Result<()> {
     if !ctx.pid_path.exists() {
@@ -1826,33 +1801,67 @@ fn create_backend(
     }
 }
 
-/// Rebuild backends from the main config — used when falling back between
-/// presenters and the first engine consumed the original backend instances.
-///
-/// The daemon's single shared pooled HTTP client is injected into every gdrive
-/// backend. The same `Arc` is passed on every call so all Drive backends share
-/// one pooled client, kept alive for the daemon's lifetime.
+/// Rebuild backends from the main config in deterministic alphabetical order.
+/// Fails loudly on an empty or duplicate mount path.
 fn rebuild_backends(
     main_config: &CascadeConfig,
     config_dir: &Path,
     shared_http: Arc<dyn cascade_engine::portable::HttpClient>,
-) -> Result<Vec<Arc<dyn cascade_engine::backend::Backend>>> {
-    let mut backends: Vec<Arc<dyn cascade_engine::backend::Backend>> = Vec::new();
-    for (name, value) in &main_config.backends {
-        let backend_cfg: BackendConfig = value
+) -> Result<Vec<cascade_engine::backend::MountedBackend>> {
+    let mut names: Vec<&String> = main_config.backends.keys().collect();
+    names.sort_unstable();
+
+    // Validate all mounts before creating any backends so config errors surface immediately.
+    let mut resolved: Vec<(&String, BackendConfig, String)> = Vec::with_capacity(names.len());
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for name in &names {
+        let cfg: BackendConfig = main_config
+            .backends
+            .get(name.as_str())
+            .ok_or_else(|| anyhow::anyhow!("backend `{name}` disappeared during iteration"))?
             .clone()
             .try_into()
             .with_context(|| format!("invalid config for backend `{name}`"))?;
+        let mount_str = cfg
+            .mount
+            .as_deref()
+            .unwrap_or(name.as_str())
+            .trim()
+            .to_string();
+        if mount_str.is_empty() {
+            anyhow::bail!(
+                "backend `{name}` has an empty mount path; remove the `mount` key or set a non-empty value"
+            );
+        }
+        let dedup = if mount_str == "/" {
+            String::new()
+        } else {
+            mount_str.clone()
+        };
+        if !seen.insert(dedup) {
+            anyhow::bail!(
+                "duplicate mount path for backend `{name}`: \"{mount_str}\" is already used"
+            );
+        }
+        resolved.push((name, cfg, mount_str));
+    }
+
+    let mut mounted: Vec<cascade_engine::backend::MountedBackend> =
+        Vec::with_capacity(resolved.len());
+    for (name, cfg, mount_str) in resolved {
         let per_backend_config = load_backend_config(config_dir, name)?;
         let backend = create_backend(
             name,
-            &backend_cfg.backend_type,
+            &cfg.backend_type,
             &per_backend_config,
             Some(shared_http.clone()),
         )?;
-        backends.push(Arc::from(backend));
+        mounted.push(cascade_engine::backend::MountedBackend::new(
+            Some(mount_str),
+            Arc::from(backend),
+        ));
     }
-    Ok(backends)
+    Ok(mounted)
 }
 
 /// Load the top-level `config.toml` from the config directory.

@@ -88,6 +88,12 @@ pub struct WebConfig {
 }
 
 /// Mount configuration.
+///
+/// The `point` field is the physical filesystem path where the neutral virtual
+/// root is exposed to the OS — the top-level directory the OS mount command
+/// binds to. Individual backends appear as named subdirectories under it
+/// (e.g. `~/Cloud/personal/`, `~/Cloud/work/`), unless a backend is explicitly
+/// mounted at `"/"`, in which case it occupies the root directly.
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct MountConfig {
     pub point: String,
@@ -132,11 +138,24 @@ pub struct P2pConfig {
     pub relay_shared_secret: Option<String>,
 }
 
-/// A single backend configuration entry.
+/// A single backend configuration entry stored in `config.toml`.
+///
+/// Each entry in the `[backends]` table deserialises to one of these.
+/// The `mount` field controls where the backend appears in the VFS tree:
+///
+/// - `None` (field absent) — defaults to the backend name at startup.
+/// - `Some(name)` — mounted at that name under the neutral root.
+/// - `Some("/")` — mounted at the root prefix (single-backend, at-root mode).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BackendConfig {
     #[serde(rename = "type")]
     pub backend_type: String,
+    /// Optional VFS mount path for this backend.
+    ///
+    /// When absent the backend's name is used as the mount path.
+    /// Use `"/"` to mount a backend at the neutral root (single-backend mode).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mount: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
 }
@@ -424,6 +443,9 @@ fn write_main_config(
 
     let backend_config = BackendConfig {
         backend_type: backend_type.to_string(),
+        // Default mount is the backend name — write it explicitly so
+        // the config file documents where the backend appears in the tree.
+        mount: Some(name.to_string()),
         account: None,
     };
 
@@ -438,7 +460,7 @@ fn write_main_config(
     let config_str = toml::to_string_pretty(&config)?;
     std::fs::write(&config_path, &config_str)?;
 
-    // Register the backend in the state DB.
+    // Register the backend in the state DB with its mount path.
     let db = StateDb::open(&ctx.db_path)?;
     let display_name = BACKEND_TYPES
         .iter()
@@ -448,7 +470,7 @@ fn write_main_config(
         name,
         backend_type,
         &format!("{display_name} ({name})"),
-        None,
+        Some(name),
         None,
     )?;
 
@@ -666,6 +688,9 @@ fn run_interactive(ctx: &CliContext) -> Result<()> {
     // TOML carries the actual credential configuration.
     let backend_config = BackendConfig {
         backend_type: backend_type.to_string(),
+        // Default mount is the backend name — write it explicitly so
+        // the config file documents where the backend appears in the tree.
+        mount: Some(name.clone()),
         account: None,
     };
 
@@ -688,7 +713,7 @@ fn run_interactive(ctx: &CliContext) -> Result<()> {
         &name,
         backend_type,
         &format!("{backend_display_name} ({name})"),
-        None,
+        Some(&name),
         None,
     )?;
 
@@ -724,6 +749,7 @@ mod tests {
         let mut config = CascadeConfig::default();
         let backend = BackendConfig {
             backend_type: "gdrive".to_string(),
+            mount: Some("personal".to_string()),
             account: Some("personal".to_string()),
         };
         config
@@ -736,6 +762,7 @@ mod tests {
         let toml_str = toml::to_string_pretty(&config).unwrap();
         assert!(toml_str.contains("[backends.personal]"));
         assert!(toml_str.contains("type = \"gdrive\""));
+        assert!(toml_str.contains("mount = \"personal\""));
         assert!(toml_str.contains("[mount]"));
         assert!(toml_str.contains("point = \"/Users/joe/Cloud\""));
     }
@@ -745,6 +772,7 @@ mod tests {
         let mut config = CascadeConfig::default();
         let backend = BackendConfig {
             backend_type: "gdrive".to_string(),
+            mount: Some("personal".to_string()),
             account: Some("personal".to_string()),
         };
         config
@@ -759,17 +787,53 @@ mod tests {
 
         assert_eq!(parsed.mount.point, "/home/user/Cloud");
         assert!(parsed.backends.contains_key("personal"));
+        // Verify the mount round-trips.
+        let parsed_backend: BackendConfig = parsed
+            .backends
+            .get("personal")
+            .unwrap()
+            .clone()
+            .try_into()
+            .unwrap();
+        assert_eq!(parsed_backend.mount.as_deref(), Some("personal"));
     }
 
     #[test]
-    fn backend_config_without_account() {
+    fn backend_config_without_account_or_mount() {
         let backend = BackendConfig {
             backend_type: "local".to_string(),
+            mount: None,
             account: None,
         };
         let toml_str = toml::to_string_pretty(&backend).unwrap();
         assert!(toml_str.contains("type = \"local\""));
         assert!(!toml_str.contains("account"));
+        assert!(!toml_str.contains("mount"));
+    }
+
+    #[test]
+    fn backend_config_with_mount_serialises() {
+        let backend = BackendConfig {
+            backend_type: "local".to_string(),
+            mount: Some("files".to_string()),
+            account: None,
+        };
+        let toml_str = toml::to_string_pretty(&backend).unwrap();
+        assert!(toml_str.contains("type = \"local\""));
+        assert!(toml_str.contains("mount = \"files\""));
+        assert!(!toml_str.contains("account"));
+    }
+
+    #[test]
+    fn backend_config_root_mount_serialises() {
+        // "/" mount means "at-root mode" — single-backend path shape.
+        let backend = BackendConfig {
+            backend_type: "gdrive".to_string(),
+            mount: Some("/".to_string()),
+            account: None,
+        };
+        let toml_str = toml::to_string_pretty(&backend).unwrap();
+        assert!(toml_str.contains("mount = \"/\""));
     }
 
     #[test]
@@ -824,6 +888,8 @@ mod tests {
         let config_toml = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
         assert!(config_toml.contains("[backends.mybucket]"));
         assert!(config_toml.contains("type = \"s3\""));
+        // The init command writes the mount path defaulting to the backend name.
+        assert!(config_toml.contains("mount = \"mybucket\""));
         assert!(config_toml.contains(&*mount.to_string_lossy()));
 
         // Mount point directory was created.
@@ -857,6 +923,8 @@ mod tests {
         let config_toml = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
         assert!(config_toml.contains("[backends.personal]"));
         assert!(config_toml.contains("type = \"gdrive\""));
+        // The init command writes the mount path defaulting to the backend name.
+        assert!(config_toml.contains("mount = \"personal\""));
         assert!(config_toml.contains(&*mount.to_string_lossy()));
 
         // Mount point directory was created.
@@ -940,9 +1008,10 @@ mod tests {
         let backend_toml = std::fs::read_to_string(dir.path().join("s3.toml")).unwrap();
         assert!(backend_toml.contains("region = \"us-east-1\""));
 
-        // Main config references "s3" as the backend name.
+        // Main config references "s3" as the backend name, with mount defaulting to name.
         let config_toml = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
         assert!(config_toml.contains("[backends.s3]"));
+        assert!(config_toml.contains("mount = \"s3\""));
     }
 
     // -- P2pConfig serialisation tests ---------------------------------------
@@ -1009,6 +1078,8 @@ relay_shared_secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
         let config_toml = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
         assert!(config_toml.contains("[backends.mylocal]"));
         assert!(config_toml.contains("type = \"local\""));
+        // The init command writes the mount path defaulting to the backend name.
+        assert!(config_toml.contains("mount = \"mylocal\""));
 
         // The local TOML should NOT contain an `account` key.
         assert!(!backend_toml.contains("account"));
@@ -1056,6 +1127,8 @@ relay_shared_secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
         let config_toml = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
         assert!(config_toml.contains("[backends.myp2p]"));
         assert!(config_toml.contains("type = \"p2p\""));
+        // The init command writes the mount path defaulting to the backend name.
+        assert!(config_toml.contains("mount = \"myp2p\""));
     }
 
     #[test]

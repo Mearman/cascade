@@ -440,3 +440,118 @@ fn resolve_p2p_bridge_config_rejects_malformed_relay_secret() {
         "error was: {msg}"
     );
 }
+
+// --- rebuild_backends validation ---
+
+/// A minimal `CascadeConfig` with two backends that can be used to test
+/// `rebuild_backends` without running a real engine.
+fn make_test_config(backends: &[(&str, Option<&str>)]) -> CascadeConfig {
+    use crate::cli::init::{BackendConfig, CascadeConfig, MountConfig};
+    let mut config = CascadeConfig {
+        mount: MountConfig {
+            point: "/tmp/test-cloud".to_string(),
+        },
+        ..CascadeConfig::default()
+    };
+    for &(name, mount) in backends {
+        let entry = BackendConfig {
+            backend_type: "s3".to_string(),
+            mount: mount.map(str::to_string),
+            account: None,
+        };
+        config
+            .backends
+            .insert(name.to_string(), toml::Value::try_from(&entry).unwrap());
+    }
+    config
+}
+
+/// `rebuild_backends` rejects a backend whose `mount` is empty after trimming.
+#[test]
+fn rebuild_backends_rejects_empty_mount() {
+    let dir = TempDir::new().unwrap();
+    // Write a per-backend TOML so load_backend_config succeeds.
+    std::fs::write(dir.path().join("s3.toml"), "type = \"s3\"\n").unwrap();
+
+    let config = make_test_config(&[("s3", Some("  "))]);
+    // shared_http is never reached because the validation fires first.
+    let http: std::sync::Arc<dyn cascade_engine::portable::HttpClient> =
+        std::sync::Arc::new(cascade_engine::portable::native::ReqwestClient::new());
+    let result = rebuild_backends(&config, dir.path(), http);
+    assert!(result.is_err(), "expected error for empty mount");
+    let msg = format!("{:#}", result.unwrap_err());
+    assert!(msg.contains("empty mount path"), "error was: {msg}");
+}
+
+/// `rebuild_backends` rejects two backends mapped to the same mount path.
+#[test]
+fn rebuild_backends_rejects_duplicate_mount() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("alpha.toml"), "type = \"s3\"\n").unwrap();
+    std::fs::write(dir.path().join("beta.toml"), "type = \"s3\"\n").unwrap();
+
+    let config = make_test_config(&[("alpha", Some("shared")), ("beta", Some("shared"))]);
+    let http: std::sync::Arc<dyn cascade_engine::portable::HttpClient> =
+        std::sync::Arc::new(cascade_engine::portable::native::ReqwestClient::new());
+    let result = rebuild_backends(&config, dir.path(), http);
+    assert!(result.is_err(), "expected error for duplicate mount");
+    let msg = format!("{:#}", result.unwrap_err());
+    assert!(msg.contains("duplicate mount path"), "error was: {msg}");
+}
+
+/// `rebuild_backends` rejects two backends both using the at-root `"/"` mount.
+#[test]
+fn rebuild_backends_rejects_two_at_root_mounts() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("alpha.toml"), "type = \"s3\"\n").unwrap();
+    std::fs::write(dir.path().join("beta.toml"), "type = \"s3\"\n").unwrap();
+
+    let config = make_test_config(&[("alpha", Some("/")), ("beta", Some("/"))]);
+    let http: std::sync::Arc<dyn cascade_engine::portable::HttpClient> =
+        std::sync::Arc::new(cascade_engine::portable::native::ReqwestClient::new());
+    let result = rebuild_backends(&config, dir.path(), http);
+    assert!(result.is_err(), "expected error for two at-root mounts");
+    let msg = format!("{:#}", result.unwrap_err());
+    assert!(msg.contains("duplicate mount path"), "error was: {msg}");
+}
+
+/// `rebuild_backends` uses the backend name as the default when `mount` is absent.
+#[test]
+fn rebuild_backends_defaults_mount_to_name() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("mybucket.toml"), "type = \"s3\"\nendpoint = \"https://s3.example.com\"\nbucket = \"b\"\nregion = \"us-east-1\"\naccess_key_id = \"k\"\nsecret_access_key = \"s\"\n").unwrap();
+
+    // BackendConfig without `mount` — should default to "mybucket".
+    let config = make_test_config(&[("mybucket", None)]);
+    let http: std::sync::Arc<dyn cascade_engine::portable::HttpClient> =
+        std::sync::Arc::new(cascade_engine::portable::native::ReqwestClient::new());
+    let result = rebuild_backends(&config, dir.path(), http);
+    assert!(result.is_ok(), "expected success: {:#?}", result.err());
+    let backends = result.unwrap();
+    assert_eq!(backends.len(), 1);
+    assert_eq!(backends[0].mount.as_deref(), Some("mybucket"));
+}
+
+/// `rebuild_backends` returns backends in alphabetical order regardless of the
+/// insertion order in `config.toml`.
+#[test]
+fn rebuild_backends_is_alphabetically_ordered() {
+    let dir = TempDir::new().unwrap();
+    let s3_toml = "type = \"s3\"\nendpoint = \"https://s3.example.com\"\nbucket = \"b\"\nregion = \"us-east-1\"\naccess_key_id = \"k\"\nsecret_access_key = \"s\"\n";
+    std::fs::write(dir.path().join("z-last.toml"), s3_toml).unwrap();
+    std::fs::write(dir.path().join("a-first.toml"), s3_toml).unwrap();
+    std::fs::write(dir.path().join("m-middle.toml"), s3_toml).unwrap();
+
+    let config = make_test_config(&[
+        ("z-last", Some("z-last")),
+        ("a-first", Some("a-first")),
+        ("m-middle", Some("m-middle")),
+    ]);
+    let http: std::sync::Arc<dyn cascade_engine::portable::HttpClient> =
+        std::sync::Arc::new(cascade_engine::portable::native::ReqwestClient::new());
+    let result = rebuild_backends(&config, dir.path(), http).unwrap();
+    assert_eq!(result.len(), 3);
+    assert_eq!(result[0].mount.as_deref(), Some("a-first"));
+    assert_eq!(result[1].mount.as_deref(), Some("m-middle"));
+    assert_eq!(result[2].mount.as_deref(), Some("z-last"));
+}

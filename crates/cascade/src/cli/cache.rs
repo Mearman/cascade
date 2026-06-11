@@ -433,8 +433,12 @@ pub fn backend_add(
     } else {
         CascadeConfig::default()
     };
+    // Use the explicit mount_path when given; otherwise default to the
+    // backend name (the same default the engine applies at startup).
+    let resolved_mount = mount_path.map_or_else(|| backend_name.to_string(), ToOwned::to_owned);
     let backend_entry = BackendConfig {
         backend_type: backend_type.to_string(),
+        mount: Some(resolved_mount),
         account: None,
     };
     main_config.backends.insert(
