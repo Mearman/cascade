@@ -748,16 +748,49 @@ impl Backend for GdriveBackend {
                         "Shared with me",
                     ));
                 };
-                if !path_rest.is_empty() {
-                    anyhow::bail!(
-                        "nested paths under 'Shared with me' not supported in metadata yet"
-                    );
-                }
+
                 let entries = self
                     .list_files_all_pages(&ListQuery::SharedWithMe, &token)
                     .await?;
-                let found = entries.into_iter().find(|e| e.name == *name);
-                return found.ok_or_else(|| anyhow::anyhow!("Path not found: {path_str}"));
+                let first = entries
+                    .into_iter()
+                    .find(|e| e.name == *name)
+                    .ok_or_else(|| {
+                        BackendError::NotFound(format!("Path not found: {path_str}"))
+                    })?;
+
+                if path_rest.is_empty() {
+                    return Ok(first);
+                }
+
+                if !first.is_dir {
+                    return Err(BackendError::NotFound(format!(
+                        "Path not found: {path_str} ({name} is not a directory)"
+                    ))
+                    .into());
+                }
+
+                let mut current = first;
+                for component in path_rest {
+                    let children = self
+                        .list_files_all_pages(
+                            &ListQuery::ChildrenOf {
+                                parent_id: current.id.native_id().to_owned(),
+                                drive_id: None,
+                            },
+                            &token,
+                        )
+                        .await?;
+                    current = children
+                        .into_iter()
+                        .find(|e| e.name == *component)
+                        .ok_or_else(|| {
+                            BackendError::NotFound(format!(
+                                "Path not found: {path_str}"
+                            ))
+                        })?;
+                }
+                return Ok(current);
             }
             "Bin" => {
                 let Some((name, path_rest)) = remaining.split_first() else {

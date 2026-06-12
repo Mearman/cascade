@@ -717,3 +717,101 @@ async fn concurrent_refresh_through_shared_client_does_not_deadlock() {
         assert_eq!(entries[0].name, "a.txt");
     }
 }
+
+// ── Shared with me — nested metadata ───────────────────────────────────────────
+
+#[tokio::test]
+async fn metadata_shared_with_me_single_file_still_works() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/files"))
+        .and(query_param(
+            "q",
+            "sharedWithMe = true and trashed = false",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "files": [file_json("swm-f1", "readme.md", "other-user", 42)]
+        })))
+        .mount(&server)
+        .await;
+
+    let backend = make_backend(&server);
+    let entry = backend
+        .metadata(Path::new("Shared with me/readme.md"))
+        .await
+        .unwrap();
+    assert_eq!(entry.name, "readme.md");
+    assert!(!entry.is_dir);
+    assert_eq!(entry.size, Some(42));
+}
+
+#[tokio::test]
+async fn metadata_shared_with_me_walks_into_shared_folder() {
+    let server = MockServer::start().await;
+
+    // Shared-with-me listing returns a folder.
+    Mock::given(method("GET"))
+        .and(path("/files"))
+        .and(query_param(
+            "q",
+            "sharedWithMe = true and trashed = false",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "files": [folder_json("swm-folder-1", "project", "other-user")]
+        })))
+        .mount(&server)
+        .await;
+
+    // Children of the shared folder.
+    Mock::given(method("GET"))
+        .and(path("/files"))
+        .and(query_param(
+            "q",
+            "'swm-folder-1' in parents and trashed = false",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "files": [file_json("swm-file-1", "notes.txt", "swm-folder-1", 128)]
+        })))
+        .mount(&server)
+        .await;
+
+    let backend = make_backend(&server);
+    let entry = backend
+        .metadata(Path::new("Shared with me/project/notes.txt"))
+        .await
+        .unwrap();
+    assert_eq!(entry.name, "notes.txt");
+    assert!(!entry.is_dir);
+    assert_eq!(entry.size, Some(128));
+    assert_eq!(
+        entry.id,
+        ItemId::new("gdrive-test-account", "swm-file-1")
+    );
+}
+
+#[tokio::test]
+async fn metadata_shared_with_me_rejects_path_through_non_directory() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/files"))
+        .and(query_param(
+            "q",
+            "sharedWithMe = true and trashed = false",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "files": [file_json("swm-file", "document.pdf", "other-user", 999)]
+        })))
+        .mount(&server)
+        .await;
+
+    let backend = make_backend(&server);
+    let err = backend
+        .metadata(Path::new("Shared with me/document.pdf/extra"))
+        .await
+        .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("not a directory"),
+        "expected 'not a directory' in error, got: {msg}"
+    );
+}
