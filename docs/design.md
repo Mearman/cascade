@@ -310,29 +310,50 @@ trait Backend: Send + Sync {
     /// Fetch metadata for a single file or directory by path.
     async fn metadata(&self, path: &Path) -> Result<FileEntry>;
 
-    /// Download file content. The backend writes to the provided writer.
-    async fn download(&self, file: &FileEntry, writer: &mut dyn tokio::io::AsyncWrite) -> Result<()>;
+    /// Download whole file content.
+    async fn download(&self, file: &FileEntry) -> Result<Vec<u8>>;
 
-    /// Upload file content, replacing the existing file or creating a new one.
-    async fn upload(
-        &self,
-        path: &Path,
-        reader: &mut dyn tokio::io::AsyncRead,
-        parent_id: &FileId,
-    ) -> Result<FileEntry>;
+    /// Read a byte range of a file (for on-demand presenters that fault in
+    /// content page by page rather than fetching the whole object).
+    async fn read_range(&self, file: &FileEntry, offset: u64, length: u32) -> Result<Vec<u8>>;
 
-    /// Create a directory.
+    /// Upload new file content under a parent, creating the file.
+    async fn upload(&self, path: &Path, data: &[u8], parent_id: &FileId) -> Result<FileEntry>;
+
+    /// Replace the content of an existing file by id.
+    async fn update(&self, file_id: &FileId, data: &[u8]) -> Result<FileEntry>;
+
+    /// List the immediate children of a directory by its NATIVE parent id —
+    /// the `root` sentinel (see `root_native_id`) or a backend node id such as
+    /// a Drive folder id. This is the on-demand listing path `VfsTree::read_dir`
+    /// and the presenters' lazy expansion drive; it is never passed a path.
+    async fn list_children(&self, parent_native_id: &str) -> Result<Vec<FileEntry>>;
+
+    /// The native id that names this backend's root container (defaults to the
+    /// `root` sentinel; the local-filesystem backend uses `/`). `is_root_native_id`
+    /// reports whether a given native id is a root.
+    fn root_native_id(&self) -> &'static str;
+    fn is_root_native_id(&self, native_id: &str) -> bool;
+
+    /// Create a directory (optionally under an explicit native parent id).
     async fn create_dir(&self, path: &Path) -> Result<FileEntry>;
+    async fn create_dir_with_parent(&self, name: &str, parent_id: &FileId) -> Result<FileEntry>;
 
     /// Delete a file or directory.
     async fn delete(&self, file: &FileEntry) -> Result<()>;
 
-    /// Move/rename a file or directory.
+    /// Move/rename a file or directory (by path, or by id for backends that key
+    /// on a stable node id).
     async fn move_entry(&self, src: &Path, dst: &Path) -> Result<FileEntry>;
+    async fn move_by_id(&self, src_id: &FileId, dst_parent_id: &FileId, new_name: &str) -> Result<FileEntry>;
 
     /// Recommended poll interval for this backend. None if the backend
     /// doesn't support polling (use fixed interval from config instead).
     async fn poll_interval(&self) -> Option<Duration>;
+
+    // The node-management plane also injects collaborators through the trait:
+    // `set_manage_dispatch` and `set_data_authority` hand a backend the hooks
+    // it needs to serve remote-administration and authority decisions.
 }
 ```
 
@@ -435,23 +456,21 @@ impl VfsTree {
 
     /// List directory entries, merging backend content with child mount points.
     async fn read_dir(&self, path: &Path) -> Result<Vec<DirEntry>> {
-        let mut entries = vec![];
+        // 1. Route to the owning backend, capturing the backend-relative path
+        //    and the names of any child mounts whose parent is this path.
+        let (backend, backend_path, mount_names) = self.resolve_listing(path)?;
 
-        // 1. Get entries from the backend that owns this path
-        let (backend, backend_path) = self.resolve(path);
-        entries.extend(backend.read_dir(&backend_path).await?);
+        // 2. `Backend::list_children` is contracted on a NATIVE parent id (the
+        //    `root` sentinel, or a backend node id such as a Drive folder id) —
+        //    never a path. Resolve the backend-relative path to that native id
+        //    first: the mount root (empty path) maps to `backend.root_native_id()`;
+        //    a sub-path resolves through `backend.metadata(path).id`.
+        let native_id = resolve_listing_native_id(backend, &backend_path).await?;
+        let children = backend.list_children(&native_id).await?;
 
-        // 2. Inject child mount point directories if this path is their parent
-        for (child_prefix, _) in &self.children {
-            if child_prefix.parent() == Some(path) {
-                let mount_dir_name = child_prefix.file_name().unwrap();
-                if !entries.iter().any(|e| e.name == mount_dir_name) {
-                    entries.push(DirEntry::dir(mount_dir_name));
-                }
-            }
-        }
-
-        Ok(entries)
+        // 3. Inject each child mount-point directory, shadowing a same-named
+        //    entry from the parent backend (see Shadowing rules).
+        Ok(merge_listing(children, &mount_names))
     }
 
     /// Move a file, handling cross-backend transfers.
