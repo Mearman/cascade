@@ -1597,12 +1597,10 @@ impl SyncEngine {
     /// Negotiate a `SyncPunch` agreement with `peer` and drive
     /// [`run_hole_punch`] over a freshly bound UDP socket.
     ///
-    /// For v1 the post-punch BEP transport upgrade is a stub log
-    /// message — the goal is to prove the wiring (nonce exchange, UDP
-    /// socket bind, state-machine invocation) without yet plumbing the
-    /// resulting flow into the full BEP session. A successful
-    /// `EstablishedFlow` is recorded at info; failures log the
-    /// underlying `PunchError` and return `Ok(())` so the caller can
+    /// On success the punched UDP socket is upgraded to a full BEP
+    /// session via [`UdpFlowTransport`] → [`FramedSession`] →
+    /// [`Self::run_transport_session`]. A failed punch logs the
+    /// underlying `PunchError` and returns `Ok(())` so the caller can
     /// move on to the next peer rather than tearing down its loop.
     async fn attempt_hole_punch(&self, peer: &Peer, remote_candidates: &[Candidate]) -> Result<()> {
         // Pick a remote candidate the punch state machine should

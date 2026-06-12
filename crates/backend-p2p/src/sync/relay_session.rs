@@ -15,14 +15,12 @@ use super::{
 impl SyncEngine {
     /// Open an HMAC-authenticated relay connection to `peer` via `relay`.
     ///
-    /// The relay client now drives the full handshake against the
+    /// The relay client drives the full handshake against the
     /// `cascade-relay-server` (see
     /// [`cascade_p2p::relay::RelayClient::connect_with_secret`] and
-    /// `crates/relay-server/src/auth.rs`). For v1 we connect through
-    /// the relay (proving the address is reachable and the shared
-    /// secret matches) and immediately log success — the post-relay
-    /// BEP transport upgrade lives with the post-punch upgrade in the
-    /// next round.
+    /// `crates/relay-server/src/auth.rs`). On success the relay
+    /// WebSocket is upgraded to a full BEP session via
+    /// [`RelayTransport`] → [`FramedSession`] → [`Self::run_transport_session`].
     ///
     /// The session id used for the rendezvous is the remote peer's
     /// device id: that matches the legacy `RelayClient::connect` API
