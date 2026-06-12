@@ -27,7 +27,6 @@ use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 
 use crate::discovery::DiscoveredPeer;
 use crate::identity::DeviceIdentity;
-use crate::relay::RelayConnection;
 
 /// Ensure a process-level `CryptoProvider` is installed.
 ///
@@ -59,8 +58,6 @@ pub struct ConnectionManager {
 pub enum PeerConnection {
     /// Direct TLS connection.
     Direct(Box<TlsStream<TcpStream>>),
-    /// TLS-through-relay connection.
-    Relay(Box<RelayConnection>),
 }
 
 impl ConnectionManager {
@@ -588,7 +585,6 @@ mod tests {
 
         match connection {
             PeerConnection::Direct(_) => {}
-            PeerConnection::Relay(_) => panic!("expected direct connection"),
         }
         accept_task.await.unwrap();
     }

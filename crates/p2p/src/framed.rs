@@ -43,16 +43,9 @@ pub struct FramedPeer {
 
 impl FramedPeer {
     /// Wrap a [`PeerConnection`] for BEP framing.
-    ///
-    /// Only the direct TLS variant is currently supported. Relay
-    /// connections require WebSocket framing and will be added later.
     pub fn from_connection(conn: PeerConnection) -> Result<Self> {
-        match conn {
-            PeerConnection::Direct(stream) => Ok(Self { stream: *stream }),
-            PeerConnection::Relay(_) => {
-                anyhow::bail!("BEP framing over relay is not yet supported")
-            }
-        }
+        let PeerConnection::Direct(stream) = conn;
+        Ok(Self { stream: *stream })
     }
 
     /// Wrap a raw TLS stream (used by the listener after acceptance).
