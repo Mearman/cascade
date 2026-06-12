@@ -74,14 +74,17 @@ async fn stop_is_noop_on_non_windows() {
     presenter.stop().await.unwrap();
 }
 
-/// `fetch_contents` is documented as unimplemented — the real work
-/// will live in the `GetFileData` callback.
+/// `fetch_contents` without a `ContentProvider` bails with a clear
+/// message directing callers to the `GetFileData` callback path.
 #[tokio::test]
-async fn fetch_contents_returns_unimplemented_error() {
+async fn fetch_contents_bails_without_content_provider() {
     let presenter = ProjFsPresenter::new(PathBuf::from("/tmp/cascade-projfs-test"));
     let id = ItemId::new("backend", "file");
     let err = presenter.fetch_contents(&id).await.unwrap_err();
-    assert!(err.to_string().contains("not yet implemented"));
+    assert!(
+        err.to_string().contains("no ContentProvider installed"),
+        "expected provider-missing error, got: {err}"
+    );
 }
 
 /// `update_state` and `evict_item` are intentional no-ops on
@@ -413,6 +416,55 @@ async fn with_content_provider_round_trips() {
     let presenter = presenter.with_content_provider(Arc::clone(&provider));
     let installed = presenter.content_provider().unwrap();
     assert!(Arc::ptr_eq(installed, &provider));
+}
+
+/// `fetch_contents` reads the full file through the `ContentProvider`,
+/// writes it to the cache directory, and returns the cache path. A
+/// second call for the same id returns the cached file without
+/// consulting the provider again.
+#[tokio::test]
+async fn fetch_contents_reads_via_provider_and_caches() {
+    let cache_dir = std::env::temp_dir().join("cascade-projfs-test-fetch-contents");
+    let _ = tokio::fs::remove_dir_all(&cache_dir).await;
+
+    let id = ItemId::new("backend", "file");
+    let provider = MockContentProvider::default();
+    let data = b"hello, projfs world!".to_vec();
+    provider.insert(id.clone(), data.clone());
+
+    let presenter = ProjFsPresenter::new(PathBuf::from("/tmp/cascade-projfs-test"))
+        .with_content_provider(Arc::new(provider))
+        .with_cache_dir(&cache_dir);
+
+    // Upsert the item so `fetch_contents` can resolve its size.
+    presenter
+        .upsert_item(VfsItem {
+            id: id.clone(),
+            parent_id: ItemId::new("backend", "root"),
+            name: "file.txt".to_string(),
+            path: "file.txt".to_string(),
+            is_dir: false,
+            size: Some(data.len() as u64),
+            mod_time: None,
+            cache_state: CacheState::Online,
+            mime_type: None,
+        })
+        .await
+        .unwrap();
+
+    let path = presenter.fetch_contents(&id).await.unwrap();
+    assert!(path.exists(), "cached file should exist on disk");
+    let bytes = tokio::fs::read(&path).await.unwrap();
+    assert_eq!(bytes, data);
+
+    // The cache path follows the id-slug convention.
+    let expected_name = id.0.replace(['/', '\\'], "_");
+    assert_eq!(
+        path.file_name().unwrap().to_str().unwrap(),
+        expected_name
+    );
+
+    let _ = tokio::fs::remove_dir_all(&cache_dir).await;
 }
 
 /// Every `PRJ_NOTIFICATION_*` flag maps to a distinct

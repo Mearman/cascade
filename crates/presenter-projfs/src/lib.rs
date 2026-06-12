@@ -49,9 +49,10 @@
 //!   no equivalent of `FSKit`'s `update_state` push hook.
 //! - [`ProjFsPresenter::evict_item`] logs and returns `Ok(())`; `ProjFS`
 //!   manages projection cache eviction at the OS layer.
-//! - [`ProjFsPresenter::fetch_contents`] intentionally bails: on-demand
-//!   reads flow through the `GetFileData` callback, not through direct
-//!   calls into this method, so there is nothing for it to do.
+//! - [`ProjFsPresenter::fetch_contents`] fetches file contents through
+//!   the installed [`ContentProvider`] and caches them on disk. When no
+//!   provider is installed, the method bails: on-demand reads must then
+//!   flow through the `GetFileData` callback instead.
 //! - [`ProjFsPresenter::start`] marks the mount directory as a
 //!   placeholder via `PrjMarkDirectoryAsPlaceholder` and begins
 //!   virtualising via `PrjStartVirtualizing`.
@@ -839,6 +840,10 @@ pub struct ProjFsPresenter {
     /// `CallbackContextInner` so both callbacks see the same map.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     cancellation_tokens: Arc<Mutex<HashMap<i32, CancellationToken>>>,
+    /// Directory where `fetch_contents` caches downloaded files. Each
+    /// file is named after its `ItemId` (with path separators replaced
+    /// by `_`), written to a `.tmp` file first, then atomically renamed.
+    cache_dir: PathBuf,
 }
 
 /// Owning record of the heap allocation handed to `ProjFS` via
@@ -921,6 +926,7 @@ impl ProjFsPresenter {
             callback_ctx: Arc::new(tokio::sync::Mutex::new(None)),
             content_provider: None,
             cancellation_tokens: Arc::new(Mutex::new(HashMap::new())),
+            cache_dir: std::env::temp_dir().join("cascade-projfs-cache"),
         }
     }
 
@@ -962,10 +968,29 @@ impl ProjFsPresenter {
         self
     }
 
+    /// Override the cache directory used by [`Self::fetch_contents`].
+    #[must_use]
+    pub fn with_cache_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.cache_dir = dir.into();
+        self
+    }
+
     /// The configured mount point.
     #[must_use]
     pub fn mount_point(&self) -> &Path {
         &self.mount_point
+    }
+
+    /// The configured cache directory.
+    #[must_use]
+    pub fn cache_dir(&self) -> &Path {
+        &self.cache_dir
+    }
+
+    /// Derive a cache file path for an item. Path separators in the id
+    /// are replaced with `_` so the result is a flat filename.
+    fn cache_path_for(&self, id: &ItemId) -> PathBuf {
+        self.cache_dir.join(id.0.replace(['/', '\\'], "_"))
     }
 
     /// Access the configured content provider, if any. Exposed for
@@ -1015,10 +1040,55 @@ impl VfsPresenter for ProjFsPresenter {
     }
 
     async fn fetch_contents(&self, id: &ItemId) -> anyhow::Result<PathBuf> {
-        tracing::debug!(id = %id, "fetch_contents (not yet implemented)");
-        anyhow::bail!(
-            "ProjFS fetch_contents is not yet implemented; the GetFileData callback should drive this"
-        )
+        let cache_path = self.cache_path_for(id);
+        if cache_path.exists() {
+            return Ok(cache_path);
+        }
+
+        let Some(provider) = &self.content_provider else {
+            anyhow::bail!(
+                "no ContentProvider installed; ProjFS reads flow through \
+                 GetFileData callbacks, not fetch_contents"
+            );
+        };
+
+        let file_size = {
+            let items = self.items.read().await;
+            let item = items
+                .get(&id.0)
+                .ok_or_else(|| anyhow::anyhow!("item not found: {id}"))?;
+            item.size.unwrap_or(0)
+        };
+
+        tokio::fs::create_dir_all(&self.cache_dir).await?;
+
+        let mut all_bytes = Vec::new();
+        let mut offset = 0u64;
+        const READ_CHUNK: u32 = 1024 * 1024;
+        loop {
+            let remaining = file_size.saturating_sub(offset);
+            let to_read = if remaining == 0 {
+                READ_CHUNK
+            } else {
+                u32::try_from(remaining)
+                    .unwrap_or(READ_CHUNK)
+                    .min(READ_CHUNK)
+            };
+            let chunk = provider.read_range(id, offset, to_read)?;
+            if chunk.is_empty() {
+                break;
+            }
+            offset += chunk.len() as u64;
+            all_bytes.extend_from_slice(&chunk);
+            if remaining > 0 && chunk.len() < to_read as usize {
+                break;
+            }
+        }
+
+        let temp_path = cache_path.with_extension("tmp");
+        tokio::fs::write(&temp_path, &all_bytes).await?;
+        tokio::fs::rename(&temp_path, &cache_path).await?;
+        Ok(cache_path)
     }
 
     async fn evict_item(&self, id: &ItemId) -> anyhow::Result<()> {
