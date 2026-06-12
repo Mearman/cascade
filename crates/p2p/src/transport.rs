@@ -637,6 +637,64 @@ mod tests {
         frame.extend_from_slice(body);
         frame
     }
+
+    /// `RelayTransport` wraps a real WebSocket pair and round-trips a
+    /// BEP frame end to end through `FramedSession`. A TCP listener +
+    /// tungstenite accept/connect produces a genuine WebSocket on
+    /// loopback; the server echoes binary frames back so the client's
+    /// `FramedSession<RelayTransport>` can send and receive without a
+    /// full relay server.
+    #[tokio::test]
+    async fn relay_transport_round_trips_bep_frame() {
+        use futures_util::StreamExt;
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::tungstenite::Message;
+        use tokio_tungstenite::{accept_async, connect_async};
+
+        use crate::framed::FramedSession;
+        use crate::protocol::{BepMessage, Folder};
+        use crate::relay::RelayConnection;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Server: accept TCP, upgrade to WS, echo binary frames.
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            while let Some(result) = ws.next().await {
+                match result.unwrap() {
+                    Message::Binary(bytes) => {
+                        ws.send(Message::Binary(bytes)).await.unwrap();
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+        });
+
+        // Client: connect, upgrade to WS, wrap in RelayTransport.
+        let (client_ws, _) = connect_async(format!("ws://{addr}")).await.unwrap();
+        let conn = RelayConnection::from_websocket(client_ws);
+        let transport = RelayTransport::new(conn);
+        let (mut reader, mut writer) = FramedSession::new(transport).split();
+
+        // Round-trip a ClusterConfig message.
+        let msg = BepMessage::ClusterConfig {
+            folders: vec![Folder {
+                id: "relay-test".into(),
+                label: "Relay Test".into(),
+            }],
+            data_token: None,
+        };
+        writer.send(&msg).await.unwrap();
+        let got = reader.recv().await.unwrap().unwrap();
+        assert_eq!(got, msg);
+
+        // Close cleanly.
+        writer.shutdown().await.unwrap();
+        let _ = server.await;
+    }
 }
 
 // Re-export the channel pair for the framed-session tests above us.

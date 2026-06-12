@@ -244,6 +244,16 @@ impl RelayConnection {
     }
 }
 
+#[cfg(test)]
+impl RelayConnection {
+    /// Construct from a raw WebSocket for testing.
+    pub fn from_websocket(socket: WebSocketStream<MaybeTlsStream<TcpStream>>) -> Self {
+        Self {
+            socket: Mutex::new(socket),
+        }
+    }
+}
+
 fn relay_join_url(relay_url: &str, session_id: &str) -> String {
     format!(
         "{}/{RELAY_JOIN_PATH}/{session_id}",
