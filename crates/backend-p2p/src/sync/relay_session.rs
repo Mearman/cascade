@@ -1200,6 +1200,23 @@ impl SyncEngine {
                 );
                 Ok(())
             }
+            BepMessage::OplogHave { .. }
+            | BepMessage::OplogRequest { .. }
+            | BepMessage::OplogData { .. } => {
+                // This node does not advertise the oplog capability domain, so a
+                // peer must never negotiate it and never send these frames. Per
+                // the node protocol a frame for an un-negotiated domain is dropped
+                // (with a domain-violation log), never guessed at and never a
+                // reason to tear the session down — the peer can still serve
+                // content, management, and exec frames. Wiring oplog sync is a
+                // later step that lands with the entry-payload co-design.
+                debug!(
+                    target: "cascade::backend::p2p",
+                    peer = %peer_device_id,
+                    "dropping oplog frame — node does not advertise the oplog capability",
+                );
+                Ok(())
+            }
         }
     }
 

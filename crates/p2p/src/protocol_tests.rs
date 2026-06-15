@@ -1065,6 +1065,80 @@ fn handshake_drops_unknown_domain_discriminant() {
 }
 
 #[test]
+fn negotiate_domains_is_order_independent_intersection() {
+    use CapabilityDomain::{Content, Exec, Management, Oplog};
+    // Both sides full: intersection is the full set in canonical order.
+    assert_eq!(
+        negotiate_domains(&[Content, Management, Exec], &[Exec, Content, Management],),
+        vec![Content, Management, Exec],
+    );
+    // A domain only one side advertises is excluded.
+    assert_eq!(
+        negotiate_domains(&[Content, Management, Exec], &[Content, Management]),
+        vec![Content, Management],
+    );
+    // Disjoint advertisements negotiate nothing.
+    assert_eq!(negotiate_domains(&[Exec], &[Oplog]), Vec::new());
+    // The result is always in frozen discriminant order regardless of inputs.
+    assert_eq!(
+        negotiate_domains(
+            &[Oplog, Exec, Management, Content],
+            &[Content, Oplog, Exec, Management]
+        ),
+        vec![Content, Management, Exec, Oplog],
+    );
+}
+
+#[test]
+fn frame_domain_maps_each_family_to_its_domain() {
+    use CapabilityDomain::{Content, Exec, Management, Oplog};
+    assert_eq!(BepMessage::Ping.frame_domain(), None);
+    assert_eq!(
+        BepMessage::Handshake {
+            protocol_version: PROTOCOL_VERSION,
+            domains: Vec::new(),
+        }
+        .frame_domain(),
+        None,
+    );
+    assert_eq!(
+        BepMessage::Response {
+            request_id: 1,
+            data: Vec::new(),
+        }
+        .frame_domain(),
+        Some(Content),
+    );
+    assert_eq!(
+        BepMessage::ManageResponse {
+            request_id: 1,
+            result: ManageResult::Ok {
+                summary: String::new(),
+            },
+        }
+        .frame_domain(),
+        Some(Management),
+    );
+    assert_eq!(
+        BepMessage::ExecStreamAck {
+            session: 1,
+            ack_seq: 0,
+            window: 0,
+        }
+        .frame_domain(),
+        Some(Exec),
+    );
+    assert_eq!(
+        BepMessage::OplogHave {
+            peer: "P".to_owned(),
+            head_seq: 0,
+        }
+        .frame_domain(),
+        Some(Oplog),
+    );
+}
+
+#[test]
 fn capability_domain_wire_form_round_trips() {
     for domain in [
         CapabilityDomain::Content,
@@ -1211,4 +1285,86 @@ fn encode_decode_exec_spawned_result_round_trip() {
         request_id: 3,
         result: ManageResult::ExecSpawned { session: 123 },
     });
+}
+
+// ── Oplog frames ──
+
+#[test]
+fn encode_decode_oplog_have_round_trip() {
+    round_trip(BepMessage::OplogHave {
+        peer: "PEER-DEVICE-ID".to_owned(),
+        head_seq: 42,
+    });
+    // A peer with no entries yet advertises head zero.
+    round_trip(BepMessage::OplogHave {
+        peer: "FRESH-PEER".to_owned(),
+        head_seq: 0,
+    });
+}
+
+#[test]
+fn encode_decode_oplog_request_round_trip() {
+    round_trip(BepMessage::OplogRequest {
+        peer: "PEER-DEVICE-ID".to_owned(),
+        from_seq: 7,
+    });
+    // from_seq zero pulls the log from its first entry.
+    round_trip(BepMessage::OplogRequest {
+        peer: "PEER-DEVICE-ID".to_owned(),
+        from_seq: 0,
+    });
+}
+
+#[test]
+fn encode_decode_oplog_data_round_trip() {
+    round_trip(BepMessage::OplogData {
+        peer: "PEER-DEVICE-ID".to_owned(),
+        from_seq: 7,
+        ops: vec![b"op-eight".to_vec(), b"op-nine".to_vec(), Vec::new()],
+    });
+    // An empty batch (no entries) must round-trip distinctly.
+    round_trip(BepMessage::OplogData {
+        peer: "PEER-DEVICE-ID".to_owned(),
+        from_seq: 0,
+        ops: Vec::new(),
+    });
+}
+
+#[test]
+fn decode_oplog_data_rejects_excessive_entry_count() {
+    // Honest body-length prefix, but the inner entry count exceeds the cap — the
+    // receiver must refuse to allocate the oversized vector.
+    let mut body = Vec::new();
+    encode_u32(&mut body, MSG_OPLOG_DATA);
+    encode_string(&mut body, "PEER").unwrap();
+    encode_u64(&mut body, 0);
+    encode_u32(&mut body, MAX_OPLOG_ENTRIES + 1);
+    let body_len = u32::try_from(body.len()).unwrap_or(0);
+    let mut frame = Vec::new();
+    encode_u32(&mut frame, body_len);
+    frame.extend_from_slice(&body);
+    let result = decode_message(&frame);
+    assert!(result.is_err(), "excessive oplog entry count must fail");
+    assert!(
+        result
+            .err()
+            .map(|e| e.to_string())
+            .is_some_and(|msg| msg.contains("exceeds maximum")),
+        "error should mention the cap",
+    );
+}
+
+#[test]
+fn encode_oplog_data_rejects_overflow() {
+    let cap_plus_one = (MAX_OPLOG_ENTRIES + 1) as usize;
+    let ops = vec![Vec::new(); cap_plus_one];
+    let err = encode_message(&BepMessage::OplogData {
+        peer: "PEER".to_owned(),
+        from_seq: 0,
+        ops,
+    })
+    .err()
+    .map(|e| e.to_string())
+    .unwrap_or_default();
+    assert!(err.contains("exceeds maximum"), "got: {err}");
 }

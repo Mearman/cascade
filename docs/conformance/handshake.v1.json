@@ -1,0 +1,62 @@
+{
+  "protocol_version": 1,
+  "description": "Capability-negotiation conformance vectors for protocol version 1. Each vector gives the capability domains the local node advertises (local_domains) and the domains a peer advertised in its opening Handshake frame (peer_domains). expected_negotiated is the usable set: the intersection of the two, in the frozen domain discriminant order content < management < exec < oplog, independent of the order either side listed its domains. expected_refusals names the domains whose frames the local node must reject from this peer because they were not negotiated; a node must not send frames for a domain the peer did not advertise, and must refuse inbound frames whose domain the peer never declared, rather than guess. A pre-version peer that sends no Handshake is treated as advertising only content and management, the documented baseline before versioned negotiation, so it is modelled here as peer_domains [content, management].",
+  "vectors": [
+    {
+      "name": "symmetric_content_management_exec",
+      "local_domains": ["content", "management", "exec"],
+      "peer_domains": ["content", "management", "exec"],
+      "expected_negotiated": ["content", "management", "exec"],
+      "expected_refusals": ["oplog"]
+    },
+    {
+      "name": "peer_listed_out_of_order",
+      "local_domains": ["content", "management", "exec"],
+      "peer_domains": ["exec", "content", "management"],
+      "expected_negotiated": ["content", "management", "exec"],
+      "expected_refusals": ["oplog"]
+    },
+    {
+      "name": "local_offers_exec_peer_does_not",
+      "local_domains": ["content", "management", "exec"],
+      "peer_domains": ["content", "management"],
+      "expected_negotiated": ["content", "management"],
+      "expected_refusals": ["exec", "oplog"]
+    },
+    {
+      "name": "peer_offers_exec_local_does_not",
+      "local_domains": ["content", "management"],
+      "peer_domains": ["content", "management", "exec"],
+      "expected_negotiated": ["content", "management"],
+      "expected_refusals": ["exec", "oplog"]
+    },
+    {
+      "name": "pre_version_peer_baseline",
+      "local_domains": ["content", "management", "exec"],
+      "peer_domains": ["content", "management"],
+      "expected_negotiated": ["content", "management"],
+      "expected_refusals": ["exec", "oplog"]
+    },
+    {
+      "name": "oplog_both_sides",
+      "local_domains": ["content", "management", "exec", "oplog"],
+      "peer_domains": ["content", "management", "oplog"],
+      "expected_negotiated": ["content", "management", "oplog"],
+      "expected_refusals": ["exec"]
+    },
+    {
+      "name": "content_only_intersection",
+      "local_domains": ["content", "exec"],
+      "peer_domains": ["content", "management"],
+      "expected_negotiated": ["content"],
+      "expected_refusals": ["management", "exec", "oplog"]
+    },
+    {
+      "name": "disjoint_no_overlap",
+      "local_domains": ["exec"],
+      "peer_domains": ["oplog"],
+      "expected_negotiated": [],
+      "expected_refusals": ["content", "management", "exec", "oplog"]
+    }
+  ]
+}

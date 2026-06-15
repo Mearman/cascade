@@ -1,6 +1,6 @@
 {
   "protocol_version": 1,
-  "description": "Frame encode/decode conformance vectors for protocol version 1. A conformant codec must decode each wire_hex to the described message and re-encode that message to exactly wire_hex. wire_hex is the lowercase hex of the full frame: a 4-byte big-endian body length, a 4-byte big-endian message-type discriminant, then the XDR body. The message field documents the frame for a human and a cross-language implementation; the byte-exact contract is wire_hex. This phase covers the handshake and exec frames frozen alongside the exec capability; the pre-existing content and management frames are exercised by the in-crate round-trip tests and are appended here as the protocol crate gains serialisable message representations.",
+  "description": "Frame encode/decode conformance vectors for protocol version 1. A conformant codec must decode each wire_hex to the described message and re-encode that message to exactly wire_hex. wire_hex is the lowercase hex of the full frame: a 4-byte big-endian body length, a 4-byte big-endian message-type discriminant, then the XDR body. The message field documents the frame for a human and a cross-language implementation; the byte-exact contract is wire_hex. This file covers the handshake, exec, and oplog frames frozen alongside the exec and oplog capabilities; the pre-existing content and management frames are exercised by the in-crate round-trip tests and are appended here as the protocol crate gains serialisable message representations. For the oplog frames the envelope (peer id, sequence, length-prefixed opaque entries) is frozen; the internal byte shape of an entry, its signature, and the deterministic reduce/merge are deliberately not frozen and are the oplog co-design items, so the vector entries carry arbitrary opaque bytes.",
   "vectors": [
     {
       "name": "handshake_v1_content_management_exec",
@@ -76,6 +76,37 @@
         "window": 65536
       },
       "wire_hex": "0000001800000013000000000000002a000000000000000100010000"
+    },
+    {
+      "name": "oplog_have",
+      "msg_type": 20,
+      "message": {
+        "kind": "OplogHave",
+        "peer": "PEER",
+        "head_seq": 3
+      },
+      "wire_hex": "000000140000001400000004504545520000000000000003"
+    },
+    {
+      "name": "oplog_request",
+      "msg_type": 21,
+      "message": {
+        "kind": "OplogRequest",
+        "peer": "PEER",
+        "from_seq": 1
+      },
+      "wire_hex": "000000140000001500000004504545520000000000000001"
+    },
+    {
+      "name": "oplog_data",
+      "msg_type": 22,
+      "message": {
+        "kind": "OplogData",
+        "peer": "PEER",
+        "from_seq": 1,
+        "ops_hex": ["6f7032", "6f7033"]
+      },
+      "wire_hex": "00000028000000160000000450454552000000000000000100000002000000036f703200000000036f703300"
     }
   ]
 }

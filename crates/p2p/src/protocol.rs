@@ -37,6 +37,14 @@ const MSG_HANDSHAKE: u32 = 17;
 const MSG_EXEC_STREAM: u32 = 18;
 /// Backpressure credit for [`MSG_EXEC_STREAM`]. FROZEN at 19.
 const MSG_EXEC_STREAM_ACK: u32 = 19;
+/// Advertise the head sequence of a named peer's append-only oplog. FROZEN at
+/// 20.
+const MSG_OPLOG_HAVE: u32 = 20;
+/// Request the oplog entries of a named peer after a given sequence. FROZEN at
+/// 21.
+const MSG_OPLOG_REQUEST: u32 = 21;
+/// Carry a contiguous range of opaque, signed oplog entries. FROZEN at 22.
+const MSG_OPLOG_DATA: u32 = 22;
 
 /// The protocol version this implementation speaks. FROZEN; a version bump is
 /// gated by the conformance vectors in `docs/conformance/`.
@@ -47,6 +55,12 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// malicious or buggy peer; the domain vocabulary is tiny, so the cap leaves
 /// headroom without being lavish. Mirrors [`MAX_CANDIDATES_PER_FRAME`].
 const MAX_DOMAINS: u32 = 64;
+
+/// Maximum number of oplog entries carried in a single [`BepMessage::OplogData`]
+/// frame. Bounds receiver allocation against a malicious or buggy peer that
+/// declares a huge entry count; a sync round trips a bounded batch per frame and
+/// requests further entries with a follow-up [`BepMessage::OplogRequest`].
+const MAX_OPLOG_ENTRIES: u32 = 65_536;
 
 /// Wire discriminant for the stdin stream in an [`BepMessage::ExecStream`]
 /// frame. FROZEN.
@@ -774,6 +788,32 @@ impl CapabilityDomain {
             _ => None,
         }
     }
+
+    /// Every domain this protocol version knows, in their frozen discriminant
+    /// order. The canonical ordering for a negotiated set, so two implementations
+    /// that intersect the same inputs produce the same ordered result.
+    const ALL: [Self; 4] = [Self::Content, Self::Management, Self::Exec, Self::Oplog];
+}
+
+/// Negotiate the usable capability set for a connection: the intersection of
+/// what the local node advertises and what the peer advertised, in canonical
+/// discriminant order.
+///
+/// A domain is usable only when *both* ends advertise it — the mesh is
+/// heterogeneous, and a frame for a domain only one side speaks must never be
+/// sent or honoured. The result is deduplicated and ordered by frozen
+/// discriminant so the outcome is independent of the order either side listed
+/// its domains, which is what lets the conformance vectors pin a single expected
+/// negotiated set.
+#[must_use]
+pub fn negotiate_domains(
+    local: &[CapabilityDomain],
+    peer: &[CapabilityDomain],
+) -> Vec<CapabilityDomain> {
+    CapabilityDomain::ALL
+        .into_iter()
+        .filter(|domain| local.contains(domain) && peer.contains(domain))
+        .collect()
 }
 
 /// BEP message types.
@@ -1029,6 +1069,62 @@ pub enum BepMessage {
         /// The credit window in bytes the consumer will accept past `ack_seq`.
         window: u32,
     },
+    /// Advertise the latest sequence of the sender's single-writer oplog for a
+    /// named peer.
+    ///
+    /// The unit of oplog sync is a per-peer, single-writer, append-only log:
+    /// each peer owns exactly one log it alone appends to, so two peers' logs can
+    /// never conflict and distributing them is pure replication. This frame tells
+    /// the receiver "I hold `peer`'s log up to `head_seq`"; the receiver compares
+    /// it to what it holds and asks for the gap with [`Self::OplogRequest`]. The
+    /// `peer` named need not be the sender — a node advertises the heads of every
+    /// peer log it holds, so logs propagate transitively across the mesh.
+    OplogHave {
+        /// The device id of the peer whose log head is advertised. Its log is the
+        /// single-writer, append-only log that peer alone appends to.
+        peer: String,
+        /// The highest sequence number the sender holds for `peer`'s log. Zero
+        /// means the sender holds no entries for that peer yet.
+        head_seq: u64,
+    },
+    /// Request the entries of a named peer's oplog after a given sequence.
+    ///
+    /// Sent in response to an [`Self::OplogHave`] (or proactively) to pull the
+    /// entries the receiver is missing. The reply is one or more
+    /// [`Self::OplogData`] frames carrying the contiguous range `from_seq + 1 ..`.
+    OplogRequest {
+        /// The device id of the peer whose log entries are requested.
+        peer: String,
+        /// The exclusive lower bound: the sender already holds up to and
+        /// including this sequence and wants entries strictly after it. Zero
+        /// requests the log from its first entry.
+        from_seq: u64,
+    },
+    /// Carry a contiguous range of a named peer's oplog entries.
+    ///
+    /// Each entry is one opaque, signed op: the envelope here (the owning peer id,
+    /// the contiguous sequence range, and the length-prefixed opaque entries) is
+    /// frozen, but the internal byte shape of an entry, its signature scheme, and
+    /// the deterministic reduce/merge that consumers apply are deliberately not
+    /// frozen — they are the co-design items the first external oplog
+    /// implementation settles. The protocol crate treats each entry as opaque
+    /// bytes and never interprets it.
+    ///
+    /// The entries are the contiguous range starting at `from_seq + 1`: the i-th
+    /// entry (zero-based) carries sequence `from_seq + 1 + i`. A receiver appends
+    /// them to its copy of `peer`'s log in order and rejects a frame whose
+    /// `from_seq` would leave a gap against what it already holds.
+    OplogData {
+        /// The device id of the peer whose log entries these are.
+        peer: String,
+        /// The exclusive lower bound of the carried range: the first entry has
+        /// sequence `from_seq + 1`.
+        from_seq: u64,
+        /// The opaque, signed op entries, in ascending sequence order. Each is
+        /// length-prefixed on the wire; the protocol crate does not interpret the
+        /// bytes.
+        ops: Vec<Vec<u8>>,
+    },
 }
 
 impl BepMessage {
@@ -1054,6 +1150,57 @@ impl BepMessage {
             Self::Handshake { .. } => MSG_HANDSHAKE,
             Self::ExecStream { .. } => MSG_EXEC_STREAM,
             Self::ExecStreamAck { .. } => MSG_EXEC_STREAM_ACK,
+            Self::OplogHave { .. } => MSG_OPLOG_HAVE,
+            Self::OplogRequest { .. } => MSG_OPLOG_REQUEST,
+            Self::OplogData { .. } => MSG_OPLOG_DATA,
+        }
+    }
+
+    /// The capability domain a peer must have advertised for this frame to be
+    /// legitimate, or `None` for a domain-independent transport frame.
+    ///
+    /// A peer must not send frames for a domain the other did not advertise, and
+    /// the receiver refuses an inbound frame whose domain the sender never
+    /// declared (see `docs/node-protocol.md`). This mapping is the single source
+    /// of truth for which frames that rule governs:
+    ///
+    /// - `content` covers the block-exchange family (`ClusterConfig`, `Index`,
+    ///   `IndexUpdate`, `Request`, `Response`).
+    /// - `management` covers `ManageRequest` / `ManageResponse`.
+    /// - `exec` covers the live stdio stream frames (`ExecStream`,
+    ///   `ExecStreamAck`); exec *control* travels as `management` frames and is
+    ///   governed by the management domain plus the exec capability grant, not by
+    ///   this mapping.
+    /// - `oplog` covers `OplogHave` / `OplogRequest` / `OplogData`.
+    /// - Everything else is transport plumbing (the handshake itself, keepalive,
+    ///   NAT-traversal and relay frames) that every peer speaks regardless of the
+    ///   negotiated capability set, so it maps to `None`.
+    #[must_use]
+    pub const fn frame_domain(&self) -> Option<CapabilityDomain> {
+        match self {
+            Self::ClusterConfig { .. }
+            | Self::Index { .. }
+            | Self::IndexUpdate { .. }
+            | Self::Request { .. }
+            | Self::Response { .. } => Some(CapabilityDomain::Content),
+            Self::ManageRequest { .. } | Self::ManageResponse { .. } => {
+                Some(CapabilityDomain::Management)
+            }
+            Self::ExecStream { .. } | Self::ExecStreamAck { .. } => Some(CapabilityDomain::Exec),
+            Self::OplogHave { .. } | Self::OplogRequest { .. } | Self::OplogData { .. } => {
+                Some(CapabilityDomain::Oplog)
+            }
+            Self::Ping
+            | Self::Close { .. }
+            | Self::Gossip { .. }
+            | Self::Candidates { .. }
+            | Self::SyncPunch { .. }
+            | Self::ObservedAddress(_)
+            | Self::RelayOffer { .. }
+            | Self::RelayConnect { .. }
+            | Self::RelayData { .. }
+            | Self::RelayInbound { .. }
+            | Self::Handshake { .. } => None,
         }
     }
 }
@@ -1220,6 +1367,31 @@ pub fn encode_message(msg: &BepMessage) -> Result<Vec<u8>> {
             encode_u64(&mut body, *session);
             encode_u64(&mut body, *ack_seq);
             encode_u32(&mut body, *window);
+        }
+        BepMessage::OplogHave { peer, head_seq } => {
+            encode_string(&mut body, peer)?;
+            encode_u64(&mut body, *head_seq);
+        }
+        BepMessage::OplogRequest { peer, from_seq } => {
+            encode_string(&mut body, peer)?;
+            encode_u64(&mut body, *from_seq);
+        }
+        BepMessage::OplogData {
+            peer,
+            from_seq,
+            ops,
+        } => {
+            encode_string(&mut body, peer)?;
+            encode_u64(&mut body, *from_seq);
+            let count = u32::try_from(ops.len())
+                .map_err(|_| anyhow::anyhow!("oplog entry count exceeds u32"))?;
+            if count > MAX_OPLOG_ENTRIES {
+                anyhow::bail!("oplog entry count {count} exceeds maximum {MAX_OPLOG_ENTRIES}");
+            }
+            encode_u32(&mut body, count);
+            for op in ops {
+                encode_opaque(&mut body, op)?;
+            }
         }
     }
 
@@ -1627,6 +1799,9 @@ pub fn decode_message(frame: &[u8]) -> Result<BepMessage> {
         MSG_HANDSHAKE => decode_handshake(rest),
         MSG_EXEC_STREAM => decode_exec_stream(rest),
         MSG_EXEC_STREAM_ACK => decode_exec_stream_ack(rest),
+        MSG_OPLOG_HAVE => decode_oplog_have(rest),
+        MSG_OPLOG_REQUEST => decode_oplog_request(rest),
+        MSG_OPLOG_DATA => decode_oplog_data(rest),
         _ => anyhow::bail!("unknown message type: {msg_type}"),
     }
 }
@@ -1962,6 +2137,38 @@ fn decode_exec_stream_ack(data: &[u8]) -> Result<BepMessage> {
         session,
         ack_seq,
         window,
+    })
+}
+
+fn decode_oplog_have(data: &[u8]) -> Result<BepMessage> {
+    let (peer, rest) = decode_string(data)?;
+    let (head_seq, _) = decode_u64(rest)?;
+    Ok(BepMessage::OplogHave { peer, head_seq })
+}
+
+fn decode_oplog_request(data: &[u8]) -> Result<BepMessage> {
+    let (peer, rest) = decode_string(data)?;
+    let (from_seq, _) = decode_u64(rest)?;
+    Ok(BepMessage::OplogRequest { peer, from_seq })
+}
+
+fn decode_oplog_data(data: &[u8]) -> Result<BepMessage> {
+    let (peer, rest) = decode_string(data)?;
+    let (from_seq, rest) = decode_u64(rest)?;
+    let (count, mut rest) = decode_u32(rest)?;
+    if count > MAX_OPLOG_ENTRIES {
+        anyhow::bail!("oplog entry count {count} exceeds maximum {MAX_OPLOG_ENTRIES}");
+    }
+    let mut ops = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let (op, next) = decode_opaque(rest)?;
+        ops.push(op.to_vec());
+        rest = next;
+    }
+    Ok(BepMessage::OplogData {
+        peer,
+        from_seq,
+        ops,
     })
 }
 
