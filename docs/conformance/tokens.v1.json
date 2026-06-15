@@ -1,0 +1,467 @@
+{
+  "description": "Capability-token verification conformance vectors for protocol version 1. Each vector carries a fully materialised CapabilityToken (issuer certificate and signature inline, so verification needs no shared private key), the verifying node device id, the connected (bearer) device id, the verifier wall clock as Unix milliseconds, and the revocation set. expected is \"ok\" when the token must verify, or { \"err\": <discriminant> } naming the hard rejection the verifier must reach: one of bad_signature, wrong_issuer, bearer_mismatch, expired, revoked, delegation_exceeds_parent, parent_invalid. A failure deep in a delegation chain (a revoked or over-deep ancestor) is reported at the leaf as parent_invalid, which recursively carries the underlying chain_too_deep or revoked cause. The signing bytes are the serialiser-independent canonical encoding in token.rs signing_bytes(), so a second implementation reproduces the same verdicts from the same JSON. These fixtures are generated once by the ignored generate_token_vectors test and committed; the harness only reads them.",
+  "protocol_version": 1,
+  "vectors": [
+    {
+      "connected_device": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+      "expected": "ok",
+      "name": "node_issued_ok",
+      "now_unix_ms": 1767225600000,
+      "revoked_ids": [],
+      "token_json": {
+        "claims": {
+          "bearer": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+          "capability": "pin:write",
+          "expires": "2026-12-31T00:00:00Z",
+          "issuer": "XBKMTPPF3HSUZERQYVROXXTCBXZPNUPHDGAQTP6D3EJX5KYROVLA",
+          "scope": {
+            "kind": "folder",
+            "path": "/work"
+          },
+          "token_id": "tok-1"
+        },
+        "issuer_cert_der": "MIIBYzCCAQmgAwIBAgIUasct6NSuNY5oOpQXO79fw3GZAa0wCgYIKoZIzj0EAwIwITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDAgFw03NTAxMDEwMDAwMDBaGA80MDk2MDEwMTAwMDAwMFowITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABGy4krOA8RhTnquXImLBx5A73p03nxO5leqj2yx4VbWX5r5NPJSTnxlQDsvzjmgkqA8PejgSLRhOGzuVOenPWYCjHTAbMBkGA1UdEQQSMBCCDmNhc2NhZGUtZGV2aWNlMAoGCCqGSM49BAMCA0gAMEUCIQDunNIKBR20szT1ncGZrXue9kGtNT4RQg50skDC4C3JVwIgTHc56lof84KKGKhaa35yrgvCG7fmUdxcj6/ZIjbn7/c=",
+        "signature": "LpFHi4GpDYvk7qP5kHWFlNlToj1E0iMr0YpAY0VpSB46XAbVhhimg9Q70ZU58FNa0cEH73zneCj2fzZ357j3vA=="
+      },
+      "verifying_node": "XBKMTPPF3HSUZERQYVROXXTCBXZPNUPHDGAQTP6D3EJX5KYROVLA"
+    },
+    {
+      "connected_device": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+      "expected": "ok",
+      "name": "exec_pty_ok",
+      "now_unix_ms": 1767225600000,
+      "revoked_ids": [],
+      "token_json": {
+        "claims": {
+          "bearer": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+          "capability": "exec:pty",
+          "expires": "2026-12-31T00:00:00Z",
+          "issuer": "XBKMTPPF3HSUZERQYVROXXTCBXZPNUPHDGAQTP6D3EJX5KYROVLA",
+          "scope": {
+            "kind": "folder",
+            "path": "/work"
+          },
+          "token_id": "tok-exec"
+        },
+        "issuer_cert_der": "MIIBYzCCAQmgAwIBAgIUasct6NSuNY5oOpQXO79fw3GZAa0wCgYIKoZIzj0EAwIwITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDAgFw03NTAxMDEwMDAwMDBaGA80MDk2MDEwMTAwMDAwMFowITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABGy4krOA8RhTnquXImLBx5A73p03nxO5leqj2yx4VbWX5r5NPJSTnxlQDsvzjmgkqA8PejgSLRhOGzuVOenPWYCjHTAbMBkGA1UdEQQSMBCCDmNhc2NhZGUtZGV2aWNlMAoGCCqGSM49BAMCA0gAMEUCIQDunNIKBR20szT1ncGZrXue9kGtNT4RQg50skDC4C3JVwIgTHc56lof84KKGKhaa35yrgvCG7fmUdxcj6/ZIjbn7/c=",
+        "signature": "GJJD05X14tGNt7EKE8mlsUcnypvC9dIj8hE0SnbjSJo6bTFkBa3GaFDop1Goiitp8fI7uMZGL69bP2WARgzGOg=="
+      },
+      "verifying_node": "XBKMTPPF3HSUZERQYVROXXTCBXZPNUPHDGAQTP6D3EJX5KYROVLA"
+    },
+    {
+      "connected_device": "ZQLX34ZWSYQJAWADIZQA3GKGLSB3BRG7MKKEFQYOGKIFVVNRBCTA",
+      "expected": "ok",
+      "name": "delegated_chain_ok",
+      "now_unix_ms": 1767225600000,
+      "revoked_ids": [],
+      "token_json": {
+        "claims": {
+          "bearer": "ZQLX34ZWSYQJAWADIZQA3GKGLSB3BRG7MKKEFQYOGKIFVVNRBCTA",
+          "capability": "pin:write",
+          "expires": "2026-06-01T00:00:00Z",
+          "issuer": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+          "scope": {
+            "kind": "folder",
+            "path": "/work/sub"
+          },
+          "token_id": "tok-1-g"
+        },
+        "issuer_cert_der": "MIIBYjCCAQmgAwIBAgIUfNF8OYaXtG3d7f9wEIXxNb+E4G0wCgYIKoZIzj0EAwIwITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDAgFw03NTAxMDEwMDAwMDBaGA80MDk2MDEwMTAwMDAwMFowITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABMiUAFy3UHTbuicbiIrDlD8SINIhCfggBIy2vQmuskniBc79kY8FTCsjD7f1n7nsx0uIGQ5zU3EVgne2eAC9d0ajHTAbMBkGA1UdEQQSMBCCDmNhc2NhZGUtZGV2aWNlMAoGCCqGSM49BAMCA0cAMEQCIAtomeUNwIWuKeqyoa9XSbf8g1p2KdMpoAic9IFgsxcHAiBs0vHx8EUJAeVqGeYnrtOy+uOgAGgeAdOp/ilQFoBbRg==",
+        "parent": {
+          "claims": {
+            "bearer": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+            "capability": "pin:write",
+            "expires": "2026-12-31T00:00:00Z",
+            "issuer": "XBKMTPPF3HSUZERQYVROXXTCBXZPNUPHDGAQTP6D3EJX5KYROVLA",
+            "scope": {
+              "kind": "folder",
+              "path": "/work"
+            },
+            "token_id": "tok-1"
+          },
+          "issuer_cert_der": "MIIBYzCCAQmgAwIBAgIUasct6NSuNY5oOpQXO79fw3GZAa0wCgYIKoZIzj0EAwIwITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDAgFw03NTAxMDEwMDAwMDBaGA80MDk2MDEwMTAwMDAwMFowITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABGy4krOA8RhTnquXImLBx5A73p03nxO5leqj2yx4VbWX5r5NPJSTnxlQDsvzjmgkqA8PejgSLRhOGzuVOenPWYCjHTAbMBkGA1UdEQQSMBCCDmNhc2NhZGUtZGV2aWNlMAoGCCqGSM49BAMCA0gAMEUCIQDunNIKBR20szT1ncGZrXue9kGtNT4RQg50skDC4C3JVwIgTHc56lof84KKGKhaa35yrgvCG7fmUdxcj6/ZIjbn7/c=",
+          "signature": "LpFHi4GpDYvk7qP5kHWFlNlToj1E0iMr0YpAY0VpSB46XAbVhhimg9Q70ZU58FNa0cEH73zneCj2fzZ357j3vA=="
+        },
+        "signature": "8oTNxAfS4wCOrCuHgwDArlxyWQYIHz+//YJAzPdgYf+m3EK5X1EVnzNeQ1ieneugMkaMZTrYU1bPxaIS95PY4w=="
+      },
+      "verifying_node": "XBKMTPPF3HSUZERQYVROXXTCBXZPNUPHDGAQTP6D3EJX5KYROVLA"
+    },
+    {
+      "connected_device": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+      "expected": {
+        "err": "bad_signature"
+      },
+      "name": "tampered_claims_bad_signature",
+      "now_unix_ms": 1767225600000,
+      "revoked_ids": [],
+      "token_json": {
+        "claims": {
+          "bearer": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+          "capability": "pin:write",
+          "expires": "2026-12-31T00:00:00Z",
+          "issuer": "XBKMTPPF3HSUZERQYVROXXTCBXZPNUPHDGAQTP6D3EJX5KYROVLA",
+          "scope": {
+            "kind": "node"
+          },
+          "token_id": "tok-1"
+        },
+        "issuer_cert_der": "MIIBYzCCAQmgAwIBAgIUasct6NSuNY5oOpQXO79fw3GZAa0wCgYIKoZIzj0EAwIwITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDAgFw03NTAxMDEwMDAwMDBaGA80MDk2MDEwMTAwMDAwMFowITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABGy4krOA8RhTnquXImLBx5A73p03nxO5leqj2yx4VbWX5r5NPJSTnxlQDsvzjmgkqA8PejgSLRhOGzuVOenPWYCjHTAbMBkGA1UdEQQSMBCCDmNhc2NhZGUtZGV2aWNlMAoGCCqGSM49BAMCA0gAMEUCIQDunNIKBR20szT1ncGZrXue9kGtNT4RQg50skDC4C3JVwIgTHc56lof84KKGKhaa35yrgvCG7fmUdxcj6/ZIjbn7/c=",
+        "signature": "gP78RitEHwchs2StFqBgLF9g3Clb6XZmlwcsSRTvHIKQronpAQsVvYkNfxRFBo60+ncSKAcDmljtm3AuaTCO8Q=="
+      },
+      "verifying_node": "XBKMTPPF3HSUZERQYVROXXTCBXZPNUPHDGAQTP6D3EJX5KYROVLA"
+    },
+    {
+      "connected_device": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+      "expected": {
+        "err": "bad_signature"
+      },
+      "name": "substituted_certificate_bad_signature",
+      "now_unix_ms": 1767225600000,
+      "revoked_ids": [],
+      "token_json": {
+        "claims": {
+          "bearer": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+          "capability": "pin:write",
+          "expires": "2026-12-31T00:00:00Z",
+          "issuer": "XBKMTPPF3HSUZERQYVROXXTCBXZPNUPHDGAQTP6D3EJX5KYROVLA",
+          "scope": {
+            "kind": "folder",
+            "path": "/work"
+          },
+          "token_id": "tok-1"
+        },
+        "issuer_cert_der": "MIIBYzCCAQmgAwIBAgIUdZ2bMOT7himdciGLlexIZjlVSwcwCgYIKoZIzj0EAwIwITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDAgFw03NTAxMDEwMDAwMDBaGA80MDk2MDEwMTAwMDAwMFowITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABFQB9A3FxUFZtsxYYSO07v5E+MTGQraOksY5vCcaHWhKThK2m2Pfg8k7IvJQ2mpJJSM8GKDbKdo+F/3rsZDcwdWjHTAbMBkGA1UdEQQSMBCCDmNhc2NhZGUtZGV2aWNlMAoGCCqGSM49BAMCA0gAMEUCIQDpv4UdQlBPhpQ7MM4Iqay27aS2AsfRL6inysMKOwV3EQIgfTboDHdl2Kz2qOUwaSZvtV2NVrSPPINO6iRI/v5rYb0=",
+        "signature": "FcvZqtGWZSfttlKjqNDCC60+lPZGTv5D4G7MnrKQSEJ55RdZRHV6sMXWut+gByzIJNdaRyoiejedCRY3/qssIA=="
+      },
+      "verifying_node": "XBKMTPPF3HSUZERQYVROXXTCBXZPNUPHDGAQTP6D3EJX5KYROVLA"
+    },
+    {
+      "connected_device": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+      "expected": {
+        "err": "wrong_issuer"
+      },
+      "name": "root_from_another_node_wrong_issuer",
+      "now_unix_ms": 1767225600000,
+      "revoked_ids": [],
+      "token_json": {
+        "claims": {
+          "bearer": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+          "capability": "pin:write",
+          "expires": "2026-12-31T00:00:00Z",
+          "issuer": "4RYHE5QZB2ANLK5ECGUCPHF4TLBP33HZ4NAIV677Y32OO6GFF3PQ",
+          "scope": {
+            "kind": "folder",
+            "path": "/work"
+          },
+          "token_id": "tok-1"
+        },
+        "issuer_cert_der": "MIIBYjCCAQmgAwIBAgIULKPcPann40Hj8n/95zwDf4wElpwwCgYIKoZIzj0EAwIwITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDAgFw03NTAxMDEwMDAwMDBaGA80MDk2MDEwMTAwMDAwMFowITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABBYGn5UfDYH+CJXqzyl4MLis/GSISnsuT+gsMCRrCIQ1hgPQCgFqbBRM6eq2B1fYhmd3YCrYHUttQFkv8x98K+yjHTAbMBkGA1UdEQQSMBCCDmNhc2NhZGUtZGV2aWNlMAoGCCqGSM49BAMCA0cAMEQCIE4eHGpW3/CCsZqqAArfTIWj49CYV1q4ZFadkh8UOuKsAiA8jw5U0AMsFOsp7BiQM3YY2vGKN/6sznLLqA7f+0aBFQ==",
+        "signature": "LzTr9jQt2GZS8VqXsVCqXhYv87WVGR1U9qfXhqZx4kzUwXFF4cKc7OXV0s9jxaHvEMnVzyeQjuuBEGsIbAz1LA=="
+      },
+      "verifying_node": "XBKMTPPF3HSUZERQYVROXXTCBXZPNUPHDGAQTP6D3EJX5KYROVLA"
+    },
+    {
+      "connected_device": "ZQLX34ZWSYQJAWADIZQA3GKGLSB3BRG7MKKEFQYOGKIFVVNRBCTA",
+      "expected": {
+        "err": "bearer_mismatch"
+      },
+      "name": "presented_by_wrong_device_bearer_mismatch",
+      "now_unix_ms": 1767225600000,
+      "revoked_ids": [],
+      "token_json": {
+        "claims": {
+          "bearer": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+          "capability": "pin:write",
+          "expires": "2026-12-31T00:00:00Z",
+          "issuer": "XBKMTPPF3HSUZERQYVROXXTCBXZPNUPHDGAQTP6D3EJX5KYROVLA",
+          "scope": {
+            "kind": "folder",
+            "path": "/work"
+          },
+          "token_id": "tok-1"
+        },
+        "issuer_cert_der": "MIIBYzCCAQmgAwIBAgIUasct6NSuNY5oOpQXO79fw3GZAa0wCgYIKoZIzj0EAwIwITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDAgFw03NTAxMDEwMDAwMDBaGA80MDk2MDEwMTAwMDAwMFowITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABGy4krOA8RhTnquXImLBx5A73p03nxO5leqj2yx4VbWX5r5NPJSTnxlQDsvzjmgkqA8PejgSLRhOGzuVOenPWYCjHTAbMBkGA1UdEQQSMBCCDmNhc2NhZGUtZGV2aWNlMAoGCCqGSM49BAMCA0gAMEUCIQDunNIKBR20szT1ncGZrXue9kGtNT4RQg50skDC4C3JVwIgTHc56lof84KKGKhaa35yrgvCG7fmUdxcj6/ZIjbn7/c=",
+        "signature": "LpFHi4GpDYvk7qP5kHWFlNlToj1E0iMr0YpAY0VpSB46XAbVhhimg9Q70ZU58FNa0cEH73zneCj2fzZ357j3vA=="
+      },
+      "verifying_node": "XBKMTPPF3HSUZERQYVROXXTCBXZPNUPHDGAQTP6D3EJX5KYROVLA"
+    },
+    {
+      "connected_device": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+      "expected": {
+        "err": "expired"
+      },
+      "name": "past_expiry_expired",
+      "now_unix_ms": 1798761600000,
+      "revoked_ids": [],
+      "token_json": {
+        "claims": {
+          "bearer": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+          "capability": "pin:write",
+          "expires": "2026-12-31T00:00:00Z",
+          "issuer": "XBKMTPPF3HSUZERQYVROXXTCBXZPNUPHDGAQTP6D3EJX5KYROVLA",
+          "scope": {
+            "kind": "folder",
+            "path": "/work"
+          },
+          "token_id": "tok-1"
+        },
+        "issuer_cert_der": "MIIBYzCCAQmgAwIBAgIUasct6NSuNY5oOpQXO79fw3GZAa0wCgYIKoZIzj0EAwIwITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDAgFw03NTAxMDEwMDAwMDBaGA80MDk2MDEwMTAwMDAwMFowITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABGy4krOA8RhTnquXImLBx5A73p03nxO5leqj2yx4VbWX5r5NPJSTnxlQDsvzjmgkqA8PejgSLRhOGzuVOenPWYCjHTAbMBkGA1UdEQQSMBCCDmNhc2NhZGUtZGV2aWNlMAoGCCqGSM49BAMCA0gAMEUCIQDunNIKBR20szT1ncGZrXue9kGtNT4RQg50skDC4C3JVwIgTHc56lof84KKGKhaa35yrgvCG7fmUdxcj6/ZIjbn7/c=",
+        "signature": "LpFHi4GpDYvk7qP5kHWFlNlToj1E0iMr0YpAY0VpSB46XAbVhhimg9Q70ZU58FNa0cEH73zneCj2fzZ357j3vA=="
+      },
+      "verifying_node": "XBKMTPPF3HSUZERQYVROXXTCBXZPNUPHDGAQTP6D3EJX5KYROVLA"
+    },
+    {
+      "connected_device": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+      "expected": {
+        "err": "revoked"
+      },
+      "name": "leaf_on_revocation_list_revoked",
+      "now_unix_ms": 1767225600000,
+      "revoked_ids": [
+        "tok-1"
+      ],
+      "token_json": {
+        "claims": {
+          "bearer": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+          "capability": "pin:write",
+          "expires": "2026-12-31T00:00:00Z",
+          "issuer": "XBKMTPPF3HSUZERQYVROXXTCBXZPNUPHDGAQTP6D3EJX5KYROVLA",
+          "scope": {
+            "kind": "folder",
+            "path": "/work"
+          },
+          "token_id": "tok-1"
+        },
+        "issuer_cert_der": "MIIBYzCCAQmgAwIBAgIUasct6NSuNY5oOpQXO79fw3GZAa0wCgYIKoZIzj0EAwIwITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDAgFw03NTAxMDEwMDAwMDBaGA80MDk2MDEwMTAwMDAwMFowITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABGy4krOA8RhTnquXImLBx5A73p03nxO5leqj2yx4VbWX5r5NPJSTnxlQDsvzjmgkqA8PejgSLRhOGzuVOenPWYCjHTAbMBkGA1UdEQQSMBCCDmNhc2NhZGUtZGV2aWNlMAoGCCqGSM49BAMCA0gAMEUCIQDunNIKBR20szT1ncGZrXue9kGtNT4RQg50skDC4C3JVwIgTHc56lof84KKGKhaa35yrgvCG7fmUdxcj6/ZIjbn7/c=",
+        "signature": "LpFHi4GpDYvk7qP5kHWFlNlToj1E0iMr0YpAY0VpSB46XAbVhhimg9Q70ZU58FNa0cEH73zneCj2fzZ357j3vA=="
+      },
+      "verifying_node": "XBKMTPPF3HSUZERQYVROXXTCBXZPNUPHDGAQTP6D3EJX5KYROVLA"
+    },
+    {
+      "connected_device": "ZQLX34ZWSYQJAWADIZQA3GKGLSB3BRG7MKKEFQYOGKIFVVNRBCTA",
+      "expected": {
+        "err": "delegation_exceeds_parent"
+      },
+      "name": "widened_delegation_exceeds_parent",
+      "now_unix_ms": 1767225600000,
+      "revoked_ids": [],
+      "token_json": {
+        "claims": {
+          "bearer": "ZQLX34ZWSYQJAWADIZQA3GKGLSB3BRG7MKKEFQYOGKIFVVNRBCTA",
+          "capability": "pin:write",
+          "expires": "2026-06-01T00:00:00Z",
+          "issuer": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+          "scope": {
+            "kind": "node"
+          },
+          "token_id": "tok-1-wide"
+        },
+        "issuer_cert_der": "MIIBYjCCAQmgAwIBAgIUfNF8OYaXtG3d7f9wEIXxNb+E4G0wCgYIKoZIzj0EAwIwITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDAgFw03NTAxMDEwMDAwMDBaGA80MDk2MDEwMTAwMDAwMFowITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABMiUAFy3UHTbuicbiIrDlD8SINIhCfggBIy2vQmuskniBc79kY8FTCsjD7f1n7nsx0uIGQ5zU3EVgne2eAC9d0ajHTAbMBkGA1UdEQQSMBCCDmNhc2NhZGUtZGV2aWNlMAoGCCqGSM49BAMCA0cAMEQCIAtomeUNwIWuKeqyoa9XSbf8g1p2KdMpoAic9IFgsxcHAiBs0vHx8EUJAeVqGeYnrtOy+uOgAGgeAdOp/ilQFoBbRg==",
+        "parent": {
+          "claims": {
+            "bearer": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+            "capability": "pin:write",
+            "expires": "2026-12-31T00:00:00Z",
+            "issuer": "XBKMTPPF3HSUZERQYVROXXTCBXZPNUPHDGAQTP6D3EJX5KYROVLA",
+            "scope": {
+              "kind": "folder",
+              "path": "/work"
+            },
+            "token_id": "tok-1"
+          },
+          "issuer_cert_der": "MIIBYzCCAQmgAwIBAgIUasct6NSuNY5oOpQXO79fw3GZAa0wCgYIKoZIzj0EAwIwITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDAgFw03NTAxMDEwMDAwMDBaGA80MDk2MDEwMTAwMDAwMFowITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABGy4krOA8RhTnquXImLBx5A73p03nxO5leqj2yx4VbWX5r5NPJSTnxlQDsvzjmgkqA8PejgSLRhOGzuVOenPWYCjHTAbMBkGA1UdEQQSMBCCDmNhc2NhZGUtZGV2aWNlMAoGCCqGSM49BAMCA0gAMEUCIQDunNIKBR20szT1ncGZrXue9kGtNT4RQg50skDC4C3JVwIgTHc56lof84KKGKhaa35yrgvCG7fmUdxcj6/ZIjbn7/c=",
+          "signature": "LpFHi4GpDYvk7qP5kHWFlNlToj1E0iMr0YpAY0VpSB46XAbVhhimg9Q70ZU58FNa0cEH73zneCj2fzZ357j3vA=="
+        },
+        "signature": "4E0WIaYAErQDvcloHJ4GK81DtysywM3cEh7LUV1Q+mYK/SVqmwDRIjODCDVuc/jKxQ52jR40IjmCGQuNFgk1mg=="
+      },
+      "verifying_node": "XBKMTPPF3HSUZERQYVROXXTCBXZPNUPHDGAQTP6D3EJX5KYROVLA"
+    },
+    {
+      "connected_device": "ZQLX34ZWSYQJAWADIZQA3GKGLSB3BRG7MKKEFQYOGKIFVVNRBCTA",
+      "expected": {
+        "err": "parent_invalid"
+      },
+      "name": "revoked_root_parent_invalid",
+      "now_unix_ms": 1767225600000,
+      "revoked_ids": [
+        "tok-1"
+      ],
+      "token_json": {
+        "claims": {
+          "bearer": "ZQLX34ZWSYQJAWADIZQA3GKGLSB3BRG7MKKEFQYOGKIFVVNRBCTA",
+          "capability": "pin:write",
+          "expires": "2026-06-01T00:00:00Z",
+          "issuer": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+          "scope": {
+            "kind": "folder",
+            "path": "/work/sub"
+          },
+          "token_id": "tok-1-g"
+        },
+        "issuer_cert_der": "MIIBYjCCAQmgAwIBAgIUfNF8OYaXtG3d7f9wEIXxNb+E4G0wCgYIKoZIzj0EAwIwITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDAgFw03NTAxMDEwMDAwMDBaGA80MDk2MDEwMTAwMDAwMFowITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABMiUAFy3UHTbuicbiIrDlD8SINIhCfggBIy2vQmuskniBc79kY8FTCsjD7f1n7nsx0uIGQ5zU3EVgne2eAC9d0ajHTAbMBkGA1UdEQQSMBCCDmNhc2NhZGUtZGV2aWNlMAoGCCqGSM49BAMCA0cAMEQCIAtomeUNwIWuKeqyoa9XSbf8g1p2KdMpoAic9IFgsxcHAiBs0vHx8EUJAeVqGeYnrtOy+uOgAGgeAdOp/ilQFoBbRg==",
+        "parent": {
+          "claims": {
+            "bearer": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+            "capability": "pin:write",
+            "expires": "2026-12-31T00:00:00Z",
+            "issuer": "XBKMTPPF3HSUZERQYVROXXTCBXZPNUPHDGAQTP6D3EJX5KYROVLA",
+            "scope": {
+              "kind": "folder",
+              "path": "/work"
+            },
+            "token_id": "tok-1"
+          },
+          "issuer_cert_der": "MIIBYzCCAQmgAwIBAgIUasct6NSuNY5oOpQXO79fw3GZAa0wCgYIKoZIzj0EAwIwITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDAgFw03NTAxMDEwMDAwMDBaGA80MDk2MDEwMTAwMDAwMFowITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABGy4krOA8RhTnquXImLBx5A73p03nxO5leqj2yx4VbWX5r5NPJSTnxlQDsvzjmgkqA8PejgSLRhOGzuVOenPWYCjHTAbMBkGA1UdEQQSMBCCDmNhc2NhZGUtZGV2aWNlMAoGCCqGSM49BAMCA0gAMEUCIQDunNIKBR20szT1ncGZrXue9kGtNT4RQg50skDC4C3JVwIgTHc56lof84KKGKhaa35yrgvCG7fmUdxcj6/ZIjbn7/c=",
+          "signature": "LpFHi4GpDYvk7qP5kHWFlNlToj1E0iMr0YpAY0VpSB46XAbVhhimg9Q70ZU58FNa0cEH73zneCj2fzZ357j3vA=="
+        },
+        "signature": "8oTNxAfS4wCOrCuHgwDArlxyWQYIHz+//YJAzPdgYf+m3EK5X1EVnzNeQ1ieneugMkaMZTrYU1bPxaIS95PY4w=="
+      },
+      "verifying_node": "XBKMTPPF3HSUZERQYVROXXTCBXZPNUPHDGAQTP6D3EJX5KYROVLA"
+    },
+    {
+      "connected_device": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+      "expected": {
+        "err": "parent_invalid"
+      },
+      "name": "over_deep_chain_parent_invalid",
+      "now_unix_ms": 1767225600000,
+      "revoked_ids": [],
+      "token_json": {
+        "claims": {
+          "bearer": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+          "capability": "pin:write",
+          "expires": "2026-12-31T00:00:00Z",
+          "issuer": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+          "scope": {
+            "kind": "folder",
+            "path": "/work"
+          },
+          "token_id": "tok-deep-7"
+        },
+        "issuer_cert_der": "MIIBYjCCAQmgAwIBAgIUfNF8OYaXtG3d7f9wEIXxNb+E4G0wCgYIKoZIzj0EAwIwITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDAgFw03NTAxMDEwMDAwMDBaGA80MDk2MDEwMTAwMDAwMFowITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABMiUAFy3UHTbuicbiIrDlD8SINIhCfggBIy2vQmuskniBc79kY8FTCsjD7f1n7nsx0uIGQ5zU3EVgne2eAC9d0ajHTAbMBkGA1UdEQQSMBCCDmNhc2NhZGUtZGV2aWNlMAoGCCqGSM49BAMCA0cAMEQCIAtomeUNwIWuKeqyoa9XSbf8g1p2KdMpoAic9IFgsxcHAiBs0vHx8EUJAeVqGeYnrtOy+uOgAGgeAdOp/ilQFoBbRg==",
+        "parent": {
+          "claims": {
+            "bearer": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+            "capability": "pin:write",
+            "expires": "2026-12-31T00:00:00Z",
+            "issuer": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+            "scope": {
+              "kind": "folder",
+              "path": "/work"
+            },
+            "token_id": "tok-deep-6"
+          },
+          "issuer_cert_der": "MIIBYjCCAQmgAwIBAgIUfNF8OYaXtG3d7f9wEIXxNb+E4G0wCgYIKoZIzj0EAwIwITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDAgFw03NTAxMDEwMDAwMDBaGA80MDk2MDEwMTAwMDAwMFowITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABMiUAFy3UHTbuicbiIrDlD8SINIhCfggBIy2vQmuskniBc79kY8FTCsjD7f1n7nsx0uIGQ5zU3EVgne2eAC9d0ajHTAbMBkGA1UdEQQSMBCCDmNhc2NhZGUtZGV2aWNlMAoGCCqGSM49BAMCA0cAMEQCIAtomeUNwIWuKeqyoa9XSbf8g1p2KdMpoAic9IFgsxcHAiBs0vHx8EUJAeVqGeYnrtOy+uOgAGgeAdOp/ilQFoBbRg==",
+          "parent": {
+            "claims": {
+              "bearer": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+              "capability": "pin:write",
+              "expires": "2026-12-31T00:00:00Z",
+              "issuer": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+              "scope": {
+                "kind": "folder",
+                "path": "/work"
+              },
+              "token_id": "tok-deep-5"
+            },
+            "issuer_cert_der": "MIIBYjCCAQmgAwIBAgIUfNF8OYaXtG3d7f9wEIXxNb+E4G0wCgYIKoZIzj0EAwIwITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDAgFw03NTAxMDEwMDAwMDBaGA80MDk2MDEwMTAwMDAwMFowITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABMiUAFy3UHTbuicbiIrDlD8SINIhCfggBIy2vQmuskniBc79kY8FTCsjD7f1n7nsx0uIGQ5zU3EVgne2eAC9d0ajHTAbMBkGA1UdEQQSMBCCDmNhc2NhZGUtZGV2aWNlMAoGCCqGSM49BAMCA0cAMEQCIAtomeUNwIWuKeqyoa9XSbf8g1p2KdMpoAic9IFgsxcHAiBs0vHx8EUJAeVqGeYnrtOy+uOgAGgeAdOp/ilQFoBbRg==",
+            "parent": {
+              "claims": {
+                "bearer": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+                "capability": "pin:write",
+                "expires": "2026-12-31T00:00:00Z",
+                "issuer": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+                "scope": {
+                  "kind": "folder",
+                  "path": "/work"
+                },
+                "token_id": "tok-deep-4"
+              },
+              "issuer_cert_der": "MIIBYjCCAQmgAwIBAgIUfNF8OYaXtG3d7f9wEIXxNb+E4G0wCgYIKoZIzj0EAwIwITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDAgFw03NTAxMDEwMDAwMDBaGA80MDk2MDEwMTAwMDAwMFowITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABMiUAFy3UHTbuicbiIrDlD8SINIhCfggBIy2vQmuskniBc79kY8FTCsjD7f1n7nsx0uIGQ5zU3EVgne2eAC9d0ajHTAbMBkGA1UdEQQSMBCCDmNhc2NhZGUtZGV2aWNlMAoGCCqGSM49BAMCA0cAMEQCIAtomeUNwIWuKeqyoa9XSbf8g1p2KdMpoAic9IFgsxcHAiBs0vHx8EUJAeVqGeYnrtOy+uOgAGgeAdOp/ilQFoBbRg==",
+              "parent": {
+                "claims": {
+                  "bearer": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+                  "capability": "pin:write",
+                  "expires": "2026-12-31T00:00:00Z",
+                  "issuer": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+                  "scope": {
+                    "kind": "folder",
+                    "path": "/work"
+                  },
+                  "token_id": "tok-deep-3"
+                },
+                "issuer_cert_der": "MIIBYjCCAQmgAwIBAgIUfNF8OYaXtG3d7f9wEIXxNb+E4G0wCgYIKoZIzj0EAwIwITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDAgFw03NTAxMDEwMDAwMDBaGA80MDk2MDEwMTAwMDAwMFowITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABMiUAFy3UHTbuicbiIrDlD8SINIhCfggBIy2vQmuskniBc79kY8FTCsjD7f1n7nsx0uIGQ5zU3EVgne2eAC9d0ajHTAbMBkGA1UdEQQSMBCCDmNhc2NhZGUtZGV2aWNlMAoGCCqGSM49BAMCA0cAMEQCIAtomeUNwIWuKeqyoa9XSbf8g1p2KdMpoAic9IFgsxcHAiBs0vHx8EUJAeVqGeYnrtOy+uOgAGgeAdOp/ilQFoBbRg==",
+                "parent": {
+                  "claims": {
+                    "bearer": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+                    "capability": "pin:write",
+                    "expires": "2026-12-31T00:00:00Z",
+                    "issuer": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+                    "scope": {
+                      "kind": "folder",
+                      "path": "/work"
+                    },
+                    "token_id": "tok-deep-2"
+                  },
+                  "issuer_cert_der": "MIIBYjCCAQmgAwIBAgIUfNF8OYaXtG3d7f9wEIXxNb+E4G0wCgYIKoZIzj0EAwIwITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDAgFw03NTAxMDEwMDAwMDBaGA80MDk2MDEwMTAwMDAwMFowITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABMiUAFy3UHTbuicbiIrDlD8SINIhCfggBIy2vQmuskniBc79kY8FTCsjD7f1n7nsx0uIGQ5zU3EVgne2eAC9d0ajHTAbMBkGA1UdEQQSMBCCDmNhc2NhZGUtZGV2aWNlMAoGCCqGSM49BAMCA0cAMEQCIAtomeUNwIWuKeqyoa9XSbf8g1p2KdMpoAic9IFgsxcHAiBs0vHx8EUJAeVqGeYnrtOy+uOgAGgeAdOp/ilQFoBbRg==",
+                  "parent": {
+                    "claims": {
+                      "bearer": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+                      "capability": "pin:write",
+                      "expires": "2026-12-31T00:00:00Z",
+                      "issuer": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+                      "scope": {
+                        "kind": "folder",
+                        "path": "/work"
+                      },
+                      "token_id": "tok-deep-1"
+                    },
+                    "issuer_cert_der": "MIIBYjCCAQmgAwIBAgIUfNF8OYaXtG3d7f9wEIXxNb+E4G0wCgYIKoZIzj0EAwIwITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDAgFw03NTAxMDEwMDAwMDBaGA80MDk2MDEwMTAwMDAwMFowITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABMiUAFy3UHTbuicbiIrDlD8SINIhCfggBIy2vQmuskniBc79kY8FTCsjD7f1n7nsx0uIGQ5zU3EVgne2eAC9d0ajHTAbMBkGA1UdEQQSMBCCDmNhc2NhZGUtZGV2aWNlMAoGCCqGSM49BAMCA0cAMEQCIAtomeUNwIWuKeqyoa9XSbf8g1p2KdMpoAic9IFgsxcHAiBs0vHx8EUJAeVqGeYnrtOy+uOgAGgeAdOp/ilQFoBbRg==",
+                    "parent": {
+                      "claims": {
+                        "bearer": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+                        "capability": "pin:write",
+                        "expires": "2026-12-31T00:00:00Z",
+                        "issuer": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+                        "scope": {
+                          "kind": "folder",
+                          "path": "/work"
+                        },
+                        "token_id": "tok-deep-0"
+                      },
+                      "issuer_cert_der": "MIIBYjCCAQmgAwIBAgIUfNF8OYaXtG3d7f9wEIXxNb+E4G0wCgYIKoZIzj0EAwIwITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDAgFw03NTAxMDEwMDAwMDBaGA80MDk2MDEwMTAwMDAwMFowITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABMiUAFy3UHTbuicbiIrDlD8SINIhCfggBIy2vQmuskniBc79kY8FTCsjD7f1n7nsx0uIGQ5zU3EVgne2eAC9d0ajHTAbMBkGA1UdEQQSMBCCDmNhc2NhZGUtZGV2aWNlMAoGCCqGSM49BAMCA0cAMEQCIAtomeUNwIWuKeqyoa9XSbf8g1p2KdMpoAic9IFgsxcHAiBs0vHx8EUJAeVqGeYnrtOy+uOgAGgeAdOp/ilQFoBbRg==",
+                      "parent": {
+                        "claims": {
+                          "bearer": "NR256XNL5QZ42Q3KMUDT6B3ACYAPCSWLUQM7CT2CE232XLBLLJEQ",
+                          "capability": "pin:write",
+                          "expires": "2026-12-31T00:00:00Z",
+                          "issuer": "XBKMTPPF3HSUZERQYVROXXTCBXZPNUPHDGAQTP6D3EJX5KYROVLA",
+                          "scope": {
+                            "kind": "folder",
+                            "path": "/work"
+                          },
+                          "token_id": "tok-1"
+                        },
+                        "issuer_cert_der": "MIIBYzCCAQmgAwIBAgIUasct6NSuNY5oOpQXO79fw3GZAa0wCgYIKoZIzj0EAwIwITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDAgFw03NTAxMDEwMDAwMDBaGA80MDk2MDEwMTAwMDAwMFowITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABGy4krOA8RhTnquXImLBx5A73p03nxO5leqj2yx4VbWX5r5NPJSTnxlQDsvzjmgkqA8PejgSLRhOGzuVOenPWYCjHTAbMBkGA1UdEQQSMBCCDmNhc2NhZGUtZGV2aWNlMAoGCCqGSM49BAMCA0gAMEUCIQDunNIKBR20szT1ncGZrXue9kGtNT4RQg50skDC4C3JVwIgTHc56lof84KKGKhaa35yrgvCG7fmUdxcj6/ZIjbn7/c=",
+                        "signature": "tzgdKRnJ1hzwEqJaU+sM+JaDt/cRgrvc0z9nuM589Va+M9ClpDjjSDJUSUlIByVeHoBXbKlSuVs6omnJx69+4A=="
+                      },
+                      "signature": "CdK/GXJC0JtFDA+rkgd0nd6slTcFfHqCTG4F8XCV9XiP+4aR8Nm1yXOQ8pk7TWexpGmKJEmKfz532Nw4BgU2cg=="
+                    },
+                    "signature": "C/tPcpW0Ol6snTZPYhN8zTX9Wo3SZXYNc+rqnOs+mCLojYQuQPA+sEXOU8a8gl+9OkJ2OwIRPz8QUYsELdszYA=="
+                  },
+                  "signature": "+Tw00N8gVOfu6BEMvmm18q0IcKEVW35aVe3coU/VtztknGHlXmQ0AENgGw0Big0J5oIB8ApQJOrpT1YoB5GyFQ=="
+                },
+                "signature": "6ah2IZ639burSxMbYP7+dk92Zuh2fTXs067CyCaruX6NAgNr4ue/Hvft1bBJgduqoiV8LRg+uXF8qrPB9BlW8Q=="
+              },
+              "signature": "2YPQLK+hOjYst9jUCHyANd62RbTBKVqR7NKYdVCfr71FOoV7nG0400LgxH21E+SWf8lNNZ7tfckC/l4hATWqtw=="
+            },
+            "signature": "K4Uxsq0KpY2thu7O+WB5IQOUXpIq8Dg4KIRTFrQBdt9z6fL93LilTe4ima3jHw5w2un1stimRcD58brjnTjjSw=="
+          },
+          "signature": "kozSCGaDArKFqEtT8Hh41ICXK7n8zhuKNnKqOhlIpoAtRlZCgCOaA608h3mN6SPwiuUrpk4wqap+1oSZVapOTg=="
+        },
+        "signature": "Wnyt3LhBd11EosMAbnfBh8/o1qEVdpDKlFd2/WZw+D1PjncwSvABsmp44uODQfl9HAYjZHmrVE2BWMu0yzvupA=="
+      },
+      "verifying_node": "XBKMTPPF3HSUZERQYVROXXTCBXZPNUPHDGAQTP6D3EJX5KYROVLA"
+    }
+  ]
+}
