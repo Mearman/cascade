@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-tokio = { workspace = true, features = ["net", "rt", "macros", "io-util"] }
+tokio = { workspace = true, features = ["net", "rt", "macros", "io-util", "sync"] }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -28,6 +28,7 @@ ed25519-dalek = { workspace = true }
 cascade-announce-wire = { version = "0.1.56", path = "../cascade-announce-wire" }
 ring = "0.17"
 x509-parser = "0.18"
+cascade-exec = { version = "0.1.120", path = "../exec" }
 
 [features]
 ## Enable the announce-server discovery client ([`discovery::announce::AnnounceDiscovery`]).

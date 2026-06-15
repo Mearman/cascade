@@ -517,6 +517,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "cascade-announce-wire",
+ "cascade-exec",
  "cascade-relay-server",
  "chrono",
  "data-encoding",
