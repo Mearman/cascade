@@ -755,9 +755,7 @@ impl Backend for GdriveBackend {
                 let first = entries
                     .into_iter()
                     .find(|e| e.name == *name)
-                    .ok_or_else(|| {
-                        BackendError::NotFound(format!("Path not found: {path_str}"))
-                    })?;
+                    .ok_or_else(|| BackendError::NotFound(format!("Path not found: {path_str}")))?;
 
                 if path_rest.is_empty() {
                     return Ok(first);
@@ -785,9 +783,7 @@ impl Backend for GdriveBackend {
                         .into_iter()
                         .find(|e| e.name == *component)
                         .ok_or_else(|| {
-                            BackendError::NotFound(format!(
-                                "Path not found: {path_str}"
-                            ))
+                            BackendError::NotFound(format!("Path not found: {path_str}"))
                         })?;
                 }
                 return Ok(current);

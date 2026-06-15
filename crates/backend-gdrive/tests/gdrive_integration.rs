@@ -725,10 +725,7 @@ async fn metadata_shared_with_me_single_file_still_works() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/files"))
-        .and(query_param(
-            "q",
-            "sharedWithMe = true and trashed = false",
-        ))
+        .and(query_param("q", "sharedWithMe = true and trashed = false"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "files": [file_json("swm-f1", "readme.md", "other-user", 42)]
         })))
@@ -752,10 +749,7 @@ async fn metadata_shared_with_me_walks_into_shared_folder() {
     // Shared-with-me listing returns a folder.
     Mock::given(method("GET"))
         .and(path("/files"))
-        .and(query_param(
-            "q",
-            "sharedWithMe = true and trashed = false",
-        ))
+        .and(query_param("q", "sharedWithMe = true and trashed = false"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "files": [folder_json("swm-folder-1", "project", "other-user")]
         })))
@@ -783,10 +777,7 @@ async fn metadata_shared_with_me_walks_into_shared_folder() {
     assert_eq!(entry.name, "notes.txt");
     assert!(!entry.is_dir);
     assert_eq!(entry.size, Some(128));
-    assert_eq!(
-        entry.id,
-        ItemId::new("gdrive-test-account", "swm-file-1")
-    );
+    assert_eq!(entry.id, ItemId::new("gdrive-test-account", "swm-file-1"));
 }
 
 #[tokio::test]
@@ -794,10 +785,7 @@ async fn metadata_shared_with_me_rejects_path_through_non_directory() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/files"))
-        .and(query_param(
-            "q",
-            "sharedWithMe = true and trashed = false",
-        ))
+        .and(query_param("q", "sharedWithMe = true and trashed = false"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "files": [file_json("swm-file", "document.pdf", "other-user", 999)]
         })))

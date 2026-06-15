@@ -459,10 +459,7 @@ async fn fetch_contents_reads_via_provider_and_caches() {
 
     // The cache path follows the id-slug convention.
     let expected_name = id.0.replace(['/', '\\'], "_");
-    assert_eq!(
-        path.file_name().unwrap().to_str().unwrap(),
-        expected_name
-    );
+    assert_eq!(path.file_name().unwrap().to_str().unwrap(), expected_name);
 
     let _ = tokio::fs::remove_dir_all(&cache_dir).await;
 }
