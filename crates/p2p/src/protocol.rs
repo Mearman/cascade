@@ -30,6 +30,33 @@ const MSG_RELAY_DATA: u32 = 13;
 const MSG_RELAY_INBOUND: u32 = 14;
 const MSG_MANAGE_REQUEST: u32 = 15;
 const MSG_MANAGE_RESPONSE: u32 = 16;
+/// Capability-negotiation / version handshake, exchanged on connect before any
+/// other post-TLS frame. FROZEN at 17.
+const MSG_HANDSHAKE: u32 = 17;
+/// Live exec stdio multiplexed over the single peer stream. FROZEN at 18.
+const MSG_EXEC_STREAM: u32 = 18;
+/// Backpressure credit for [`MSG_EXEC_STREAM`]. FROZEN at 19.
+const MSG_EXEC_STREAM_ACK: u32 = 19;
+
+/// The protocol version this implementation speaks. FROZEN; a version bump is
+/// gated by the conformance vectors in `docs/conformance/`.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Maximum number of capability domains carried in a single
+/// [`BepMessage::Handshake`] frame. Bounds receiver allocation against a
+/// malicious or buggy peer; the domain vocabulary is tiny, so the cap leaves
+/// headroom without being lavish. Mirrors [`MAX_CANDIDATES_PER_FRAME`].
+const MAX_DOMAINS: u32 = 64;
+
+/// Wire discriminant for the stdin stream in an [`BepMessage::ExecStream`]
+/// frame. FROZEN.
+const EXEC_STREAM_STDIN: u32 = 0;
+/// Wire discriminant for the stdout stream in an [`BepMessage::ExecStream`]
+/// frame. FROZEN.
+const EXEC_STREAM_STDOUT: u32 = 1;
+/// Wire discriminant for the stderr stream in an [`BepMessage::ExecStream`]
+/// frame. FROZEN.
+const EXEC_STREAM_STDERR: u32 = 2;
 
 /// Wire discriminant for a [`ManageResult::Ok`] outcome inside a
 /// [`BepMessage::ManageResponse`] frame.
@@ -37,6 +64,10 @@ const MANAGE_RESULT_OK: u32 = 0;
 /// Wire discriminant for a [`ManageResult::Err`] outcome inside a
 /// [`BepMessage::ManageResponse`] frame.
 const MANAGE_RESULT_ERR: u32 = 1;
+/// Wire discriminant for a [`ManageResult::ExecSpawned`] outcome inside a
+/// [`BepMessage::ManageResponse`] frame. Carries the new exec session id a
+/// `pty.spawn` / `proc.spawn` command minted. FROZEN at 2.
+const MANAGE_RESULT_EXEC_SPAWNED: u32 = 2;
 
 /// Maximum number of candidates carried in a single
 /// [`BepMessage::Candidates`] frame. Bounds the receiver's allocation
@@ -453,6 +484,77 @@ pub enum ManageCommand {
         /// authorised over.
         scope: ManageScope,
     },
+    /// Spawn an interactive PTY session and return its session id. Requires the
+    /// dangerous `exec:pty` capability over the session's `cwd`, granted
+    /// explicitly for a folder scope (never node-wide).
+    PtySpawn {
+        /// The shell to launch. Absent uses the node's default shell.
+        shell: Option<String>,
+        /// Additional arguments passed to the shell.
+        argv: Vec<String>,
+        /// The working directory the PTY is rooted in — the scope this command
+        /// is authorised over.
+        cwd: Option<String>,
+        /// Environment variables to set for the session.
+        env: Vec<(String, String)>,
+        /// Initial terminal column count.
+        cols: u16,
+        /// Initial terminal row count.
+        rows: u16,
+    },
+    /// Write bytes to a PTY session's stdin. Requires the dangerous `exec:pty`
+    /// capability over the scope the session was spawned under (resolved from
+    /// node state, never the wire scope).
+    PtyWrite {
+        /// The target session id.
+        session: u64,
+        /// The bytes to write.
+        bytes: Vec<u8>,
+    },
+    /// Resize a PTY session. Requires the dangerous `exec:pty` capability over
+    /// the scope the session was spawned under.
+    PtyResize {
+        /// The target session id.
+        session: u64,
+        /// The new column count.
+        cols: u16,
+        /// The new row count.
+        rows: u16,
+    },
+    /// Send a signal to a PTY session's child process. Requires the dangerous
+    /// `exec:pty` capability over the scope the session was spawned under.
+    PtyKill {
+        /// The target session id.
+        session: u64,
+        /// The POSIX signal number to send.
+        signal: i32,
+    },
+    /// Spawn a headless process session and return its session id. Requires the
+    /// dangerous `exec:proc` capability over the session's `cwd`, granted
+    /// explicitly for a folder scope (never node-wide).
+    ProcSpawn {
+        /// The program and its arguments.
+        argv: Vec<String>,
+        /// The working directory the process is rooted in — the scope this
+        /// command is authorised over.
+        cwd: Option<String>,
+        /// Environment variables to set for the process.
+        env: Vec<(String, String)>,
+    },
+    /// Send a signal to a headless process session. Requires the dangerous
+    /// `exec:proc` capability over the scope the session was spawned under.
+    ProcSignal {
+        /// The target session id.
+        session: u64,
+        /// The POSIX signal number to send.
+        signal: i32,
+    },
+    /// Kill a headless process session. Requires the dangerous `exec:proc`
+    /// capability over the scope the session was spawned under.
+    ProcKill {
+        /// The target session id.
+        session: u64,
+    },
 }
 
 /// The serialisation format of a [`ManageCommand::ConfigPush`] body.
@@ -528,6 +630,20 @@ const MANAGE_CMD_STOP: u32 = 10;
 const MANAGE_CMD_GRANT_ADD: u32 = 11;
 /// Wire discriminant for [`ManageCommand::GrantRevoke`].
 const MANAGE_CMD_GRANT_REVOKE: u32 = 12;
+/// Wire discriminant for [`ManageCommand::PtySpawn`]. FROZEN.
+const MANAGE_CMD_PTY_SPAWN: u32 = 13;
+/// Wire discriminant for [`ManageCommand::PtyWrite`]. FROZEN.
+const MANAGE_CMD_PTY_WRITE: u32 = 14;
+/// Wire discriminant for [`ManageCommand::PtyResize`]. FROZEN.
+const MANAGE_CMD_PTY_RESIZE: u32 = 15;
+/// Wire discriminant for [`ManageCommand::PtyKill`]. FROZEN.
+const MANAGE_CMD_PTY_KILL: u32 = 16;
+/// Wire discriminant for [`ManageCommand::ProcSpawn`]. FROZEN.
+const MANAGE_CMD_PROC_SPAWN: u32 = 17;
+/// Wire discriminant for [`ManageCommand::ProcSignal`]. FROZEN.
+const MANAGE_CMD_PROC_SIGNAL: u32 = 18;
+/// Wire discriminant for [`ManageCommand::ProcKill`]. FROZEN.
+const MANAGE_CMD_PROC_KILL: u32 = 19;
 
 /// Wire sentinel for an absent optional value (for example a `None` expiry or
 /// an unbounded policy dimension). Paired with [`OPTION_SOME`].
@@ -558,6 +674,13 @@ pub enum ManageResult {
         /// A human-readable message describing the failure.
         message: String,
     },
+    /// A `pty.spawn` / `proc.spawn` command ran successfully and minted a new
+    /// exec session. Carries the session id the caller drives subsequent
+    /// write/resize/signal/kill verbs against.
+    ExecSpawned {
+        /// The newly assigned exec session id.
+        session: u64,
+    },
 }
 
 /// The kind of failure carried by [`ManageResult::Err`].
@@ -574,6 +697,84 @@ pub enum ManageErrorKind {
 const MANAGE_ERR_UNAUTHORISED: u32 = 0;
 /// Wire discriminant for [`ManageErrorKind::Failed`].
 const MANAGE_ERR_FAILED: u32 = 1;
+
+/// A capability domain a node advertises in its [`BepMessage::Handshake`].
+///
+/// The mesh is heterogeneous by design: a node advertises only the domains it
+/// implements, and a peer must not send frames for a domain the other did not
+/// advertise (see `docs/node-protocol.md`). Kept wire-typed so the protocol
+/// crate stays free of the engine's notion of which subsystems are built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum CapabilityDomain {
+    /// Content-addressed block exchange (BEP-derived).
+    Content,
+    /// `ManageRequest` / `ManageResponse` control plane.
+    Management,
+    /// Process / PTY control plus live stdio streams.
+    Exec,
+    /// Per-peer append-only operation-log sync.
+    Oplog,
+}
+
+/// Wire discriminant for [`CapabilityDomain::Content`]. FROZEN.
+const CAP_DOMAIN_CONTENT: u32 = 0;
+/// Wire discriminant for [`CapabilityDomain::Management`]. FROZEN.
+const CAP_DOMAIN_MANAGEMENT: u32 = 1;
+/// Wire discriminant for [`CapabilityDomain::Exec`]. FROZEN.
+const CAP_DOMAIN_EXEC: u32 = 2;
+/// Wire discriminant for [`CapabilityDomain::Oplog`]. FROZEN.
+const CAP_DOMAIN_OPLOG: u32 = 3;
+
+impl CapabilityDomain {
+    /// The stable wire/storage identifier for this domain.
+    #[must_use]
+    pub const fn as_wire(self) -> &'static str {
+        match self {
+            Self::Content => "content",
+            Self::Management => "management",
+            Self::Exec => "exec",
+            Self::Oplog => "oplog",
+        }
+    }
+
+    /// Parse a domain from its [wire form](Self::as_wire). Returns `None` for an
+    /// unrecognised identifier so an unknown domain is dropped, never assumed.
+    #[must_use]
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "content" => Some(Self::Content),
+            "management" => Some(Self::Management),
+            "exec" => Some(Self::Exec),
+            "oplog" => Some(Self::Oplog),
+            _ => None,
+        }
+    }
+
+    /// The frozen u32 wire discriminant for this domain.
+    #[must_use]
+    const fn wire_tag(self) -> u32 {
+        match self {
+            Self::Content => CAP_DOMAIN_CONTENT,
+            Self::Management => CAP_DOMAIN_MANAGEMENT,
+            Self::Exec => CAP_DOMAIN_EXEC,
+            Self::Oplog => CAP_DOMAIN_OPLOG,
+        }
+    }
+
+    /// Parse a domain from its frozen u32 wire discriminant. Returns `None` for
+    /// an unrecognised value so an unknown domain decode-fails rather than being
+    /// assumed.
+    #[must_use]
+    const fn from_wire_tag(tag: u32) -> Option<Self> {
+        match tag {
+            CAP_DOMAIN_CONTENT => Some(Self::Content),
+            CAP_DOMAIN_MANAGEMENT => Some(Self::Management),
+            CAP_DOMAIN_EXEC => Some(Self::Exec),
+            CAP_DOMAIN_OPLOG => Some(Self::Oplog),
+            _ => None,
+        }
+    }
+}
 
 /// BEP message types.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -783,6 +984,51 @@ pub enum BepMessage {
         /// The command outcome.
         result: ManageResult,
     },
+    /// Capability-negotiation / version handshake, exchanged on connect before
+    /// any other post-TLS frame.
+    ///
+    /// A node advertises the protocol version it speaks and the set of
+    /// capability domains it implements. A peer must not send frames for a
+    /// domain the node did not advertise, and must reject or quarantine frames
+    /// it does not understand rather than guess (see `docs/node-protocol.md`).
+    Handshake {
+        /// The protocol version the sender speaks.
+        protocol_version: u32,
+        /// The capability domains the sender implements.
+        domains: Vec<CapabilityDomain>,
+    },
+    /// Live exec stdio, multiplexed over the single peer stream.
+    ///
+    /// Stdin travels manager -> node (only `stream == 0`); stdout/stderr travel
+    /// node -> manager. The bytes never enter the content-addressed block store:
+    /// a live stream is ephemeral and mutable, the block store is immutable and
+    /// addressable. A frame for a session the peer is not authorised to drive is
+    /// refused per frame, so a revoked grant cuts the stream at the next frame.
+    ExecStream {
+        /// The session the bytes belong to.
+        session: u64,
+        /// Per-session monotonic sequence number, for ordering and ack.
+        seq: u64,
+        /// Which stream the bytes are for (0=stdin, 1=stdout, 2=stderr).
+        stream: u8,
+        /// The raw stream bytes.
+        bytes: Vec<u8>,
+    },
+    /// Backpressure credit for an exec stream.
+    ///
+    /// The consumer advertises a credit window (the maximum in-flight bytes it
+    /// will accept past `ack_seq`); the producer must not send beyond it. A slow
+    /// consumer shrinks the window and throttles the producer rather than the
+    /// node buffering unboundedly. This is the wire half of the bounded mpsc the
+    /// node-side provider applies.
+    ExecStreamAck {
+        /// The session the credit applies to.
+        session: u64,
+        /// The highest contiguous sequence number the consumer has accepted.
+        ack_seq: u64,
+        /// The credit window in bytes the consumer will accept past `ack_seq`.
+        window: u32,
+    },
 }
 
 impl BepMessage {
@@ -805,6 +1051,9 @@ impl BepMessage {
             Self::RelayInbound { .. } => MSG_RELAY_INBOUND,
             Self::ManageRequest { .. } => MSG_MANAGE_REQUEST,
             Self::ManageResponse { .. } => MSG_MANAGE_RESPONSE,
+            Self::Handshake { .. } => MSG_HANDSHAKE,
+            Self::ExecStream { .. } => MSG_EXEC_STREAM,
+            Self::ExecStreamAck { .. } => MSG_EXEC_STREAM_ACK,
         }
     }
 }
@@ -936,6 +1185,41 @@ pub fn encode_message(msg: &BepMessage) -> Result<Vec<u8>> {
         BepMessage::ManageResponse { request_id, result } => {
             encode_u64(&mut body, *request_id);
             encode_manage_result(&mut body, result)?;
+        }
+        BepMessage::Handshake {
+            protocol_version,
+            domains,
+        } => {
+            let count = u32::try_from(domains.len())
+                .map_err(|_| anyhow::anyhow!("domain count exceeds u32"))?;
+            if count > MAX_DOMAINS {
+                anyhow::bail!("domain count {count} exceeds maximum {MAX_DOMAINS}");
+            }
+            encode_u32(&mut body, *protocol_version);
+            encode_u32(&mut body, count);
+            for domain in domains {
+                encode_u32(&mut body, domain.wire_tag());
+            }
+        }
+        BepMessage::ExecStream {
+            session,
+            seq,
+            stream,
+            bytes,
+        } => {
+            encode_u64(&mut body, *session);
+            encode_u64(&mut body, *seq);
+            encode_u32(&mut body, u32::from(*stream));
+            encode_opaque(&mut body, bytes)?;
+        }
+        BepMessage::ExecStreamAck {
+            session,
+            ack_seq,
+            window,
+        } => {
+            encode_u64(&mut body, *session);
+            encode_u64(&mut body, *ack_seq);
+            encode_u32(&mut body, *window);
         }
     }
 
@@ -1141,6 +1425,90 @@ fn encode_manage_command(buf: &mut Vec<u8>, command: &ManageCommand) -> Result<(
             encode_i64(buf, *grant_id);
             encode_manage_scope(buf, scope)?;
         }
+        ManageCommand::PtySpawn {
+            shell,
+            argv,
+            cwd,
+            env,
+            cols,
+            rows,
+        } => {
+            encode_u32(buf, MANAGE_CMD_PTY_SPAWN);
+            encode_opt_string(buf, shell.as_deref())?;
+            encode_string_list(buf, argv)?;
+            encode_opt_string(buf, cwd.as_deref())?;
+            encode_env(buf, env)?;
+            encode_u32(buf, u32::from(*cols));
+            encode_u32(buf, u32::from(*rows));
+        }
+        ManageCommand::PtyWrite { session, bytes } => {
+            encode_u32(buf, MANAGE_CMD_PTY_WRITE);
+            encode_u64(buf, *session);
+            encode_opaque(buf, bytes)?;
+        }
+        ManageCommand::PtyResize {
+            session,
+            cols,
+            rows,
+        } => {
+            encode_u32(buf, MANAGE_CMD_PTY_RESIZE);
+            encode_u64(buf, *session);
+            encode_u32(buf, u32::from(*cols));
+            encode_u32(buf, u32::from(*rows));
+        }
+        ManageCommand::PtyKill { session, signal } => {
+            encode_u32(buf, MANAGE_CMD_PTY_KILL);
+            encode_u64(buf, *session);
+            encode_i32(buf, *signal);
+        }
+        ManageCommand::ProcSpawn { argv, cwd, env } => {
+            encode_u32(buf, MANAGE_CMD_PROC_SPAWN);
+            encode_string_list(buf, argv)?;
+            encode_opt_string(buf, cwd.as_deref())?;
+            encode_env(buf, env)?;
+        }
+        ManageCommand::ProcSignal { session, signal } => {
+            encode_u32(buf, MANAGE_CMD_PROC_SIGNAL);
+            encode_u64(buf, *session);
+            encode_i32(buf, *signal);
+        }
+        ManageCommand::ProcKill { session } => {
+            encode_u32(buf, MANAGE_CMD_PROC_KILL);
+            encode_u64(buf, *session);
+        }
+    }
+    Ok(())
+}
+
+/// Maximum number of argv entries or environment pairs carried in a single exec
+/// command. Bounds receiver allocation against a malicious or buggy peer while
+/// leaving ample headroom for any realistic command line or environment.
+const MAX_EXEC_LIST_LEN: u32 = 4096;
+
+/// Encode a list of strings as a count followed by each length-prefixed string.
+fn encode_string_list(buf: &mut Vec<u8>, items: &[String]) -> Result<()> {
+    let count = u32::try_from(items.len())
+        .map_err(|_| anyhow::anyhow!("string list length exceeds u32"))?;
+    if count > MAX_EXEC_LIST_LEN {
+        anyhow::bail!("string list length {count} exceeds maximum {MAX_EXEC_LIST_LEN}");
+    }
+    encode_u32(buf, count);
+    for item in items {
+        encode_string(buf, item)?;
+    }
+    Ok(())
+}
+
+/// Encode an environment as a count followed by each `(name, value)` pair.
+fn encode_env(buf: &mut Vec<u8>, env: &[(String, String)]) -> Result<()> {
+    let count = u32::try_from(env.len()).map_err(|_| anyhow::anyhow!("env length exceeds u32"))?;
+    if count > MAX_EXEC_LIST_LEN {
+        anyhow::bail!("env length {count} exceeds maximum {MAX_EXEC_LIST_LEN}");
+    }
+    encode_u32(buf, count);
+    for (name, value) in env {
+        encode_string(buf, name)?;
+        encode_string(buf, value)?;
     }
     Ok(())
 }
@@ -1207,6 +1575,10 @@ fn encode_manage_result(buf: &mut Vec<u8>, result: &ManageResult) -> Result<()> 
             encode_u32(buf, kind_tag);
             encode_string(buf, message)?;
         }
+        ManageResult::ExecSpawned { session } => {
+            encode_u32(buf, MANAGE_RESULT_EXEC_SPAWNED);
+            encode_u64(buf, *session);
+        }
     }
     Ok(())
 }
@@ -1252,6 +1624,9 @@ pub fn decode_message(frame: &[u8]) -> Result<BepMessage> {
         MSG_RELAY_INBOUND => decode_relay_inbound(rest),
         MSG_MANAGE_REQUEST => decode_manage_request(rest),
         MSG_MANAGE_RESPONSE => decode_manage_response(rest),
+        MSG_HANDSHAKE => decode_handshake(rest),
+        MSG_EXEC_STREAM => decode_exec_stream(rest),
+        MSG_EXEC_STREAM_ACK => decode_exec_stream_ack(rest),
         _ => anyhow::bail!("unknown message type: {msg_type}"),
     }
 }
@@ -1413,6 +1788,69 @@ fn decode_manage_command(data: &[u8]) -> Result<(ManageCommand, &[u8])> {
             let (scope, rest) = decode_manage_scope(rest)?;
             Ok((ManageCommand::GrantRevoke { grant_id, scope }, rest))
         }
+        MANAGE_CMD_PTY_SPAWN => {
+            let (shell, rest) = decode_opt_string(rest)?;
+            let (argv, rest) = decode_string_list(rest)?;
+            let (cwd, rest) = decode_opt_string(rest)?;
+            let (env, rest) = decode_env(rest)?;
+            let (cols, rest) = decode_u16(rest)?;
+            let (rows, rest) = decode_u16(rest)?;
+            Ok((
+                ManageCommand::PtySpawn {
+                    shell,
+                    argv,
+                    cwd,
+                    env,
+                    cols,
+                    rows,
+                },
+                rest,
+            ))
+        }
+        MANAGE_CMD_PTY_WRITE => {
+            let (session, rest) = decode_u64(rest)?;
+            let (bytes, rest) = decode_opaque(rest)?;
+            Ok((
+                ManageCommand::PtyWrite {
+                    session,
+                    bytes: bytes.to_vec(),
+                },
+                rest,
+            ))
+        }
+        MANAGE_CMD_PTY_RESIZE => {
+            let (session, rest) = decode_u64(rest)?;
+            let (cols, rest) = decode_u16(rest)?;
+            let (rows, rest) = decode_u16(rest)?;
+            Ok((
+                ManageCommand::PtyResize {
+                    session,
+                    cols,
+                    rows,
+                },
+                rest,
+            ))
+        }
+        MANAGE_CMD_PTY_KILL => {
+            let (session, rest) = decode_u64(rest)?;
+            let (signal, rest) = decode_i32(rest)?;
+            Ok((ManageCommand::PtyKill { session, signal }, rest))
+        }
+        MANAGE_CMD_PROC_SPAWN => {
+            let (argv, rest) = decode_string_list(rest)?;
+            let (cwd, rest) = decode_opt_string(rest)?;
+            let (env, rest) = decode_env(rest)?;
+            Ok((ManageCommand::ProcSpawn { argv, cwd, env }, rest))
+        }
+        MANAGE_CMD_PROC_SIGNAL => {
+            let (session, rest) = decode_u64(rest)?;
+            let (signal, rest) = decode_i32(rest)?;
+            Ok((ManageCommand::ProcSignal { session, signal }, rest))
+        }
+        MANAGE_CMD_PROC_KILL => {
+            let (session, rest) = decode_u64(rest)?;
+            Ok((ManageCommand::ProcKill { session }, rest))
+        }
         other => anyhow::bail!("unknown manage command tag {other}"),
     }
 }
@@ -1433,6 +1871,98 @@ fn decode_i32(data: &[u8]) -> Result<(i32, &[u8])> {
         .split_first_chunk::<4>()
         .ok_or_else(|| anyhow::anyhow!("need 4 bytes for int32"))?;
     Ok((i32::from_be_bytes(*bytes), rest))
+}
+
+/// Decode a `u16` carried on the wire as a `u32` word, rejecting an
+/// out-of-range value rather than silently truncating it.
+fn decode_u16(data: &[u8]) -> Result<(u16, &[u8])> {
+    let (val, rest) = decode_u32(data)?;
+    let narrowed =
+        u16::try_from(val).map_err(|_| anyhow::anyhow!("value {val} exceeds u16 range"))?;
+    Ok((narrowed, rest))
+}
+
+/// Decode a length-prefixed list of strings written by [`encode_string_list`].
+fn decode_string_list(data: &[u8]) -> Result<(Vec<String>, &[u8])> {
+    let (count, mut rest) = decode_u32(data)?;
+    if count > MAX_EXEC_LIST_LEN {
+        anyhow::bail!("string list length {count} exceeds maximum {MAX_EXEC_LIST_LEN}");
+    }
+    let mut items = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let (item, next) = decode_string(rest)?;
+        items.push(item);
+        rest = next;
+    }
+    Ok((items, rest))
+}
+
+/// Decode a length-prefixed environment written by [`encode_env`].
+fn decode_env(data: &[u8]) -> Result<(Vec<(String, String)>, &[u8])> {
+    let (count, mut rest) = decode_u32(data)?;
+    if count > MAX_EXEC_LIST_LEN {
+        anyhow::bail!("env length {count} exceeds maximum {MAX_EXEC_LIST_LEN}");
+    }
+    let mut env = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let (name, next) = decode_string(rest)?;
+        let (value, next) = decode_string(next)?;
+        env.push((name, value));
+        rest = next;
+    }
+    Ok((env, rest))
+}
+
+fn decode_handshake(data: &[u8]) -> Result<BepMessage> {
+    let (protocol_version, rest) = decode_u32(data)?;
+    let (count, mut rest) = decode_u32(rest)?;
+    if count > MAX_DOMAINS {
+        anyhow::bail!("domain count {count} exceeds maximum {MAX_DOMAINS}");
+    }
+    let mut domains = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let (tag, next) = decode_u32(rest)?;
+        rest = next;
+        // An unknown domain discriminant is dropped, never assumed: a future
+        // peer advertising a domain this version does not know simply does not
+        // contribute it to the negotiated set.
+        if let Some(domain) = CapabilityDomain::from_wire_tag(tag) {
+            domains.push(domain);
+        }
+    }
+    Ok(BepMessage::Handshake {
+        protocol_version,
+        domains,
+    })
+}
+
+fn decode_exec_stream(data: &[u8]) -> Result<BepMessage> {
+    let (session, rest) = decode_u64(data)?;
+    let (seq, rest) = decode_u64(rest)?;
+    let (stream_word, rest) = decode_u32(rest)?;
+    let stream = match stream_word {
+        EXEC_STREAM_STDIN | EXEC_STREAM_STDOUT | EXEC_STREAM_STDERR => u8::try_from(stream_word)
+            .map_err(|_| anyhow::anyhow!("exec stream kind {stream_word} exceeds u8"))?,
+        other => anyhow::bail!("unknown exec stream kind {other}"),
+    };
+    let (bytes, _) = decode_opaque(rest)?;
+    Ok(BepMessage::ExecStream {
+        session,
+        seq,
+        stream,
+        bytes: bytes.to_vec(),
+    })
+}
+
+fn decode_exec_stream_ack(data: &[u8]) -> Result<BepMessage> {
+    let (session, rest) = decode_u64(data)?;
+    let (ack_seq, rest) = decode_u64(rest)?;
+    let (window, _) = decode_u32(rest)?;
+    Ok(BepMessage::ExecStreamAck {
+        session,
+        ack_seq,
+        window,
+    })
 }
 
 /// Decode an `Option<i64>` written by [`encode_opt_i64`].
@@ -1493,6 +2023,10 @@ fn decode_manage_result(data: &[u8]) -> Result<(ManageResult, &[u8])> {
             };
             let (message, rest) = decode_string(rest)?;
             Ok((ManageResult::Err { kind, message }, rest))
+        }
+        MANAGE_RESULT_EXEC_SPAWNED => {
+            let (session, rest) = decode_u64(rest)?;
+            Ok((ManageResult::ExecSpawned { session }, rest))
         }
         other => anyhow::bail!("unknown manage result tag {other}"),
     }

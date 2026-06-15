@@ -1018,3 +1018,197 @@ fn candidate_priority_preserved_through_wire() {
         other => panic!("decoded wrong variant: {other:?}"),
     }
 }
+
+// ── Handshake + exec frames ──
+
+#[test]
+fn encode_decode_handshake_round_trip() {
+    round_trip(BepMessage::Handshake {
+        protocol_version: PROTOCOL_VERSION,
+        domains: vec![
+            CapabilityDomain::Content,
+            CapabilityDomain::Management,
+            CapabilityDomain::Exec,
+        ],
+    });
+}
+
+#[test]
+fn encode_decode_handshake_empty_domains() {
+    round_trip(BepMessage::Handshake {
+        protocol_version: PROTOCOL_VERSION,
+        domains: Vec::new(),
+    });
+}
+
+#[test]
+fn handshake_drops_unknown_domain_discriminant() {
+    // A future peer advertising a domain this version does not know must have
+    // that domain dropped on decode, never assumed.
+    let mut body = Vec::new();
+    encode_u32(&mut body, MSG_HANDSHAKE);
+    encode_u32(&mut body, PROTOCOL_VERSION);
+    encode_u32(&mut body, 2); // two domains
+    encode_u32(&mut body, CAP_DOMAIN_EXEC);
+    encode_u32(&mut body, 9999); // unknown
+    let body_len = u32::try_from(body.len()).unwrap();
+    let mut frame = Vec::new();
+    encode_u32(&mut frame, body_len);
+    frame.extend_from_slice(&body);
+    let decoded = decode_message(&frame).unwrap();
+    match decoded {
+        BepMessage::Handshake { domains, .. } => {
+            assert_eq!(domains, vec![CapabilityDomain::Exec]);
+        }
+        other => panic!("decoded wrong variant: {other:?}"),
+    }
+}
+
+#[test]
+fn capability_domain_wire_form_round_trips() {
+    for domain in [
+        CapabilityDomain::Content,
+        CapabilityDomain::Management,
+        CapabilityDomain::Exec,
+        CapabilityDomain::Oplog,
+    ] {
+        assert_eq!(CapabilityDomain::from_wire(domain.as_wire()), Some(domain));
+        assert_eq!(
+            CapabilityDomain::from_wire_tag(domain.wire_tag()),
+            Some(domain)
+        );
+    }
+    assert_eq!(CapabilityDomain::from_wire("nonsense"), None);
+}
+
+#[test]
+fn encode_decode_exec_stream_round_trip() {
+    round_trip(BepMessage::ExecStream {
+        session: 42,
+        seq: 7,
+        stream: 1,
+        bytes: b"hello world".to_vec(),
+    });
+    round_trip(BepMessage::ExecStream {
+        session: u64::MAX,
+        seq: 0,
+        stream: 0,
+        bytes: Vec::new(),
+    });
+}
+
+#[test]
+fn exec_stream_rejects_unknown_stream_kind() {
+    let mut body = Vec::new();
+    encode_u32(&mut body, MSG_EXEC_STREAM);
+    encode_u64(&mut body, 1);
+    encode_u64(&mut body, 0);
+    encode_u32(&mut body, 99); // not stdin/stdout/stderr
+    encode_opaque(&mut body, b"x").unwrap();
+    let body_len = u32::try_from(body.len()).unwrap();
+    let mut frame = Vec::new();
+    encode_u32(&mut frame, body_len);
+    frame.extend_from_slice(&body);
+    assert!(decode_message(&frame).is_err());
+}
+
+#[test]
+fn encode_decode_exec_stream_ack_round_trip() {
+    round_trip(BepMessage::ExecStreamAck {
+        session: 42,
+        ack_seq: 100,
+        window: 65_536,
+    });
+}
+
+// ── Exec management commands ──
+
+fn exec_request(command: ManageCommand) -> BepMessage {
+    BepMessage::ManageRequest {
+        request_id: 1,
+        command,
+        scope: ManageScope::Folder {
+            path: "/work".to_owned(),
+        },
+        token: None,
+    }
+}
+
+#[test]
+fn encode_decode_pty_spawn_round_trip() {
+    round_trip(exec_request(ManageCommand::PtySpawn {
+        shell: Some("/bin/zsh".to_owned()),
+        argv: vec!["-l".to_owned()],
+        cwd: Some("/work".to_owned()),
+        env: vec![
+            ("TERM".to_owned(), "xterm-256color".to_owned()),
+            ("LANG".to_owned(), "en_GB.UTF-8".to_owned()),
+        ],
+        cols: 120,
+        rows: 40,
+    }));
+    // No shell, no argv, no cwd, empty env.
+    round_trip(exec_request(ManageCommand::PtySpawn {
+        shell: None,
+        argv: Vec::new(),
+        cwd: None,
+        env: Vec::new(),
+        cols: 80,
+        rows: 24,
+    }));
+}
+
+#[test]
+fn encode_decode_pty_write_round_trip() {
+    round_trip(exec_request(ManageCommand::PtyWrite {
+        session: 7,
+        bytes: b"ls -la\n".to_vec(),
+    }));
+}
+
+#[test]
+fn encode_decode_pty_resize_round_trip() {
+    round_trip(exec_request(ManageCommand::PtyResize {
+        session: 7,
+        cols: 200,
+        rows: 50,
+    }));
+}
+
+#[test]
+fn encode_decode_pty_kill_round_trip() {
+    round_trip(exec_request(ManageCommand::PtyKill {
+        session: 7,
+        signal: 15,
+    }));
+}
+
+#[test]
+fn encode_decode_proc_spawn_round_trip() {
+    round_trip(exec_request(ManageCommand::ProcSpawn {
+        argv: vec![
+            "/usr/bin/env".to_owned(),
+            "node".to_owned(),
+            "x.js".to_owned(),
+        ],
+        cwd: Some("/work/app".to_owned()),
+        env: vec![("NODE_ENV".to_owned(), "production".to_owned())],
+    }));
+}
+
+#[test]
+fn encode_decode_proc_signal_and_kill_round_trip() {
+    round_trip(exec_request(ManageCommand::ProcSignal {
+        session: 9,
+        signal: 9,
+    }));
+    round_trip(exec_request(ManageCommand::ProcKill { session: 9 }));
+}
+
+#[test]
+fn encode_decode_exec_spawned_result_round_trip() {
+    round_trip(BepMessage::ManageResponse {
+        request_id: 3,
+        result: ManageResult::ExecSpawned { session: 123 },
+    });
+}
