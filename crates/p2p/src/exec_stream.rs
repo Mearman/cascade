@@ -145,25 +145,34 @@ impl ExecStreamCredit {
         self.granted.notify_waiters();
     }
 
-    /// Wait until `sent_bytes` plus `chunk` fits within the consumer's window,
-    /// i.e. `sent_bytes - acked_bytes + chunk <= window`.
+    /// Wait until the consumer's window has room for another frame, i.e. the
+    /// in-flight byte count `sent_bytes - acked_bytes` is below the window.
     ///
-    /// A consumer that stops acking holds the window full and parks the producer
-    /// here indefinitely — the backpressure stall. The producer wakes on the
-    /// next [`Self::apply_ack`].
-    async fn await_credit(&self, sent_bytes: u64, chunk: u64) {
+    /// Credit is frame-granular: a send is permitted whenever any window remains,
+    /// so a frame may carry the in-flight total up to one chunk past the window —
+    /// the "window plus one frame" bound the backpressure tests assert. This is
+    /// deliberate: a chunk always makes progress when the window is non-zero, even
+    /// one larger than the whole window. Requiring the entire chunk to fit
+    /// (`in_flight + chunk <= window`) would wedge a stream whose producer emits a
+    /// chunk bigger than the window — it could never be sent and the stream would
+    /// deadlock. A consumer that stops acking holds the window full (or grants
+    /// zero) and parks the producer here until the next [`Self::apply_ack`].
+    async fn await_credit(&self, sent_bytes: u64) {
         loop {
-            // Register for notification *before* checking, so an ack landing
-            // between the check and the await is not missed.
+            // Register for notification *before* checking the condition: an ack
+            // landing between the check and the await must wake this waiter, and
+            // `notify_waiters` only wakes already-registered waiters (it stores no
+            // permit), so the future is enabled before the window is read.
             let notified = self.granted.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             {
                 let state = self.state.lock().await;
-                let in_flight = sent_bytes.saturating_sub(state.acked_bytes);
-                if in_flight + chunk <= state.window {
+                if sent_bytes.saturating_sub(state.acked_bytes) < state.window {
                     return;
                 }
             }
-            notified.await;
+            notified.as_mut().await;
         }
     }
 }
@@ -199,7 +208,7 @@ pub async fn pump_session_output<W: TransportWriter>(
                     continue;
                 }
                 let chunk = bytes.len() as u64;
-                credit.await_credit(sent_bytes, chunk).await;
+                credit.await_credit(sent_bytes).await;
 
                 let wire_stream = match stream {
                     ExecStreamKind::Stdin => STREAM_STDIN,
