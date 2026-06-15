@@ -1,0 +1,11 @@
+# Local SDK pointer; machine-specific, never committed.
+local.properties
+
+# Build output.
+.gradle/
+build/
+app/build/
+
+# Native libraries are produced by cross-compiling cascade-ffi; they are build
+# artefacts, not source.
+app/src/main/jniLibs/

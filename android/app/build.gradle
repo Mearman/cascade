@@ -1,0 +1,57 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+android {
+    namespace 'co.mearman.cascade'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'co.mearman.cascade'
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName '0.1.0'
+        ndk {
+            // Ship the ABIs we cross-compile the engine for.
+            abiFilters 'arm64-v8a', 'x86_64'
+        }
+    }
+
+    buildTypes {
+        debug {
+            // Keep the debug build unminified so the JNA/UniFFI reflection works
+            // without proguard rules.
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+
+    sourceSets {
+        main {
+            // Pull the UniFFI-generated Kotlin bindings in directly rather than
+            // copying them, so package uniffi.cascade_ffi compiles from the
+            // canonical generated source. The factory shim that drives the async
+            // constructor lives under app/src/main/java in the same package.
+            java.srcDirs += '../../crates/cascade-ffi/bindings/kotlin'
+            jniLibs.srcDirs = ['src/main/jniLibs']
+        }
+    }
+}
+
+dependencies {
+    implementation 'androidx.core:core-ktx:1.13.1'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1'
+    // UniFFI Kotlin bindings load the native lib through JNA; the Android aar
+    // variant bundles the JNI shim JNA itself needs.
+    implementation 'net.java.dev.jna:jna:5.14.0@aar'
+}
