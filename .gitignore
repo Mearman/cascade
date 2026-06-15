@@ -15,3 +15,13 @@
 
 # WASM build artefacts
 crates/cascade-wasm/pkg/
+
+# iOS File Provider extension: generated/derived artefacts (see its README for
+# the bootstrap that regenerates them). The hand-written sources, project.yml,
+# plists and entitlements are tracked; the xcodegen-generated project, the
+# xcodebuild output, and the UniFFI-generated bindings copied from
+# crates/cascade-ffi/bindings are not.
+swift/CascadeFileProvideriOS/build/
+swift/CascadeFileProvideriOS/*.xcodeproj/
+swift/CascadeFileProvideriOS/Extension/Sources/cascade_ffi.swift
+swift/CascadeFileProvideriOS/Extension/FFI/cascade_ffiFFI.h
