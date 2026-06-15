@@ -4,12 +4,13 @@
 //! the same `impl SyncEngine` surface with full private access.
 
 use super::{
-    Arc, AtomicU64, BepMessage, BlockHash, ByteMeter, CallerAuthentication, ConnectionManager,
-    Context, DeviceId, DiscoveredPeer, FileInfo, Folder, FramedHalfReader, FramedHalfWriter,
-    FramedPeer, FramedSession, HashMap, ManageCommand, ManageErrorKind, ManageResult, ManageScope,
-    Mutex, Peer, PeerHandle, RelayTransport, Result, SessionReaderBoxed, SessionWriterBoxed,
-    SocketAddr, SyncEngine, SyncPunchAgreement, Transport, debug, entry_to_file_info,
-    gather_local_candidates, info, mpsc, oneshot, peer_relay, unix_timestamp_seconds,
+    Arc, AtomicU64, BepMessage, BlockHash, ByteMeter, CallerAuthentication, CapabilityDomain,
+    ConnectionManager, Context, DeviceId, DiscoveredPeer, FileInfo, Folder, FramedHalfReader,
+    FramedHalfWriter, FramedPeer, FramedSession, HashMap, ManageCommand, ManageErrorKind,
+    ManageResult, ManageScope, Mutex, PROTOCOL_VERSION, Peer, PeerHandle, RelayTransport, Result,
+    SessionReaderBoxed, SessionWriterBoxed, SocketAddr, SyncEngine, SyncPunchAgreement, Transport,
+    debug, entry_to_file_info, gather_local_candidates, info, mpsc, oneshot, peer_relay,
+    unix_timestamp_seconds,
 };
 
 impl SyncEngine {
@@ -508,13 +509,27 @@ impl SyncEngine {
             Arc::new(Mutex::new(HashMap::new()));
         let next_request_id = Arc::new(AtomicU64::new(0));
 
-        // Register handle.
+        // Determine which capability domains this node is advertising. All
+        // sessions declare Content and Management (the implemented baseline);
+        // Exec is added when the exec subsystem is wired and ready.
+        let mut local_domains = vec![CapabilityDomain::Content, CapabilityDomain::Management];
+        if self.advertise_exec() {
+            local_domains.push(CapabilityDomain::Exec);
+        }
+
+        // Register handle with the pre-version-peer baseline domains. These
+        // are overwritten below once the peer's own Handshake is received.
+        // Any frame arriving in the very short window before the peer's
+        // Handshake is processed is treated as content-or-management only,
+        // which is the safe conservative default.
+        let baseline_domains = vec![CapabilityDomain::Content, CapabilityDomain::Management];
         {
             let mut peers = self.peers.lock().await;
             peers.insert(
                 device_id.clone(),
                 PeerHandle {
                     caller_auth,
+                    peer_domains: baseline_domains,
                     outbound: tx.clone(),
                     pending: pending.clone(),
                     manage_pending: manage_pending.clone(),
@@ -535,7 +550,119 @@ impl SyncEngine {
             let _ = writer.shutdown().await;
         });
 
-        // Handshake: ClusterConfig then Index.
+        // Capability-negotiation handshake — sent as the first frame, before
+        // ClusterConfig, on every session. The peer reads it before any other
+        // post-TLS exchange and uses the declared domains to gate outbound
+        // frames. A peer that sends ClusterConfig without a preceding Handshake
+        // is treated as a pre-version peer offering Content + Management only
+        // (see the first-frame read below).
+        tx.send(BepMessage::Handshake {
+            protocol_version: PROTOCOL_VERSION,
+            domains: local_domains,
+        })
+        .ok();
+
+        // Read the peer's opening frame. Per the protocol spec the first
+        // post-TLS frame from any versioned peer is a Handshake; we read it
+        // here (before the outbound ClusterConfig + Index are sent, but they
+        // are already queued) so we know which domains the peer supports
+        // before the main read loop starts.
+        //
+        // If the peer is a pre-version node it will send ClusterConfig as its
+        // first frame (no Handshake). In that case we keep the baseline
+        // Content + Management domains and process ClusterConfig normally.
+        //
+        // A version mismatch (peer speaks a protocol version other than ours)
+        // is logged and tolerated: the peer still gets the domains it
+        // advertised, and the session continues. A future major version bump
+        // could close the session here instead.
+        let peer_domains = match reader.recv().await {
+            Ok(Some(BepMessage::Handshake {
+                protocol_version,
+                domains,
+            })) => {
+                if protocol_version != PROTOCOL_VERSION {
+                    debug!(
+                        target: "cascade::backend::p2p",
+                        peer = %device_id,
+                        peer_version = protocol_version,
+                        our_version = PROTOCOL_VERSION,
+                        "peer speaks a different protocol version — \
+                         continuing with its advertised domains",
+                    );
+                }
+                debug!(
+                    target: "cascade::backend::p2p",
+                    peer = %device_id,
+                    peer_version = protocol_version,
+                    domain_count = domains.len(),
+                    "received capability handshake from peer",
+                );
+                domains
+            }
+            Ok(Some(other)) => {
+                // Pre-version peer: first frame is not a Handshake. Treat it
+                // as Content + Management only, then process the frame normally
+                // via handle_message rather than discarding it.
+                debug!(
+                    target: "cascade::backend::p2p",
+                    peer = %device_id,
+                    "peer sent non-Handshake first frame (no Handshake) — \
+                     treating as pre-version peer with Content + Management",
+                );
+                let domains = vec![CapabilityDomain::Content, CapabilityDomain::Management];
+                if let Err(e) = self
+                    .handle_message(
+                        &device_id,
+                        caller_auth,
+                        other,
+                        &domains,
+                        &tx,
+                        &pending,
+                        &manage_pending,
+                    )
+                    .await
+                {
+                    // Clean up the peer entry before returning so the map
+                    // does not retain a stale handle for a dead session.
+                    let mut peers = self.peers.lock().await;
+                    peers.remove(&device_id);
+                    drop(tx);
+                    let _ = writer_task.await;
+                    return Err(e);
+                }
+                domains
+            }
+            Ok(None) => {
+                // Peer closed before sending any frame.
+                let mut peers = self.peers.lock().await;
+                peers.remove(&device_id);
+                drop(tx);
+                let _ = writer_task.await;
+                return Ok(());
+            }
+            Err(e) => {
+                let mut peers = self.peers.lock().await;
+                peers.remove(&device_id);
+                drop(tx);
+                let _ = writer_task.await;
+                return Err(e);
+            }
+        };
+
+        // Persist the peer's negotiated domains on the handle so the map
+        // reflects the negotiated set (used by callers of `peer_domains()`).
+        // Also keep the local copy for the per-frame enforcement inside the
+        // read loop below, so we do not need to take the peers lock on every
+        // frame.
+        {
+            let mut peers = self.peers.lock().await;
+            if let Some(handle) = peers.get_mut(&device_id) {
+                handle.peer_domains.clone_from(&peer_domains);
+            }
+        }
+
+        // Post-handshake exchange: ClusterConfig then Index.
         tx.send(BepMessage::ClusterConfig {
             folders: vec![Folder {
                 id: self.folder_id.clone(),
@@ -640,7 +767,15 @@ impl SyncEngine {
                 Err(e) => break Err(e),
             };
             if let Err(e) = self
-                .handle_message(&device_id, caller_auth, msg, &tx, &pending, &manage_pending)
+                .handle_message(
+                    &device_id,
+                    caller_auth,
+                    msg,
+                    &peer_domains,
+                    &tx,
+                    &pending,
+                    &manage_pending,
+                )
                 .await
             {
                 break Err(e);
@@ -708,11 +843,19 @@ impl SyncEngine {
     }
 
     /// Dispatch one incoming message.
+    ///
+    /// `peer_domains` is the set of capability domains the peer declared in
+    /// its opening [`BepMessage::Handshake`], as negotiated by
+    /// [`Self::run_session_loop`]. Frames for domains the peer did not
+    /// advertise are refused (dropped with a debug log) rather than
+    /// processed, implementing the spec requirement that a peer must not send
+    /// frames for a domain the other did not advertise.
     pub(crate) async fn handle_message(
         &self,
         peer_device_id: &str,
         caller_auth: CallerAuthentication,
         msg: BepMessage,
+        peer_domains: &[CapabilityDomain],
         outbound: &mpsc::UnboundedSender<BepMessage>,
         pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<u8>>>>>,
         manage_pending: &Arc<Mutex<HashMap<u64, oneshot::Sender<ManageResult>>>>,
@@ -1031,6 +1174,19 @@ impl SyncEngine {
                 Ok(())
             }
             BepMessage::ExecStream { session, .. } | BepMessage::ExecStreamAck { session, .. } => {
+                // A peer that did not advertise the exec capability domain must not
+                // send exec-stream frames. Drop with a domain-violation log rather
+                // than tearing the session down — the misconfigured peer can still
+                // serve content and management frames.
+                if !peer_domains.contains(&CapabilityDomain::Exec) {
+                    debug!(
+                        target: "cascade::backend::p2p",
+                        peer = %peer_device_id,
+                        session,
+                        "dropping exec stream frame — peer did not advertise exec capability",
+                    );
+                    return Ok(());
+                }
                 // Live exec stdio is not routed through this message handler yet:
                 // the node-side stdio pump that binds these frames to an exec
                 // session is a later wiring step. Until then, drop the frame

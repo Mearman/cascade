@@ -58,8 +58,8 @@ use cascade_p2p::nat::{
 };
 use cascade_p2p::pipe::ByteMeter;
 use cascade_p2p::protocol::{
-    BepMessage, FileInfo, Folder, GossipPeer, MAX_RELAY_OFFER_ADDRESSES, ManageCommand,
-    ManageErrorKind, ManageResult, ManageScope, Version,
+    BepMessage, CapabilityDomain, FileInfo, Folder, GossipPeer, MAX_RELAY_OFFER_ADDRESSES,
+    ManageCommand, ManageErrorKind, ManageResult, ManageScope, PROTOCOL_VERSION, Version,
 };
 use cascade_p2p::store::BlockStore;
 use cascade_p2p::transport::{
@@ -425,6 +425,15 @@ struct PeerHandle {
     /// this so it never sends a management request down a session the node
     /// will reject, dialling a fresh direct session instead.
     caller_auth: CallerAuthentication,
+    /// The capability domains the peer advertised in its opening
+    /// [`BepMessage::Handshake`] frame. A peer that sent no Handshake (a
+    /// pre-version peer) is treated as advertising only
+    /// [`CapabilityDomain::Content`] and [`CapabilityDomain::Management`],
+    /// the documented baseline for deployed peers before versioned
+    /// negotiation was introduced. Used to gate outbound frame types (we must
+    /// not send frames for a domain the peer did not advertise) and to refuse
+    /// inbound frames whose domain the peer never declared.
+    peer_domains: Vec<CapabilityDomain>,
     outbound: mpsc::UnboundedSender<BepMessage>,
     /// Outstanding block requests, keyed by the `request_id` allocated
     /// when the Request frame was sent. The responder echoes the id in
@@ -701,6 +710,17 @@ pub struct SyncEngine {
     /// bound and the bit is consulted per-accept so the gate is closed
     /// by construction.
     data_plane_ready: Arc<AtomicBool>,
+    /// Whether to advertise the [`CapabilityDomain::Exec`] domain in
+    /// the opening [`BepMessage::Handshake`]. Flipped to `true` when the
+    /// exec subsystem is wired into the engine (an `Arc<dyn ExecProvider>`
+    /// is installed). A wasm / no-exec build or a node that has not yet
+    /// installed the exec provider leaves this `false` and omits the domain
+    /// from the handshake, so peers know not to send exec frames to it.
+    ///
+    /// Uses an `AtomicBool` behind an `Arc` for the same reason as
+    /// `data_plane_ready`: the bit may be flipped after the engine is
+    /// constructed and its clone distributed to running session loops.
+    advertise_exec: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for SyncEngine {
@@ -765,6 +785,10 @@ impl SyncEngine {
             // integration tests that never wire an authority) leave the
             // bit at `true` and the listener serves as before.
             data_plane_ready: Arc::new(AtomicBool::new(true)),
+            // Exec is not wired by default: a wasm build or a node that has
+            // not yet installed the exec provider leaves this false. Flip it
+            // via `set_advertise_exec(true)` after the exec subsystem is ready.
+            advertise_exec: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -840,6 +864,32 @@ impl SyncEngine {
     /// (`true`) and the listener serves as before.
     pub fn set_data_plane_ready_flag(&self, ready: bool) {
         self.data_plane_ready.store(ready, Ordering::Release);
+    }
+
+    /// Returns `true` when the exec subsystem is wired and the engine should
+    /// include [`CapabilityDomain::Exec`] in its opening
+    /// [`BepMessage::Handshake`] frame.
+    #[must_use]
+    pub fn advertise_exec(&self) -> bool {
+        self.advertise_exec.load(Ordering::Acquire)
+    }
+
+    /// Set whether to include [`CapabilityDomain::Exec`] in future handshakes.
+    ///
+    /// The daemon calls this with `true` once the exec provider has been wired
+    /// into the engine and is ready to serve exec verbs from remote peers. The
+    /// flag may be set at any time; sessions already open are not
+    /// retroactively updated.
+    pub fn set_advertise_exec(&self, enabled: bool) {
+        self.advertise_exec.store(enabled, Ordering::Release);
+    }
+
+    /// Returns the capability domains the connected peer advertised in its
+    /// opening [`BepMessage::Handshake`]. Returns `None` when no session with
+    /// `device_id` is registered.
+    pub async fn peer_domains(&self, device_id: &str) -> Option<Vec<CapabilityDomain>> {
+        let peers = self.peers.lock().await;
+        peers.get(device_id).map(|h| h.peer_domains.clone())
     }
 
     /// Resolve the directional data-plane access a `peer` has for this engine's
@@ -2195,6 +2245,7 @@ impl SyncEngine {
                         id.clone(),
                         PeerHandle {
                             caller_auth: h.caller_auth,
+                            peer_domains: h.peer_domains.clone(),
                             outbound: h.outbound.clone(),
                             pending: h.pending.clone(),
                             manage_pending: h.manage_pending.clone(),
@@ -2256,6 +2307,7 @@ impl SyncEngine {
             let peers = self.peers.lock().await;
             peers.get(device_id).map(|h| PeerHandle {
                 caller_auth: h.caller_auth,
+                peer_domains: h.peer_domains.clone(),
                 outbound: h.outbound.clone(),
                 pending: h.pending.clone(),
                 manage_pending: h.manage_pending.clone(),

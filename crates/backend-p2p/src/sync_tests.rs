@@ -1808,6 +1808,7 @@ async fn candidates_frame_updates_peer_book() {
             BepMessage::Candidates {
                 candidates: candidates.clone(),
             },
+            &[CapabilityDomain::Content, CapabilityDomain::Management],
             &tx,
             &pending,
             &manage_pending,
@@ -1842,6 +1843,7 @@ async fn sync_punch_frame_records_agreement_on_peer_book() {
                 nonce: 0xCAFE_BABE,
                 deadline_unix_ms: 1_700_000_000_000,
             },
+            &[CapabilityDomain::Content, CapabilityDomain::Management],
             &tx,
             &pending,
             &manage_pending,
@@ -2297,6 +2299,7 @@ async fn write_denied_peer_is_quarantined_not_merged() {
                 folder: "f".to_owned(),
                 files: vec![sample_file("drop.txt")],
             },
+            &[CapabilityDomain::Content, CapabilityDomain::Management],
             &tx,
             &pending,
             &manage_pending,
@@ -2342,6 +2345,7 @@ async fn write_allowed_peer_is_merged() {
                 folder: "f".to_owned(),
                 files: vec![sample_file("keep.txt")],
             },
+            &[CapabilityDomain::Content, CapabilityDomain::Management],
             &tx,
             &pending,
             &manage_pending,
@@ -2382,6 +2386,7 @@ async fn unverified_session_cannot_write_even_with_write_grant() {
                 folder: "f".to_owned(),
                 files: vec![sample_file("spoof.txt")],
             },
+            &[CapabilityDomain::Content, CapabilityDomain::Management],
             &tx,
             &pending,
             &manage_pending,
@@ -2431,6 +2436,7 @@ async fn read_denied_peer_gets_empty_block_response() {
                 block_size: 128 * 1024,
                 block_hash: hash.0,
             },
+            &[CapabilityDomain::Content, CapabilityDomain::Management],
             &tx,
             &pending,
             &manage_pending,
@@ -2479,6 +2485,7 @@ async fn read_allowed_peer_gets_block() {
                 block_size: 128 * 1024,
                 block_hash: hash.0,
             },
+            &[CapabilityDomain::Content, CapabilityDomain::Management],
             &tx,
             &pending,
             &manage_pending,
@@ -2520,6 +2527,7 @@ async fn cluster_config_captures_and_clears_presented_token() {
                 }],
                 data_token: Some("token-json".to_owned()),
             },
+            &[CapabilityDomain::Content, CapabilityDomain::Management],
             &tx,
             &pending,
             &manage_pending,
@@ -2544,6 +2552,7 @@ async fn cluster_config_captures_and_clears_presented_token() {
                 folders: vec![],
                 data_token: None,
             },
+            &[CapabilityDomain::Content, CapabilityDomain::Management],
             &tx,
             &pending,
             &manage_pending,
@@ -2667,4 +2676,121 @@ async fn default_trusted_peer_still_syncs_both_ways() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("default trusted peer did not receive the update");
+}
+
+// ── Capability-negotiation handshake tests ────────────────────────────────────
+
+/// After two engines exchange their opening Handshake frames, each engine
+/// should be able to read back the other's advertised capability domains via
+/// `peer_domains()`.
+///
+/// Both engines start with the default configuration (exec not advertised), so
+/// each peer's domain list is Content + Management only.
+#[tokio::test]
+async fn handshake_records_peer_domains() {
+    let (_dir_a, engine_a) = make_engine("shared");
+    let (_dir_b, engine_b) = make_engine("shared");
+
+    engine_a.trust(engine_b.device_id().to_string()).await;
+    engine_b.trust(engine_a.device_id().to_string()).await;
+
+    let (_cancel_tx_b, cancel_rx_b) = tokio::sync::watch::channel(false);
+    let (addr_b, _b_task) = engine_b
+        .start_listener("127.0.0.1:0".parse().unwrap(), cancel_rx_b)
+        .await
+        .unwrap();
+    engine_a
+        .connect_to(Peer {
+            device_id: engine_b.device_id().to_string(),
+            address: addr_b,
+        })
+        .await
+        .unwrap();
+
+    // Allow the handshake to complete.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // A should know B's domains.
+    let b_domains_from_a = engine_a
+        .peer_domains(engine_b.device_id())
+        .await
+        .expect("A must have recorded B's domains after handshake");
+
+    assert!(
+        b_domains_from_a.contains(&CapabilityDomain::Content),
+        "B must advertise Content",
+    );
+    assert!(
+        b_domains_from_a.contains(&CapabilityDomain::Management),
+        "B must advertise Management",
+    );
+    assert!(
+        !b_domains_from_a.contains(&CapabilityDomain::Exec),
+        "B must not advertise Exec when exec is not enabled",
+    );
+
+    // B should know A's domains (recorded from the listener side).
+    let a_domains_from_b = engine_b
+        .peer_domains(engine_a.device_id())
+        .await
+        .expect("B must have recorded A's domains after handshake");
+
+    assert!(
+        a_domains_from_b.contains(&CapabilityDomain::Content),
+        "A must advertise Content",
+    );
+    assert!(
+        !a_domains_from_b.contains(&CapabilityDomain::Exec),
+        "A must not advertise Exec when exec is not enabled",
+    );
+}
+
+/// Heterogeneous-peer test: engine A enables exec, engine B does not.
+/// After the handshake, A's domain list (as seen by B) must include Exec,
+/// while B's domain list (as seen by A) must not.
+#[tokio::test]
+async fn heterogeneous_exec_capability_is_negotiated() {
+    let (_dir_a, engine_a) = make_engine("shared");
+    let (_dir_b, engine_b) = make_engine("shared");
+
+    // Only A advertises exec.
+    engine_a.set_advertise_exec(true);
+
+    engine_a.trust(engine_b.device_id().to_string()).await;
+    engine_b.trust(engine_a.device_id().to_string()).await;
+
+    let (_cancel_tx_b, cancel_rx_b) = tokio::sync::watch::channel(false);
+    let (addr_b, _b_task) = engine_b
+        .start_listener("127.0.0.1:0".parse().unwrap(), cancel_rx_b)
+        .await
+        .unwrap();
+    engine_a
+        .connect_to(Peer {
+            device_id: engine_b.device_id().to_string(),
+            address: addr_b,
+        })
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // B sees A as exec-capable (A advertised it).
+    let a_domains_from_b = engine_b
+        .peer_domains(engine_a.device_id())
+        .await
+        .expect("B must have recorded A's domains");
+    assert!(
+        a_domains_from_b.contains(&CapabilityDomain::Exec),
+        "B must see A as exec-capable (A set advertise_exec = true)",
+    );
+
+    // A sees B as exec-incapable (B did not advertise it).
+    let b_domains_from_a = engine_a
+        .peer_domains(engine_b.device_id())
+        .await
+        .expect("A must have recorded B's domains");
+    assert!(
+        !b_domains_from_a.contains(&CapabilityDomain::Exec),
+        "A must see B as exec-incapable (B did not set advertise_exec)",
+    );
 }
