@@ -793,8 +793,11 @@ mod tests {
     #[tokio::test]
     async fn pty_spawn_returns_session_id_and_records_it() {
         let provider = LocalExecProvider::new();
+        // `/bin/sh` is an absolute path that does not exist on Windows; use the
+        // always-present `cmd` shell there so the PTY actually spawns.
+        let shell = if cfg!(windows) { "cmd" } else { "/bin/sh" };
         let spec = PtySpec {
-            shell: Some("/bin/sh".to_owned()),
+            shell: Some(shell.to_owned()),
             argv: vec![],
             cwd: None,
             env: vec![],
