@@ -19,7 +19,7 @@ reqwest = { workspace = true, optional = true }
 cascade-p2p = { path = "../p2p", optional = true }
 data-encoding.workspace = true
 sha2 = { workspace = true }
-cascade-exec = { version = "0.1.121", path = "../exec", optional = true }
+cascade-exec = { version = "0.1.122", path = "../exec", optional = true }
 
 [features]
 # `native` carries the host-only runtime and storage backends — tokio,
