@@ -185,7 +185,12 @@ jobs:
           echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
       - name: Ensure the SDK platform and build-tools the app targets
         shell: bash
-        run: yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0" >/dev/null
+        run: |
+          # `set +o pipefail` so `yes` getting SIGPIPE when sdkmanager exits
+          # (the runner default is `-o pipefail`) does not fail the step; the
+          # pipeline's status is then sdkmanager's own exit code.
+          set +o pipefail
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0" >/dev/null
       - name: Bootstrap (cross-compile the .so slices into jniLibs)
         run: ./android/bootstrap.sh
       - name: Assemble the debug APK
