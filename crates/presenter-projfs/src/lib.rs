@@ -1040,6 +1040,12 @@ impl VfsPresenter for ProjFsPresenter {
     }
 
     async fn fetch_contents(&self, id: &ItemId) -> anyhow::Result<PathBuf> {
+        // The fixed window each `read_range` call pulls from the content
+        // provider — one mebibyte. Declared at the top of the scope it lives in
+        // (a `const` is visible from the start of the block regardless of where
+        // it is written, so placing it mid-body only reads as a surprise).
+        const READ_CHUNK: u32 = 1024 * 1024;
+
         let cache_path = self.cache_path_for(id);
         if cache_path.exists() {
             return Ok(cache_path);
@@ -1064,7 +1070,6 @@ impl VfsPresenter for ProjFsPresenter {
 
         let mut all_bytes = Vec::new();
         let mut offset = 0u64;
-        const READ_CHUNK: u32 = 1024 * 1024;
         loop {
             let remaining = file_size.saturating_sub(offset);
             let to_read = if remaining == 0 {
