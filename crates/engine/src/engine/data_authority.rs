@@ -14,6 +14,7 @@ use crate::manage::{
     DataAccess, DataAuthority, DeviceId, ExplicitControlState, data_access_with_explicit_control,
     verify_data_token,
 };
+use crate::portable::{Clock, RuntimeHandle};
 
 /// The engine is the data-plane authority for the BEP sync path: it resolves a
 /// peer's directional read/write access to a folder from the on-node data
@@ -28,7 +29,7 @@ use crate::manage::{
 /// explicit-control bit is consulted on every call too, so a verified-token
 /// restriction survives the token revocation or expiry that prompted it.
 #[async_trait]
-impl DataAuthority for Engine {
+impl<R: RuntimeHandle, C: Clock> DataAuthority for Engine<R, C> {
     async fn data_access(
         &self,
         peer: &DeviceId,
@@ -40,8 +41,9 @@ impl DataAuthority for Engine {
         // grant is honoured promptly. A grant row carries no token, so the
         // revocation list does not touch these — only a presented token below.
         let mut grants: Vec<crate::manage::Grant> = self
-            .db
-            .list_data_grants()?
+            .storage
+            .list_data_grants()
+            .await?
             .into_iter()
             .map(|record| record.grant)
             .collect();
@@ -60,19 +62,22 @@ impl DataAuthority for Engine {
             // `folder`, the runtime value the BEP session is bound to, not
             // the token's carried scope — the verify path's scope-cover
             // check has already confirmed the two agree.
-            self.db.record_data_explicit_control(
-                peer.as_str(),
-                folder,
-                matches!(token_grant.capability, crate::manage::Capability::DataRead),
-                matches!(token_grant.capability, crate::manage::Capability::DataWrite),
-                now,
-            )?;
+            self.storage
+                .record_data_explicit_control(
+                    peer.as_str(),
+                    folder,
+                    matches!(token_grant.capability, crate::manage::Capability::DataRead),
+                    matches!(token_grant.capability, crate::manage::Capability::DataWrite),
+                    now,
+                )
+                .await?;
             grants.push(token_grant);
         }
 
         let explicit_control: Vec<ExplicitControlState> = self
-            .db
-            .list_data_explicit_control()?
+            .storage
+            .list_data_explicit_control()
+            .await?
             .into_iter()
             .map(|record| ExplicitControlState {
                 peer: record.peer_device,
@@ -99,12 +104,15 @@ impl DataAuthority for Engine {
         file_json: &str,
         observed_at: DateTime<Utc>,
     ) -> Result<()> {
-        self.db.upsert_quarantine(&QuarantineRecord {
-            folder_id: folder.to_string(),
-            peer_device: peer.as_str().to_string(),
-            path: path.to_string(),
-            file_json: file_json.to_string(),
-            observed_at,
-        })
+        self.storage
+            .upsert_quarantine(&QuarantineRecord {
+                folder_id: folder.to_string(),
+                peer_device: peer.as_str().to_string(),
+                path: path.to_string(),
+                file_json: file_json.to_string(),
+                observed_at,
+            })
+            .await
+            .map_err(Into::into)
     }
 }

@@ -41,7 +41,7 @@ async fn ready(
 ) -> Result<Json<ReadyResponse>, ApiError> {
     // The state database backs readiness; an unreadable database is a hard
     // `unavailable`, not a silent "no backends".
-    let status = state.engine.status();
+    let status = state.engine.status().await;
     let started_at = state.readiness.started_at();
 
     if !state.readiness.data_plane_ready() {

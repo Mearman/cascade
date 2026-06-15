@@ -26,11 +26,12 @@ use cascade_p2p::protocol::{ManageCommand, ManageResult, ManageScope as WireScop
 use super::Engine;
 use crate::db::AuditEntry;
 use crate::manage::{DeviceId, Grant, Scope};
+use crate::portable::{Clock, RuntimeHandle};
 
 #[cfg(feature = "p2p")]
 /// The engine is the grant store and audit sink for the management plane,
 /// reading and writing the two `state.db` tables the prior phase added.
-impl crate::manage::ManageGrantStore for Engine {
+impl<R: RuntimeHandle, C: Clock> crate::manage::ManageGrantStore for Engine<R, C> {
     fn manage_grants(&self) -> Result<Vec<Grant>> {
         Ok(self
             .db
@@ -89,9 +90,9 @@ impl crate::manage::ManageGrantStore for Engine {
 /// do to itself, and no command logic is duplicated. The remote path reaches
 /// these only after authorisation and auditing in [`crate::manage::run_dispatch`].
 #[async_trait]
-impl crate::manage::ManageCommandExecutor for Engine {
+impl<R: RuntimeHandle, C: Clock> crate::manage::ManageCommandExecutor for Engine<R, C> {
     async fn manage_status(&self) -> Result<String> {
-        let status = self.status();
+        let status = self.status().await;
         Ok(format!(
             "running={} backends={} online={} cached={} pinned={} p2p_enabled={}",
             status.running,
@@ -140,7 +141,7 @@ impl crate::manage::ManageCommandExecutor for Engine {
         body: &str,
     ) -> Result<String> {
         let config = super::operations::parse_config_fragment(format, body)?;
-        self.config_push(folder, &config)
+        self.config_push(folder, &config).await
     }
 
     async fn manage_policy_set(
@@ -151,6 +152,7 @@ impl crate::manage::ManageCommandExecutor for Engine {
         priority: i32,
     ) -> Result<String> {
         self.policy_set(path_glob, max_age_secs, max_file_size, priority)
+            .await
     }
 
     async fn manage_backend_add(
@@ -161,10 +163,11 @@ impl crate::manage::ManageCommandExecutor for Engine {
         config_toml: &str,
     ) -> Result<String> {
         self.backend_add(name, backend_type, mount_path, config_toml)
+            .await
     }
 
     async fn manage_backend_remove(&self, name: &str, mount_path: &str) -> Result<String> {
-        self.backend_remove(name, mount_path)
+        self.backend_remove(name, mount_path).await
     }
 
     async fn manage_restart(&self) -> Result<String> {
@@ -182,11 +185,11 @@ impl crate::manage::ManageCommandExecutor for Engine {
     }
 
     async fn manage_grant_add(&self, grant: &Grant) -> Result<String> {
-        self.grant_add(grant)
+        self.grant_add(grant).await
     }
 
     async fn manage_grant_revoke(&self, grant_id: i64) -> Result<String> {
-        self.grant_revoke(grant_id)
+        self.grant_revoke(grant_id).await
     }
 
     #[cfg(feature = "exec")]
@@ -238,7 +241,7 @@ impl crate::manage::ManageCommandExecutor for Engine {
         exec.pty_kill(cascade_exec::ExecSessionId(session), signal)
             .await?;
         self.db
-            .mark_exec_session_ended(session, chrono::Utc::now(), None, Some(signal))?;
+            .mark_exec_session_ended(session, self.clock.now(), None, Some(signal))?;
         Ok(format!("sent signal {signal} to session {session}"))
     }
 
@@ -276,13 +279,13 @@ impl crate::manage::ManageCommandExecutor for Engine {
         let exec = self.exec_provider()?;
         exec.proc_kill(cascade_exec::ExecSessionId(session)).await?;
         self.db
-            .mark_exec_session_ended(session, chrono::Utc::now(), None, None)?;
+            .mark_exec_session_ended(session, self.clock.now(), None, None)?;
         Ok(format!("killed session {session}"))
     }
 }
 
 #[cfg(feature = "exec")]
-impl Engine {
+impl<R: RuntimeHandle, C: Clock> Engine<R, C> {
     /// The injected exec provider, or a loud error when none is wired.
     ///
     /// A node without the exec provider refuses an exec verb rather than
@@ -313,7 +316,7 @@ impl Engine {
             owner_device: owner.clone(),
             scope: scope.clone(),
             command,
-            started_at: chrono::Utc::now(),
+            started_at: self.clock.now(),
         })
     }
 }
@@ -341,7 +344,7 @@ fn proc_command_summary(argv: &[String]) -> String {
 
 #[cfg(feature = "p2p")]
 #[async_trait]
-impl crate::manage::ManageDispatch for Engine {
+impl<R: RuntimeHandle, C: Clock> crate::manage::ManageDispatch for Engine<R, C> {
     async fn dispatch(
         &self,
         caller: &DeviceId,

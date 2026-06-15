@@ -26,8 +26,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use super::{
-    BoxFuture, FileSystem, FsDirEntry, FsError, HeaderMap, HttpClient, HttpError, HttpResponse,
-    JoinError, JoinHandle, RuntimeHandle, StateStorage, StorageError,
+    BoxFuture, Clock, FileSystem, FsDirEntry, FsError, HeaderMap, HttpClient, HttpError,
+    HttpResponse, JoinError, JoinHandle, RuntimeHandle, StateStorage, StorageError,
 };
 #[cfg(feature = "p2p")]
 use crate::db::TokenRecord;
@@ -82,6 +82,15 @@ impl RuntimeHandle for TokioRuntimeHandle {
         drop(self.0.spawn(fut));
     }
 
+    fn spawn_joinable(&self, fut: BoxFuture<()>) -> JoinHandle<()> {
+        let handle = self.0.spawn(fut);
+        let abort = handle.abort_handle();
+        JoinHandle::with_abort(
+            Box::pin(async move { handle.await.map_err(|e| JoinError(e.to_string())) }),
+            Box::new(move || abort.abort()),
+        )
+    }
+
     fn spawn_blocking<F, R>(&self, f: F) -> JoinHandle<R>
     where
         F: FnOnce() -> R + Send + 'static,
@@ -95,6 +104,18 @@ impl RuntimeHandle for TokioRuntimeHandle {
 
     fn sleep(&self, duration: Duration) -> BoxFuture<()> {
         Box::pin(tokio::time::sleep(duration))
+    }
+}
+
+// ─────────────────────────── Clock ───────────────────────────
+
+/// [`Clock`] backed by `chrono::Utc::now()`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NativeClock;
+
+impl Clock for NativeClock {
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now()
     }
 }
 
@@ -568,6 +589,13 @@ impl<R: RuntimeHandle> StateStorage for SqliteStorage<R> {
         let folder_id = folder_id.to_owned();
         self.run(move |db| db.clear_data_explicit_control(&peer_device, &folder_id))
             .await
+    }
+
+    // ── Backend mount lookup ──
+
+    async fn get_backend_mount(&self, id: &str) -> Result<Option<Option<String>>, StorageError> {
+        let id = id.to_owned();
+        self.run(move |db| db.get_backend_mount(&id)).await
     }
 }
 

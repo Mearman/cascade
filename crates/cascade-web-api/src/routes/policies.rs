@@ -65,6 +65,7 @@ async fn create(
             body.max_file_size,
             body.priority,
         )
+        .await
         .map_err(|e| ApiError::internal(format!("could not set policy: {e}")))?;
 
     let created = policy_views(&state)?

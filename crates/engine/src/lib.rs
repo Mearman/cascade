@@ -20,11 +20,18 @@ pub mod backend;
     all(feature = "portable", not(target_arch = "wasm32"))
 ))]
 pub mod cache;
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "portable"))]
 pub mod changefeed;
 pub mod config;
 pub mod db;
-#[cfg(feature = "native")]
+// The engine owns the cache manager and sync runner (daemon-level concerns) as
+// fields, so it shares their compilation gate: native, or a non-wasm32 portable
+// host. A wasm32 build drives the router and storage directly and never names
+// the engine type.
+#[cfg(any(
+    feature = "native",
+    all(feature = "portable", not(target_arch = "wasm32"))
+))]
 pub mod engine;
 pub mod manage;
 #[cfg(feature = "p2p")]
@@ -39,8 +46,13 @@ pub mod protocol;
 ))]
 pub mod sync;
 pub mod types;
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "portable"))]
 pub mod vfs;
 
 #[cfg(feature = "native")]
+pub use engine::NativeEngine;
+#[cfg(any(
+    feature = "native",
+    all(feature = "portable", not(target_arch = "wasm32"))
+))]
 pub use engine::{Engine, EngineConfig, EngineHandle, EngineStatus};

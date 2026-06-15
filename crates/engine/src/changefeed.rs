@@ -53,9 +53,7 @@
 //!   [`ChangeQueryResult::Evicted`].
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
-
-use tokio::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use crate::types::{Change, FileEntry, ItemId};
 
@@ -248,6 +246,24 @@ impl ChangeFeed {
         }
     }
 
+    /// Acquire a write guard, recovering from a poisoned lock by taking the
+    /// inner value. A lock is poisoned only when a thread panicked while
+    /// holding it; in that case the inner state may be partially written but
+    /// is structurally valid (all fields are plain `HashMap`/`VecDeque`
+    /// values), so continuing with the recovered guard is safe.
+    fn write_state(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, BackendChangeState>> {
+        self.state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Acquire a read guard, recovering from a poisoned lock.
+    fn read_state(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, BackendChangeState>> {
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// File a batch of applied changes for `backend_id` into the index.
     ///
     /// Called by the sync runner after it has applied a poll batch to the
@@ -255,17 +271,17 @@ impl ChangeFeed {
     /// (post-ignore-filter) changes. Sequences are allocated in iteration
     /// order and persist across calls, so the cursor a presenter holds
     /// stays monotonic from one poll cycle to the next.
-    pub async fn record(&self, backend_id: &str, changes: &[Change]) {
+    pub fn record(&self, backend_id: &str, changes: &[Change]) {
         if changes.is_empty() {
             // Still register the backend so a parent query can distinguish
             // "backend known, parent empty" from "backend never seen". A
             // backend with no changes yet should not block the delta path
             // once changes do arrive.
-            let mut guard = self.state.write().await;
+            let mut guard = self.write_state();
             guard.entry(backend_id.to_string()).or_default();
             return;
         }
-        let mut guard = self.state.write().await;
+        let mut guard = self.write_state();
         let entry = guard.entry(backend_id.to_string()).or_default();
         for change in changes {
             entry.file_change(change.clone());
@@ -278,13 +294,14 @@ impl ChangeFeed {
     /// parent". A successful [`ChangeQueryResult::Delta`] carries the
     /// new max sequence; the caller persists it into its cursor and
     /// passes it back on the next call.
-    pub async fn parent_changes_since(
+    #[must_use]
+    pub fn parent_changes_since(
         &self,
         backend_id: &str,
         parent_id: &ItemId,
         since: Option<u64>,
     ) -> ChangeQueryResult {
-        let guard = self.state.read().await;
+        let guard = self.read_state();
         let Some(backend_state) = guard.get(backend_id) else {
             return ChangeQueryResult::Unknown;
         };
@@ -352,11 +369,10 @@ mod tests {
                 Change::Created(make_entry("scripted", "b", "root", "b.txt")),
                 Change::Created(make_entry("scripted", "c", "root", "c.txt")),
             ],
-        )
-        .await;
+        );
 
         // No since -> all three back.
-        match feed.parent_changes_since("scripted", &parent, None).await {
+        match feed.parent_changes_since("scripted", &parent, None) {
             ChangeQueryResult::Delta { events, new_seq } => {
                 assert_eq!(events.len(), 3);
                 assert_eq!(new_seq, 2);
@@ -365,10 +381,7 @@ mod tests {
         }
 
         // Since seq=0 -> events with seq>0 (i.e. seq 1 and 2).
-        match feed
-            .parent_changes_since("scripted", &parent, Some(0))
-            .await
-        {
+        match feed.parent_changes_since("scripted", &parent, Some(0)) {
             ChangeQueryResult::Delta { events, new_seq } => {
                 assert_eq!(events.len(), 2);
                 assert_eq!(new_seq, 2);
@@ -387,22 +400,17 @@ mod tests {
             &[Change::Created(make_entry(
                 "scripted", "a", "root", "a.txt",
             ))],
-        )
-        .await;
+        );
         feed.record(
             "scripted",
             &[Change::Created(make_entry(
                 "scripted", "b", "root", "b.txt",
             ))],
-        )
-        .await;
+        );
 
         // The second batch must continue the sequence (0 then 1), so a
         // caller that saw seq=0 only gets the second event back.
-        match feed
-            .parent_changes_since("scripted", &parent, Some(0))
-            .await
-        {
+        match feed.parent_changes_since("scripted", &parent, Some(0)) {
             ChangeQueryResult::Delta { events, new_seq } => {
                 assert_eq!(events.len(), 1);
                 assert_eq!(new_seq, 1);
@@ -427,25 +435,18 @@ mod tests {
                 &[Change::Created(make_entry(
                     "scripted", &name, "root", &name,
                 ))],
-            )
-            .await;
+            );
         }
 
         // A `since` older than the new oldest must report Evicted.
-        match feed
-            .parent_changes_since("scripted", &parent, Some(0))
-            .await
-        {
+        match feed.parent_changes_since("scripted", &parent, Some(0)) {
             ChangeQueryResult::Evicted => {}
             other => panic!("expected Evicted, got {other:?}"),
         }
 
         // A `since` that still has a contiguous timeline with the
         // buffer's head must still get a Delta.
-        match feed
-            .parent_changes_since("scripted", &parent, Some(2))
-            .await
-        {
+        match feed.parent_changes_since("scripted", &parent, Some(2)) {
             ChangeQueryResult::Delta { .. } => {}
             other => panic!("expected Delta for in-range since, got {other:?}"),
         }
@@ -459,23 +460,16 @@ mod tests {
             &[Change::Created(make_entry(
                 "scripted", "a", "root", "a.txt",
             ))],
-        )
-        .await;
+        );
 
         let ghost_parent = ItemId::new("scripted", "ghost");
-        match feed
-            .parent_changes_since("scripted", &ghost_parent, None)
-            .await
-        {
+        match feed.parent_changes_since("scripted", &ghost_parent, None) {
             ChangeQueryResult::Unknown => {}
             other => panic!("expected Unknown, got {other:?}"),
         }
 
         // Backend that the feed has never recorded also returns Unknown.
-        match feed
-            .parent_changes_since("nonexistent", &ghost_parent, None)
-            .await
-        {
+        match feed.parent_changes_since("nonexistent", &ghost_parent, None) {
             ChangeQueryResult::Unknown => {}
             other => panic!("expected Unknown, got {other:?}"),
         }
@@ -487,9 +481,9 @@ mod tests {
         // Recording an empty batch registers the backend but files no
         // events; a known parent therefore still reports Unknown because
         // it has no buffer, but the backend itself is recognised.
-        feed.record("scripted", &[]).await;
+        feed.record("scripted", &[]);
         let parent = ItemId::new("scripted", "root");
-        match feed.parent_changes_since("scripted", &parent, None).await {
+        match feed.parent_changes_since("scripted", &parent, None) {
             ChangeQueryResult::Unknown => {}
             other => panic!("expected Unknown for parent with no events, got {other:?}"),
         }
@@ -511,25 +505,19 @@ mod tests {
             mime_type: None,
             hash: None,
         };
-        feed.record("scripted", &[Change::Moved { from, to }]).await;
+        feed.record("scripted", &[Change::Moved { from, to }]);
 
         let old_parent = ItemId::new("scripted", "old");
         let new_parent = ItemId::new("scripted", "new");
 
-        match feed
-            .parent_changes_since("scripted", &old_parent, None)
-            .await
-        {
+        match feed.parent_changes_since("scripted", &old_parent, None) {
             ChangeQueryResult::Delta { events, .. } => match events.as_slice() {
                 [Change::Deleted(_)] => {}
                 other => panic!("expected exactly one Deleted event, got {other:?}"),
             },
             other => panic!("expected Delta on old parent, got {other:?}"),
         }
-        match feed
-            .parent_changes_since("scripted", &new_parent, None)
-            .await
-        {
+        match feed.parent_changes_since("scripted", &new_parent, None) {
             ChangeQueryResult::Delta { events, .. } => match events.as_slice() {
                 [Change::Created(_)] => {}
                 other => panic!("expected exactly one Created event, got {other:?}"),

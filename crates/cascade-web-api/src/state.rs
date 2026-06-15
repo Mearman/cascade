@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use cascade_engine::engine::Engine;
+use cascade_engine::engine::NativeEngine;
 use cascade_engine::manage::DeviceId;
 use cascade_p2p::identity::DeviceIdentity;
 use chrono::{DateTime, Utc};
@@ -166,7 +166,7 @@ impl Readiness {
 #[derive(Clone)]
 pub struct AppState {
     /// The engine — the single data-plane and management-plane authority.
-    pub engine: Arc<Engine>,
+    pub engine: Arc<NativeEngine>,
     /// The node's signing identity.
     pub identity: Arc<NodeIdentity>,
     /// Immutable bind-time configuration.
@@ -189,7 +189,7 @@ impl AppState {
     /// Construct application state.
     #[must_use]
     pub fn new(
-        engine: Arc<Engine>,
+        engine: Arc<NativeEngine>,
         identity: NodeIdentity,
         bind: BindConfig,
         readiness: Readiness,

@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use cascade_engine::backend::{MountedBackend, NullBackend};
-use cascade_engine::engine::{Engine, EngineConfig};
+use cascade_engine::engine::{Engine, EngineConfig, NativeEngine};
 use cascade_engine::manage::token::CapabilityToken;
 use cascade_engine::manage::{Capability, DataAccess, DataAuthority, DeviceId, Grant, Scope};
 use cascade_p2p::identity::DeviceIdentity;
@@ -60,7 +60,7 @@ fn now() -> DateTime<Utc> {
 /// key the engine's `manage_node_device_id` resolves to, so tokens signed by
 /// it verify. The temp dir is returned so it outlives the engine (dropping it
 /// would delete `state.db` and the identity PEMs).
-fn make_engine() -> (tempfile::TempDir, Arc<Engine>, DeviceIdentity) {
+fn make_engine() -> (tempfile::TempDir, Arc<NativeEngine>, DeviceIdentity) {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("state.db");
     let p2p_dir = dir.path().join("p2p");
@@ -120,7 +120,7 @@ fn issue_token_json(
 
 /// Insert an on-node data grant for `peer` over `FOLDER`.
 fn insert_data_grant(
-    engine: &Engine,
+    engine: &NativeEngine,
     peer: &DeviceId,
     capability: Capability,
     expires: Option<DateTime<Utc>>,

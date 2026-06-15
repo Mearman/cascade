@@ -233,7 +233,7 @@ impl<R: RuntimeHandle> SyncRunner<R> {
         // canonical poll loop — the feed never polls backends itself.
         #[cfg(feature = "native")]
         if let Some(feed) = &self.change_feed {
-            feed.record(backend_id, &applied).await;
+            feed.record(backend_id, &applied);
         }
 
         Ok(applied.len())
@@ -2138,9 +2138,7 @@ mod tests {
         assert_eq!(count, 1);
 
         // The applied change is queryable from the feed under its parent.
-        let result = feed
-            .parent_changes_since("scr", &ItemId::new("scr", "root"), None)
-            .await;
+        let result = feed.parent_changes_since("scr", &ItemId::new("scr", "root"), None);
         match result {
             ChangeQueryResult::Delta { events, .. } => {
                 assert_eq!(events.len(), 1);

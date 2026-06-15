@@ -681,7 +681,6 @@ impl EngineHandlers {
         let feed_head_seq = match self
             .change_feed
             .parent_changes_since(&backend_id, parent, None)
-            .await
         {
             ChangeQueryResult::Delta { new_seq, .. } => new_seq,
             ChangeQueryResult::Evicted | ChangeQueryResult::Unknown => 0,
@@ -1040,10 +1039,9 @@ impl FileProviderHandlers for EngineHandlers {
         });
 
         if let Some(since_seq) = feed_query {
-            let result = self
-                .change_feed
-                .parent_changes_since(&backend_id_owned, &parent, Some(since_seq))
-                .await;
+            let result =
+                self.change_feed
+                    .parent_changes_since(&backend_id_owned, &parent, Some(since_seq));
             if let ChangeQueryResult::Delta { events, new_seq } = result
                 && !events.is_empty()
             {

@@ -103,13 +103,39 @@ pub struct JoinError(pub String);
 /// resolves the work immediately and yields it back.
 pub struct JoinHandle<R> {
     inner: BoxFuture<Result<R, JoinError>>,
+    abort: Option<AbortFn>,
 }
 
+/// Cancellation hook for a spawned task. Present only on runtimes with a
+/// cancellation primitive (tokio's `AbortHandle`); absent on runtimes that
+/// resolve work inline or cannot abort (wasm single-threaded).
+type AbortFn = Box<dyn Fn() + Send + Sync>;
+
 impl<R> JoinHandle<R> {
-    /// Wrap a future yielding the task's result as a join handle.
+    /// Wrap a future yielding the task's result, with no cancellation hook
+    /// (e.g. blocking-pool work that always runs to completion).
     #[must_use]
-    pub const fn new(inner: BoxFuture<Result<R, JoinError>>) -> Self {
-        Self { inner }
+    pub fn new(inner: BoxFuture<Result<R, JoinError>>) -> Self {
+        Self { inner, abort: None }
+    }
+
+    /// Wrap a future together with a hook that cancels the underlying task.
+    #[must_use]
+    pub fn with_abort(inner: BoxFuture<Result<R, JoinError>>, abort: AbortFn) -> Self {
+        Self {
+            inner,
+            abort: Some(abort),
+        }
+    }
+
+    /// Cancel the underlying task immediately, if the runtime supports it.
+    ///
+    /// A no-op on runtimes without a cancellation primitive (wasm), where
+    /// callers must instead rely on a cooperative cancellation flag.
+    pub fn abort(&self) {
+        if let Some(abort) = &self.abort {
+            abort();
+        }
     }
 }
 
@@ -140,6 +166,12 @@ pub trait RuntimeHandle: Send + Sync + Clone + 'static {
     /// [`Self::spawn_blocking`] when the result is needed.
     fn spawn(&self, fut: BoxFuture<()>);
 
+    /// Spawn a future onto the runtime, returning a [`JoinHandle`] that
+    /// resolves when the future completes. Use this when the caller needs to
+    /// await the spawned task's completion (e.g. to hold a background task
+    /// handle and join it on shutdown).
+    fn spawn_joinable(&self, fut: BoxFuture<()>) -> JoinHandle<()>;
+
     /// Offload a blocking, synchronous computation so it does not stall the
     /// async path. The returned [`JoinHandle`] resolves to the computation's
     /// result.
@@ -150,6 +182,22 @@ pub trait RuntimeHandle: Send + Sync + Clone + 'static {
 
     /// Complete after `duration` has elapsed.
     fn sleep(&self, duration: Duration) -> BoxFuture<()>;
+}
+
+// ─────────────────────────── Clock ───────────────────────────
+
+/// Abstraction over a wall-clock — returning the current UTC instant.
+///
+/// `Clone` is required so the clock can be cheaply threaded into tasks without
+/// `Arc`-wrapping. The trait is consumed generically (`C: Clock`) rather than
+/// as a trait object.
+///
+/// On native targets this wraps `chrono::Utc::now()`. On wasm32 it uses the
+/// JS `Date.now()` millisecond timestamp. Injecting the clock into the engine
+/// keeps the core logic free of platform-specific time APIs.
+pub trait Clock: Send + Sync + Clone + 'static {
+    /// The current UTC instant.
+    fn now(&self) -> DateTime<Utc>;
 }
 
 // ─────────────────────────── State storage ───────────────────────────
@@ -462,6 +510,16 @@ pub trait StateStorage: Send + Sync {
         peer_device: &str,
         folder_id: &str,
     ) -> Result<bool, StorageError>;
+
+    // ── Backend mount lookup ──
+
+    /// Look up the stored mount path for a backend by id.
+    ///
+    /// Returns `None` when no row exists for the backend. When a row exists
+    /// and its `mount_path` column is `NULL` (meaning "default to the backend
+    /// id"), returns `Some(None)`. When a configured mount path is stored,
+    /// returns `Some(Some(path))`.
+    async fn get_backend_mount(&self, id: &str) -> Result<Option<Option<String>>, StorageError>;
 }
 
 // ─────────────────────────── HTTP ───────────────────────────

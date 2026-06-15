@@ -467,6 +467,7 @@ dependencies = [
  "chrono",
  "data-encoding",
  "js-sys",
+ "num-traits",
  "reqwest",
  "rusqlite",
  "serde",

@@ -11,7 +11,7 @@ use crate::manage::{DeviceId, Grant, Scope};
 #[cfg(feature = "p2p")]
 use cascade_p2p::protocol::{ManageCommand, ManageResult, ManageScope as WireScope};
 
-fn make_test_engine() -> Engine {
+fn make_test_engine() -> NativeEngine {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("state.db");
     let config = EngineConfig {
@@ -41,7 +41,7 @@ fn make_test_engine() -> Engine {
 async fn engine_new_with_null_backend() {
     let engine = make_test_engine();
 
-    let status = engine.status();
+    let status = engine.status().await;
     // NullBackend's display_name is "P2P Only", registered with type "unknown".
     assert!(status.backends.iter().any(|b| b.contains("P2P Only")));
     assert!(!status.p2p_enabled);
@@ -90,7 +90,7 @@ async fn engine_pin_unpin_list() {
 async fn engine_status_reflects_state() {
     let engine = make_test_engine();
 
-    let status = engine.status();
+    let status = engine.status().await;
     assert!(status.running);
     assert_eq!(status.backends.len(), 1);
     assert_eq!(status.cache_stats.online_count, 0);
@@ -101,7 +101,7 @@ async fn engine_shutdown_signals_cancel() {
     let engine = make_test_engine();
     engine.shutdown();
 
-    let status = engine.status();
+    let status = engine.status().await;
     assert!(!status.running);
 }
 
@@ -114,7 +114,9 @@ async fn engine_start_and_shutdown() {
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
     engine.shutdown();
-    handle.cache_handle.abort();
+    // `shutdown` sets the cancel flag the cache worker polls; dropping the join
+    // handle detaches the task, which returns on its next flag check.
+    drop(handle);
 }
 
 #[tokio::test]
@@ -375,13 +377,15 @@ async fn engine_with_multiple_backends() {
     })
     .unwrap();
 
-    let tree = engine.vfs().read().unwrap();
     // Both backends now mount as children of the neutral root (the old model
-    // special-cased the first as the tree root).
-    assert_eq!(tree.children().len(), 2);
-    drop(tree);
+    // special-cased the first as the tree root). Scope the read guard so it is
+    // released before the async status read.
+    {
+        let tree = engine.vfs().read().unwrap();
+        assert_eq!(tree.children().len(), 2);
+    }
 
-    let status = engine.status();
+    let status = engine.status().await;
     assert_eq!(status.backends.len(), 2);
 }
 
@@ -685,7 +689,7 @@ async fn config_push_applies_pins_and_policies_into_db() {
         priority = 3
     "#;
     let config = cascade_config::parse::toml::parse(body).unwrap();
-    engine.config_push("/work", &config).unwrap();
+    engine.config_push("/work", &config).await.unwrap();
 
     let pins = engine.db().list_pin_rules().unwrap();
     assert!(
@@ -720,7 +724,7 @@ async fn config_push_roots_absolute_rule_paths_under_the_folder() {
         priority = 1
     "#;
     let config = cascade_config::parse::toml::parse(body).unwrap();
-    engine.config_push("/work", &config).unwrap();
+    engine.config_push("/work", &config).await.unwrap();
 
     let pins = engine.db().list_pin_rules().unwrap();
     assert!(
@@ -755,6 +759,7 @@ async fn config_push_with_traversal_escape_applies_nothing() {
     let config = cascade_config::parse::toml::parse(body).unwrap();
     let err = engine
         .config_push("/work", &config)
+        .await
         .expect_err("a traversal escape must reject the push");
     assert!(
         err.to_string().contains("escapes the authorised folder"),
@@ -771,6 +776,7 @@ async fn policy_set_inserts_a_lifecycle_policy() {
     let engine = make_test_engine();
     engine
         .policy_set("/work/*.tmp", Some(3600), None, 1)
+        .await
         .unwrap();
     let policies = engine.db().list_lifecycle_policies().unwrap();
     let policy = policies
@@ -792,14 +798,14 @@ async fn grant_add_and_revoke_round_trip_through_db() {
         granted_by: manager_id(),
         expires: None,
     };
-    engine.grant_add(&g).unwrap();
+    engine.grant_add(&g).await.unwrap();
     let grants = engine.db().list_grants().unwrap();
     assert_eq!(grants.len(), 1);
     let record = grants.first().expect("one grant");
     assert_eq!(record.grant.grantee, DeviceId::new("SUBORDINATE"));
     assert_eq!(record.grant.granted_by, manager_id());
 
-    let summary = engine.grant_revoke(record.id).unwrap();
+    let summary = engine.grant_revoke(record.id).await.unwrap();
     assert!(summary.contains("revoked"), "summary: {summary}");
     assert!(engine.db().list_grants().unwrap().is_empty());
 }
@@ -811,6 +817,7 @@ async fn backend_add_without_factory_fails_loudly() {
     let engine = make_test_engine();
     let err = engine
         .backend_add("x", "gdrive", "/drive", "type = \"gdrive\"\n")
+        .await
         .expect_err("backend_add must fail with no factory");
     assert!(
         err.to_string().contains("no backend factory"),
@@ -822,10 +829,13 @@ async fn backend_add_without_factory_fails_loudly() {
 async fn restart_rearms_running_state() {
     let engine = make_test_engine();
     engine.shutdown();
-    assert!(!engine.status().running, "shutdown should stop the engine");
+    assert!(
+        !engine.status().await.running,
+        "shutdown should stop the engine"
+    );
     let _handle = engine.restart().unwrap();
     assert!(
-        engine.status().running,
+        engine.status().await.running,
         "restart must re-arm the running state",
     );
 }

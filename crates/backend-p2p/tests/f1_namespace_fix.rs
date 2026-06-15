@@ -30,7 +30,7 @@ use std::sync::Arc;
 use cascade_backend_p2p::index::FolderIndex;
 use cascade_backend_p2p::sync::SyncEngine;
 use cascade_engine::backend::{MountedBackend, NullBackend};
-use cascade_engine::engine::{Engine, EngineConfig};
+use cascade_engine::engine::{Engine, EngineConfig, NativeEngine};
 use cascade_engine::manage::{Capability, DataAccess, DataAuthority, DeviceId, Grant, Scope};
 use cascade_p2p::identity::DeviceIdentity;
 use cascade_p2p::store::BlockStore;
@@ -43,7 +43,7 @@ use cascade_p2p::store::BlockStore;
 /// `SyncEngine` injected into the engine as the data authority.
 fn make_engine_with_p2p_data_authority(
     register_backend_name: &str,
-) -> (tempfile::TempDir, Arc<Engine>) {
+) -> (tempfile::TempDir, Arc<NativeEngine>) {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("state.db");
     // A real `NullBackend` is mounted so `Engine::new` succeeds. Its

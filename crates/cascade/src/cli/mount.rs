@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
-use cascade_engine::engine::{Engine, EngineConfig};
+use cascade_engine::engine::{EngineConfig, NativeEngine};
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 use cascade_engine::presenter::VfsPresenter;
 use cascade_presenter_nfs::nfs::server::{NfsCacheMode, NfsServer, NfsServerConfig};
@@ -129,7 +129,7 @@ fn validated_web_config(
 /// Build the HTTP API state from a live engine and spawn the server, when the
 /// `web` feature is compiled in and the operator enabled it.
 #[cfg(feature = "web")]
-async fn start_web(engine: &Arc<Engine>, web: &WebOptions) -> Result<WebRuntimeOpt> {
+async fn start_web(engine: &Arc<NativeEngine>, web: &WebOptions) -> Result<WebRuntimeOpt> {
     use cascade_web_api::state::{AppState, NodeIdentity, Readiness};
 
     if !web.enabled {
@@ -167,7 +167,7 @@ async fn start_web(engine: &Arc<Engine>, web: &WebOptions) -> Result<WebRuntimeO
 /// for the API, otherwise do nothing.
 #[cfg(not(feature = "web"))]
 #[allow(clippy::unused_async)]
-async fn start_web(_engine: &Arc<Engine>, web: &WebOptions) -> Result<WebRuntimeOpt> {
+async fn start_web(_engine: &Arc<NativeEngine>, web: &WebOptions) -> Result<WebRuntimeOpt> {
     if web.enabled {
         anyhow::bail!(
             "the HTTP API was requested (--web or [web].enabled) but this binary was built \
@@ -342,8 +342,8 @@ async fn wait_for_shutdown_signal() -> std::io::Result<()> {
 struct PresenterResources {
     /// The engine instance (dropped last so cancel signals reach tasks). Held as
     /// an `Arc` so the management-plane dispatcher wired into the P2P backend at
-    /// startup ([`Engine::wire_manage_dispatch`]) can share ownership.
-    engine: Arc<Engine>,
+    /// startup ([`NativeEngine::wire_manage_dispatch`]) can share ownership.
+    engine: Arc<NativeEngine>,
     /// Join handle for the cache-manager background task.
     engine_handle: cascade_engine::engine::EngineHandle,
     /// Join handle for the sync runner task.
@@ -352,11 +352,14 @@ struct PresenterResources {
 
 impl PresenterResources {
     /// Shut down all components in reverse start order: abort the sync runner,
-    /// signal the engine to cancel, then abort the cache-manager task as a safety net.
+    /// then signal the engine to cancel, which quiesces the cache-manager task.
     fn shutdown(self) {
         self.sync_handle.abort();
         self.engine.shutdown();
-        self.engine_handle.cache_handle.abort();
+        // Abort the cache-manager task immediately rather than waiting up to a
+        // full sweep interval for it to observe the cancel flag `shutdown` set.
+        self.engine_handle.abort();
+        drop(self.engine_handle);
         // `engine` is dropped here, releasing the VFS tree and cancel token.
     }
 }
@@ -739,7 +742,7 @@ async fn try_fskit(
         p2p_relay_shared_secret: p2p.relay_shared_secret,
         backend_factory: Some(cli_backend_factory()),
     };
-    let engine = Arc::new(Engine::new(engine_config)?);
+    let engine = Arc::new(NativeEngine::new(engine_config)?);
     // Wire the management-plane dispatcher into every backend that serves
     // remote management (the P2P backend). Done before the presenter starts so
     // an inbound ManageRequest is authorised and executed rather than refused.
@@ -909,7 +912,7 @@ async fn try_fileprovider(
         p2p_relay_shared_secret: p2p.relay_shared_secret,
         backend_factory: Some(cli_backend_factory()),
     };
-    let engine = Arc::new(Engine::new(engine_config)?);
+    let engine = Arc::new(NativeEngine::new(engine_config)?);
     // Wire the management-plane dispatcher into every backend that serves
     // remote management (the P2P backend). Done before the presenter starts so
     // an inbound ManageRequest is authorised and executed rather than refused.
@@ -1051,7 +1054,7 @@ async fn try_projfs(
         p2p_relay_shared_secret: p2p.relay_shared_secret,
         backend_factory: Some(cli_backend_factory()),
     };
-    let engine = Arc::new(Engine::new(engine_config)?);
+    let engine = Arc::new(NativeEngine::new(engine_config)?);
     // Wire the management-plane dispatcher into every backend that serves
     // remote management (the P2P backend). Done before the presenter starts so
     // an inbound ManageRequest is authorised and executed rather than refused.
@@ -1197,7 +1200,7 @@ async fn try_webdav(
         p2p_relay_shared_secret: p2p.relay_shared_secret,
         backend_factory: Some(cli_backend_factory()),
     };
-    let engine = Arc::new(Engine::new(engine_config)?);
+    let engine = Arc::new(NativeEngine::new(engine_config)?);
     // Wire the management-plane dispatcher into every backend that serves
     // remote management (the P2P backend). Done before the presenter starts so
     // an inbound ManageRequest is authorised and executed rather than refused.
@@ -1341,7 +1344,7 @@ async fn try_fuse(
         p2p_relay_shared_secret: p2p.relay_shared_secret,
         backend_factory: Some(cli_backend_factory()),
     };
-    let engine = Arc::new(Engine::new(engine_config)?);
+    let engine = Arc::new(NativeEngine::new(engine_config)?);
     // Wire the management-plane dispatcher into every backend that serves
     // remote management (the P2P backend). Done before the presenter starts so
     // an inbound ManageRequest is authorised and executed rather than refused.
@@ -1440,7 +1443,7 @@ async fn try_nfs(
         p2p_relay_shared_secret: p2p.relay_shared_secret,
         backend_factory: Some(cli_backend_factory()),
     };
-    let engine = Arc::new(Engine::new(engine_config)?);
+    let engine = Arc::new(NativeEngine::new(engine_config)?);
     // Wire the management-plane dispatcher into every backend that serves
     // remote management (the P2P backend). Done before the presenter starts so
     // an inbound ManageRequest is authorised and executed rather than refused.

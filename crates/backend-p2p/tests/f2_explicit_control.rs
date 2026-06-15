@@ -43,7 +43,7 @@ use cascade_backend_p2p::index::FolderIndex;
 use cascade_backend_p2p::sync::SyncEngine;
 use cascade_engine::backend::{MountedBackend, NullBackend};
 use cascade_engine::db::StateDb;
-use cascade_engine::engine::{Engine, EngineConfig};
+use cascade_engine::engine::{Engine, EngineConfig, NativeEngine};
 use cascade_engine::manage::{
     Capability, DataAccess, DataAuthority, DeviceId, Scope, token::CapabilityToken,
 };
@@ -69,7 +69,7 @@ type TempDir = tempfile::TempDir;
 /// sign tokens.
 fn make_engine_with_real_device_id(
     register_backend_name: &str,
-) -> (TempDir, PathBuf, Arc<Engine>, DeviceIdentity) {
+) -> (TempDir, PathBuf, Arc<NativeEngine>, DeviceIdentity) {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("state.db");
     let p2p_dir = dir.path().join("p2p");
@@ -279,7 +279,7 @@ async fn f2_token_only_data_read_survives_token_expiry() {
     // successful verify above; the engine's in-memory mirror must still
     // carry the per-direction state, so the gate continues to allow read
     // and deny write even though the token no longer verifies.
-    let mirror = engine.explicit_data_control_snapshot();
+    let mirror = engine.explicit_data_control_snapshot().await;
     let stored = mirror
         .get(&(bearer.as_str().to_owned(), "p2p-shared".to_owned()))
         .expect("the explicit-control bit must persist after the token lapses");

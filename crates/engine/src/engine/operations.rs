@@ -9,13 +9,14 @@ use anyhow::Result;
 
 use super::Engine;
 use crate::manage::Scope;
+use crate::portable::{Clock, RuntimeHandle};
 
 /// Merge a parsed `.cascade` fragment rooted at `folder` into the node's
 /// rule set.
 ///
 /// See [`Engine::config_push`] for the full contract.
-pub(super) fn config_push(
-    engine: &Engine,
+pub(super) async fn config_push<R: RuntimeHandle, C: Clock>(
+    engine: &Engine<R, C>,
     folder: &str,
     config: &cascade_config::CascadeConfig,
 ) -> Result<String> {
@@ -50,14 +51,15 @@ pub(super) fn config_push(
 
     let pins_applied = pin_paths.len();
     for path in pin_paths {
-        engine.db.add_pin_rule(&path, true, None)?;
+        engine.storage.add_pin_rule(&path, true, None).await?;
     }
 
     let policies_applied = policy_inputs.len();
     for (path, max_age, max_file_size, priority) in policy_inputs {
         engine
-            .db
-            .add_lifecycle_policy(&path, max_age, max_file_size, priority, None)?;
+            .storage
+            .add_lifecycle_policy(&path, max_age, max_file_size, priority, None)
+            .await?;
     }
 
     Ok(format!(
@@ -66,22 +68,23 @@ pub(super) fn config_push(
 }
 
 /// Set a single lifecycle policy on the node.
-pub(super) fn policy_set(
-    engine: &Engine,
+pub(super) async fn policy_set<R: RuntimeHandle, C: Clock>(
+    engine: &Engine<R, C>,
     path_glob: &str,
     max_age_secs: Option<i64>,
     max_file_size: Option<i64>,
     priority: i32,
 ) -> Result<String> {
     engine
-        .db
-        .add_lifecycle_policy(path_glob, max_age_secs, max_file_size, priority, None)?;
+        .storage
+        .add_lifecycle_policy(path_glob, max_age_secs, max_file_size, priority, None)
+        .await?;
     Ok(format!("lifecycle policy set for {path_glob}"))
 }
 
 /// Register and mount a backend at runtime.
-pub(super) fn backend_add(
-    engine: &Engine,
+pub(super) async fn backend_add<R: RuntimeHandle, C: Clock>(
+    engine: &Engine<R, C>,
     name: &str,
     backend_type: &str,
     mount_path: &str,
@@ -94,13 +97,16 @@ pub(super) fn backend_add(
     // Persist the mount as the source of truth so a restart re-mounts the
     // backend at the same place, then mount it live at the resolved prefix
     // (an explicit `"/"` resolves to the empty prefix — the at-root case).
-    engine.db.register_backend(
-        name,
-        backend_type,
-        backend.display_name(),
-        Some(mount_path),
-        Some(config_toml),
-    )?;
+    engine
+        .storage
+        .register_backend(
+            name,
+            backend_type,
+            backend.display_name(),
+            Some(mount_path),
+            Some(config_toml),
+        )
+        .await?;
     let prefix = crate::backend::mount_prefix_from_str(mount_path);
     engine.mount_backend(prefix, backend);
     Ok(format!(
@@ -109,11 +115,15 @@ pub(super) fn backend_add(
 }
 
 /// Unmount and deregister a backend by name.
-pub(super) fn backend_remove(engine: &Engine, name: &str, mount_path: &str) -> Result<String> {
+pub(super) async fn backend_remove<R: RuntimeHandle, C: Clock>(
+    engine: &Engine<R, C>,
+    name: &str,
+    mount_path: &str,
+) -> Result<String> {
     // Resolve through the shared mapping so a backend mounted at `"/"` (the
     // empty prefix) is unmounted by the same prefix it was mounted under.
     engine.unmount_backend(&crate::backend::mount_prefix_from_str(mount_path));
-    let removed = engine.db.remove_backend(name)?;
+    let removed = engine.storage.remove_backend(name).await?;
     Ok(if removed {
         format!("backend {name} removed from {mount_path}")
     } else {
@@ -128,28 +138,41 @@ pub(super) fn backend_remove(engine: &Engine, name: &str, mount_path: &str) -> R
 /// Files matching `path_glob` that exceed `max_bytes` will be skipped during
 /// sync. Rules are ordered by `priority` (higher wins). An optional
 /// `conditions` expression is evaluated against the engine's `EvalContext`.
-pub(super) fn add_max_file_length_rule(
-    engine: &Engine,
+pub(super) async fn add_max_file_length_rule<R: RuntimeHandle, C: Clock>(
+    engine: &Engine<R, C>,
     path_glob: &str,
     max_bytes: u64,
     priority: i32,
     conditions: Option<&str>,
 ) -> Result<()> {
     engine
-        .db
+        .storage
         .add_max_file_length_rule(path_glob, max_bytes, priority, conditions)
+        .await
+        .map_err(Into::into)
 }
 
 /// List all max file length rules, ordered by priority descending.
-pub(super) fn list_max_file_length_rules(
-    engine: &Engine,
+pub(super) async fn list_max_file_length_rules<R: RuntimeHandle, C: Clock>(
+    engine: &Engine<R, C>,
 ) -> Result<Vec<crate::db::MaxFileLengthRecord>> {
-    engine.db.list_max_file_length_rules()
+    engine
+        .storage
+        .list_max_file_length_rules()
+        .await
+        .map_err(Into::into)
 }
 
 /// Remove a max file length rule by id. Returns `true` if a row was removed.
-pub(super) fn remove_max_file_length_rule(engine: &Engine, id: i64) -> Result<bool> {
-    engine.db.remove_max_file_length_rule(id)
+pub(super) async fn remove_max_file_length_rule<R: RuntimeHandle, C: Clock>(
+    engine: &Engine<R, C>,
+    id: i64,
+) -> Result<bool> {
+    engine
+        .storage
+        .remove_max_file_length_rule(id)
+        .await
+        .map_err(Into::into)
 }
 
 /// Root a config rule's path under the fragment's target folder, joining

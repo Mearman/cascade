@@ -29,14 +29,17 @@ use crate::backend::{Backend, BackendFactory, MountedBackend, NullBackend};
 use crate::cache::manager::{CacheManager, CacheManagerConfig};
 use crate::changefeed::ChangeFeed;
 use crate::config::ConfigResolver;
-use crate::db::{PinRuleRecord, StateDb};
+use crate::db::PinRuleRecord;
+#[cfg(feature = "native")]
+use crate::db::StateDb;
 use crate::manage::Grant;
 #[cfg(feature = "p2p")]
 use crate::manage::{DataAuthority, ManageDispatch};
 #[cfg(feature = "p2p")]
 use crate::p2p_bridge::P2pBridge;
-use crate::portable::native::{SqliteStorage, StdFileSystem, TokioRuntimeHandle};
-use crate::portable::{FileSystem, StateStorage};
+#[cfg(feature = "native")]
+use crate::portable::native::{NativeClock, SqliteStorage, StdFileSystem, TokioRuntimeHandle};
+use crate::portable::{Clock, FileSystem, RuntimeHandle, StateStorage};
 use crate::presenter::VfsPresenter;
 use crate::sync::runner::{MountedRunnerBackend, SyncRunner};
 use crate::vfs::{NEUTRAL_ROOT_ID, VfsTree};
@@ -126,18 +129,23 @@ impl fmt::Debug for EngineConfig {
 /// trait object (for use by the cache manager and sync runner, which are
 /// portable). Cancellation uses an `AtomicBool` flag — runtime-agnostic and
 /// observable by both native and portable workers.
-pub struct Engine {
+pub struct Engine<R: RuntimeHandle, C: Clock> {
     /// Native state database — used directly by operations, management plane,
-    /// and external crates via [`Engine::db`].
+    /// and external crates via [`Engine::db`]. Present only on native builds; a
+    /// bare-portable host has no concrete `SQLite` database to expose.
+    #[cfg(feature = "native")]
     db: Arc<StateDb>,
-    /// Portable state storage — wraps the same `StateDb` behind the trait.
+    /// Portable state storage — the backing-store-independent contract every
+    /// portable code path reads and writes through.
     storage: Arc<dyn StateStorage>,
     /// Portable filesystem adapter.
     fs: Arc<dyn FileSystem>,
     /// Runtime handle for spawning and timers.
-    runtime: TokioRuntimeHandle,
+    runtime: R,
+    /// Wall-clock port — injected so the core names no platform time API.
+    clock: C,
     vfs: Arc<RwLock<VfsTree>>,
-    cache: CacheManager<TokioRuntimeHandle>,
+    cache: CacheManager<R>,
     config: Arc<ConfigResolver>,
     #[cfg(feature = "p2p")]
     p2p: Option<P2pBridge>,
@@ -160,7 +168,7 @@ pub struct Engine {
     exec: Option<std::sync::Arc<dyn cascade_exec::ExecProvider>>,
 }
 
-impl fmt::Debug for Engine {
+impl<R: RuntimeHandle, C: Clock> fmt::Debug for Engine<R, C> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut binding = f.debug_struct("Engine");
         #[cfg(feature = "p2p")]
@@ -171,30 +179,25 @@ impl fmt::Debug for Engine {
     }
 }
 
-impl Engine {
-    /// Resolve a backend's effective mount, preferring the persisted value.
-    ///
-    /// The database's `backends.mount_path` is the source of truth on restart:
-    /// a runtime-added backend recorded its mount there, so re-reading it lets
-    /// the backend reclaim its placement rather than reverting to the default
-    /// derived from its id. When no row exists yet (first run for that backend)
-    /// the configured mount on the [`MountedBackend`] is used. A persisted row
-    /// whose `mount_path` is `NULL` means "default to the backend id", which is
-    /// represented as a `None` mount.
-    fn resolve_mount(db: &StateDb, mounted: &MountedBackend) -> Result<MountedBackend> {
-        let effective_mount = db
-            .get_backend_mount(mounted.backend.id())?
-            .unwrap_or_else(|| mounted.mount.clone());
-        Ok(MountedBackend::new(
-            effective_mount,
-            mounted.backend.clone(),
-        ))
-    }
+/// The native engine instantiation.
+///
+/// The concrete `Engine` every native consumer (the daemon, the presenters, the
+/// web API) names. A bare-portable host parameterises `Engine` over its own
+/// runtime and clock and so never refers to this alias.
+#[cfg(feature = "native")]
+pub type NativeEngine = Engine<TokioRuntimeHandle, NativeClock>;
 
-    /// Create and initialise a new engine.
+#[cfg(feature = "native")]
+impl Engine<TokioRuntimeHandle, NativeClock> {
+    /// Create and initialise a new native engine.
     ///
-    /// Opens the state database, creates the VFS tree, registers backends,
-    /// and wires up the cache manager and optional P2P bridge.
+    /// Opens the `SQLite` state database, builds the native runtime, storage,
+    /// filesystem, and clock adapters, then performs the same construction
+    /// sequence (VFS tree, backend registration, cache manager) that
+    /// `with_ports` runs for non-native builds — over the concrete synchronous
+    /// `StateDb` here rather than the async storage port. The optional P2P
+    /// bridge, a native-and-`p2p` concern that needs the concrete database
+    /// handle, is wired in afterwards.
     pub fn new(config: EngineConfig) -> Result<Self> {
         let backends = config.backends;
         let backend_factory = config.backend_factory;
@@ -206,16 +209,9 @@ impl Engine {
         let db = Arc::new(StateDb::open(&config.db_path)?);
         info!(path = %config.db_path.display(), "state database opened");
 
-        // The VFS root is a neutral container that owns no content of its own;
-        // `VfsTree::read_dir` injects the mounted child directories. Every
-        // configured backend mounts beneath it as a child — including a backend
-        // at the empty prefix (the `"/"` case), which routes as the catch-all
-        // fallback and so reproduces the single-backend-at-root path shape.
+        // Build the VFS tree, resolving and persisting each backend's mount
+        // synchronously through the concrete database.
         let mut vfs_tree = VfsTree::new(Arc::new(NullBackend::new(NEUTRAL_ROOT_ID)));
-
-        // Reject duplicate mount prefixes loudly: two backends at the same
-        // prefix would shadow each other and silently misroute. The empty
-        // prefix (a backend at `"/"`) is a single slot like any other.
         let mut claimed: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
         for mounted in &backends {
             // On restart, the persisted mount in the database is the source of
@@ -223,29 +219,17 @@ impl Engine {
             // fresh `EngineConfig` would otherwise default it back to its id and
             // lose the placement. Fall back to the configured mount when the
             // backend has no persisted row yet (first run for that backend).
-            let resolved = Self::resolve_mount(&db, mounted)?;
+            let effective_mount = db
+                .get_backend_mount(mounted.backend.id())?
+                .unwrap_or_else(|| mounted.mount.clone());
+            let resolved = MountedBackend::new(effective_mount, mounted.backend.clone());
             let prefix = resolved.resolve_prefix();
-            if !claimed.insert(prefix.clone()) {
-                // An empty prefix is the at-root case; name it so the message is
-                // not a bare, confusing empty path.
-                let shown = if prefix.as_os_str().is_empty() {
-                    "/ (root)".to_owned()
-                } else {
-                    prefix.display().to_string()
-                };
-                anyhow::bail!(
-                    "duplicate mount path {shown}: backend {} collides with another mount",
-                    mounted.backend.id(),
-                );
-            }
-            // Persist the mount for every backend so a later restart hydrates the
-            // same placement from the database.
-            let persisted_mount = resolved.mount.as_deref();
+            Self::claim_prefix(&mut claimed, &prefix, mounted)?;
             db.register_backend(
                 mounted.backend.id(),
                 "unknown",
                 mounted.backend.display_name(),
-                persisted_mount,
+                resolved.mount.as_deref(),
                 None,
             )?;
             vfs_tree.mount(prefix, mounted.backend.clone());
@@ -253,23 +237,22 @@ impl Engine {
         let vfs = Arc::new(RwLock::new(vfs_tree));
         info!(backends = backends.len(), "VFS tree initialised");
 
-        // Config resolver for .cascade file filtering.
-        let config_resolver = Arc::new(ConfigResolver::new(config.mount_point.clone()));
-
-        // Portable adapters wrapping the native StateDb.
+        // Native ports: the tokio runtime, the SQLite-backed storage wrapping
+        // the database just opened, the std filesystem, and the chrono clock.
         let runtime = TokioRuntimeHandle::current();
         let storage: Arc<dyn StateStorage> =
             Arc::new(SqliteStorage::new(db.clone(), runtime.clone()));
         let fs: Arc<dyn FileSystem> = Arc::new(StdFileSystem);
+        let clock = NativeClock;
 
-        // Cache manager backed by portable storage.
+        let config_resolver = Arc::new(ConfigResolver::new(config.mount_point.clone()));
         let cache = CacheManager::new(
             storage.clone(),
             runtime.clone(),
             CacheManagerConfig::default(),
         );
 
-        // P2P bridge (optional).
+        // P2P bridge (optional) — a native-and-`p2p` concern needing the db.
         #[cfg(feature = "p2p")]
         let p2p = if config.enable_p2p {
             let p2p_dir = config.p2p_data_dir.unwrap_or_else(|| {
@@ -305,6 +288,7 @@ impl Engine {
             storage,
             fs,
             runtime,
+            clock,
             vfs,
             cache,
             config: config_resolver,
@@ -330,6 +314,124 @@ impl Engine {
     ) -> Self {
         self.exec = Some(exec);
         self
+    }
+}
+
+impl<R: RuntimeHandle, C: Clock> Engine<R, C> {
+    /// Create and initialise an engine from injected ports.
+    ///
+    /// This is the portable construction path: it depends only on the
+    /// [`StateStorage`], [`RuntimeHandle`], and [`Clock`] contracts, naming no
+    /// host-only runtime or storage type, and it is asynchronous because the
+    /// storage contract is. It builds the VFS tree, registers and mounts every
+    /// configured backend (resolving each one's persisted mount through the
+    /// storage contract), and wires the cache manager.
+    ///
+    /// A native host constructs the engine through [`Engine::new`] instead — that
+    /// path owns the concrete `SQLite` database and resolves mounts
+    /// synchronously, and also wires the optional P2P bridge, which is a
+    /// native-and-`p2p` concern this portable path does not know about. The two
+    /// constructors are mutually exclusive by feature: `new` exists only on
+    /// native builds, `with_ports` only on bare-portable ones.
+    #[cfg(not(feature = "native"))]
+    pub async fn with_ports(
+        config: EngineConfig,
+        storage: Arc<dyn StateStorage>,
+        fs: Arc<dyn FileSystem>,
+        runtime: R,
+        clock: C,
+    ) -> Result<Self> {
+        let backends = config.backends;
+        let backend_factory = config.backend_factory;
+        if backends.is_empty() {
+            anyhow::bail!("at least one backend is required");
+        }
+
+        // The VFS root is a neutral container that owns no content of its own;
+        // `VfsTree::read_dir` injects the mounted child directories. Every
+        // configured backend mounts beneath it as a child — including a backend
+        // at the empty prefix (the `"/"` case), which routes as the catch-all
+        // fallback and so reproduces the single-backend-at-root path shape.
+        let mut vfs_tree = VfsTree::new(Arc::new(NullBackend::new(NEUTRAL_ROOT_ID)));
+
+        let mut claimed: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        for mounted in &backends {
+            // On restart, the persisted mount in storage is the source of truth —
+            // a runtime-added backend recorded its mount there, and a fresh
+            // `EngineConfig` would otherwise default it back to its id and lose
+            // the placement. Fall back to the configured mount when the backend
+            // has no persisted row yet (first run for that backend).
+            let effective_mount = storage
+                .get_backend_mount(mounted.backend.id())
+                .await?
+                .unwrap_or_else(|| mounted.mount.clone());
+            let resolved = MountedBackend::new(effective_mount, mounted.backend.clone());
+            let prefix = resolved.resolve_prefix();
+            Self::claim_prefix(&mut claimed, &prefix, mounted)?;
+            storage
+                .register_backend(
+                    mounted.backend.id(),
+                    "unknown",
+                    mounted.backend.display_name(),
+                    resolved.mount.as_deref(),
+                    None,
+                )
+                .await?;
+            vfs_tree.mount(prefix, mounted.backend.clone());
+        }
+        let vfs = Arc::new(RwLock::new(vfs_tree));
+        info!(backends = backends.len(), "VFS tree initialised");
+
+        let config_resolver = Arc::new(ConfigResolver::new(config.mount_point.clone()));
+        let cache = CacheManager::new(
+            storage.clone(),
+            runtime.clone(),
+            CacheManagerConfig::default(),
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        Ok(Self {
+            storage,
+            fs,
+            runtime,
+            clock,
+            vfs,
+            cache,
+            config: config_resolver,
+            #[cfg(feature = "p2p")]
+            p2p: None,
+            change_feed: Arc::new(ChangeFeed::new()),
+            backend_factory,
+            cancel,
+            #[cfg(feature = "exec")]
+            exec: None,
+        })
+    }
+
+    /// Reject a duplicate mount prefix loudly.
+    ///
+    /// Two backends at the same prefix would shadow each other and silently
+    /// misroute. The empty prefix (a backend at `"/"`) is a single slot like any
+    /// other. Returns the prefix as freshly claimed, or fails when it collides.
+    fn claim_prefix(
+        claimed: &mut std::collections::HashSet<PathBuf>,
+        prefix: &Path,
+        mounted: &MountedBackend,
+    ) -> Result<()> {
+        if claimed.insert(prefix.to_path_buf()) {
+            return Ok(());
+        }
+        // An empty prefix is the at-root case; name it so the message is not a
+        // bare, confusing empty path.
+        let shown = if prefix.as_os_str().is_empty() {
+            "/ (root)".to_owned()
+        } else {
+            prefix.display().to_string()
+        };
+        anyhow::bail!(
+            "duplicate mount path {shown}: backend {} collides with another mount",
+            mounted.backend.id(),
+        )
     }
 
     /// The engine's shared per-parent change index.
@@ -408,10 +510,7 @@ impl Engine {
     /// The runner receives a clone of the engine's cancellation flag, so
     /// [`Engine::shutdown`] / [`Engine::stop`] stop the sync loop along with the
     /// cache worker.
-    pub fn create_sync_runner(
-        &self,
-        presenter: Arc<dyn VfsPresenter>,
-    ) -> SyncRunner<TokioRuntimeHandle> {
+    pub fn create_sync_runner(&self, presenter: Arc<dyn VfsPresenter>) -> SyncRunner<R> {
         // Collect the mounted child backends from the VFS tree, each paired with
         // the mount prefix it is mounted at. Sourcing both halves from the same
         // mount table the router resolves on means the prefix the runner stamps
@@ -429,15 +528,19 @@ impl Engine {
             .collect();
         drop(tree);
 
-        SyncRunner::new(
+        let runner = SyncRunner::new(
             self.storage.clone(),
             self.fs.clone(),
             self.runtime.clone(),
             backends,
             presenter,
             self.config.clone(),
-        )
-        .with_change_feed(self.change_feed.clone())
+        );
+        // The per-parent change feed the File Provider presenter consumes is a
+        // native-only concern; a bare-portable build has no such presenter.
+        #[cfg(feature = "native")]
+        let runner = runner.with_change_feed(self.change_feed.clone());
+        runner
     }
 
     /// The engine's shared cancellation flag.
@@ -460,9 +563,9 @@ impl Engine {
             self.runtime.clone(),
             CacheManagerConfig::default(),
         );
-        let cache_handle = tokio::spawn(async move {
+        let cache_handle = self.runtime.spawn_joinable(Box::pin(async move {
             cache.run_with_flag(cancel).await;
-        });
+        }));
 
         info!("engine started");
 
@@ -511,23 +614,23 @@ impl Engine {
     /// Files matching `path_glob` that exceed `max_bytes` will be skipped during
     /// sync. Rules are ordered by `priority` (higher wins). An optional
     /// `conditions` expression is evaluated against the engine's `EvalContext`.
-    pub fn add_max_file_length_rule(
+    pub async fn add_max_file_length_rule(
         &self,
         path_glob: &str,
         max_bytes: u64,
         conditions: Option<&str>,
     ) -> Result<()> {
-        operations::add_max_file_length_rule(self, path_glob, max_bytes, 0, conditions)
+        operations::add_max_file_length_rule(self, path_glob, max_bytes, 0, conditions).await
     }
 
     /// List all max file length rules, ordered by priority descending.
-    pub fn list_max_file_length_rules(&self) -> Result<Vec<crate::db::MaxFileLengthRecord>> {
-        operations::list_max_file_length_rules(self)
+    pub async fn list_max_file_length_rules(&self) -> Result<Vec<crate::db::MaxFileLengthRecord>> {
+        operations::list_max_file_length_rules(self).await
     }
 
     /// Remove a max file length rule by id. Returns `true` if a row was removed.
-    pub fn remove_max_file_length_rule(&self, id: i64) -> Result<bool> {
-        operations::remove_max_file_length_rule(self, id)
+    pub async fn remove_max_file_length_rule(&self, id: i64) -> Result<bool> {
+        operations::remove_max_file_length_rule(self, id).await
     }
 
     /// Merge a parsed `.cascade` fragment rooted at `folder` into the node's
@@ -550,12 +653,12 @@ impl Engine {
     /// traversal that climbs out — fails the whole push loudly, and **nothing**
     /// is applied. The escape check is performed up front so a later rule
     /// escaping cannot leave earlier rules already written to the database.
-    pub fn config_push(
+    pub async fn config_push(
         &self,
         folder: &str,
         config: &cascade_config::CascadeConfig,
     ) -> Result<String> {
-        operations::config_push(self, folder, config)
+        operations::config_push(self, folder, config).await
     }
 
     /// Set a single lifecycle policy on the node.
@@ -563,14 +666,14 @@ impl Engine {
     /// Delegates to the same `add_lifecycle_policy` state-database operation the
     /// local config-merge path uses, so a pushed policy behaves identically to
     /// one declared in a `.cascade` file.
-    pub fn policy_set(
+    pub async fn policy_set(
         &self,
         path_glob: &str,
         max_age_secs: Option<i64>,
         max_file_size: Option<i64>,
         priority: i32,
     ) -> Result<String> {
-        operations::policy_set(self, path_glob, max_age_secs, max_file_size, priority)
+        operations::policy_set(self, path_glob, max_age_secs, max_file_size, priority).await
     }
 
     /// Register and mount a backend at runtime.
@@ -580,22 +683,22 @@ impl Engine {
     /// in the state database, and mounts it into the live VFS tree at
     /// `mount_path`. Fails loudly when no factory was injected rather than
     /// silently dropping the request.
-    pub fn backend_add(
+    pub async fn backend_add(
         &self,
         name: &str,
         backend_type: &str,
         mount_path: &str,
         config_toml: &str,
     ) -> Result<String> {
-        operations::backend_add(self, name, backend_type, mount_path, config_toml)
+        operations::backend_add(self, name, backend_type, mount_path, config_toml).await
     }
 
     /// Unmount and deregister a backend by name.
     ///
     /// Unmounts it from the live VFS tree and removes its state-database row,
     /// the inverse of [`Engine::backend_add`].
-    pub fn backend_remove(&self, name: &str, mount_path: &str) -> Result<String> {
-        operations::backend_remove(self, name, mount_path)
+    pub async fn backend_remove(&self, name: &str, mount_path: &str) -> Result<String> {
+        operations::backend_remove(self, name, mount_path).await
     }
 
     /// Restart the engine's cache-manager worker.
@@ -634,8 +737,8 @@ impl Engine {
     /// Delegates to the same `insert_grant` operation the local grant store
     /// uses. Authorisation and the subset/escalation check are the dispatcher's
     /// responsibility — this is the raw state mutation.
-    pub fn grant_add(&self, grant: &Grant) -> Result<String> {
-        let id = self.db.insert_grant(grant)?;
+    pub async fn grant_add(&self, grant: &Grant) -> Result<String> {
+        let id = self.storage.insert_grant(grant).await?;
         Ok(format!(
             "grant {id} added: {} over {:?} for {}",
             grant.capability.as_wire(),
@@ -645,8 +748,8 @@ impl Engine {
     }
 
     /// Revoke a grant by its row id.
-    pub fn grant_revoke(&self, grant_id: i64) -> Result<String> {
-        let removed = self.db.revoke_grant(grant_id)?;
+    pub async fn grant_revoke(&self, grant_id: i64) -> Result<String> {
+        let removed = self.storage.revoke_grant(grant_id).await?;
         Ok(if removed {
             format!("grant {grant_id} revoked")
         } else {
@@ -655,11 +758,13 @@ impl Engine {
     }
 
     /// Get engine status — running state, mounted backends, cache stats.
-    #[must_use]
-    pub fn status(&self) -> EngineStatus {
+    ///
+    /// Reads through the asynchronous storage contract, so it is itself async.
+    pub async fn status(&self) -> EngineStatus {
         let backends = self
-            .db
+            .storage
             .list_backends()
+            .await
             .map(|records| {
                 records
                     .into_iter()
@@ -668,18 +773,19 @@ impl Engine {
             })
             .unwrap_or_default();
 
-        // Cache stats are async on the portable path. For the synchronous
-        // status snapshot, read directly from the native DB.
         let online = self
-            .db
-            .list_files_by_cache_state(crate::types::CacheState::Online);
+            .storage
+            .list_files_by_cache_state(crate::types::CacheState::Online)
+            .await;
         let cached = self
-            .db
-            .list_files_by_cache_state(crate::types::CacheState::Cached);
+            .storage
+            .list_files_by_cache_state(crate::types::CacheState::Cached)
+            .await;
         let pinned = self
-            .db
-            .list_files_by_cache_state(crate::types::CacheState::Pinned);
-        let total_size = self.db.cache_size();
+            .storage
+            .list_files_by_cache_state(crate::types::CacheState::Pinned)
+            .await;
+        let total_size = self.storage.cache_size().await;
 
         let cache_stats = match (online, cached, pinned, total_size) {
             (Ok(o), Ok(c), Ok(p), Ok(t)) => CacheStatsSnapshot {
@@ -714,8 +820,22 @@ impl Engine {
         &self.vfs
     }
 
-    /// Get the state database (for presenters to use).
+    /// The injected wall-clock port.
+    ///
+    /// Code that timestamps engine-side state reads the current instant through
+    /// this rather than a platform time API, so the same path holds on any
+    /// target.
     #[must_use]
+    pub const fn clock(&self) -> &C {
+        &self.clock
+    }
+
+    /// Get the state database (for presenters to use).
+    ///
+    /// Native-only: a bare-portable host has no concrete `SQLite` handle to
+    /// expose. Portable consumers read through the [`StateStorage`] contract.
+    #[must_use]
+    #[cfg(feature = "native")]
     pub const fn db(&self) -> &Arc<StateDb> {
         &self.db
     }
@@ -738,11 +858,10 @@ impl Engine {
     /// the last successful token verify. Exists for the F2 integration
     /// test to assert the in-memory mirror reflects the durable state
     /// the engine just observed.
-    #[must_use]
-    pub fn explicit_data_control_snapshot(
+    pub async fn explicit_data_control_snapshot(
         &self,
     ) -> std::collections::HashMap<(String, String), (bool, bool)> {
-        let Ok(rows) = self.db.list_data_explicit_control() else {
+        let Ok(rows) = self.storage.list_data_explicit_control().await else {
             return std::collections::HashMap::new();
         };
         rows.into_iter()
@@ -754,8 +873,21 @@ impl Engine {
 /// Handle returned by [`Engine::start()`] for monitoring background tasks.
 #[derive(Debug)]
 pub struct EngineHandle {
-    /// Join handle for the cache manager background task.
-    pub cache_handle: tokio::task::JoinHandle<()>,
+    /// Join handle for the cache manager background task. A portable handle so
+    /// the same type is returned whichever runtime spawned the task.
+    pub cache_handle: crate::portable::JoinHandle<()>,
+}
+
+impl EngineHandle {
+    /// Cancel the cache-manager task immediately.
+    ///
+    /// [`Engine::shutdown`] only sets the cooperative cancel flag, which a task
+    /// parked in its sweep sleep observes no sooner than the next interval.
+    /// Aborting kills the task at once, matching the daemon's prompt-teardown
+    /// expectation. A no-op on runtimes without a cancellation primitive.
+    pub fn abort(&self) {
+        self.cache_handle.abort();
+    }
 }
 
 /// Snapshot of current engine status.

@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 #[cfg(target_arch = "wasm32")]
-use super::{BoxFuture, JoinHandle, RuntimeHandle};
+use super::{BoxFuture, Clock, JoinHandle, RuntimeHandle};
 use super::{StateStorage, StorageError};
 use crate::db::{
     AuditEntry, AuditRecord, BackendRecord, DirtyFileRecord, ExplicitControlRecord, GrantRecord,
@@ -47,6 +47,14 @@ pub struct WasmRuntimeHandle;
 impl RuntimeHandle for WasmRuntimeHandle {
     fn spawn(&self, fut: BoxFuture<()>) {
         wasm_bindgen_futures::spawn_local(fut);
+    }
+
+    fn spawn_joinable(&self, fut: BoxFuture<()>) -> JoinHandle<()> {
+        // WASM is single-threaded; spawn_local does not give back a joinable
+        // handle. Resolve immediately after spawning: the caller gets a handle
+        // that resolves to `Ok(())` without blocking the event loop.
+        wasm_bindgen_futures::spawn_local(fut);
+        JoinHandle::new(Box::pin(async { Ok(()) }))
     }
 
     fn spawn_blocking<F, R>(&self, f: F) -> JoinHandle<R>
@@ -81,6 +89,32 @@ impl RuntimeHandle for WasmRuntimeHandle {
             // we simply return rather than panicking.
             let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
         })
+    }
+}
+
+// ─────────────────────────── Clock ───────────────────────────
+
+/// [`Clock`] backed by the JS `Date.now()` millisecond timestamp.
+///
+/// Available on `wasm32` only, matching the pattern used by
+/// [`WasmRuntimeHandle`].
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WasmClock;
+
+#[cfg(target_arch = "wasm32")]
+impl Clock for WasmClock {
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        // `js_sys::Date::now()` returns milliseconds since the Unix epoch as an
+        // `f64`. `num_traits::cast` performs a range-checked float-to-integer
+        // conversion that returns `None` rather than silently truncating an
+        // out-of-range or non-finite reading, so no lossy `as` cast is needed.
+        // A reading that does not fit i64 (never produced by a real clock) falls
+        // back to the epoch floor.
+        let millis_f = js_sys::Date::now().round();
+        let millis = num_traits::cast::<f64, i64>(millis_f).unwrap_or(i64::MIN);
+        chrono::DateTime::from_timestamp_millis(millis)
+            .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC)
     }
 }
 
@@ -1142,6 +1176,21 @@ impl StateStorage for WasmStateStorage {
             .explicit_control
             .retain(|r| !(r.peer_device == peer_device && r.folder_id == folder_id));
         Ok(inner.explicit_control.len() < before)
+    }
+
+    // ── Backend mount lookup ──
+
+    async fn get_backend_mount(&self, id: &str) -> Result<Option<Option<String>>, StorageError> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|e| StorageError::Unavailable(e.to_string()))?;
+        // Find the backend record; None if not registered, Some(mount_path) if registered.
+        Ok(inner
+            .backends
+            .iter()
+            .find(|b| b.id == id)
+            .map(|b| b.mount_path.clone()))
     }
 }
 

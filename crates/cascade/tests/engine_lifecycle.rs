@@ -10,9 +10,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use cascade_engine::backend::{MountedBackend, NullBackend};
-use cascade_engine::engine::{Engine, EngineConfig};
+use cascade_engine::engine::{Engine, EngineConfig, NativeEngine};
 
-fn make_engine_with_backends(backends: Vec<Arc<dyn cascade_engine::backend::Backend>>) -> Engine {
+fn make_engine_with_backends(
+    backends: Vec<Arc<dyn cascade_engine::backend::Backend>>,
+) -> NativeEngine {
     let dir = tempfile::tempdir().unwrap();
     Engine::new(EngineConfig {
         db_path: dir.path().join("state.db"),
@@ -37,7 +39,7 @@ async fn full_engine_lifecycle() {
     let engine = make_engine_with_backends(vec![Arc::new(NullBackend::new("test"))]);
 
     // Engine should report as running before shutdown.
-    let status = engine.status();
+    let status = engine.status().await;
     assert!(status.running);
     assert_eq!(status.backends.len(), 1);
 
@@ -51,9 +53,9 @@ async fn full_engine_lifecycle() {
 
     // Shut down.
     engine.shutdown();
-    handle.cache_handle.abort();
+    drop(handle);
 
-    let status = engine.status();
+    let status = engine.status().await;
     assert!(!status.running);
 }
 
@@ -64,7 +66,7 @@ async fn engine_with_two_backends() {
         Arc::new(NullBackend::new("work")),
     ]);
 
-    let status = engine.status();
+    let status = engine.status().await;
     assert_eq!(status.backends.len(), 2);
 
     // Both backends mount as children of the neutral root.
@@ -81,7 +83,7 @@ async fn engine_start_stop_idempotent() {
     let handle = engine.start().unwrap();
     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     engine.shutdown();
-    handle.cache_handle.abort();
+    drop(handle);
 }
 
 #[tokio::test]

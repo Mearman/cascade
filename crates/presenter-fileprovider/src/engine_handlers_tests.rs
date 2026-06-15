@@ -1408,8 +1408,7 @@ async fn enumerate_changes_uses_feed_delta_when_recorded() -> anyhow::Result<()>
     };
     handlers
         .change_feed
-        .record("stub", &[Change::Created(ghost1), Change::Created(ghost2)])
-        .await;
+        .record("stub", &[Change::Created(ghost1), Change::Created(ghost2)]);
 
     // A V2 cursor naming (stub, root) with feed_seq=0 queries the feed
     // for events strictly after seq 0 — i.e. the second recorded
