@@ -53,6 +53,26 @@ the dylib and bake in an un-shippable absolute load path). The result is a
 self-contained appex with the Rust engine compiled in — `otool -L` shows no
 `libcascade_ffi` dependency.
 
+## Release artifacts
+
+CI uploads the ad-hoc-signed Simulator app as a per-run artifact
+(`cascade-ios-simulator-app`) — unzip and drag into a booted simulator.
+
+A signed `.ipa` for real devices is built and attached to GitHub releases by
+the `release-ios-ipa` CI job, but only when these repository secrets are set
+(it skips without failing otherwise):
+
+- `IOS_DIST_CERT_P12` — base64 of the signing certificate `.p12`
+- `IOS_DIST_CERT_PASSWORD` — its export password
+- `IOS_KEYCHAIN_PASSWORD` — any password for the temporary CI keychain
+- `IOS_PROVISIONING_PROFILE` — base64 of the `.mobileprovision`
+- `IOS_TEAM_ID` — the Apple Developer team id
+- `IOS_EXPORT_METHOD` — `development`, `ad-hoc`, or `app-store`
+
+The profile must cover the bundle ids `co.uk.mearman.cascade.ios` and
+`co.uk.mearman.cascade.ios.fileprovider`; re-add the shared app group (see
+`Extension/Resources/Extension.entitlements`) if the profile authorises it.
+
 ## Known limits
 
 - **Real device needs a provisioning profile.** iOS requires a profile to

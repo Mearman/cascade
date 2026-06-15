@@ -160,6 +160,19 @@ jobs:
           -project swift/CascadeFileProvideriOS/CascadeFileProvideriOS.xcodeproj
           -target CascadeHostApp -sdk iphonesimulator -configuration Debug
           ARCHS=arm64 ONLY_ACTIVE_ARCH=NO build
+      - name: Package the Simulator app
+        # The ad-hoc signed Simulator .app — drag into a booted simulator to run.
+        # Not a device build: a real iPhone needs a signed .ipa (see release-ios-ipa).
+        run: >
+          ditto -c -k --keepParent
+          swift/CascadeFileProvideriOS/build/Debug-iphonesimulator/CascadeHostApp.app
+          "$RUNNER_TEMP/cascade-ios-simulator-app.zip"
+      - name: Upload the Simulator app (CI artifact)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cascade-ios-simulator-app
+          path: ${{ runner.temp }}/cascade-ios-simulator-app.zip
+          if-no-files-found: error
 
   # Builds the Android DocumentsProvider app: cross-compiles the cascade-ffi
   # shared library for both ABIs into jniLibs and runs gradle assembleDebug.
@@ -196,6 +209,152 @@ jobs:
       - name: Assemble the debug APK
         working-directory: android
         run: ./gradlew :app:assembleDebug --no-daemon
+      - name: Upload the debug APK (CI artifact)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cascade-android-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+  # Attaches the Android debug APK to the GitHub release. Runs only when the
+  # release job actually cut a release, mirroring the cascade-binary release
+  # jobs. Debug-signed (no keystore secret needed); installable for testing,
+  # though MANAGE_DOCUMENTS only registers the provider on a system install.
+  release-android:
+    name: Release Android APK
+    needs: release
+    if: needs.release.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ needs.release.outputs.version }}
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: android-ffi
+      - name: Resolve the preinstalled NDK and JDK 17
+        shell: bash
+        run: |
+          echo "ANDROID_NDK=$(ls -d "$ANDROID_SDK_ROOT"/ndk/*/ | sort -V | tail -1)" >> "$GITHUB_ENV"
+          echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
+      - name: Ensure the SDK platform and build-tools the app targets
+        shell: bash
+        run: |
+          set +o pipefail
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0" >/dev/null
+      - name: Bootstrap (cross-compile the .so slices into jniLibs)
+        run: ./android/bootstrap.sh
+      - name: Assemble the debug APK
+        working-directory: android
+        run: ./gradlew :app:assembleDebug --no-daemon
+      - name: Package the APK with a versioned name
+        run: |
+          mkdir -p dist
+          cp android/app/build/outputs/apk/debug/app-debug.apk dist/cascade-android.apk
+          shasum -a 256 dist/cascade-android.apk | awk '{print $1}' > dist/cascade-android.apk.sha256
+      - name: Upload to release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        with:
+          tag_name: ${{ needs.release.outputs.version }}
+          files: dist/cascade-android.apk*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Builds and attaches a signed iOS .ipa to the release. iOS requires a
+  # provisioning profile to install on any device, so this needs Apple signing
+  # secrets and is skipped (without failing) when they are absent. Required
+  # secrets (see swift/CascadeFileProvideriOS/README.md): IOS_DIST_CERT_P12
+  # (base64 .p12), IOS_DIST_CERT_PASSWORD, IOS_KEYCHAIN_PASSWORD,
+  # IOS_PROVISIONING_PROFILE (base64 .mobileprovision), IOS_TEAM_ID,
+  # IOS_EXPORT_METHOD (e.g. development / ad-hoc / app-store).
+  release-ios-ipa:
+    name: Release iOS IPA (signed)
+    needs: release
+    if: needs.release.outputs.released == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 40
+    permissions:
+      contents: write
+    steps:
+      - name: Detect signing secrets
+        id: signing
+        env:
+          CERT: ${{ secrets.IOS_DIST_CERT_P12 }}
+        run: |
+          if [ -n "$CERT" ]; then echo "have=true" >> "$GITHUB_OUTPUT"; else echo "have=false" >> "$GITHUB_OUTPUT"; fi
+      - name: Note skipped (no signing secrets)
+        if: steps.signing.outputs.have != 'true'
+        run: echo "iOS signing secrets are not configured; skipping the IPA build. See swift/CascadeFileProvideriOS/README.md."
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        if: steps.signing.outputs.have == 'true'
+        with:
+          ref: ${{ needs.release.outputs.version }}
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        if: steps.signing.outputs.have == 'true'
+        with:
+          targets: aarch64-apple-ios
+      - name: Install xcodegen
+        if: steps.signing.outputs.have == 'true'
+        run: brew install xcodegen
+      - name: Import signing certificate
+        if: steps.signing.outputs.have == 'true'
+        env:
+          CERT_P12: ${{ secrets.IOS_DIST_CERT_P12 }}
+          CERT_PW: ${{ secrets.IOS_DIST_CERT_PASSWORD }}
+          KEYCHAIN_PW: ${{ secrets.IOS_KEYCHAIN_PASSWORD }}
+        run: |
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PW" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PW" build.keychain
+          security import "$RUNNER_TEMP/cert.p12" -k build.keychain -P "$CERT_PW" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PW" build.keychain
+      - name: Install provisioning profile
+        if: steps.signing.outputs.have == 'true'
+        env:
+          PROFILE: ${{ secrets.IOS_PROVISIONING_PROFILE }}
+        run: |
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          echo "$PROFILE" | base64 --decode > "$HOME/Library/MobileDevice/Provisioning Profiles/cascade.mobileprovision"
+      - name: Bootstrap (build FFI device slice, bindings, project)
+        if: steps.signing.outputs.have == 'true'
+        run: ./swift/CascadeFileProvideriOS/bootstrap.sh
+      - name: Archive and export the signed IPA
+        if: steps.signing.outputs.have == 'true'
+        env:
+          TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+          EXPORT_METHOD: ${{ secrets.IOS_EXPORT_METHOD }}
+        working-directory: swift/CascadeFileProvideriOS
+        run: |
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>${EXPORT_METHOD:-development}</string>
+            <key>teamID</key><string>${TEAM_ID}</string>
+            <key>signingStyle</key><string>manual</string>
+          </dict></plist>
+          PLIST
+          xcodebuild -project CascadeFileProvideriOS.xcodeproj -scheme CascadeHostApp \
+            -sdk iphoneos -configuration Release -archivePath "$RUNNER_TEMP/Cascade.xcarchive" \
+            DEVELOPMENT_TEAM="$TEAM_ID" archive
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/Cascade.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" -exportPath "$RUNNER_TEMP/ipa"
+          mkdir -p dist && cp "$RUNNER_TEMP"/ipa/*.ipa dist/cascade-ios.ipa
+      - name: Upload to release
+        if: steps.signing.outputs.have == 'true'
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        with:
+          tag_name: ${{ needs.release.outputs.version }}
+          files: swift/CascadeFileProvideriOS/dist/cascade-ios.ipa
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   check:
     name: Check (${{ matrix.target }})
