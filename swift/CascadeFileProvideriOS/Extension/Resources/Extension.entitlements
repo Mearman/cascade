@@ -1,10 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  No restricted entitlements, so the bundle can be ad-hoc signed
+  (CODE_SIGN_IDENTITY "-") with no provisioning profile, on any machine and in
+  CI. CascadeEngine falls back to the extension's own container when the app
+  group is absent.
+
+  To share a container between the host app and the extension, add
+  com.apple.security.application-groups here and in Host.entitlements, and build
+  with a real development team and a provisioning profile that authorises it
+  (ad-hoc cannot grant app-group entitlements).
+-->
 <plist version="1.0">
-<dict>
-    <key>com.apple.security.application-groups</key>
-    <array>
-        <string>group.co.uk.mearman.cascade</string>
-    </array>
-</dict>
+<dict/>
 </plist>

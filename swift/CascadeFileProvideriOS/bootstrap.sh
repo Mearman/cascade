@@ -11,13 +11,18 @@ set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "$here/../.." && pwd)"
-target="aarch64-apple-ios"
 
-echo "==> Building cascade-ffi static library for $target (release)"
-( cd "$repo" && cargo build -p cascade-ffi --target "$target" --release )
+# Device slice (arm64 iOS) and simulator slice (arm64 sim). The project links
+# the matching one per SDK; the simulator slice is what supports an ad-hoc
+# signed, profile-free build (a device build needs a real provisioning profile).
+for target in aarch64-apple-ios aarch64-apple-ios-sim; do
+  echo "==> Building cascade-ffi static library for $target (release)"
+  rustup target add "$target" >/dev/null 2>&1 || true
+  ( cd "$repo" && cargo build -p cascade-ffi --target "$target" --release )
+done
 
 echo "==> Generating Swift bindings from the built library"
-lib="$repo/target/$target/release/libcascade_ffi.dylib"
+lib="$repo/target/aarch64-apple-ios/release/libcascade_ffi.dylib"
 ( cd "$repo" && cargo run -p cascade-ffi --bin uniffi-bindgen -- generate \
     --library "$lib" --language swift \
     --out-dir "$here/Extension/_bindings" )

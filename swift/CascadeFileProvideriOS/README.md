@@ -26,30 +26,41 @@ they are gitignored and produced by `bootstrap.sh`.
 ## Build
 
 ```bash
-./bootstrap.sh                 # build the Rust lib, generate bindings, gen project
-# then, for the iOS device slice (arm64), unsigned:
-xcodebuild -project CascadeFileProvideriOS.xcodeproj \
-  -target CascadeHostApp -sdk iphoneos -configuration Debug \
-  ARCHS=arm64 ONLY_ACTIVE_ARCH=NO CODE_SIGNING_ALLOWED=NO build
+./bootstrap.sh   # builds the device + simulator Rust slices, generates bindings, gens the project
 ```
 
-The extension statically links `libcascade_ffi.a` via `-force_load` (the crate
-emits both a `.a` and a `.dylib`; a bare `-lcascade_ffi` would pick the dylib
-and bake in an un-shippable absolute load path). The result is a self-contained
-appex with the Rust engine compiled in — `otool -L` shows no `libcascade_ffi`
-dependency.
+**Simulator (ad-hoc signed, no Apple account needed):**
+
+```bash
+xcodebuild -project CascadeFileProvideriOS.xcodeproj \
+  -target CascadeHostApp -sdk iphonesimulator -configuration Debug \
+  ARCHS=arm64 ONLY_ACTIVE_ARCH=NO build
+```
+
+The project ad-hoc signs (`CODE_SIGN_IDENTITY = "-"`), which needs no developer
+identity or provisioning profile, so this works on any machine and in CI
+(`codesign -dv` shows `Signature=adhoc`).
+
+**Device (compile/link check, unsigned):**
+
+```bash
+xcodebuild ... -sdk iphoneos ARCHS=arm64 CODE_SIGNING_ALLOWED=NO build
+```
+
+The extension statically links `libcascade_ffi.a` via `-force_load`, per SDK
+(the crate emits both a `.a` and a `.dylib`; a bare `-lcascade_ffi` would pick
+the dylib and bake in an un-shippable absolute load path). The result is a
+self-contained appex with the Rust engine compiled in — `otool -L` shows no
+`libcascade_ffi` dependency.
 
 ## Known limits
 
-- **Device run needs signing.** The build here is unsigned
-  (`CODE_SIGNING_ALLOWED=NO`) for compile/link verification. Running on a real
-  device needs a development team, signing, and a provisioned
-  `group.co.uk.mearman.cascade` app-group entitlement (declared but not
-  provisioned). `CascadeEngine` falls back to the extension's caches directory
-  when the app group is unavailable.
-- **Simulator slice not built.** Only the `aarch64-apple-ios` (device) library
-  is built. Running in the Simulator additionally needs the
-  `aarch64-apple-ios-sim` target and a matching library build.
+- **Real device needs a provisioning profile.** iOS requires a profile to
+  install *any* app on a device, so ad-hoc signing only covers the Simulator
+  (and macOS). To run on a real iPhone, open the project in Xcode and let
+  automatic signing provision it with your team — a free personal Apple ID
+  works (a 7-day development profile), which also lets you re-add the shared
+  app group (see `Extension/Resources/Extension.entitlements`).
 - **Read-only.** The `cascade-ffi` surface exposes enumeration and content
   fetch (`list_dir`/`read_file`), so the extension is read-only; write
   operations through the Files app return `noSuchItem` rather than faking

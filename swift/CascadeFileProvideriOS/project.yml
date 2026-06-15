@@ -9,9 +9,14 @@ settings:
   base:
     SWIFT_VERSION: "5.0"
     IPHONEOS_DEPLOYMENT_TARGET: "17.0"
-    CODE_SIGNING_ALLOWED: NO
+    # Ad-hoc signing ("-"): no developer identity or provisioning profile
+    # needed, so the build is reproducible on any machine and in CI. This is
+    # enough to produce a signed bundle for the Mac and the iOS Simulator.
+    # Running the File Provider on a real device additionally needs a real
+    # team and a provisioning profile that authorises the app-group and File
+    # Provider entitlements (see README); ad-hoc cannot grant those.
+    CODE_SIGN_IDENTITY: "-"
     CODE_SIGNING_REQUIRED: NO
-    CODE_SIGN_IDENTITY: ""
     CODE_SIGN_STYLE: Manual
 
 targets:
@@ -45,13 +50,19 @@ targets:
         CODE_SIGN_ENTITLEMENTS: Extension/Resources/Extension.entitlements
         GENERATE_INFOPLIST_FILE: NO
         SWIFT_INCLUDE_PATHS: "$(SRCROOT)/Extension/FFI"
-        # Statically link the Rust archive explicitly. The crate emits both a
-        # .a and a .dylib into the same directory, so a bare -lcascade_ffi would
-        # resolve to the dylib (an absolute build-machine load path that cannot
-        # ship in the appex). -force_load pulls the whole archive into the
-        # extension binary instead.
-        OTHER_LDFLAGS:
+        # Statically link the Rust archive explicitly, per SDK. The crate emits
+        # both a .a and a .dylib into the same directory, so a bare
+        # -lcascade_ffi would resolve to the dylib (an absolute build-machine
+        # load path that cannot ship in the appex). -force_load pulls the whole
+        # archive in. The device and simulator need different arch slices, so
+        # the path is conditioned on the SDK.
+        "OTHER_LDFLAGS[sdk=iphoneos*]":
           - "-force_load"
           - "$(PROJECT_DIR)/../../target/aarch64-apple-ios/release/libcascade_ffi.a"
+          - "-framework"
+          - "CoreFoundation"
+        "OTHER_LDFLAGS[sdk=iphonesimulator*]":
+          - "-force_load"
+          - "$(PROJECT_DIR)/../../target/aarch64-apple-ios-sim/release/libcascade_ffi.a"
           - "-framework"
           - "CoreFoundation"
