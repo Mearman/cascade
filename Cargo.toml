@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/engine",
+    "crates/exec",
     "crates/cascade-config",
     "crates/expr",
     "crates/backend-gdrive",
