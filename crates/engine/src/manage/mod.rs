@@ -99,6 +99,17 @@ pub enum Capability {
     /// wildcard scope.
     #[serde(rename = "grant:admin")]
     GrantAdmin,
+    /// Spawn and control interactive PTY sessions. Dangerous — never satisfied
+    /// by a wildcard scope. This is remote code execution; it must be granted
+    /// explicitly for an exact folder scope.
+    #[serde(rename = "exec:pty")]
+    ExecPty,
+    /// Spawn and control headless process sessions. Dangerous — never satisfied
+    /// by a wildcard scope. Kept distinct from `exec:pty` so an operator can
+    /// grant a terminal without granting headless process spawn (a different
+    /// blast radius), and vice versa.
+    #[serde(rename = "exec:proc")]
+    ExecProc,
     /// Data-plane read: the bearer (peer device) may read this node's data for
     /// the scoped folder — we serve our index and blocks to them. Gates the
     /// outbound/serve direction. Folder-scoped; not dangerous.
@@ -128,6 +139,8 @@ impl Capability {
             Self::BackendManage => "backend:manage",
             Self::LifecycleControl => "lifecycle:control",
             Self::GrantAdmin => "grant:admin",
+            Self::ExecPty => "exec:pty",
+            Self::ExecProc => "exec:proc",
             Self::DataRead => "data:read",
             Self::DataWrite => "data:write",
         }
@@ -146,6 +159,8 @@ impl Capability {
             "backend:manage" => Some(Self::BackendManage),
             "lifecycle:control" => Some(Self::LifecycleControl),
             "grant:admin" => Some(Self::GrantAdmin),
+            "exec:pty" => Some(Self::ExecPty),
+            "exec:proc" => Some(Self::ExecProc),
             "data:read" => Some(Self::DataRead),
             "data:write" => Some(Self::DataWrite),
             _ => None,
@@ -160,7 +175,11 @@ impl Capability {
     pub const fn is_dangerous(self) -> bool {
         matches!(
             self,
-            Self::BackendManage | Self::LifecycleControl | Self::GrantAdmin
+            Self::BackendManage
+                | Self::LifecycleControl
+                | Self::GrantAdmin
+                | Self::ExecPty
+                | Self::ExecProc
         )
     }
 
@@ -681,6 +700,48 @@ mod tests {
     }
 
     #[test]
+    fn exec_capabilities_are_dangerous() {
+        // Exec is remote code execution: both verbs sit in the dangerous tier,
+        // exactly as backend/lifecycle/grant-admin, so a node-wide grant can
+        // never satisfy them.
+        assert!(Capability::ExecPty.is_dangerous());
+        assert!(Capability::ExecProc.is_dangerous());
+    }
+
+    #[test]
+    fn exec_capabilities_are_not_data_verbs() {
+        assert!(!Capability::ExecPty.is_data_verb());
+        assert!(!Capability::ExecProc.is_data_verb());
+    }
+
+    #[test]
+    fn exec_capabilities_round_trip_through_wire_form() {
+        assert_eq!(Capability::ExecPty.as_wire(), "exec:pty");
+        assert_eq!(Capability::ExecProc.as_wire(), "exec:proc");
+        assert_eq!(Capability::from_wire("exec:pty"), Some(Capability::ExecPty));
+        assert_eq!(
+            Capability::from_wire("exec:proc"),
+            Some(Capability::ExecProc)
+        );
+    }
+
+    #[test]
+    fn exec_capabilities_round_trip_through_serde() {
+        let json = serde_json::to_string(&Capability::ExecPty).unwrap();
+        assert_eq!(json, "\"exec:pty\"");
+        assert_eq!(
+            serde_json::from_str::<Capability>(&json).unwrap(),
+            Capability::ExecPty
+        );
+        let json = serde_json::to_string(&Capability::ExecProc).unwrap();
+        assert_eq!(json, "\"exec:proc\"");
+        assert_eq!(
+            serde_json::from_str::<Capability>(&json).unwrap(),
+            Capability::ExecProc
+        );
+    }
+
+    #[test]
     fn safe_capabilities_are_not_dangerous() {
         assert!(!Capability::StatusRead.is_dangerous());
         assert!(!Capability::PinWrite.is_dangerous());
@@ -928,6 +989,8 @@ mod tests {
             Capability::BackendManage,
             Capability::LifecycleControl,
             Capability::GrantAdmin,
+            Capability::ExecPty,
+            Capability::ExecProc,
         ] {
             let grants = vec![grant(cap, Scope::Node)];
             assert!(
@@ -956,6 +1019,8 @@ mod tests {
             Capability::BackendManage,
             Capability::LifecycleControl,
             Capability::GrantAdmin,
+            Capability::ExecPty,
+            Capability::ExecProc,
         ] {
             for scope_path in ["/", "", "//", "/.", "/work/.."] {
                 let grants = vec![grant(cap, Scope::folder(scope_path))];
@@ -986,6 +1051,8 @@ mod tests {
             Capability::BackendManage,
             Capability::LifecycleControl,
             Capability::GrantAdmin,
+            Capability::ExecPty,
+            Capability::ExecProc,
         ] {
             let grants = vec![grant(cap, Scope::folder("/work"))];
             // Exact scope: allowed.

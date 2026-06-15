@@ -125,6 +125,64 @@ pub trait ManageCommandExecutor: Send + Sync {
     /// Revoke a grant by its row id. Backs the dangerous
     /// [`Capability::GrantAdmin`].
     async fn manage_grant_revoke(&self, grant_id: i64) -> anyhow::Result<String>;
+
+    /// Spawn an interactive PTY session, returning its new session id. Backs the
+    /// dangerous [`Capability::ExecPty`]. `owner` is the authenticated caller
+    /// recorded as the session owner; `scope` is the folder the session is
+    /// confined to, both used to record the durable session row the dispatcher
+    /// later resolves session-id-only verbs against.
+    ///
+    /// The exec methods are present only with the `exec` feature; a build without
+    /// it carries no exec provider and the wire verbs decode but never reach an
+    /// executor (see `run_dispatch`).
+    #[cfg(feature = "exec")]
+    async fn manage_pty_spawn(
+        &self,
+        owner: &DeviceId,
+        scope: &Scope,
+        shell: Option<&str>,
+        argv: &[String],
+        cwd: Option<&str>,
+        env: &[(String, String)],
+        cols: u16,
+        rows: u16,
+    ) -> anyhow::Result<u64>;
+
+    /// Write bytes to a PTY session's stdin. Backs [`Capability::ExecPty`].
+    #[cfg(feature = "exec")]
+    async fn manage_pty_write(&self, session: u64, bytes: &[u8]) -> anyhow::Result<String>;
+
+    /// Resize a PTY session. Backs [`Capability::ExecPty`].
+    #[cfg(feature = "exec")]
+    async fn manage_pty_resize(&self, session: u64, cols: u16, rows: u16)
+    -> anyhow::Result<String>;
+
+    /// Send a signal to a PTY session's child process. Backs
+    /// [`Capability::ExecPty`].
+    #[cfg(feature = "exec")]
+    async fn manage_pty_kill(&self, session: u64, signal: i32) -> anyhow::Result<String>;
+
+    /// Spawn a headless process session, returning its new session id. Backs the
+    /// dangerous [`Capability::ExecProc`]. `owner` and `scope` are recorded the
+    /// same way as for [`manage_pty_spawn`](Self::manage_pty_spawn).
+    #[cfg(feature = "exec")]
+    async fn manage_proc_spawn(
+        &self,
+        owner: &DeviceId,
+        scope: &Scope,
+        argv: &[String],
+        cwd: Option<&str>,
+        env: &[(String, String)],
+    ) -> anyhow::Result<u64>;
+
+    /// Send a signal to a headless process session. Backs
+    /// [`Capability::ExecProc`].
+    #[cfg(feature = "exec")]
+    async fn manage_proc_signal(&self, session: u64, signal: i32) -> anyhow::Result<String>;
+
+    /// Kill a headless process session. Backs [`Capability::ExecProc`].
+    #[cfg(feature = "exec")]
+    async fn manage_proc_kill(&self, session: u64) -> anyhow::Result<String>;
 }
 
 /// The grant store and audit sink the dispatcher reads and writes.
@@ -157,6 +215,24 @@ pub trait ManageGrantStore: Send + Sync {
     /// predicate the token verify path consults. Returning the whole set lets a
     /// chain be checked without a database round-trip per token.
     fn manage_revoked_token_ids(&self) -> anyhow::Result<std::collections::HashSet<String>>;
+
+    /// The [`Scope`] a live exec session was spawned under, or `None` when no
+    /// live session with that id exists.
+    ///
+    /// A session-id-only exec verb (pty.write/resize/kill, proc.signal/kill)
+    /// derives its authorisation target from the scope the session actually runs
+    /// in, never the caller-advertised wire scope. The dispatcher resolves the
+    /// real scope from here before authorising, exactly as `GrantRevoke`
+    /// resolves the stored grant's scope via [`manage_grant_scope`]. This closes
+    /// the scope-escape class where a caller holding `exec:pty` over `/work`
+    /// drives a session spawned under `/personal` by lying in the wire scope.
+    ///
+    /// A node built without the exec capability has no exec sessions; the
+    /// default implementation returns `None`, so a session-id-only verb finds no
+    /// session and is refused.
+    fn exec_session_scope(&self, _session: u64) -> anyhow::Result<Option<Scope>> {
+        Ok(None)
+    }
 }
 
 /// The injected port the BEP message handler calls when a
@@ -205,6 +281,13 @@ pub const fn required_capability(command: &ManageCommand) -> Capability {
         ManageCommand::GrantAdd { .. } | ManageCommand::GrantRevoke { .. } => {
             Capability::GrantAdmin
         }
+        ManageCommand::PtySpawn { .. }
+        | ManageCommand::PtyWrite { .. }
+        | ManageCommand::PtyResize { .. }
+        | ManageCommand::PtyKill { .. } => Capability::ExecPty,
+        ManageCommand::ProcSpawn { .. }
+        | ManageCommand::ProcSignal { .. }
+        | ManageCommand::ProcKill { .. } => Capability::ExecProc,
     }
 }
 
@@ -259,7 +342,18 @@ fn command_target_scope(command: &ManageCommand) -> Option<Scope> {
             Some(Scope::folder(mount_path.clone()))
         }
         ManageCommand::GrantAdd { grant } => Some(scope_from_wire(&grant.scope)),
-        // These three derive no target from their payload and so return `None`:
+        // An exec spawn's real target is the working directory it runs in: a
+        // caller holding `exec:pty`/`exec:proc` over `/work` may only spawn a
+        // session rooted there. An absent `cwd` has no folder to confine the
+        // session, so it targets the node root `/` — which is node-wide, and the
+        // dangerous-capability bar therefore refuses it. This forces an explicit
+        // cwd: a remote shell can never be opened without naming the folder it is
+        // confined to.
+        ManageCommand::PtySpawn { cwd, .. } | ManageCommand::ProcSpawn { cwd, .. } => Some(
+            cwd.as_deref()
+                .map_or_else(|| Scope::folder("/"), Scope::folder),
+        ),
+        // These derive no target from their payload and so return `None`:
         //
         // - `GrantRevoke`'s real target is the scope of the *stored* grant being
         //   revoked, resolved from the store in `run_dispatch` (the payload only
@@ -268,7 +362,19 @@ fn command_target_scope(command: &ManageCommand) -> Option<Scope> {
         // - `Restart`/`Stop` carry no payload path; only the advertised wire
         //   scope confines them, and the dangerous-capability bar requires that
         //   to be an explicit folder anyway.
-        ManageCommand::GrantRevoke { .. } | ManageCommand::Restart | ManageCommand::Stop => None,
+        // - The session-id-only exec verbs (write/resize/kill/signal) target the
+        //   scope the *session* was spawned under, resolved from `exec_sessions`
+        //   in `run_dispatch` — never the caller-advertised wire scope. The
+        //   payload carries only a session id, so they are routed specially, the
+        //   same way `GrantRevoke` resolves the stored grant's scope.
+        ManageCommand::GrantRevoke { .. }
+        | ManageCommand::Restart
+        | ManageCommand::Stop
+        | ManageCommand::PtyWrite { .. }
+        | ManageCommand::PtyResize { .. }
+        | ManageCommand::PtyKill { .. }
+        | ManageCommand::ProcSignal { .. }
+        | ManageCommand::ProcKill { .. } => None,
     }
 }
 
@@ -330,6 +436,29 @@ fn command_summary(command: &ManageCommand) -> String {
             grant.capability, grant.grantee, grant.scope
         ),
         ManageCommand::GrantRevoke { grant_id, .. } => format!("grant revoke {grant_id}"),
+        ManageCommand::PtySpawn { shell, cwd, .. } => {
+            let shell = shell.as_deref().unwrap_or("<default shell>");
+            let cwd = cwd.as_deref().unwrap_or("<default cwd>");
+            format!("pty spawn {shell} in {cwd}")
+        }
+        ManageCommand::PtyWrite { session, bytes } => {
+            format!("pty write {} bytes to {session}", bytes.len())
+        }
+        ManageCommand::PtyResize {
+            session,
+            cols,
+            rows,
+        } => format!("pty resize {session} to {cols}x{rows}"),
+        ManageCommand::PtyKill { session, signal } => format!("pty signal {signal} to {session}"),
+        ManageCommand::ProcSpawn { argv, cwd, .. } => {
+            let program = argv.first().map_or("<empty argv>", String::as_str);
+            let cwd = cwd.as_deref().unwrap_or("<default cwd>");
+            format!("proc spawn {program} in {cwd}")
+        }
+        ManageCommand::ProcSignal { session, signal } => {
+            format!("proc signal {signal} to {session}")
+        }
+        ManageCommand::ProcKill { session } => format!("proc kill {session}"),
     }
 }
 
@@ -588,6 +717,29 @@ where
                 };
             }
         },
+        // A session-id-only exec verb authorises over the scope the *session*
+        // was spawned under, resolved from node state — never the caller-
+        // advertised wire scope. A verb naming a session that does not exist has
+        // no real scope to authorise over; it targets the node-wide scope, which
+        // the dangerous-capability bar always refuses, so it can never run. This
+        // closes the scope-escape where a caller holding exec over `/work`
+        // drives a `/personal` session by lying in the wire scope, and refuses a
+        // verb on an unknown (or already-ended) session rather than falling back
+        // to an attacker-chosen scope.
+        ManageCommand::PtyWrite { session, .. }
+        | ManageCommand::PtyResize { session, .. }
+        | ManageCommand::PtyKill { session, .. }
+        | ManageCommand::ProcSignal { session, .. }
+        | ManageCommand::ProcKill { session } => match store.exec_session_scope(*session) {
+            Ok(Some(session_scope)) => session_scope,
+            Ok(None) => Scope::Node,
+            Err(e) => {
+                return ManageResult::Err {
+                    kind: ManageErrorKind::Failed,
+                    message: format!("could not resolve exec session {session} scope: {e}"),
+                };
+            }
+        },
         _ => command_target_scope(&command).unwrap_or_else(|| scope.clone()),
     };
 
@@ -662,9 +814,11 @@ where
         // function has already returned above. Bound is irrelevant here.
         Delegation::Refused => ExpiryBound::Unbounded,
     };
-    let applied = execute(executor, caller, command, delegation_bound).await;
+    let applied = execute(executor, caller, &target_scope, command, delegation_bound).await;
     match applied {
-        Ok(summary) => ManageResult::Ok { summary },
+        Ok(DispatchOutcome::Summary(summary)) => ManageResult::Ok { summary },
+        #[cfg(feature = "exec")]
+        Ok(DispatchOutcome::ExecSpawned(session)) => ManageResult::ExecSpawned { session },
         Err(e) => {
             // The command was authorised and audited as allowed, but failed
             // while running. Record a follow-up audit row marking the failure
@@ -695,58 +849,81 @@ where
     }
 }
 
+/// The outcome of executing an authorised command.
+///
+/// Most commands return a human-readable summary; a `pty.spawn` / `proc.spawn`
+/// returns the new session id, which the dispatcher reports as a typed
+/// [`ManageResult::ExecSpawned`] so the caller learns the id to drive subsequent
+/// verbs against.
+enum DispatchOutcome {
+    /// A human-readable summary of the command's effect.
+    Summary(String),
+    /// A new exec session was spawned with this id. Only produced by the exec
+    /// spawn arms, which a build without the `exec` feature does not compile.
+    #[cfg(feature = "exec")]
+    ExecSpawned(u64),
+}
+
 /// Dispatch an authorised command into the executor's matching method.
 ///
 /// `caller` is the authenticated delegating principal; it is the `granted_by`
-/// stamped onto a delegated grant, never a value taken off the wire.
+/// stamped onto a delegated grant, never a value taken off the wire. For an exec
+/// spawn it is also recorded as the session owner, and `target_scope` is the
+/// folder the session is confined to — both resolved before this point and
+/// passed through so the session row records the real authorisation extent.
 async fn execute<E>(
     executor: &E,
     caller: &DeviceId,
+    target_scope: &Scope,
     command: ManageCommand,
     delegation_bound: ExpiryBound,
-) -> anyhow::Result<String>
+) -> anyhow::Result<DispatchOutcome>
 where
     E: ManageCommandExecutor + ?Sized,
 {
-    match command {
-        ManageCommand::StatusRead => executor.manage_status().await,
+    Ok(match command {
+        ManageCommand::StatusRead => DispatchOutcome::Summary(executor.manage_status().await?),
         ManageCommand::Pin {
             path_glob,
             recursive,
-        } => executor.manage_pin(&path_glob, recursive).await,
-        ManageCommand::Unpin { path_glob } => executor.manage_unpin(&path_glob).await,
-        ManageCommand::CacheEvict => executor.manage_cache_evict().await,
-        ManageCommand::CacheWarm { path_glob } => executor.manage_cache_warm(&path_glob).await,
+        } => DispatchOutcome::Summary(executor.manage_pin(&path_glob, recursive).await?),
+        ManageCommand::Unpin { path_glob } => {
+            DispatchOutcome::Summary(executor.manage_unpin(&path_glob).await?)
+        }
+        ManageCommand::CacheEvict => DispatchOutcome::Summary(executor.manage_cache_evict().await?),
+        ManageCommand::CacheWarm { path_glob } => {
+            DispatchOutcome::Summary(executor.manage_cache_warm(&path_glob).await?)
+        }
         ManageCommand::ConfigPush {
             format,
             folder,
             body,
-        } => executor.manage_config_push(format, &folder, &body).await,
+        } => DispatchOutcome::Summary(executor.manage_config_push(format, &folder, &body).await?),
         ManageCommand::PolicySet {
             path_glob,
             max_age_secs,
             max_file_size,
             priority,
-        } => {
+        } => DispatchOutcome::Summary(
             executor
                 .manage_policy_set(&path_glob, max_age_secs, max_file_size, priority)
-                .await
-        }
+                .await?,
+        ),
         ManageCommand::BackendAdd {
             name,
             backend_type,
             mount_path,
             config_toml,
-        } => {
+        } => DispatchOutcome::Summary(
             executor
                 .manage_backend_add(&name, &backend_type, &mount_path, &config_toml)
-                .await
-        }
+                .await?,
+        ),
         ManageCommand::BackendRemove { name, mount_path } => {
-            executor.manage_backend_remove(&name, &mount_path).await
+            DispatchOutcome::Summary(executor.manage_backend_remove(&name, &mount_path).await?)
         }
-        ManageCommand::Restart => executor.manage_restart().await,
-        ManageCommand::Stop => executor.manage_stop().await,
+        ManageCommand::Restart => DispatchOutcome::Summary(executor.manage_restart().await?),
+        ManageCommand::Stop => DispatchOutcome::Summary(executor.manage_stop().await?),
         ManageCommand::GrantAdd { grant } => {
             // Build the domain grant, stamping the authenticated caller as
             // `granted_by`. The grantee/capability/scope/expiry come off the
@@ -754,10 +931,77 @@ where
             // not a silent skip. The expiry is clamped to `delegation_bound` so
             // a delegate can never outlive the authority that backed it.
             let domain = grant_from_wire(&grant, caller, delegation_bound)?;
-            executor.manage_grant_add(&domain).await
+            DispatchOutcome::Summary(executor.manage_grant_add(&domain).await?)
         }
-        ManageCommand::GrantRevoke { grant_id, .. } => executor.manage_grant_revoke(grant_id).await,
-    }
+        ManageCommand::GrantRevoke { grant_id, .. } => {
+            DispatchOutcome::Summary(executor.manage_grant_revoke(grant_id).await?)
+        }
+        #[cfg(feature = "exec")]
+        ManageCommand::PtySpawn {
+            shell,
+            argv,
+            cwd,
+            env,
+            cols,
+            rows,
+        } => DispatchOutcome::ExecSpawned(
+            executor
+                .manage_pty_spawn(
+                    caller,
+                    target_scope,
+                    shell.as_deref(),
+                    &argv,
+                    cwd.as_deref(),
+                    &env,
+                    cols,
+                    rows,
+                )
+                .await?,
+        ),
+        #[cfg(feature = "exec")]
+        ManageCommand::PtyWrite { session, bytes } => {
+            DispatchOutcome::Summary(executor.manage_pty_write(session, &bytes).await?)
+        }
+        #[cfg(feature = "exec")]
+        ManageCommand::PtyResize {
+            session,
+            cols,
+            rows,
+        } => DispatchOutcome::Summary(executor.manage_pty_resize(session, cols, rows).await?),
+        #[cfg(feature = "exec")]
+        ManageCommand::PtyKill { session, signal } => {
+            DispatchOutcome::Summary(executor.manage_pty_kill(session, signal).await?)
+        }
+        #[cfg(feature = "exec")]
+        ManageCommand::ProcSpawn { argv, cwd, env } => DispatchOutcome::ExecSpawned(
+            executor
+                .manage_proc_spawn(caller, target_scope, &argv, cwd.as_deref(), &env)
+                .await?,
+        ),
+        #[cfg(feature = "exec")]
+        ManageCommand::ProcSignal { session, signal } => {
+            DispatchOutcome::Summary(executor.manage_proc_signal(session, signal).await?)
+        }
+        #[cfg(feature = "exec")]
+        ManageCommand::ProcKill { session } => {
+            DispatchOutcome::Summary(executor.manage_proc_kill(session).await?)
+        }
+        // A build without the exec feature decodes the exec wire verbs but has no
+        // provider to run them; refuse loudly rather than silently doing nothing.
+        #[cfg(not(feature = "exec"))]
+        ManageCommand::PtySpawn { .. }
+        | ManageCommand::PtyWrite { .. }
+        | ManageCommand::PtyResize { .. }
+        | ManageCommand::PtyKill { .. }
+        | ManageCommand::ProcSpawn { .. }
+        | ManageCommand::ProcSignal { .. }
+        | ManageCommand::ProcKill { .. } => {
+            // `target_scope` is only read by the exec arms above, which this
+            // build does not compile; bind it so it is not an unused parameter.
+            let _ = target_scope;
+            anyhow::bail!("this node was built without the exec capability");
+        }
+    })
 }
 
 /// The upper bound a delegated grant's expiry must respect, derived from the

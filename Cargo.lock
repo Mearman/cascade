@@ -461,6 +461,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "cascade-config",
+ "cascade-exec",
  "cascade-expr",
  "cascade-p2p",
  "chrono",

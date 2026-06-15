@@ -38,6 +38,9 @@ struct FakeStore {
     node_identity: cascade_p2p::identity::DeviceIdentity,
     /// The revoked token ids the verify path consults.
     revoked: std::collections::HashSet<String>,
+    /// Live exec sessions addressable by id, so `exec_session_scope` can
+    /// resolve a session-id-only verb's target scope the way the real DB does.
+    exec_sessions: Vec<(u64, Scope)>,
 }
 
 impl FakeStore {
@@ -49,6 +52,27 @@ impl FakeStore {
             node_identity: cascade_p2p::identity::DeviceIdentity::generate()
                 .expect("generate node identity"),
             revoked: std::collections::HashSet::new(),
+            exec_sessions: Vec::new(),
+        }
+    }
+
+    /// Seed a live exec session with a given id and spawn scope, for
+    /// session-id-only exec verb target-resolution tests.
+    fn with_exec_session(mut self, id: u64, scope: Scope) -> Self {
+        self.exec_sessions.push((id, scope));
+        self
+    }
+
+    /// Build a store whose node identity is a specific [`DeviceIdentity`], so a
+    /// delegation chain rooted in that identity verifies against this store.
+    fn with_node_identity(node_identity: cascade_p2p::identity::DeviceIdentity) -> Self {
+        Self {
+            grants: Vec::new(),
+            stored: Vec::new(),
+            audit: Mutex::new(Vec::new()),
+            node_identity,
+            revoked: std::collections::HashSet::new(),
+            exec_sessions: Vec::new(),
         }
     }
 
@@ -128,6 +152,14 @@ impl ManageGrantStore for FakeStore {
 
     fn manage_revoked_token_ids(&self) -> anyhow::Result<std::collections::HashSet<String>> {
         Ok(self.revoked.clone())
+    }
+
+    fn exec_session_scope(&self, session: u64) -> anyhow::Result<Option<Scope>> {
+        Ok(self
+            .exec_sessions
+            .iter()
+            .find(|(id, _)| *id == session)
+            .map(|(_, scope)| scope.clone()))
     }
 }
 
@@ -250,7 +282,78 @@ impl ManageCommandExecutor for FakeExecutor {
         self.record(&format!("grant_revoke {grant_id}"));
         Ok(format!("grant {grant_id} revoked"))
     }
+
+    async fn manage_pty_spawn(
+        &self,
+        owner: &DeviceId,
+        scope: &Scope,
+        shell: Option<&str>,
+        argv: &[String],
+        cwd: Option<&str>,
+        _env: &[(String, String)],
+        cols: u16,
+        rows: u16,
+    ) -> anyhow::Result<u64> {
+        self.record(&format!(
+            "pty_spawn owner={owner} scope={scope:?} shell={shell:?} argv={argv:?} cwd={cwd:?} {cols}x{rows}"
+        ));
+        if self.fail {
+            anyhow::bail!("pty spawn failed");
+        }
+        Ok(SPAWNED_SESSION_ID)
+    }
+
+    async fn manage_pty_write(&self, session: u64, bytes: &[u8]) -> anyhow::Result<String> {
+        self.record(&format!("pty_write {session} {}", bytes.len()));
+        Ok(format!("wrote to {session}"))
+    }
+
+    async fn manage_pty_resize(
+        &self,
+        session: u64,
+        cols: u16,
+        rows: u16,
+    ) -> anyhow::Result<String> {
+        self.record(&format!("pty_resize {session} {cols}x{rows}"));
+        Ok(format!("resized {session}"))
+    }
+
+    async fn manage_pty_kill(&self, session: u64, signal: i32) -> anyhow::Result<String> {
+        self.record(&format!("pty_kill {session} {signal}"));
+        Ok(format!("signalled {session}"))
+    }
+
+    async fn manage_proc_spawn(
+        &self,
+        owner: &DeviceId,
+        scope: &Scope,
+        argv: &[String],
+        cwd: Option<&str>,
+        _env: &[(String, String)],
+    ) -> anyhow::Result<u64> {
+        self.record(&format!(
+            "proc_spawn owner={owner} scope={scope:?} argv={argv:?} cwd={cwd:?}"
+        ));
+        if self.fail {
+            anyhow::bail!("proc spawn failed");
+        }
+        Ok(SPAWNED_SESSION_ID)
+    }
+
+    async fn manage_proc_signal(&self, session: u64, signal: i32) -> anyhow::Result<String> {
+        self.record(&format!("proc_signal {session} {signal}"));
+        Ok(format!("signalled {session}"))
+    }
+
+    async fn manage_proc_kill(&self, session: u64) -> anyhow::Result<String> {
+        self.record(&format!("proc_kill {session}"));
+        Ok(format!("killed {session}"))
+    }
 }
+
+/// The session id the [`FakeExecutor`] returns from a spawn. A fixed value the
+/// exec authorisation tests assert against.
+const SPAWNED_SESSION_ID: u64 = 42;
 
 fn grant(capability: Capability, scope: Scope) -> Grant {
     Grant {
@@ -1612,4 +1715,534 @@ async fn malformed_token_is_a_failed_error() {
         }
     ));
     assert!(executor.calls().is_empty());
+}
+
+// ── Exec verbs: dangerous-tier authorisation ──
+//
+// Exec is remote code execution; these prove the authorisation discipline the
+// exec-capability.md spec demands: never satisfied by a node-wide grant, only by
+// an explicit-scope grant; revoked/expired tokens refused; a delegation can only
+// narrow; and every spawn/signal/kill is audited.
+
+/// Every exec verb paired with the spawn payload that exercises it under the
+/// `exec:pty` capability, so the node-wide-grant bar can be asserted for each.
+fn pty_spawn_in(cwd: &str) -> ManageCommand {
+    ManageCommand::PtySpawn {
+        shell: Some("/bin/sh".to_owned()),
+        argv: Vec::new(),
+        cwd: Some(cwd.to_owned()),
+        env: Vec::new(),
+        cols: 80,
+        rows: 24,
+    }
+}
+
+fn proc_spawn_in(cwd: &str) -> ManageCommand {
+    ManageCommand::ProcSpawn {
+        argv: vec!["/bin/echo".to_owned(), "hi".to_owned()],
+        cwd: Some(cwd.to_owned()),
+        env: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn node_wide_grant_cannot_exec() {
+    // A node-wide grant of an exec capability never authorises a spawn — exec
+    // sits in the dangerous tier, so only an explicit folder grant satisfies it.
+    // Asserted for both verbs and for the explicit Node scope plus a root folder
+    // scope that is node-wide in everything but name.
+    for (cap, command) in [
+        (Capability::ExecPty, pty_spawn_in("/work")),
+        (Capability::ExecProc, proc_spawn_in("/work")),
+    ] {
+        for grant_scope in [Scope::Node, Scope::folder("/"), Scope::folder("/work/..")] {
+            let store = FakeStore::new(vec![grant(cap, grant_scope.clone())]);
+            let executor = FakeExecutor::default();
+            let result = run_dispatch(
+                &store,
+                &executor,
+                &manager(),
+                command.clone(),
+                WireScope::Folder {
+                    path: "/work".to_owned(),
+                },
+                None,
+                at(2026, 1, 1),
+            )
+            .await;
+            assert!(
+                matches!(
+                    result,
+                    ManageResult::Err {
+                        kind: ManageErrorKind::Unauthorised,
+                        ..
+                    }
+                ),
+                "node-wide grant ({grant_scope:?}) of {cap:?} must not authorise a spawn, got {result:?}",
+            );
+            assert!(
+                executor.calls().is_empty(),
+                "no exec session may be spawned under a node-wide grant",
+            );
+            let audit = store.audit_rows();
+            assert_eq!(audit.len(), 1, "the denial must still be audited");
+            assert_eq!(
+                audit.first().map(|r| r.outcome.as_str()),
+                Some(OUTCOME_DENIED),
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn explicit_scope_grant_can_exec_and_is_audited() {
+    // An explicit folder grant of exec:pty authorises a spawn rooted in that
+    // folder, the spawn runs, and the spawn is audited as allowed. The reply
+    // carries the new session id.
+    let store = FakeStore::new(vec![grant(Capability::ExecPty, Scope::folder("/work"))]);
+    let executor = FakeExecutor::default();
+    let result = run_dispatch(
+        &store,
+        &executor,
+        &manager(),
+        pty_spawn_in("/work/reports"),
+        WireScope::Folder {
+            path: "/work/reports".to_owned(),
+        },
+        None,
+        at(2026, 1, 1),
+    )
+    .await;
+    assert!(
+        matches!(result, ManageResult::ExecSpawned { session } if session == SPAWNED_SESSION_ID),
+        "an explicit-scope exec grant must spawn and return a session id, got {result:?}",
+    );
+    assert_eq!(
+        executor.calls().len(),
+        1,
+        "exactly one spawn must run, got {:?}",
+        executor.calls(),
+    );
+    let audit = store.audit_rows();
+    assert_eq!(audit.len(), 1, "the spawn must be audited");
+    let row = audit.first().expect("one audit row");
+    assert_eq!(row.outcome, OUTCOME_ALLOWED);
+    assert_eq!(row.capability, Capability::ExecPty);
+    assert_eq!(
+        row.scope,
+        Scope::folder("/work/reports"),
+        "the audit row records the cwd the session is confined to",
+    );
+}
+
+#[tokio::test]
+async fn proc_explicit_scope_grant_can_exec() {
+    let store = FakeStore::new(vec![grant(Capability::ExecProc, Scope::folder("/work"))]);
+    let executor = FakeExecutor::default();
+    let result = run_dispatch(
+        &store,
+        &executor,
+        &manager(),
+        proc_spawn_in("/work"),
+        WireScope::Folder {
+            path: "/work".to_owned(),
+        },
+        None,
+        at(2026, 1, 1),
+    )
+    .await;
+    assert!(
+        matches!(result, ManageResult::ExecSpawned { .. }),
+        "an explicit exec:proc grant must spawn, got {result:?}",
+    );
+}
+
+#[tokio::test]
+async fn pty_grant_does_not_authorise_proc_spawn() {
+    // The two exec capabilities are distinct: an exec:pty grant must not
+    // authorise a headless proc spawn (a different blast radius).
+    let store = FakeStore::new(vec![grant(Capability::ExecPty, Scope::folder("/work"))]);
+    let executor = FakeExecutor::default();
+    let result = run_dispatch(
+        &store,
+        &executor,
+        &manager(),
+        proc_spawn_in("/work"),
+        WireScope::Folder {
+            path: "/work".to_owned(),
+        },
+        None,
+        at(2026, 1, 1),
+    )
+    .await;
+    assert!(
+        matches!(
+            result,
+            ManageResult::Err {
+                kind: ManageErrorKind::Unauthorised,
+                ..
+            }
+        ),
+        "an exec:pty grant must not authorise a proc spawn, got {result:?}",
+    );
+    assert!(executor.calls().is_empty());
+}
+
+#[tokio::test]
+async fn spawn_without_cwd_targets_node_root_and_is_refused() {
+    // A spawn with no cwd has no folder to confine the session, so it targets the
+    // node root — which the dangerous bar refuses even with an explicit grant.
+    // This forces an explicit cwd: a remote shell can never be opened without
+    // naming the folder it is confined to.
+    let store = FakeStore::new(vec![grant(Capability::ExecPty, Scope::folder("/work"))]);
+    let executor = FakeExecutor::default();
+    let result = run_dispatch(
+        &store,
+        &executor,
+        &manager(),
+        ManageCommand::PtySpawn {
+            shell: Some("/bin/sh".to_owned()),
+            argv: Vec::new(),
+            cwd: None,
+            env: Vec::new(),
+            cols: 80,
+            rows: 24,
+        },
+        WireScope::Folder {
+            path: "/work".to_owned(),
+        },
+        None,
+        at(2026, 1, 1),
+    )
+    .await;
+    assert!(
+        matches!(
+            result,
+            ManageResult::Err {
+                kind: ManageErrorKind::Unauthorised,
+                ..
+            }
+        ),
+        "a cwd-less spawn must be refused, got {result:?}",
+    );
+    assert!(executor.calls().is_empty());
+}
+
+#[tokio::test]
+async fn session_id_verb_resolves_scope_from_session_not_wire_scope() {
+    // The scope-escape regression for session-id-only verbs: the caller holds
+    // exec:pty over /work only, and advertises a wire scope of /work (which the
+    // grant covers), but the target session was spawned under /personal. The
+    // verb must authorise over the session's real scope, resolved from node
+    // state, so it is refused — a caller cannot drive a /personal session by
+    // lying in the wire scope.
+    let store = FakeStore::new(vec![grant(Capability::ExecPty, Scope::folder("/work"))])
+        .with_exec_session(7, Scope::folder("/personal"));
+    let executor = FakeExecutor::default();
+    let result = run_dispatch(
+        &store,
+        &executor,
+        &manager(),
+        ManageCommand::PtyWrite {
+            session: 7,
+            bytes: b"rm -rf /\n".to_vec(),
+        },
+        WireScope::Folder {
+            path: "/work".to_owned(),
+        },
+        None,
+        at(2026, 1, 1),
+    )
+    .await;
+    assert!(
+        matches!(
+            result,
+            ManageResult::Err {
+                kind: ManageErrorKind::Unauthorised,
+                ..
+            }
+        ),
+        "a verb on a session spawned under a folder the caller cannot reach must be refused, got {result:?}",
+    );
+    assert!(
+        executor.calls().is_empty(),
+        "no write may reach a session outside the granted scope",
+    );
+    let audit = store.audit_rows();
+    assert_eq!(
+        audit.first().map(|r| r.scope.clone()),
+        Some(Scope::folder("/personal")),
+        "the audit row records the session's real scope, not the advertised wire scope",
+    );
+}
+
+#[tokio::test]
+async fn session_id_verb_authorised_over_session_scope_runs() {
+    // The positive case: the caller holds exec:pty over /personal and the session
+    // was spawned there. The write authorises over the session's scope and runs.
+    let store = FakeStore::new(vec![grant(Capability::ExecPty, Scope::folder("/personal"))])
+        .with_exec_session(7, Scope::folder("/personal"));
+    let executor = FakeExecutor::default();
+    let result = run_dispatch(
+        &store,
+        &executor,
+        &manager(),
+        ManageCommand::PtyWrite {
+            session: 7,
+            bytes: b"ls\n".to_vec(),
+        },
+        WireScope::Folder {
+            path: "/personal".to_owned(),
+        },
+        None,
+        at(2026, 1, 1),
+    )
+    .await;
+    assert!(
+        matches!(result, ManageResult::Ok { .. }),
+        "a write authorised over the session's scope must run, got {result:?}",
+    );
+    assert_eq!(executor.calls().len(), 1, "the write must run once");
+    let audit = store.audit_rows();
+    assert_eq!(
+        audit.first().map(|r| r.outcome.as_str()),
+        Some(OUTCOME_ALLOWED),
+        "every exec verb is audited",
+    );
+}
+
+#[tokio::test]
+async fn session_id_verb_on_unknown_session_is_refused() {
+    // A verb naming a session that does not exist resolves to no scope; it
+    // targets the node-wide scope, which the dangerous bar refuses, so it never
+    // runs. The caller cannot fall back to an attacker-chosen wire scope.
+    let store = FakeStore::new(vec![grant(Capability::ExecProc, Scope::folder("/work"))]);
+    let executor = FakeExecutor::default();
+    let result = run_dispatch(
+        &store,
+        &executor,
+        &manager(),
+        ManageCommand::ProcKill { session: 999 },
+        WireScope::Folder {
+            path: "/work".to_owned(),
+        },
+        None,
+        at(2026, 1, 1),
+    )
+    .await;
+    assert!(
+        matches!(
+            result,
+            ManageResult::Err {
+                kind: ManageErrorKind::Unauthorised,
+                ..
+            }
+        ),
+        "a verb on an unknown session must be refused, got {result:?}",
+    );
+    assert!(executor.calls().is_empty());
+}
+
+#[tokio::test]
+async fn exec_token_with_explicit_scope_authorises_spawn() {
+    // A token issued by this node for the caller, carrying exec:pty over a folder
+    // scope, authorises a spawn rooted there with no on-node grant.
+    let store = FakeStore::new(Vec::new());
+    let executor = FakeExecutor::default();
+    let token = store.issue_token_json(
+        "tok-exec",
+        &manager(),
+        Capability::ExecPty,
+        Scope::folder("/work"),
+        at(2026, 12, 31),
+    );
+    let result = run_dispatch(
+        &store,
+        &executor,
+        &manager(),
+        pty_spawn_in("/work"),
+        WireScope::Folder {
+            path: "/work".to_owned(),
+        },
+        Some(token),
+        at(2026, 1, 1),
+    )
+    .await;
+    assert!(
+        matches!(result, ManageResult::ExecSpawned { .. }),
+        "a valid exec token must authorise the spawn, got {result:?}",
+    );
+}
+
+#[tokio::test]
+async fn revoked_exec_token_is_refused() {
+    let store = FakeStore::new(Vec::new()).with_revoked_token("tok-exec-revoked");
+    let executor = FakeExecutor::default();
+    let token = store.issue_token_json(
+        "tok-exec-revoked",
+        &manager(),
+        Capability::ExecPty,
+        Scope::folder("/work"),
+        at(2026, 12, 31),
+    );
+    let result = run_dispatch(
+        &store,
+        &executor,
+        &manager(),
+        pty_spawn_in("/work"),
+        WireScope::Folder {
+            path: "/work".to_owned(),
+        },
+        Some(token),
+        at(2026, 1, 1),
+    )
+    .await;
+    assert!(
+        matches!(
+            result,
+            ManageResult::Err {
+                kind: ManageErrorKind::Unauthorised,
+                ..
+            }
+        ),
+        "a revoked exec token must be refused, got {result:?}",
+    );
+    assert!(executor.calls().is_empty());
+}
+
+#[tokio::test]
+async fn expired_exec_token_is_refused() {
+    let store = FakeStore::new(Vec::new());
+    let executor = FakeExecutor::default();
+    let token = store.issue_token_json(
+        "tok-exec-expired",
+        &manager(),
+        Capability::ExecProc,
+        Scope::folder("/work"),
+        at(2025, 12, 31),
+    );
+    let result = run_dispatch(
+        &store,
+        &executor,
+        &manager(),
+        proc_spawn_in("/work"),
+        WireScope::Folder {
+            path: "/work".to_owned(),
+        },
+        Some(token),
+        // After the token's expiry.
+        at(2026, 1, 1),
+    )
+    .await;
+    assert!(
+        matches!(
+            result,
+            ManageResult::Err {
+                kind: ManageErrorKind::Unauthorised,
+                ..
+            }
+        ),
+        "an expired exec token must be refused, got {result:?}",
+    );
+    assert!(executor.calls().is_empty());
+}
+
+#[tokio::test]
+async fn delegated_exec_token_cannot_widen_scope() {
+    // A delegated exec token can only narrow authority. Minting a child that
+    // widens the scope (/work -> /) is refused at mint, so a widened token can
+    // never exist to present. The narrowed child authorises only within its
+    // narrowed scope.
+    let node = cascade_p2p::identity::DeviceIdentity::generate().unwrap();
+    let delegator = cascade_p2p::identity::DeviceIdentity::generate().unwrap();
+    let sub = cascade_p2p::identity::DeviceIdentity::generate().unwrap();
+    let delegator_id = DeviceId::new(delegator.device_id.clone());
+    let sub_id = DeviceId::new(sub.device_id.clone());
+
+    let parent = CapabilityToken::issue(
+        "tok-exec-parent",
+        &node,
+        &delegator_id,
+        Capability::ExecPty,
+        Scope::folder("/work"),
+        at(2026, 12, 31),
+    )
+    .unwrap();
+
+    // Attempting to widen the scope at delegation is refused at mint.
+    let widened = parent.delegate(
+        "tok-exec-wide",
+        &delegator,
+        &sub_id,
+        Capability::ExecPty,
+        Scope::folder("/"),
+        at(2026, 12, 31),
+    );
+    assert!(
+        widened.is_err(),
+        "delegating a wider exec scope must be refused at mint",
+    );
+
+    // A properly narrowed child mints, and authorises a spawn in the narrowed
+    // subtree against the node that issued the chain root.
+    let narrowed = parent
+        .delegate(
+            "tok-exec-narrow",
+            &delegator,
+            &sub_id,
+            Capability::ExecPty,
+            Scope::folder("/work/sub"),
+            at(2026, 6, 1),
+        )
+        .expect("a narrowing delegation must mint");
+
+    // Build a store whose node identity is the chain-root issuer, so the token
+    // verifies against it. The caller is the narrowed child's bearer.
+    let store = FakeStore::with_node_identity(node);
+    let executor = FakeExecutor::default();
+    let token_json = serde_json::to_string(&narrowed).unwrap();
+
+    // In the narrowed subtree: authorised.
+    let allowed = run_dispatch(
+        &store,
+        &executor,
+        &sub_id,
+        pty_spawn_in("/work/sub"),
+        WireScope::Folder {
+            path: "/work/sub".to_owned(),
+        },
+        Some(token_json.clone()),
+        at(2026, 1, 1),
+    )
+    .await;
+    assert!(
+        matches!(allowed, ManageResult::ExecSpawned { .. }),
+        "the narrowed exec token must authorise a spawn in its subtree, got {allowed:?}",
+    );
+
+    // Outside the narrowed subtree (the parent's wider /work) the child does not
+    // reach: refused, proving the delegate cannot exercise authority beyond the
+    // narrowed scope even though its parent could.
+    let refused = run_dispatch(
+        &store,
+        &executor,
+        &sub_id,
+        pty_spawn_in("/work/other"),
+        WireScope::Folder {
+            path: "/work/other".to_owned(),
+        },
+        Some(token_json),
+        at(2026, 1, 1),
+    )
+    .await;
+    assert!(
+        matches!(
+            refused,
+            ManageResult::Err {
+                kind: ManageErrorKind::Unauthorised,
+                ..
+            }
+        ),
+        "the narrowed exec token must not reach beyond its scope, got {refused:?}",
+    );
 }

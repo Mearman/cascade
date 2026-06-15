@@ -979,6 +979,163 @@ impl StateDb {
         })
     }
 
+    // ── Exec-session operations ──
+
+    /// Insert a live exec session, returning the row id it was stored under.
+    ///
+    /// `id` is the [`ExecSessionId`](cascade_exec::ExecSessionId) the provider
+    /// minted; it is the primary key so the dispatcher can resolve a session's
+    /// spawn scope from it later. `scope` is the folder the session was spawned
+    /// under — the extent a subsequent write/resize/kill/signal verb is
+    /// authorised over, never the caller-advertised wire scope.
+    #[cfg(feature = "exec")]
+    pub fn insert_exec_session(&self, session: &ExecSessionRow) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let (scope_kind, scope_path) = session.scope.to_columns();
+        conn.execute(
+            "INSERT INTO exec_sessions
+                 (id, kind, owner_device, scope_kind, scope_path, command, started_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            (
+                i64::try_from(session.id)
+                    .map_err(|_| anyhow::anyhow!("exec session id exceeds i64"))?,
+                session.kind_wire(),
+                session.owner_device.as_str(),
+                scope_kind,
+                scope_path,
+                &session.command,
+                session.started_at.timestamp(),
+            ),
+        )?;
+        Ok(())
+    }
+
+    /// Mark an exec session ended, recording its exit code and signal. Returns
+    /// `true` if a live row was updated.
+    #[cfg(feature = "exec")]
+    pub fn mark_exec_session_ended(
+        &self,
+        id: u64,
+        ended_at: DateTime<Utc>,
+        exit_code: Option<i32>,
+        exit_signal: Option<i32>,
+    ) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let rows = conn.execute(
+            "UPDATE exec_sessions
+                SET ended_at = ?2, exit_code = ?3, exit_signal = ?4
+              WHERE id = ?1 AND ended_at IS NULL",
+            (
+                i64::try_from(id).map_err(|_| anyhow::anyhow!("exec session id exceeds i64"))?,
+                ended_at.timestamp(),
+                exit_code,
+                exit_signal,
+            ),
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// List every currently-live exec session (`ended_at IS NULL`), in spawn
+    /// order. Backs the enumerate-for-authorised-peer requirement.
+    #[cfg(feature = "exec")]
+    pub fn list_live_exec_sessions(&self) -> Result<Vec<ExecSessionRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, kind, owner_device, scope_kind, scope_path, command, started_at
+             FROM exec_sessions WHERE ended_at IS NULL ORDER BY id ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                let id: i64 = row.get(0)?;
+                let kind: String = row.get(1)?;
+                let owner_device: String = row.get(2)?;
+                let scope_kind: String = row.get(3)?;
+                let scope_path: Option<String> = row.get(4)?;
+                let command: String = row.get(5)?;
+                let started_ts: i64 = row.get(6)?;
+                Ok((
+                    id,
+                    kind,
+                    owner_device,
+                    scope_kind,
+                    scope_path,
+                    command,
+                    started_ts,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(
+                |(id, kind, owner_device, scope_kind, scope_path, command, started_ts)| {
+                    let id = u64::try_from(id)
+                        .map_err(|_| anyhow::anyhow!("negative exec session id"))?;
+                    let scope = Scope::from_columns(&scope_kind, scope_path).ok_or_else(|| {
+                        anyhow::anyhow!("invalid scope kind in exec session {id}: {scope_kind}")
+                    })?;
+                    let started_at = DateTime::from_timestamp(started_ts, 0).ok_or_else(|| {
+                        anyhow::anyhow!("invalid started_at in exec session {id}")
+                    })?;
+                    Ok(ExecSessionRow {
+                        id,
+                        kind: exec_kind_from_wire(&kind)?,
+                        owner_device: DeviceId::new(owner_device),
+                        scope,
+                        command,
+                        started_at,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    /// The `(owner_device, scope)` a live exec session was spawned under, or
+    /// `None` when no live session with that id exists.
+    ///
+    /// The dispatcher resolves a session-id-only exec verb's authorisation
+    /// target from this — both the spawn scope (so the verb is authorised over
+    /// the folder the session actually runs in, not a caller-advertised wire
+    /// scope) and the owner (so the live stdio path can refuse a frame for a
+    /// session the authenticated peer does not own).
+    #[cfg(feature = "exec")]
+    pub fn exec_session_scope(&self, id: u64) -> Result<Option<(DeviceId, Scope)>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+        let id_i64 =
+            i64::try_from(id).map_err(|_| anyhow::anyhow!("exec session id exceeds i64"))?;
+        let row = conn.query_row(
+            "SELECT owner_device, scope_kind, scope_path
+               FROM exec_sessions WHERE id = ?1 AND ended_at IS NULL",
+            [id_i64],
+            |row| {
+                let owner: String = row.get(0)?;
+                let kind: String = row.get(1)?;
+                let path: Option<String> = row.get(2)?;
+                Ok((owner, kind, path))
+            },
+        );
+        match row {
+            Ok((owner, kind, path)) => {
+                let scope = Scope::from_columns(&kind, path).ok_or_else(|| {
+                    anyhow::anyhow!("invalid scope kind in exec session {id}: {kind}")
+                })?;
+                Ok(Some((DeviceId::new(owner), scope)))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     // ── Capability-token operations ──
 
     /// Record an issued [`CapabilityToken`].
@@ -1631,6 +1788,63 @@ impl AuditRecord {
     }
 }
 
+/// Storage discriminant for a PTY exec session row's `kind` column.
+#[cfg(feature = "exec")]
+const EXEC_KIND_PTY: &str = "pty";
+/// Storage discriminant for a headless-process exec session row's `kind`
+/// column.
+#[cfg(feature = "exec")]
+const EXEC_KIND_PROC: &str = "proc";
+
+/// The storage discriminant for an [`ExecKind`](cascade_exec::ExecKind).
+#[cfg(feature = "exec")]
+const fn exec_kind_to_wire(kind: cascade_exec::ExecKind) -> &'static str {
+    match kind {
+        cascade_exec::ExecKind::Pty => EXEC_KIND_PTY,
+        cascade_exec::ExecKind::Proc => EXEC_KIND_PROC,
+    }
+}
+
+/// Parse an [`ExecKind`](cascade_exec::ExecKind) from its storage discriminant,
+/// failing loudly on an unrecognised value rather than guessing.
+#[cfg(feature = "exec")]
+fn exec_kind_from_wire(s: &str) -> Result<cascade_exec::ExecKind> {
+    match s {
+        EXEC_KIND_PTY => Ok(cascade_exec::ExecKind::Pty),
+        EXEC_KIND_PROC => Ok(cascade_exec::ExecKind::Proc),
+        other => anyhow::bail!("unknown exec session kind: {other}"),
+    }
+}
+
+/// A live exec session row — the durable record the dispatcher resolves a
+/// session-id-only exec verb's authorisation scope and owner from.
+#[cfg(feature = "exec")]
+#[derive(Debug, Clone)]
+pub struct ExecSessionRow {
+    /// The session id the provider minted (the `exec_sessions.id` primary key).
+    pub id: u64,
+    /// Whether the session is backed by a PTY or a headless process.
+    pub kind: cascade_exec::ExecKind,
+    /// The authenticated caller that spawned the session.
+    pub owner_device: DeviceId,
+    /// The folder scope the session was spawned under — the extent a
+    /// session-id-only verb is authorised over.
+    pub scope: Scope,
+    /// A short summary of the spawned command, for audit and enumeration.
+    pub command: String,
+    /// When the session was spawned.
+    pub started_at: DateTime<Utc>,
+}
+
+#[cfg(feature = "exec")]
+impl ExecSessionRow {
+    /// The storage discriminant for this row's [`kind`](Self::kind).
+    #[must_use]
+    pub const fn kind_wire(&self) -> &'static str {
+        exec_kind_to_wire(self.kind)
+    }
+}
+
 /// A registered backend row from the database.
 #[derive(Debug, Clone)]
 pub struct BackendRecord {
@@ -2181,6 +2395,79 @@ mod tests {
             db.quarantine_count("folder2", "PEER").unwrap(),
             1,
             "pruning folder1 must not affect folder2"
+        );
+    }
+
+    // ── Exec sessions (schema v8) ──
+
+    #[cfg(feature = "exec")]
+    fn exec_row(id: u64, scope: Scope) -> ExecSessionRow {
+        ExecSessionRow {
+            id,
+            kind: cascade_exec::ExecKind::Pty,
+            owner_device: DeviceId::new("OWNER"),
+            scope,
+            command: "/bin/sh".to_owned(),
+            started_at: Utc::now(),
+        }
+    }
+
+    #[cfg(feature = "exec")]
+    #[test]
+    fn exec_session_scope_resolves_spawn_scope() {
+        let db = StateDb::open_in_memory().unwrap();
+        db.insert_exec_session(&exec_row(1, Scope::folder("/personal")))
+            .unwrap();
+        let resolved = db.exec_session_scope(1).unwrap();
+        assert_eq!(
+            resolved,
+            Some((DeviceId::new("OWNER"), Scope::folder("/personal"))),
+            "the session's owner and spawn scope must round-trip",
+        );
+        // An unknown id resolves to None — a session-id-only verb on it is
+        // refused rather than falling back to a caller-chosen scope.
+        assert_eq!(db.exec_session_scope(999).unwrap(), None);
+    }
+
+    #[cfg(feature = "exec")]
+    #[test]
+    fn ended_exec_session_no_longer_resolves() {
+        let db = StateDb::open_in_memory().unwrap();
+        db.insert_exec_session(&exec_row(2, Scope::folder("/work")))
+            .unwrap();
+        assert!(db.exec_session_scope(2).unwrap().is_some());
+        let ended = db
+            .mark_exec_session_ended(2, Utc::now(), Some(0), None)
+            .unwrap();
+        assert!(ended, "marking a live session ended must update a row");
+        assert_eq!(
+            db.exec_session_scope(2).unwrap(),
+            None,
+            "an ended session must not resolve a scope — a verb on it is refused",
+        );
+        // Marking an already-ended (or unknown) session ended is a no-op.
+        assert!(
+            !db.mark_exec_session_ended(2, Utc::now(), None, None)
+                .unwrap()
+        );
+    }
+
+    #[cfg(feature = "exec")]
+    #[test]
+    fn list_live_exec_sessions_excludes_ended() {
+        let db = StateDb::open_in_memory().unwrap();
+        db.insert_exec_session(&exec_row(3, Scope::folder("/a")))
+            .unwrap();
+        db.insert_exec_session(&exec_row(4, Scope::folder("/b")))
+            .unwrap();
+        db.mark_exec_session_ended(3, Utc::now(), Some(0), None)
+            .unwrap();
+        let live = db.list_live_exec_sessions().unwrap();
+        assert_eq!(live.len(), 1, "only the live session is listed");
+        assert_eq!(live.first().map(|s| s.id), Some(4));
+        assert_eq!(
+            live.first().map(|s| s.scope.clone()),
+            Some(Scope::folder("/b"))
         );
     }
 }

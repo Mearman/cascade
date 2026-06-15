@@ -578,8 +578,8 @@ async fn dispatch_status_read_is_authorised_by_node_scope() {
         ManageResult::Ok { summary } => {
             assert!(summary.contains("running="), "status summary: {summary}");
         }
-        err @ ManageResult::Err { .. } => {
-            panic!("status read should be authorised, got {err:?}")
+        other @ (ManageResult::Err { .. } | ManageResult::ExecSpawned { .. }) => {
+            panic!("status read should be authorised, got {other:?}")
         }
     }
 }

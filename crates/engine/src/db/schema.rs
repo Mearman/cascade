@@ -9,7 +9,7 @@ impl SchemaVersion {
     /// Current schema version.
     #[must_use]
     pub const fn current() -> Self {
-        Self(7)
+        Self(8)
     }
 }
 
@@ -35,6 +35,9 @@ pub fn migrate(conn: &Connection, from: SchemaVersion, _to: SchemaVersion) -> Re
     }
     if from < SchemaVersion(7) {
         v7_max_file_length_rules(conn)?;
+    }
+    if from < SchemaVersion(8) {
+        v8_exec_sessions(conn)?;
     }
 
     Ok(())
@@ -339,6 +342,47 @@ fn v7_max_file_length_rules(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_max_file_length_priority
             ON max_file_length_rules(priority DESC);
+        ",
+    )?;
+
+    Ok(())
+}
+
+/// Schema v8 -- exec sessions (PTY and headless process control).
+///
+/// `exec_sessions` tracks every PTY / process session the node spawns through
+/// the management plane. The row is the durable, restart-survivable record the
+/// dispatcher resolves a write/resize/kill/signal verb's authorisation scope
+/// from: a verb that carries only a session id resolves its target scope from
+/// `scope_kind` / `scope_path` here, never the caller-advertised wire scope, so
+/// a caller holding `exec:pty` over `/work` cannot drive a session spawned under
+/// `/personal`. The two scope columns reuse the exact `Scope::to_columns` /
+/// `Scope::from_columns` encoding the `grants` and `manage_audit` tables use.
+///
+/// `owner_device` is the authenticated caller that spawned the session, and the
+/// `command` summary backs both audit and the enumerate-for-authorised-peer
+/// requirement. `ended_at` is NULL while a session is live and set on exit;
+/// because exec rows are operational state rather than integrity state, a future
+/// prune of ended rows is acceptable (unlike the audit and token tables, which
+/// have no DELETE path).
+fn v8_exec_sessions(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS exec_sessions (
+            id            INTEGER PRIMARY KEY,
+            kind          TEXT NOT NULL,
+            owner_device  TEXT NOT NULL,
+            scope_kind    TEXT NOT NULL,
+            scope_path    TEXT,
+            command       TEXT NOT NULL,
+            started_at    INTEGER NOT NULL,
+            ended_at      INTEGER,
+            exit_code     INTEGER,
+            exit_signal   INTEGER
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_exec_sessions_owner ON exec_sessions(owner_device);
+        CREATE INDEX IF NOT EXISTS idx_exec_sessions_live ON exec_sessions(ended_at);
         ",
     )?;
 

@@ -69,6 +69,17 @@ impl crate::manage::ManageGrantStore for Engine {
     fn manage_revoked_token_ids(&self) -> Result<HashSet<String>> {
         self.db.revoked_token_ids()
     }
+
+    #[cfg(feature = "exec")]
+    fn exec_session_scope(&self, session: u64) -> Result<Option<Scope>> {
+        // Resolve the scope the live session was spawned under, dropping the
+        // owner the row also records: authorisation keys on the scope, and the
+        // owner is enforced separately at the live-stdio frame path.
+        Ok(self
+            .db
+            .exec_session_scope(session)?
+            .map(|(_owner, scope)| scope))
+    }
 }
 
 #[cfg(feature = "p2p")]
@@ -176,6 +187,155 @@ impl crate::manage::ManageCommandExecutor for Engine {
 
     async fn manage_grant_revoke(&self, grant_id: i64) -> Result<String> {
         self.grant_revoke(grant_id)
+    }
+
+    #[cfg(feature = "exec")]
+    async fn manage_pty_spawn(
+        &self,
+        owner: &DeviceId,
+        scope: &Scope,
+        shell: Option<&str>,
+        argv: &[String],
+        cwd: Option<&str>,
+        env: &[(String, String)],
+        cols: u16,
+        rows: u16,
+    ) -> Result<u64> {
+        let exec = self.exec_provider()?;
+        let spec = cascade_exec::PtySpec {
+            shell: shell.map(ToOwned::to_owned),
+            argv: argv.to_vec(),
+            cwd: cwd.map(ToOwned::to_owned),
+            env: env.to_vec(),
+            cols,
+            rows,
+        };
+        let id = exec.pty_spawn(spec).await?;
+        let command = pty_command_summary(shell, argv);
+        self.record_exec_session(id, cascade_exec::ExecKind::Pty, owner, scope, command)?;
+        Ok(id.0)
+    }
+
+    #[cfg(feature = "exec")]
+    async fn manage_pty_write(&self, session: u64, bytes: &[u8]) -> Result<String> {
+        let exec = self.exec_provider()?;
+        exec.pty_write(cascade_exec::ExecSessionId(session), bytes)
+            .await?;
+        Ok(format!("wrote {} bytes to session {session}", bytes.len()))
+    }
+
+    #[cfg(feature = "exec")]
+    async fn manage_pty_resize(&self, session: u64, cols: u16, rows: u16) -> Result<String> {
+        let exec = self.exec_provider()?;
+        exec.pty_resize(cascade_exec::ExecSessionId(session), cols, rows)
+            .await?;
+        Ok(format!("resized session {session} to {cols}x{rows}"))
+    }
+
+    #[cfg(feature = "exec")]
+    async fn manage_pty_kill(&self, session: u64, signal: i32) -> Result<String> {
+        let exec = self.exec_provider()?;
+        exec.pty_kill(cascade_exec::ExecSessionId(session), signal)
+            .await?;
+        self.db
+            .mark_exec_session_ended(session, chrono::Utc::now(), None, Some(signal))?;
+        Ok(format!("sent signal {signal} to session {session}"))
+    }
+
+    #[cfg(feature = "exec")]
+    async fn manage_proc_spawn(
+        &self,
+        owner: &DeviceId,
+        scope: &Scope,
+        argv: &[String],
+        cwd: Option<&str>,
+        env: &[(String, String)],
+    ) -> Result<u64> {
+        let exec = self.exec_provider()?;
+        let spec = cascade_exec::ProcSpec {
+            argv: argv.to_vec(),
+            cwd: cwd.map(ToOwned::to_owned),
+            env: env.to_vec(),
+        };
+        let id = exec.proc_spawn(spec).await?;
+        let command = proc_command_summary(argv);
+        self.record_exec_session(id, cascade_exec::ExecKind::Proc, owner, scope, command)?;
+        Ok(id.0)
+    }
+
+    #[cfg(feature = "exec")]
+    async fn manage_proc_signal(&self, session: u64, signal: i32) -> Result<String> {
+        let exec = self.exec_provider()?;
+        exec.proc_signal(cascade_exec::ExecSessionId(session), signal)
+            .await?;
+        Ok(format!("sent signal {signal} to session {session}"))
+    }
+
+    #[cfg(feature = "exec")]
+    async fn manage_proc_kill(&self, session: u64) -> Result<String> {
+        let exec = self.exec_provider()?;
+        exec.proc_kill(cascade_exec::ExecSessionId(session)).await?;
+        self.db
+            .mark_exec_session_ended(session, chrono::Utc::now(), None, None)?;
+        Ok(format!("killed session {session}"))
+    }
+}
+
+#[cfg(feature = "exec")]
+impl Engine {
+    /// The injected exec provider, or a loud error when none is wired.
+    ///
+    /// A node without the exec provider refuses an exec verb rather than
+    /// silently doing nothing, mirroring `manage_node_device_id`'s "no P2P
+    /// backend" failure.
+    fn exec_provider(&self) -> Result<&std::sync::Arc<dyn cascade_exec::ExecProvider>> {
+        self.exec.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "no exec provider configured — this node cannot broker terminals or processes"
+            )
+        })
+    }
+
+    /// Record a freshly spawned exec session in the durable `exec_sessions`
+    /// table so a later session-id-only verb resolves its authorisation scope
+    /// and owner from it.
+    fn record_exec_session(
+        &self,
+        id: cascade_exec::ExecSessionId,
+        kind: cascade_exec::ExecKind,
+        owner: &DeviceId,
+        scope: &Scope,
+        command: String,
+    ) -> Result<()> {
+        self.db.insert_exec_session(&crate::db::ExecSessionRow {
+            id: id.0,
+            kind,
+            owner_device: owner.clone(),
+            scope: scope.clone(),
+            command,
+            started_at: chrono::Utc::now(),
+        })
+    }
+}
+
+/// A short, audit-friendly summary of a PTY spawn's command.
+#[cfg(feature = "exec")]
+fn pty_command_summary(shell: Option<&str>, argv: &[String]) -> String {
+    let shell = shell.unwrap_or("<default shell>");
+    if argv.is_empty() {
+        shell.to_owned()
+    } else {
+        format!("{shell} {}", argv.join(" "))
+    }
+}
+
+/// A short, audit-friendly summary of a process spawn's command.
+#[cfg(feature = "exec")]
+fn proc_command_summary(argv: &[String]) -> String {
+    if argv.is_empty() {
+        "<empty argv>".to_owned()
+    } else {
+        argv.join(" ")
     }
 }
 

@@ -1678,6 +1678,67 @@ mod tests {
                 self.record(&format!("grant_revoke {grant_id}"));
                 Ok(format!("grant {grant_id} revoked"))
             }
+
+            async fn manage_pty_spawn(
+                &self,
+                _owner: &DeviceId,
+                _scope: &Scope,
+                _shell: Option<&str>,
+                _argv: &[String],
+                _cwd: Option<&str>,
+                _env: &[(String, String)],
+                _cols: u16,
+                _rows: u16,
+            ) -> anyhow::Result<u64> {
+                self.record("pty_spawn");
+                Ok(1)
+            }
+
+            async fn manage_pty_write(&self, session: u64, bytes: &[u8]) -> anyhow::Result<String> {
+                self.record(&format!("pty_write {session} {}", bytes.len()));
+                Ok(format!("wrote to {session}"))
+            }
+
+            async fn manage_pty_resize(
+                &self,
+                session: u64,
+                cols: u16,
+                rows: u16,
+            ) -> anyhow::Result<String> {
+                self.record(&format!("pty_resize {session} {cols}x{rows}"));
+                Ok(format!("resized {session}"))
+            }
+
+            async fn manage_pty_kill(&self, session: u64, signal: i32) -> anyhow::Result<String> {
+                self.record(&format!("pty_kill {session} {signal}"));
+                Ok(format!("signalled {session}"))
+            }
+
+            async fn manage_proc_spawn(
+                &self,
+                _owner: &DeviceId,
+                _scope: &Scope,
+                _argv: &[String],
+                _cwd: Option<&str>,
+                _env: &[(String, String)],
+            ) -> anyhow::Result<u64> {
+                self.record("proc_spawn");
+                Ok(2)
+            }
+
+            async fn manage_proc_signal(
+                &self,
+                session: u64,
+                signal: i32,
+            ) -> anyhow::Result<String> {
+                self.record(&format!("proc_signal {session} {signal}"));
+                Ok(format!("signalled {session}"))
+            }
+
+            async fn manage_proc_kill(&self, session: u64) -> anyhow::Result<String> {
+                self.record(&format!("proc_kill {session}"));
+                Ok(format!("killed {session}"))
+            }
         }
 
         #[async_trait]

@@ -150,6 +150,14 @@ pub struct Engine {
     /// Shared cancellation flag. Workers poll this; setting it to `true`
     /// quiesces the cache manager, sync runner, and any other subscriber.
     cancel: Arc<AtomicBool>,
+    /// The exec capability provider — `None` when the node was built without the
+    /// `exec` feature or no provider was injected at composition. When `None`,
+    /// every exec management verb fails loudly rather than silently doing
+    /// nothing, mirroring the "no P2P backend" loud failure for token
+    /// verification. Injected at the daemon composition edge, the same edge that
+    /// wires p2p and the manage dispatch.
+    #[cfg(feature = "exec")]
+    exec: Option<std::sync::Arc<dyn cascade_exec::ExecProvider>>,
 }
 
 impl fmt::Debug for Engine {
@@ -305,7 +313,23 @@ impl Engine {
             change_feed: Arc::new(ChangeFeed::new()),
             backend_factory,
             cancel,
+            #[cfg(feature = "exec")]
+            exec: None,
         })
+    }
+
+    /// Inject the exec capability provider, returning the engine.
+    ///
+    /// Composed at the daemon edge, the same place the p2p backend and manage
+    /// dispatch are wired. Without it, every exec management verb fails loudly.
+    #[cfg(feature = "exec")]
+    #[must_use]
+    pub fn with_exec_provider(
+        mut self,
+        exec: std::sync::Arc<dyn cascade_exec::ExecProvider>,
+    ) -> Self {
+        self.exec = Some(exec);
+        self
     }
 
     /// The engine's shared per-parent change index.

@@ -449,6 +449,10 @@ fn render(device_id: &str, result: &ManageResult) -> Result<()> {
             kind: ManageErrorKind::Failed,
             message,
         } => anyhow::bail!("command on node {device_id} failed: {message}"),
+        ManageResult::ExecSpawned { session } => {
+            println!("spawned exec session {session}");
+            Ok(())
+        }
     }
 }
 

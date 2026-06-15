@@ -1018,6 +1018,32 @@ impl SyncEngine {
                 }
                 Ok(())
             }
+            BepMessage::Handshake { .. } => {
+                // The capability-negotiation handshake is exchanged once, before
+                // any other post-TLS frame, by the session-establishment path
+                // (see `sync.rs`). A Handshake arriving mid-session is out of
+                // place; log and drop rather than tear the session down.
+                debug!(
+                    target: "cascade::backend::p2p",
+                    peer = %peer_device_id,
+                    "dropping mid-session Handshake frame",
+                );
+                Ok(())
+            }
+            BepMessage::ExecStream { session, .. } | BepMessage::ExecStreamAck { session, .. } => {
+                // Live exec stdio is not routed through this message handler yet:
+                // the node-side stdio pump that binds these frames to an exec
+                // session is a later wiring step. Until then, drop the frame
+                // rather than fail the session — a peer that has not been handed a
+                // live session can present no authority to drive one.
+                debug!(
+                    target: "cascade::backend::p2p",
+                    peer = %peer_device_id,
+                    session,
+                    "dropping exec stream frame — live stdio routing not yet wired",
+                );
+                Ok(())
+            }
         }
     }
 
