@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      release:
+        description: "Cut a release from main (forces a patch bump when there is nothing new to release)"
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -866,7 +871,12 @@ jobs:
   release:
     name: Release
     needs: [check, test]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    # Auto on push to main, or on demand via `workflow_dispatch` with the
+    # `release` input ticked (a dispatch without it just runs CI).
+    if: >
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' ||
+       (github.event_name == 'workflow_dispatch' && inputs.release))
     # release-plz bumps Cargo.lock on every release, which invalidates
     # rust-cache's target/ wholesale, and the sccache Save steps only run on a
     # main push — so the first release after a cold/evicted cache rebuilds the
@@ -920,21 +930,34 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
           if git diff --cached --quiet; then
-            echo 'No version bump to commit'
-            echo "bumped=false" >> "$GITHUB_OUTPUT"
-          else
-            VERSION=$(grep '^version =' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-            # [skip ci] keeps this bot bump from spawning a second, redundant CI
-            # run: the release and its asset builds already ran as downstream
-            # jobs of the push that triggered this one, so re-running the full
-            # matrix here only burns minutes and cancels the original run's
-            # trailing jobs via the cancel-in-progress concurrency group.
-            git commit -m "chore: release v${VERSION} [skip ci]"
-            git push
-            echo "bumped=true" >> "$GITHUB_OUTPUT"
-            echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-            echo "Bumped to v${VERSION}"
+            # release-plz found nothing to release. On a manual dispatch the
+            # operator explicitly asked for a release, so force a patch bump
+            # rather than no-op; on a push, leave it as a clean no-release.
+            if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+              echo 'No version bump to commit'
+              echo "bumped=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            CUR=$(grep '^version = ' Cargo.toml | head -1 | sed -E 's/version = "(.*)"/\1/')
+            NEW=$(echo "$CUR" | awk -F. '{printf "%d.%d.%d", $1, $2, $3 + 1}')
+            awk -v new="$NEW" '!done && /^version = "[^"]*"/ {sub(/"[^"]*"/, "\"" new "\""); done=1} {print}' Cargo.toml > Cargo.toml.tmp
+            mv Cargo.toml.tmp Cargo.toml
+            # Sync the workspace crates' versions in Cargo.lock (not their deps).
+            cargo update --workspace
+            git add -A
+            echo "Forced patch bump v${CUR} -> v${NEW} (manual release, no new releasable commits)"
           fi
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed -E 's/version = "(.*)"/\1/')
+          # [skip ci] keeps this bot bump from spawning a second, redundant CI
+          # run: the release and its asset builds already ran as downstream
+          # jobs of the push that triggered this one, so re-running the full
+          # matrix here only burns minutes and cancels the original run's
+          # trailing jobs via the cancel-in-progress concurrency group.
+          git commit -m "chore: release v${VERSION} [skip ci]"
+          git push
+          echo "bumped=true" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Released v${VERSION}"
       - name: Create releases
         id: release
         if: steps.bump.outputs.bumped == 'true'
