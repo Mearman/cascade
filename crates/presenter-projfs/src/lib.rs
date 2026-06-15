@@ -789,6 +789,19 @@ mod handle {
 
 use handle::NamespaceHandle;
 
+/// Characters that are illegal in a filename on at least one supported
+/// platform. Windows reserves `< > : " / \ | ? *`; an `ItemId` is
+/// `backend:native_id`, so the `:` (and any separator in the native id) must be
+/// replaced or the cache-file write fails on Windows with `ERROR_INVALID_PARAMETER`.
+const FILENAME_RESERVED: [char; 9] = ['/', '\\', ':', '*', '?', '"', '<', '>', '|'];
+
+/// Derive a flat, cross-platform-safe cache filename slug from an item id by
+/// replacing every reserved character with `_`. Shared by the presenter and
+/// its tests so the two cannot drift.
+pub(crate) fn cache_slug(id: &ItemId) -> String {
+    id.0.replace(FILENAME_RESERVED, "_")
+}
+
 /// `ProjFS` presenter — implements [`VfsPresenter`] for Windows
 /// Projected File System mounts.
 #[derive(Debug)]
@@ -987,10 +1000,9 @@ impl ProjFsPresenter {
         &self.cache_dir
     }
 
-    /// Derive a cache file path for an item. Path separators in the id
-    /// are replaced with `_` so the result is a flat filename.
+    /// Derive a cache file path for an item.
     fn cache_path_for(&self, id: &ItemId) -> PathBuf {
-        self.cache_dir.join(id.0.replace(['/', '\\'], "_"))
+        self.cache_dir.join(cache_slug(id))
     }
 
     /// Access the configured content provider, if any. Exposed for
