@@ -57,20 +57,27 @@ pub struct DirEntry {
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum CascadeError {
     /// The node's config directory could not be created or prepared.
-    #[error("config error: {message}")]
-    Config { message: String },
+    ///
+    /// The field is named `detail` rather than `message` deliberately: the
+    /// Kotlin bindings generator maps each error variant onto a subclass of
+    /// `kotlin.Exception`, and a variant field literally called `message` collides
+    /// with `Throwable.message`, producing Kotlin that does not compile. Swift
+    /// has no such clash, so this rename only changes the (unread) field name on
+    /// the Swift side.
+    #[error("config error: {detail}")]
+    Config { detail: String },
     /// The engine could not be constructed or started.
-    #[error("engine error: {message}")]
-    Engine { message: String },
+    #[error("engine error: {detail}")]
+    Engine { detail: String },
     /// A directory listing failed.
-    #[error("listing error: {message}")]
-    Listing { message: String },
+    #[error("listing error: {detail}")]
+    Listing { detail: String },
     /// A file read failed.
-    #[error("read error: {message}")]
-    Read { message: String },
+    #[error("read error: {detail}")]
+    Read { detail: String },
     /// A pin or unpin operation failed.
-    #[error("pin error: {message}")]
-    Pin { message: String },
+    #[error("pin error: {detail}")]
+    Pin { detail: String },
 }
 
 /// A running Cascade node, wrapping a [`NativeEngine`].
@@ -106,7 +113,7 @@ impl CascadeNode {
         tokio::fs::create_dir_all(&files_dir)
             .await
             .map_err(|e| CascadeError::Config {
-                message: format!("create config dir {}: {e}", files_dir.display()),
+                detail: format!("create config dir {}: {e}", files_dir.display()),
             })?;
 
         let backend = build_local_backend(&files_dir)?;
@@ -123,7 +130,7 @@ impl CascadeNode {
             backend_factory: None,
         };
         let engine = NativeEngine::new(config).map_err(|e| CascadeError::Engine {
-            message: format!("build engine: {e}"),
+            detail: format!("build engine: {e}"),
         })?;
         Ok(Arc::new(Self {
             engine: Arc::new(engine),
@@ -137,7 +144,7 @@ impl CascadeNode {
     /// engine's single cancellation flag governing the workers.
     pub async fn start(&self) -> Result<(), CascadeError> {
         let started = self.engine.start().map_err(|e| CascadeError::Engine {
-            message: format!("start engine: {e}"),
+            detail: format!("start engine: {e}"),
         })?;
         *self.handle.lock().await = Some(started);
         Ok(())
@@ -180,12 +187,12 @@ impl CascadeNode {
         // presenters follow to avoid holding a std lock across an await point.
         let (backend, backend_path, mount_names) = {
             let guard = tree.read().map_err(|_| CascadeError::Listing {
-                message: "VFS lock poisoned".to_owned(),
+                detail: "VFS lock poisoned".to_owned(),
             })?;
             guard
                 .resolve_listing(Path::new(&path))
                 .map_err(|e| CascadeError::Listing {
-                    message: format!("resolve {path}: {e}"),
+                    detail: format!("resolve {path}: {e}"),
                 })?
         };
         let entries = list_via_backend(backend, &backend_path, &mount_names).await?;
@@ -203,7 +210,7 @@ impl CascadeNode {
         let tree = self.engine.vfs().clone();
         let (backend, rel) = {
             let guard = tree.read().map_err(|_| CascadeError::Read {
-                message: "VFS lock poisoned".to_owned(),
+                detail: "VFS lock poisoned".to_owned(),
             })?;
             let (backend, rel) = guard.resolve(Path::new(&path));
             (Arc::clone(backend), rel)
@@ -212,13 +219,13 @@ impl CascadeNode {
             .metadata(&rel)
             .await
             .map_err(|e| CascadeError::Read {
-                message: format!("metadata {path}: {e}"),
+                detail: format!("metadata {path}: {e}"),
             })?;
         backend
             .download(&entry)
             .await
             .map_err(|e| CascadeError::Read {
-                message: format!("download {path}: {e}"),
+                detail: format!("download {path}: {e}"),
             })
     }
 
@@ -228,7 +235,7 @@ impl CascadeNode {
             .pin(&path, true)
             .await
             .map_err(|e| CascadeError::Pin {
-                message: format!("pin {path}: {e}"),
+                detail: format!("pin {path}: {e}"),
             })
     }
 
@@ -239,7 +246,7 @@ impl CascadeNode {
             .await
             .map(|_removed| ())
             .map_err(|e| CascadeError::Pin {
-                message: format!("unpin {path}: {e}"),
+                detail: format!("unpin {path}: {e}"),
             })
     }
 }
@@ -257,13 +264,13 @@ async fn list_via_backend(
     let native_id = cascade_engine::vfs::resolve_listing_native_id(backend.as_ref(), backend_path)
         .await
         .map_err(|e| CascadeError::Listing {
-            message: format!("resolve native id for {backend_path}: {e}"),
+            detail: format!("resolve native id for {backend_path}: {e}"),
         })?;
     let children = backend
         .list_children(&native_id)
         .await
         .map_err(|e| CascadeError::Listing {
-            message: format!("list children of {backend_path}: {e}"),
+            detail: format!("list children of {backend_path}: {e}"),
         })?;
     Ok(cascade_engine::vfs::merge_listing(children, mount_names))
 }
@@ -275,7 +282,7 @@ async fn list_via_backend(
 /// backend's requirement that its root already exist.
 fn build_local_backend(files_dir: &Path) -> Result<Arc<dyn Backend>, CascadeError> {
     let root = files_dir.to_str().ok_or_else(|| CascadeError::Config {
-        message: format!("config path is not valid UTF-8: {}", files_dir.display()),
+        detail: format!("config path is not valid UTF-8: {}", files_dir.display()),
     })?;
     let mut table = toml::value::Table::new();
     table.insert(
@@ -287,7 +294,7 @@ fn build_local_backend(files_dir: &Path) -> Result<Arc<dyn Backend>, CascadeErro
     let config = toml::Value::Table(table);
     let backend =
         cascade_backend_local::create_backend(&config).map_err(|e| CascadeError::Config {
-            message: format!("build local backend: {e}"),
+            detail: format!("build local backend: {e}"),
         })?;
     Ok(Arc::from(backend))
 }

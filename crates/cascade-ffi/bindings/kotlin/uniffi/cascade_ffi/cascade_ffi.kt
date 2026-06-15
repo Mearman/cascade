@@ -1866,52 +1866,59 @@ public object FfiConverterTypeDirEntry : FfiConverterRustBuffer<DirEntry> {
 sealed class CascadeException : kotlin.Exception() {
     /**
      * The node's config directory could not be created or prepared.
+     *
+     * The field is named `detail` rather than `message` deliberately: UniFFI's
+     * Kotlin bindgen maps each error variant onto a subclass of
+     * `kotlin.Exception`, and a variant field literally called `message` collides
+     * with `Throwable.message`, producing Kotlin that does not compile. Swift has
+     * no such clash, so this rename only changes the (unread) field name on the
+     * Swift side.
      */
     class Config(
-        val `message`: kotlin.String,
+        val `detail`: kotlin.String,
     ) : CascadeException() {
         override val message
-            get() = "message=${ `message` }"
+            get() = "detail=${ `detail` }"
     }
 
     /**
      * The engine could not be constructed or started.
      */
     class Engine(
-        val `message`: kotlin.String,
+        val `detail`: kotlin.String,
     ) : CascadeException() {
         override val message
-            get() = "message=${ `message` }"
+            get() = "detail=${ `detail` }"
     }
 
     /**
      * A directory listing failed.
      */
     class Listing(
-        val `message`: kotlin.String,
+        val `detail`: kotlin.String,
     ) : CascadeException() {
         override val message
-            get() = "message=${ `message` }"
+            get() = "detail=${ `detail` }"
     }
 
     /**
      * A file read failed.
      */
     class Read(
-        val `message`: kotlin.String,
+        val `detail`: kotlin.String,
     ) : CascadeException() {
         override val message
-            get() = "message=${ `message` }"
+            get() = "detail=${ `detail` }"
     }
 
     /**
      * A pin or unpin operation failed.
      */
     class Pin(
-        val `message`: kotlin.String,
+        val `detail`: kotlin.String,
     ) : CascadeException() {
         override val message
-            get() = "message=${ `message` }"
+            get() = "detail=${ `detail` }"
     }
 
     companion object ErrorHandler : UniffiRustCallStatusErrorHandler<CascadeException> {
@@ -1965,31 +1972,31 @@ public object FfiConverterTypeCascadeError : FfiConverterRustBuffer<CascadeExcep
             is CascadeException.Config -> (
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
                 4UL +
-                    FfiConverterString.allocationSize(value.`message`)
+                    FfiConverterString.allocationSize(value.`detail`)
             )
 
             is CascadeException.Engine -> (
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
                 4UL +
-                    FfiConverterString.allocationSize(value.`message`)
+                    FfiConverterString.allocationSize(value.`detail`)
             )
 
             is CascadeException.Listing -> (
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
                 4UL +
-                    FfiConverterString.allocationSize(value.`message`)
+                    FfiConverterString.allocationSize(value.`detail`)
             )
 
             is CascadeException.Read -> (
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
                 4UL +
-                    FfiConverterString.allocationSize(value.`message`)
+                    FfiConverterString.allocationSize(value.`detail`)
             )
 
             is CascadeException.Pin -> (
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
                 4UL +
-                    FfiConverterString.allocationSize(value.`message`)
+                    FfiConverterString.allocationSize(value.`detail`)
             )
         }
 
@@ -2000,31 +2007,31 @@ public object FfiConverterTypeCascadeError : FfiConverterRustBuffer<CascadeExcep
         when (value) {
             is CascadeException.Config -> {
                 buf.putInt(1)
-                FfiConverterString.write(value.`message`, buf)
+                FfiConverterString.write(value.`detail`, buf)
                 Unit
             }
 
             is CascadeException.Engine -> {
                 buf.putInt(2)
-                FfiConverterString.write(value.`message`, buf)
+                FfiConverterString.write(value.`detail`, buf)
                 Unit
             }
 
             is CascadeException.Listing -> {
                 buf.putInt(3)
-                FfiConverterString.write(value.`message`, buf)
+                FfiConverterString.write(value.`detail`, buf)
                 Unit
             }
 
             is CascadeException.Read -> {
                 buf.putInt(4)
-                FfiConverterString.write(value.`message`, buf)
+                FfiConverterString.write(value.`detail`, buf)
                 Unit
             }
 
             is CascadeException.Pin -> {
                 buf.putInt(5)
-                FfiConverterString.write(value.`message`, buf)
+                FfiConverterString.write(value.`detail`, buf)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }

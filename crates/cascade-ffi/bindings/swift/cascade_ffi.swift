@@ -925,28 +925,35 @@ public enum CascadeError: Swift.Error, Equatable, Hashable, Foundation.Localized
     
     /**
      * The node's config directory could not be created or prepared.
+     *
+     * The field is named `detail` rather than `message` deliberately: UniFFI's
+     * Kotlin bindgen maps each error variant onto a subclass of
+     * `kotlin.Exception`, and a variant field literally called `message` collides
+     * with `Throwable.message`, producing Kotlin that does not compile. Swift has
+     * no such clash, so this rename only changes the (unread) field name on the
+     * Swift side.
      */
-    case Config(message: String
+    case Config(detail: String
     )
     /**
      * The engine could not be constructed or started.
      */
-    case Engine(message: String
+    case Engine(detail: String
     )
     /**
      * A directory listing failed.
      */
-    case Listing(message: String
+    case Listing(detail: String
     )
     /**
      * A file read failed.
      */
-    case Read(message: String
+    case Read(detail: String
     )
     /**
      * A pin or unpin operation failed.
      */
-    case Pin(message: String
+    case Pin(detail: String
     )
 
     
@@ -978,19 +985,19 @@ public struct FfiConverterTypeCascadeError: FfiConverterRustBuffer {
 
         
         case 1: return .Config(
-            message: try FfiConverterString.read(from: &buf)
+            detail: try FfiConverterString.read(from: &buf)
             )
         case 2: return .Engine(
-            message: try FfiConverterString.read(from: &buf)
+            detail: try FfiConverterString.read(from: &buf)
             )
         case 3: return .Listing(
-            message: try FfiConverterString.read(from: &buf)
+            detail: try FfiConverterString.read(from: &buf)
             )
         case 4: return .Read(
-            message: try FfiConverterString.read(from: &buf)
+            detail: try FfiConverterString.read(from: &buf)
             )
         case 5: return .Pin(
-            message: try FfiConverterString.read(from: &buf)
+            detail: try FfiConverterString.read(from: &buf)
             )
 
          default: throw UniffiInternalError.unexpectedEnumCase
@@ -1004,29 +1011,29 @@ public struct FfiConverterTypeCascadeError: FfiConverterRustBuffer {
 
         
         
-        case let .Config(message):
+        case let .Config(detail):
             writeInt(&buf, Int32(1))
-            FfiConverterString.write(message, into: &buf)
+            FfiConverterString.write(detail, into: &buf)
             
         
-        case let .Engine(message):
+        case let .Engine(detail):
             writeInt(&buf, Int32(2))
-            FfiConverterString.write(message, into: &buf)
+            FfiConverterString.write(detail, into: &buf)
             
         
-        case let .Listing(message):
+        case let .Listing(detail):
             writeInt(&buf, Int32(3))
-            FfiConverterString.write(message, into: &buf)
+            FfiConverterString.write(detail, into: &buf)
             
         
-        case let .Read(message):
+        case let .Read(detail):
             writeInt(&buf, Int32(4))
-            FfiConverterString.write(message, into: &buf)
+            FfiConverterString.write(detail, into: &buf)
             
         
-        case let .Pin(message):
+        case let .Pin(detail):
             writeInt(&buf, Int32(5))
-            FfiConverterString.write(message, into: &buf)
+            FfiConverterString.write(detail, into: &buf)
             
         }
     }
