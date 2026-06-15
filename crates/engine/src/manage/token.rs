@@ -1062,4 +1062,349 @@ mod tests {
             .expect_err("a revoked ancestor must invalidate the chain");
         assert!(matches!(err, TokenVerifyError::ParentInvalid { .. }));
     }
+
+    // ── Conformance-vector generation ──
+
+    /// Regenerate `docs/conformance/tokens.v1.json` — the language-neutral
+    /// token-verification fixtures every implementation's CI runs.
+    ///
+    /// Ignored by default: it mints fresh device identities, so it must be run
+    /// deliberately (`cargo test -p cascade-engine generate_token_vectors --
+    /// --ignored`) and the resulting JSON committed. Once committed, the
+    /// fixtures are frozen — `crates/engine/tests/conformance_tokens.rs` only
+    /// *reads* them and never regenerates, because regenerating on every run
+    /// would mint new keys and mask a real verifier drift behind a moving
+    /// target. A second implementation runs the same JSON through its own
+    /// verifier; a divergence in either verdict is a wire-incompatibility bug.
+    ///
+    /// Each vector carries a fully materialised token (issuer certificate and
+    /// signature inline), the verifying node, the connected (bearer) device, the
+    /// wall clock, and the revocation set, plus the verdict Cascade's verifier
+    /// must reach. The cases together exercise the success path and each
+    /// top-level [`TokenVerifyError`] verdict — including a delegation chain and
+    /// an `exec:pty` token that ties the exec capability into the vectors. A
+    /// failure deep in a chain surfaces at the leaf as `ParentInvalid`, so
+    /// `ChainTooDeep` and a revoked ancestor appear nested under that verdict
+    /// rather than as their own top-level discriminant.
+    #[test]
+    #[ignore = "regenerates committed conformance fixtures; run deliberately"]
+    fn generate_token_vectors() {
+        use serde_json::{Map, Value, json};
+
+        /// A `now` instant comfortably inside every vector's validity window
+        /// except the expiry case, expressed as Unix milliseconds.
+        fn now_ms(date: DateTime<Utc>) -> i64 {
+            date.timestamp_millis()
+        }
+
+        /// Build one `expected: "ok"` vector entry.
+        fn ok_vector(
+            name: &str,
+            token: &CapabilityToken,
+            verifying_node: &DeviceId,
+            connected_device: &DeviceId,
+            now: DateTime<Utc>,
+            revoked_ids: &[&str],
+        ) -> Value {
+            vector(
+                name,
+                token,
+                verifying_node,
+                connected_device,
+                now,
+                revoked_ids,
+                json!("ok"),
+            )
+        }
+
+        /// Build one `expected: { "err": <discriminant> }` vector entry.
+        fn err_vector(
+            name: &str,
+            token: &CapabilityToken,
+            verifying_node: &DeviceId,
+            connected_device: &DeviceId,
+            now: DateTime<Utc>,
+            revoked_ids: &[&str],
+            err: &str,
+        ) -> Value {
+            vector(
+                name,
+                token,
+                verifying_node,
+                connected_device,
+                now,
+                revoked_ids,
+                json!({ "err": err }),
+            )
+        }
+
+        fn vector(
+            name: &str,
+            token: &CapabilityToken,
+            verifying_node: &DeviceId,
+            connected_device: &DeviceId,
+            now: DateTime<Utc>,
+            revoked_ids: &[&str],
+            expected: Value,
+        ) -> Value {
+            let mut entry = Map::new();
+            entry.insert("name".to_owned(), json!(name));
+            entry.insert(
+                "token_json".to_owned(),
+                serde_json::to_value(token).expect("token serialises"),
+            );
+            entry.insert("verifying_node".to_owned(), json!(verifying_node.as_str()));
+            entry.insert(
+                "connected_device".to_owned(),
+                json!(connected_device.as_str()),
+            );
+            entry.insert("now_unix_ms".to_owned(), json!(now_ms(now)));
+            entry.insert("revoked_ids".to_owned(), json!(revoked_ids));
+            entry.insert("expected".to_owned(), expected);
+            Value::Object(entry)
+        }
+
+        let node = identity();
+        let other = identity();
+        let attacker = identity();
+        let bearer = identity();
+        let sub = identity();
+        let node_id = id_of(&node);
+        let bearer_id = id_of(&bearer);
+        let sub_id = id_of(&sub);
+
+        let mut vectors: Vec<Value> = Vec::new();
+
+        // Success: a node-issued pin:write token over /work, presented by its
+        // bearer, inside its validity window.
+        let ok = issued_by(&node, &bearer_id);
+        vectors.push(ok_vector(
+            "node_issued_ok",
+            &ok,
+            &node_id,
+            &bearer_id,
+            at(2026, 1, 1),
+            &[],
+        ));
+
+        // Success: an exec:pty token over an exact folder scope, tying the exec
+        // capability into the vectors. exec is a dangerous verb, but the token
+        // path is capability-agnostic: an exec token verifies exactly like any
+        // other, and the dangerous-tier node-scope bar is enforced at the grant
+        // authorisation layer, not the token verifier.
+        let exec = CapabilityToken::issue(
+            "tok-exec",
+            &node,
+            &bearer_id,
+            Capability::ExecPty,
+            Scope::folder("/work"),
+            at(2026, 12, 31),
+        )
+        .expect("issue an exec:pty token");
+        vectors.push(ok_vector(
+            "exec_pty_ok",
+            &exec,
+            &node_id,
+            &bearer_id,
+            at(2026, 1, 1),
+            &[],
+        ));
+
+        // Success: a delegation chain narrowing scope from /work to /work/sub,
+        // presented by the sub-delegate.
+        let delegated = ok
+            .delegate(
+                "tok-1-g",
+                &bearer,
+                &sub_id,
+                Capability::PinWrite,
+                Scope::folder("/work/sub"),
+                at(2026, 6, 1),
+            )
+            .expect("subset child mints");
+        vectors.push(ok_vector(
+            "delegated_chain_ok",
+            &delegated,
+            &node_id,
+            &sub_id,
+            at(2026, 1, 1),
+            &[],
+        ));
+
+        // bad_signature: a token whose claims were tampered after signing.
+        let mut tampered = issued_by(&node, &bearer_id);
+        tampered.claims.scope = Scope::Node;
+        vectors.push(err_vector(
+            "tampered_claims_bad_signature",
+            &tampered,
+            &node_id,
+            &bearer_id,
+            at(2026, 1, 1),
+            &[],
+            "bad_signature",
+        ));
+
+        // bad_signature: a substituted certificate re-signed by an attacker. The
+        // cert no longer hashes to the claimed issuer, so the binding rejects it.
+        let mut substituted = issued_by(&node, &bearer_id);
+        substituted.issuer_cert_der = attacker.cert_der().expect("attacker cert");
+        substituted.signature = attacker
+            .sign_capability(&substituted.claims.signing_bytes())
+            .expect("attacker signs");
+        vectors.push(err_vector(
+            "substituted_certificate_bad_signature",
+            &substituted,
+            &node_id,
+            &bearer_id,
+            at(2026, 1, 1),
+            &[],
+            "bad_signature",
+        ));
+
+        // wrong_issuer: a token whose chain root was signed by another node.
+        let from_other = issued_by(&other, &bearer_id);
+        vectors.push(err_vector(
+            "root_from_another_node_wrong_issuer",
+            &from_other,
+            &node_id,
+            &bearer_id,
+            at(2026, 1, 1),
+            &[],
+            "wrong_issuer",
+        ));
+
+        // bearer_mismatch: a valid token presented by a device other than its
+        // bearer.
+        vectors.push(err_vector(
+            "presented_by_wrong_device_bearer_mismatch",
+            &ok,
+            &node_id,
+            &sub_id,
+            at(2026, 1, 1),
+            &[],
+            "bearer_mismatch",
+        ));
+
+        // expired: the verifier's clock is past the token's expiry.
+        vectors.push(err_vector(
+            "past_expiry_expired",
+            &ok,
+            &node_id,
+            &bearer_id,
+            at(2027, 1, 1),
+            &[],
+            "expired",
+        ));
+
+        // revoked: the leaf token id is on the revocation list.
+        vectors.push(err_vector(
+            "leaf_on_revocation_list_revoked",
+            &ok,
+            &node_id,
+            &bearer_id,
+            at(2026, 1, 1),
+            &["tok-1"],
+            "revoked",
+        ));
+
+        // delegation_exceeds_parent: a delegated leaf widened to a node-wide
+        // scope after minting and re-signed by its own (valid) issuer, so the
+        // signature passes but the containment check catches the over-reach.
+        let mut widened = ok
+            .delegate(
+                "tok-1-wide",
+                &bearer,
+                &sub_id,
+                Capability::PinWrite,
+                Scope::folder("/work/sub"),
+                at(2026, 6, 1),
+            )
+            .expect("subset child mints");
+        widened.claims.scope = Scope::Node;
+        widened.signature = bearer
+            .sign_capability(&widened.claims.signing_bytes())
+            .expect("the delegating bearer re-signs the widened claims");
+        vectors.push(err_vector(
+            "widened_delegation_exceeds_parent",
+            &widened,
+            &node_id,
+            &sub_id,
+            at(2026, 1, 1),
+            &[],
+            "delegation_exceeds_parent",
+        ));
+
+        // parent_invalid: a well-formed delegated leaf whose root is on the
+        // revocation list. The leaf itself is fine; its parent fails, and the
+        // failure surfaces as parent_invalid naming the broken hop.
+        vectors.push(err_vector(
+            "revoked_root_parent_invalid",
+            &delegated,
+            &node_id,
+            &sub_id,
+            at(2026, 1, 1),
+            &["tok-1"],
+            "parent_invalid",
+        ));
+
+        // chain_too_deep, surfaced through parent_invalid: a delegation chain
+        // whose root sits one hop past MAX_DELEGATION_DEPTH. The verifier walks
+        // from the leaf (depth 1) toward the root; the over-deep root returns
+        // ChainTooDeep, which each hop wraps in ParentInvalid, so the top-level
+        // verdict the bearer sees is parent_invalid. Each hop reuses the same
+        // bearer identity as both delegating party and next delegate, narrowing
+        // nothing, so only the depth bound rejects the chain. The leaf is
+        // therefore at depth one beyond the ceiling once the root is reached.
+        let mut chain = issued_by(&node, &bearer_id);
+        for hop in 0..MAX_DELEGATION_DEPTH {
+            chain = chain
+                .delegate(
+                    format!("tok-deep-{hop}"),
+                    &bearer,
+                    &bearer_id,
+                    Capability::PinWrite,
+                    Scope::folder("/work"),
+                    at(2026, 12, 31),
+                )
+                .expect("equal-authority self-delegation mints");
+        }
+        vectors.push(err_vector(
+            "over_deep_chain_parent_invalid",
+            &chain,
+            &node_id,
+            &bearer_id,
+            at(2026, 1, 1),
+            &[],
+            "parent_invalid",
+        ));
+
+        // Serialise with a trailing newline so the committed file is a tidy,
+        // diff-friendly artifact.
+        let doc = json!({
+            "protocol_version": 1,
+            "description": "Capability-token verification conformance vectors for \
+        protocol version 1. Each vector carries a fully materialised CapabilityToken \
+        (issuer certificate and signature inline, so verification needs no shared \
+        private key), the verifying node device id, the connected (bearer) device id, \
+        the verifier wall clock as Unix milliseconds, and the revocation set. expected \
+        is \"ok\" when the token must verify, or { \"err\": <discriminant> } naming the \
+        hard rejection the verifier must reach: one of bad_signature, wrong_issuer, \
+        bearer_mismatch, expired, revoked, delegation_exceeds_parent, parent_invalid. \
+        A failure deep in a delegation chain (a revoked or over-deep ancestor) is \
+        reported at the leaf as parent_invalid, which recursively carries the \
+        underlying chain_too_deep or revoked cause. The signing bytes are the \
+        serialiser-independent canonical \
+        encoding in token.rs signing_bytes(), so a second implementation reproduces the \
+        same verdicts from the same JSON. These fixtures are generated once by the \
+        ignored generate_token_vectors test and committed; the harness only reads them.",
+            "vectors": vectors,
+        });
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/conformance/tokens.v1.json"
+        );
+        let mut serialised = serde_json::to_string_pretty(&doc).expect("serialise vectors");
+        serialised.push('\n');
+        std::fs::write(path, serialised).unwrap_or_else(|e| panic!("write {path}: {e}"));
+    }
 }
