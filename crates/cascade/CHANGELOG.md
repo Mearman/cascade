@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.121](https://github.com/Mearman/cascade/compare/cascade-v0.1.120...cascade-v0.1.121) - 2026-06-15
+
+### Added
+
+- *(engine)* compile vfs/engine/changefeed under the portable feature
+- *(exec)* wire exec capability into the management plane
+
+### Other
+
+- *(cascade)* move webdav_mount_command test helper to the test sibling
+
 ## [0.1.120](https://github.com/Mearman/cascade/compare/cascade-v0.1.119...cascade-v0.1.120) - 2026-06-12
 
 ### Other
