@@ -1,0 +1,40 @@
+[package]
+name = "cascade-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# A mobile node has no PTY or process-exec capability, so the engine is taken
+# without its default `exec` feature: that drops cascade-exec -> portable-pty ->
+# serial -> ioctl-rs/termios, none of which build for iOS. `native` carries the
+# tokio/rusqlite/reqwest runtime, `p2p` carries block sharing and the management
+# plane — both cross-compile to aarch64-apple-ios.
+[dependencies]
+cascade-engine = { path = "../engine", default-features = false, features = [
+    "native",
+    "p2p",
+] }
+cascade-backend-local = { path = "../backend-local" }
+tokio = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+uniffi = { version = "0.31", features = ["cli", "tokio"] }
+
+# UniFFI is driven entirely by proc-macros (uniffi::setup_scaffolding!() in
+# lib.rs), so no UDL file and no build.rs scaffolding step are needed. The
+# `[lib]` crate-types below give the C-callable cdylib/staticlib the mobile
+# toolchains link against alongside the Rust `lib` used by the bindgen binary.
+[lib]
+crate-type = ["lib", "staticlib", "cdylib"]
+
+# Binary that generates the foreign-language bindings, invoked as
+# `cargo run --bin uniffi-bindgen -- generate ...`.
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[lints]
+workspace = true

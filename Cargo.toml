@@ -20,6 +20,11 @@ members = [
     "crates/relay-server",
     "crates/cascade-announce-wire",
     "crates/cascade-web-api",
+    # UniFFI bridge exposing the native engine to Swift/Kotlin mobile nodes. Built
+    # without the engine's exec feature so it cross-compiles to aarch64-apple-ios;
+    # verify the mobile build with:
+    #   cargo build -p cascade-ffi --target aarch64-apple-ios
+    "crates/cascade-ffi",
     # cascade-wasm compiles to wasm32-unknown-unknown only. On native targets it
     # builds as an empty lib — all public functions are cfg-gated on wasm32 and
     # all deps are target-specific. Verify with:
