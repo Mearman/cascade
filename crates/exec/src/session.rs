@@ -58,7 +58,7 @@ pub enum ExecEvent {
 
 /// A summary record of a session — live or recently exited.
 ///
-/// Returned by [`ExecProvider::list_sessions`] for enumeration by an
+/// Returned by [`crate::ExecProvider::list_sessions`] for enumeration by an
 /// authorised peer.
 #[derive(Debug, Clone)]
 pub struct ExecSessionRecord {

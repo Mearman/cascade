@@ -223,7 +223,7 @@ pub trait ManageGrantStore: Send + Sync {
     /// derives its authorisation target from the scope the session actually runs
     /// in, never the caller-advertised wire scope. The dispatcher resolves the
     /// real scope from here before authorising, exactly as `GrantRevoke`
-    /// resolves the stored grant's scope via [`manage_grant_scope`]. This closes
+    /// resolves the stored grant's scope via [`Self::manage_grant_scope`]. This closes
     /// the scope-escape class where a caller holding `exec:pty` over `/work`
     /// drives a session spawned under `/personal` by lying in the wire scope.
     ///
