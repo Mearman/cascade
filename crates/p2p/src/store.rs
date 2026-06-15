@@ -132,7 +132,7 @@ mod dirs_sys {
             Ok(PathBuf::from(home).join("Library/Application Support"))
         }
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             std::env::var("XDG_CONFIG_HOME")
                 .map(PathBuf::from)
