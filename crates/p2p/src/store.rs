@@ -126,7 +126,7 @@ mod dirs_sys {
     use std::path::PathBuf;
 
     pub fn config_dir() -> Result<PathBuf, anyhow::Error> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("HOME not set"))?;
             Ok(PathBuf::from(home).join("Library/Application Support"))

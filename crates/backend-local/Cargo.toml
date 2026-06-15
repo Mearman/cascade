@@ -3,8 +3,16 @@ name = "cascade-backend-local"
 version.workspace = true
 edition.workspace = true
 
+# The local backend uses none of the engine's exec surface, so it requests the
+# engine without its default `exec` feature. That keeps the exec capability
+# provider (and its portable-pty -> serial -> termios chain, which does not build
+# for iOS) out of any consumer that only needs the local backend, so the crate
+# cross-compiles to mobile targets.
 [dependencies]
-cascade-engine = { path = "../engine" }
+cascade-engine = { path = "../engine", default-features = false, features = [
+    "native",
+    "p2p",
+] }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true

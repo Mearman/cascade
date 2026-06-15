@@ -45,7 +45,7 @@ portable = []
 # the dispatch path. A wasm / no-exec build drops it so portable-pty (which does
 # not compile to wasm32) is not pulled in. Requires the p2p feature: the exec
 # verbs travel as management frames defined in cascade-p2p.
-exec = ["dep:cascade-exec", "p2p"]
+exec = ["dep:cascade-exec", "p2p", "cascade-p2p/exec"]
 
 # WASM-only deps — used by the portable::wasm (spawn_local, setTimeout) and
 # portable::wasm_io (fetch, Blob, Headers) adapters.

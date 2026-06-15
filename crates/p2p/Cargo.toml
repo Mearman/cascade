@@ -28,7 +28,7 @@ ed25519-dalek = { workspace = true }
 cascade-announce-wire = { version = "0.1.56", path = "../cascade-announce-wire" }
 ring = "0.17"
 x509-parser = "0.18"
-cascade-exec = { version = "0.1.120", path = "../exec" }
+cascade-exec = { version = "0.1.120", path = "../exec", optional = true }
 
 [features]
 ## Enable the announce-server discovery client ([`discovery::announce::AnnounceDiscovery`]).
@@ -58,6 +58,15 @@ nat-integration = []
 ## network-facing `mainline`-backed node lives behind this feature, mirroring
 ## how the announce-server HTTP client is gated behind `announce`.
 dht = ["dep:mainline"]
+
+## Enable the live exec data-plane stream pump ([`exec_stream`]).
+##
+## Pulls in `cascade-exec`, whose PTY support reaches `portable-pty` ->
+## `ioctl-rs`, which does not compile to iOS. A mobile node has no
+## process-exec capability, so this feature is dropped on those targets; the
+## pure wire decoders in [`protocol`] (`MSG_EXEC_STREAM` / `_ACK`) stay
+## compiled regardless because they carry no `cascade-exec` dependency.
+exec = ["dep:cascade-exec"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }

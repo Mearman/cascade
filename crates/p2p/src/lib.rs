@@ -41,6 +41,7 @@ pub mod block;
 pub mod candidate;
 pub mod connection;
 pub mod discovery;
+#[cfg(feature = "exec")]
 pub mod exec_stream;
 pub mod framed;
 pub mod identity;
