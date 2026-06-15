@@ -2132,16 +2132,6 @@ fn mount_webdav(mount_point: &Path, port: u16) -> Result<()> {
     Ok(())
 }
 
-/// Build a `mount_webdav` command (for testing command construction).
-#[cfg(test)]
-#[cfg(target_os = "macos")]
-fn webdav_mount_command(mount_point: &Path, port: u16) -> std::process::Command {
-    let url = format!("http://localhost:{port}/");
-    let mut cmd = std::process::Command::new("/sbin/mount_webdav");
-    cmd.arg(&url).arg(mount_point);
-    cmd
-}
-
 /// Unmount a filesystem at the given path.
 #[cfg(target_os = "macos")]
 fn unmount_path(mount_point: &Path) -> Result<()> {

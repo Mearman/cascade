@@ -203,6 +203,15 @@ fn mount_nfs_on_unreachable_port_errors_without_privilege_escalation() {
 
 // --- WebDAV mount command construction ---
 
+/// Build a `mount_webdav` command (for testing command construction).
+#[cfg(target_os = "macos")]
+fn webdav_mount_command(mount_point: &Path, port: u16) -> std::process::Command {
+    let url = format!("http://localhost:{port}/");
+    let mut cmd = std::process::Command::new("/sbin/mount_webdav");
+    cmd.arg(&url).arg(mount_point);
+    cmd
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn webdav_mount_command_constructs_correctly() {
