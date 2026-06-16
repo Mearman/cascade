@@ -7,6 +7,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.125](https://github.com/Mearman/cascade/compare/cascade-wasm-v0.1.124...cascade-wasm-v0.1.125) - 2026-06-16
+
+### Added
+
+- *(wasm)* add file delete mutator for engine storage consistency
+- *(wasm)* wire lifecycle policies, pin deletion, peers, and query params
+- *(wasm)* wire POST /v1/backends and POST /v1/pins through engine storage
+- *(web)* wire Google Drive API to populate engine file storage
+- *(wasm)* wire Google Drive auth route and token restore
+- *(wasm)* wire engine storage through PWA request handlers
+- *(wasm)* wire WASM adapters into cascade-wasm for portable engine construction
+- *(wasm)* wire unified handle_request API and session state
+- *(wasm)* add cascade-wasm crate proving wasm32-unknown-unknown toolchain
+
+### Fixed
+
+- *(wasm)* add path field to FileEntry literal; document nested-listing follow-up
+- *(wasm)* exclude cache and sync modules from wasm32 target
+- *(wasm)* suppress dead_code on EngineState scaffold
+
+### Other
+
+- release v0.1.124 [skip ci]
+- release v0.1.123 [skip ci]
+- release v0.1.122 [skip ci]
+- release v0.1.121 [skip ci]
+- release v0.1.120 [skip ci]
+- release v0.1.119 [skip ci]
+- release v0.1.118 [skip ci]
+- release v0.1.117 [skip ci]
+- release v0.1.116 [skip ci]
+- release v0.1.115 [skip ci]
+- release v0.1.114 [skip ci]
+- release v0.1.113 [skip ci]
+- release v0.1.112 [skip ci]
+- release v0.1.111 [skip ci]
+- release v0.1.110 [skip ci]
+- release v0.1.109 [skip ci]
+- release v0.1.108 [skip ci]
+- release v0.1.107 [skip ci]
+- release v0.1.106 [skip ci]
+- release v0.1.105 [skip ci]
+- release v0.1.104 [skip ci]
+- release v0.1.103 [skip ci]
+- release v0.1.102 [skip ci]
+- release v0.1.101 [skip ci]
+- release v0.1.100 [skip ci]
+- release v0.1.99 [skip ci]
+- release v0.1.98 [skip ci]
+- release v0.1.97 [skip ci]
+- *(wasm)* cover the limit= query truncation in the router
+- release v0.1.96 [skip ci]
+- *(wasm)* inject engine state into the router and add contract tests
+- release v0.1.95 [skip ci]
+- release v0.1.94 [skip ci]
+- release v0.1.93 [skip ci]
+- release v0.1.92 [skip ci]
+- release v0.1.91 [skip ci]
+- *(cascade-wasm)* apply cargo fmt
+- release v0.1.90 [skip ci]
+- release v0.1.89 [skip ci]
+- release v0.1.88 [skip ci]
+- release v0.1.87 [skip ci]
+- release v0.1.86 [skip ci]
+- release v0.1.85 [skip ci]
+- release v0.1.84 [skip ci]
+- release v0.1.83 [skip ci]
+- release v0.1.82 [skip ci]
+- release v0.1.81 [skip ci]
+- release v0.1.80 [skip ci]
+- release v0.1.79 [skip ci]
+- release v0.1.78 [skip ci]
+- release v0.1.77 [skip ci]
+- *(wasm)* fix unresolved doc links in cascade-wasm crate root
+- release v0.1.76 [skip ci]
+- release v0.1.75 [skip ci]
+- apply cargo fmt to portable traits and cascade-wasm
+
 ## [0.1.124](https://github.com/Mearman/cascade/compare/cascade-wasm-v0.1.123...cascade-wasm-v0.1.124) - 2026-06-16
 
 ### Added

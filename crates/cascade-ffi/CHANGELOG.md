@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.125](https://github.com/Mearman/cascade/compare/cascade-ffi-v0.1.124...cascade-ffi-v0.1.125) - 2026-06-16
+
+### Added
+
+- *(ffi)* add cascade-ffi UniFFI bridge for mobile nodes
+
+### Fixed
+
+- *(ffi)* rename CascadeError field message to detail for Kotlin bindings
+
+### Other
+
+- *(ffi)* cover the CascadeNode mobile entry point; fix local list_children
+- release v0.1.124 [skip ci]
+- release v0.1.123 [skip ci]
+- release v0.1.122 [skip ci]
+- release v0.1.121 [skip ci]
+
 ## [0.1.124](https://github.com/Mearman/cascade/compare/cascade-ffi-v0.1.123...cascade-ffi-v0.1.124) - 2026-06-16
 
 ### Added
