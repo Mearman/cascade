@@ -600,8 +600,8 @@ async fn run_exec(
 
 /// Pump the exec session: forward output to the terminal and (for shell mode)
 /// forward local stdin to the remote PTY. Returns when the session's
-/// [`ExecStreamEvent::Exited`] arrives (the process exited) or, for a shell,
-/// when stdin reaches EOF.
+/// [`cascade_p2p::exec_stream::ExecStreamEvent::Exited`] arrives (the process
+/// exited) or, for a shell, when stdin reaches EOF.
 ///
 /// Returns `Ok(Some(code))` when a one-shot `exec` received the remote
 /// process's exit status (a shell-style code: `code` for a normal exit,
