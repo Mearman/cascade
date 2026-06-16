@@ -2397,8 +2397,8 @@ impl SyncEngine {
     }
 
     /// Send a `PtyResize` management command to resize the PTY of `session_id`
-    /// on `device_id` to `cols` x `rows`. See [`send_pty_write`] for the
-    /// `token` parameter.
+    /// on `device_id` to `cols` x `rows`. See [`SyncEngine::send_pty_write`] for
+    /// the `token` parameter.
     pub async fn send_pty_resize(
         &self,
         device_id: &str,
@@ -2421,8 +2421,8 @@ impl SyncEngine {
     }
 
     /// Send a `PtyKill` management command to signal `session_id` on
-    /// `device_id` with `signal`. See [`send_pty_write`] for the `token`
-    /// parameter.
+    /// `device_id` with `signal`. See [`SyncEngine::send_pty_write`] for the
+    /// `token` parameter.
     pub async fn send_pty_signal(
         &self,
         device_id: &str,
