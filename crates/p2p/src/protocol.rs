@@ -45,6 +45,16 @@ const MSG_OPLOG_HAVE: u32 = 20;
 const MSG_OPLOG_REQUEST: u32 = 21;
 /// Carry a contiguous range of opaque, signed oplog entries. FROZEN at 22.
 const MSG_OPLOG_DATA: u32 = 22;
+/// Carry the exit status of a finished exec session. FROZEN at 23.
+///
+/// Sent once by the node's exec output pump after the last
+/// [`BepMessage::ExecStream`] output frame, on the session's terminal
+/// [`cascade_exec::ExecEvent::Exited`]. It is a single control frame, not
+/// credit-gated: the manager routes it to the exec-stream consumer registered
+/// for `(device_id, session)` so a one-shot `exec` can exit with the remote
+/// process's code (a signal-killed process carries `signal`, which the CLI maps
+/// to `128 + signal` per shell convention).
+const MSG_EXEC_EXIT: u32 = 23;
 
 /// The protocol version this implementation speaks. FROZEN; a version bump is
 /// gated by the conformance vectors in `docs/conformance/`.
@@ -1069,6 +1079,26 @@ pub enum BepMessage {
         /// The credit window in bytes the consumer will accept past `ack_seq`.
         window: u32,
     },
+    /// The exit status of a finished exec session.
+    ///
+    /// Sent once by the node's exec output pump after the last
+    /// [`BepMessage::ExecStream`] output frame, on the session's terminal
+    /// [`cascade_exec::ExecEvent::Exited`]. It is a single control frame, not
+    /// credit-gated: the manager routes it to the exec-stream consumer
+    /// registered for `(device_id, session)` so a one-shot `exec` can exit with
+    /// the remote process's code. A signal-killed process carries `signal`; the
+    /// CLI maps that to `128 + signal` per shell convention. Exactly one of
+    /// `code` and `signal` is present for a normal Unix exit; both absent means
+    /// the exit status was indeterminate.
+    ExecExit {
+        /// The session that exited.
+        session: u64,
+        /// The process exit code, if it exited normally.
+        code: Option<i32>,
+        /// The POSIX signal number that terminated the process, if killed by a
+        /// signal.
+        signal: Option<i32>,
+    },
     /// Advertise the latest sequence of the sender's single-writer oplog for a
     /// named peer.
     ///
@@ -1150,6 +1180,7 @@ impl BepMessage {
             Self::Handshake { .. } => MSG_HANDSHAKE,
             Self::ExecStream { .. } => MSG_EXEC_STREAM,
             Self::ExecStreamAck { .. } => MSG_EXEC_STREAM_ACK,
+            Self::ExecExit { .. } => MSG_EXEC_EXIT,
             Self::OplogHave { .. } => MSG_OPLOG_HAVE,
             Self::OplogRequest { .. } => MSG_OPLOG_REQUEST,
             Self::OplogData { .. } => MSG_OPLOG_DATA,
@@ -1168,9 +1199,9 @@ impl BepMessage {
     ///   `IndexUpdate`, `Request`, `Response`).
     /// - `management` covers `ManageRequest` / `ManageResponse`.
     /// - `exec` covers the live stdio stream frames (`ExecStream`,
-    ///   `ExecStreamAck`); exec *control* travels as `management` frames and is
-    ///   governed by the management domain plus the exec capability grant, not by
-    ///   this mapping.
+    ///   `ExecStreamAck`, `ExecExit`); exec *control* travels as `management`
+    ///   frames and is governed by the management domain plus the exec capability
+    ///   grant, not by this mapping.
     /// - `oplog` covers `OplogHave` / `OplogRequest` / `OplogData`.
     /// - Everything else is transport plumbing (the handshake itself, keepalive,
     ///   NAT-traversal and relay frames) that every peer speaks regardless of the
@@ -1186,7 +1217,9 @@ impl BepMessage {
             Self::ManageRequest { .. } | Self::ManageResponse { .. } => {
                 Some(CapabilityDomain::Management)
             }
-            Self::ExecStream { .. } | Self::ExecStreamAck { .. } => Some(CapabilityDomain::Exec),
+            Self::ExecStream { .. } | Self::ExecStreamAck { .. } | Self::ExecExit { .. } => {
+                Some(CapabilityDomain::Exec)
+            }
             Self::OplogHave { .. } | Self::OplogRequest { .. } | Self::OplogData { .. } => {
                 Some(CapabilityDomain::Oplog)
             }
@@ -1367,6 +1400,15 @@ pub fn encode_message(msg: &BepMessage) -> Result<Vec<u8>> {
             encode_u64(&mut body, *session);
             encode_u64(&mut body, *ack_seq);
             encode_u32(&mut body, *window);
+        }
+        BepMessage::ExecExit {
+            session,
+            code,
+            signal,
+        } => {
+            encode_u64(&mut body, *session);
+            encode_opt_i32(&mut body, *code);
+            encode_opt_i32(&mut body, *signal);
         }
         BepMessage::OplogHave { peer, head_seq } => {
             encode_string(&mut body, peer)?;
@@ -1711,6 +1753,19 @@ fn encode_opt_i64(buf: &mut Vec<u8>, val: Option<i64>) {
     }
 }
 
+/// Encode an `Option<i32>` as a one-word presence sentinel followed, when
+/// present, by the value. Mirrors [`encode_opt_i64`] for the `i32`-typed exit
+/// code and signal carried by [`BepMessage::ExecExit`].
+fn encode_opt_i32(buf: &mut Vec<u8>, val: Option<i32>) {
+    match val {
+        None => encode_u32(buf, OPTION_NONE),
+        Some(v) => {
+            encode_u32(buf, OPTION_SOME);
+            encode_i32(buf, v);
+        }
+    }
+}
+
 /// Encode an `Option<&str>` as a one-word presence sentinel followed, when
 /// present, by the string.
 fn encode_opt_string(buf: &mut Vec<u8>, val: Option<&str>) -> Result<()> {
@@ -1799,6 +1854,7 @@ pub fn decode_message(frame: &[u8]) -> Result<BepMessage> {
         MSG_HANDSHAKE => decode_handshake(rest),
         MSG_EXEC_STREAM => decode_exec_stream(rest),
         MSG_EXEC_STREAM_ACK => decode_exec_stream_ack(rest),
+        MSG_EXEC_EXIT => decode_exec_exit(rest),
         MSG_OPLOG_HAVE => decode_oplog_have(rest),
         MSG_OPLOG_REQUEST => decode_oplog_request(rest),
         MSG_OPLOG_DATA => decode_oplog_data(rest),
@@ -2140,6 +2196,17 @@ fn decode_exec_stream_ack(data: &[u8]) -> Result<BepMessage> {
     })
 }
 
+fn decode_exec_exit(data: &[u8]) -> Result<BepMessage> {
+    let (session, rest) = decode_u64(data)?;
+    let (code, rest) = decode_opt_i32(rest)?;
+    let (signal, _) = decode_opt_i32(rest)?;
+    Ok(BepMessage::ExecExit {
+        session,
+        code,
+        signal,
+    })
+}
+
 fn decode_oplog_have(data: &[u8]) -> Result<BepMessage> {
     let (peer, rest) = decode_string(data)?;
     let (head_seq, _) = decode_u64(rest)?;
@@ -2179,6 +2246,19 @@ fn decode_opt_i64(data: &[u8]) -> Result<(Option<i64>, &[u8])> {
         OPTION_NONE => Ok((None, rest)),
         OPTION_SOME => {
             let (val, rest) = decode_i64(rest)?;
+            Ok((Some(val), rest))
+        }
+        other => anyhow::bail!("invalid option sentinel {other}"),
+    }
+}
+
+/// Decode an `Option<i32>` written by [`encode_opt_i32`].
+fn decode_opt_i32(data: &[u8]) -> Result<(Option<i32>, &[u8])> {
+    let (tag, rest) = decode_u32(data)?;
+    match tag {
+        OPTION_NONE => Ok((None, rest)),
+        OPTION_SOME => {
+            let (val, rest) = decode_i32(rest)?;
             Ok((Some(val), rest))
         }
         other => anyhow::bail!("invalid option sentinel {other}"),

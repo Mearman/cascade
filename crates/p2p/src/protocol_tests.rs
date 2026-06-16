@@ -1195,6 +1195,56 @@ fn encode_decode_exec_stream_ack_round_trip() {
     });
 }
 
+#[test]
+fn encode_decode_exec_exit_round_trip() {
+    // Normal exit with a code, no signal.
+    round_trip(BepMessage::ExecExit {
+        session: 42,
+        code: Some(0),
+        signal: None,
+    });
+    // Non-zero exit code.
+    round_trip(BepMessage::ExecExit {
+        session: u64::MAX,
+        code: Some(42),
+        signal: None,
+    });
+    // Signal kill: no code, signal present.
+    round_trip(BepMessage::ExecExit {
+        session: 7,
+        code: None,
+        signal: Some(9),
+    });
+    // Indeterminate exit: neither set.
+    round_trip(BepMessage::ExecExit {
+        session: 1,
+        code: None,
+        signal: None,
+    });
+    // Negative code.
+    round_trip(BepMessage::ExecExit {
+        session: 3,
+        code: Some(-1),
+        signal: None,
+    });
+}
+
+#[test]
+fn exec_exit_rejects_bad_option_sentinel() {
+    let mut body = Vec::new();
+    encode_u32(&mut body, MSG_EXEC_EXIT);
+    encode_u64(&mut body, 1);
+    // An invalid presence sentinel (2) for `code` must fail to decode.
+    encode_u32(&mut body, 2);
+    encode_i32(&mut body, 0);
+    encode_u32(&mut body, OPTION_NONE);
+    let body_len = u32::try_from(body.len()).unwrap();
+    let mut frame = Vec::new();
+    encode_u32(&mut frame, body_len);
+    frame.extend_from_slice(&body);
+    assert!(decode_message(&frame).is_err());
+}
+
 // ── Exec management commands ──
 
 fn exec_request(command: ManageCommand) -> BepMessage {

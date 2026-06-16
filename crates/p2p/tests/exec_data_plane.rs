@@ -346,3 +346,121 @@ async fn kill_tears_down_stream_cleanly() {
         "pump must return Ok after a clean kill teardown: {result:?}"
     );
 }
+
+/// On `ExecEvent::Exited`, the pump sends exactly one `BepMessage::ExecExit`
+/// control frame carrying the process's code/signal, after any output frames,
+/// then returns `Ok(())`. The exit frame is not credit-gated and carries no
+/// sequence number.
+#[tokio::test]
+async fn pump_emits_exec_exit_on_exited_event() {
+    use cascade_exec::ExecEvent;
+
+    let id = ExecSessionId(99);
+    let (events_tx, events_rx) = mpsc::channel::<ExecEvent>(8);
+
+    let (producer_t, consumer_t) = ChannelTransport::pair();
+    let (_p_reader, p_writer) = FramedSession::new(producer_t).split();
+    let (mut c_reader, _c_writer) = FramedSession::new(consumer_t).split();
+
+    let producer_writer = Arc::new(Mutex::new(p_writer));
+    let credit = ExecStreamCredit::new(DEFAULT_CREDIT_WINDOW);
+
+    // Send one output chunk, then the exit event. The pump must emit an
+    // ExecStream frame followed by an ExecExit frame.
+    events_tx
+        .send(ExecEvent::Output {
+            stream: cascade_exec::ExecStreamKind::Stdout,
+            bytes: b"hello".to_vec(),
+        })
+        .await
+        .unwrap();
+    events_tx
+        .send(ExecEvent::Exited {
+            code: Some(42),
+            signal: None,
+        })
+        .await
+        .unwrap();
+
+    let pump = {
+        let writer = Arc::clone(&producer_writer);
+        let credit = Arc::clone(&credit);
+        tokio::spawn(async move { pump_session_output(id, events_rx, &writer, &credit).await })
+    };
+
+    // First frame is the output chunk.
+    let output_frame = tokio::time::timeout(Duration::from_secs(5), c_reader.recv())
+        .await
+        .expect("output frame should arrive")
+        .unwrap()
+        .expect("output frame must be Some");
+    assert!(matches!(output_frame, BepMessage::ExecStream { bytes, .. } if bytes == b"hello"));
+
+    // Second frame is the exit control frame carrying the code.
+    let exit_frame = tokio::time::timeout(Duration::from_secs(5), c_reader.recv())
+        .await
+        .expect("exit frame should arrive")
+        .unwrap()
+        .expect("exit frame must be Some");
+    assert_eq!(
+        exit_frame,
+        BepMessage::ExecExit {
+            session: 99,
+            code: Some(42),
+            signal: None,
+        }
+    );
+
+    let result = tokio::time::timeout(Duration::from_secs(5), pump)
+        .await
+        .expect("pump should return after exit")
+        .unwrap();
+    assert!(result.is_ok(), "pump must return Ok after exit: {result:?}");
+}
+
+/// A signal-killed process carries `signal` (and no `code`) through the exit
+/// frame end to end.
+#[tokio::test]
+async fn pump_emits_exec_exit_with_signal() {
+    use cascade_exec::ExecEvent;
+
+    let id = ExecSessionId(5);
+    let (events_tx, events_rx) = mpsc::channel::<ExecEvent>(8);
+
+    let (producer_t, consumer_t) = ChannelTransport::pair();
+    let (_p_reader, p_writer) = FramedSession::new(producer_t).split();
+    let (mut c_reader, _c_writer) = FramedSession::new(consumer_t).split();
+
+    let producer_writer = Arc::new(Mutex::new(p_writer));
+    let credit = ExecStreamCredit::new(DEFAULT_CREDIT_WINDOW);
+
+    events_tx
+        .send(ExecEvent::Exited {
+            code: None,
+            signal: Some(9),
+        })
+        .await
+        .unwrap();
+
+    let pump = {
+        let writer = Arc::clone(&producer_writer);
+        let credit = Arc::clone(&credit);
+        tokio::spawn(async move { pump_session_output(id, events_rx, &writer, &credit).await })
+    };
+
+    let exit_frame = tokio::time::timeout(Duration::from_secs(5), c_reader.recv())
+        .await
+        .expect("exit frame should arrive")
+        .unwrap()
+        .expect("exit frame must be Some");
+    assert_eq!(
+        exit_frame,
+        BepMessage::ExecExit {
+            session: 5,
+            code: None,
+            signal: Some(9),
+        }
+    );
+
+    let _ = tokio::time::timeout(Duration::from_secs(5), pump).await;
+}
