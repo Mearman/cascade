@@ -1210,11 +1210,13 @@ impl SyncEngine {
                     let consumers = self.exec_stream_consumers.lock().await;
                     consumers.get(&key).is_some_and(|sender| {
                         sender
-                            .send(cascade_p2p::exec_stream::ExecStreamFrame {
-                                session,
-                                stream: kind,
-                                bytes: bytes.clone(),
-                            })
+                            .send(cascade_p2p::exec_stream::ExecStreamEvent::Output(
+                                cascade_p2p::exec_stream::ExecStreamFrame {
+                                    session,
+                                    stream: kind,
+                                    bytes: bytes.clone(),
+                                },
+                            ))
                             .is_ok()
                     })
                 };
@@ -1262,16 +1264,62 @@ impl SyncEngine {
                 );
                 Ok(())
             }
+            BepMessage::ExecExit {
+                session,
+                code,
+                signal,
+            } => {
+                // A peer that did not advertise the exec capability domain must
+                // not send exec frames. Drop with a domain-violation log rather
+                // than tearing the session down.
+                if !peer_domains.contains(&CapabilityDomain::Exec) {
+                    debug!(
+                        target: "cascade::backend::p2p",
+                        peer = %peer_device_id,
+                        session,
+                        "dropping exec exit frame — peer did not advertise exec capability",
+                    );
+                    return Ok(());
+                }
+                // Deliver the terminal exit status to the consumer registered for
+                // this (peer, session) pair as the Exited variant. Unlike byte
+                // frames this carries no sequence number and is not acked: it is
+                // a single control frame sent after the last output frame, so
+                // the backpressure window does not apply.
+                let key = (peer_device_id.to_owned(), session);
+                let consumer_alive = {
+                    let consumers = self.exec_stream_consumers.lock().await;
+                    consumers.get(&key).is_some_and(|sender| {
+                        sender
+                            .send(cascade_p2p::exec_stream::ExecStreamEvent::Exited {
+                                code,
+                                signal,
+                            })
+                            .is_ok()
+                    })
+                };
+                if !consumer_alive {
+                    debug!(
+                        target: "cascade::backend::p2p",
+                        peer = %peer_device_id,
+                        session,
+                        "dropping exec exit frame — no live consumer",
+                    );
+                    let mut consumers = self.exec_stream_consumers.lock().await;
+                    consumers.remove(&key);
+                }
+                Ok(())
+            }
             BepMessage::OplogHave { .. }
             | BepMessage::OplogRequest { .. }
             | BepMessage::OplogData { .. } => {
-                // This node does not advertise the oplog capability domain, so a
-                // peer must never negotiate it and never send these frames. Per
-                // the node protocol a frame for an un-negotiated domain is dropped
-                // (with a domain-violation log), never guessed at and never a
-                // reason to tear the session down — the peer can still serve
-                // content, management, and exec frames. Wiring oplog sync is a
-                // later step that lands with the entry-payload co-design.
+                // This node does not advertise the oplog capability domain, so
+                // a peer must never negotiate it and never send these frames.
+                // Per the node protocol a frame for an un-negotiated domain is
+                // dropped (with a domain-violation log), never guessed at and
+                // never a reason to tear the session down — the peer can still
+                // serve content, management, and exec frames. Wiring oplog sync
+                // is a later step that lands with the entry-payload co-design.
                 debug!(
                     target: "cascade::backend::p2p",
                     peer = %peer_device_id,

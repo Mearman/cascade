@@ -147,9 +147,9 @@ pub enum RemoteCommand {
     },
     /// Run a one-shot command on the remote node under a PTY. The command's
     /// stdout and stderr are streamed back and written to the terminal; the
-    /// CLI exits once the node closes the output stream. The exec data plane
-    /// does not yet carry the process exit code, so it is not reflected in the
-    /// CLI's own exit status.
+    /// CLI exits when the node signals the session ended, propagating the
+    /// remote process's exit code as its own exit status. A process killed by
+    /// a signal maps to `128 + signal` per the shell convention.
     ///
     /// Requires the dangerous `exec:pty` capability over the session's
     /// working directory, granted explicitly for a folder scope.
@@ -566,7 +566,10 @@ async fn run_exec(
     let mut stream = backend.subscribe_exec_stream(device_id, session_id).await;
 
     // Drive the session: multiplex output draining with stdin forwarding
-    // (shell mode only) using tokio::select.
+    // (shell mode only) using tokio::select. For a one-shot `exec` the pump
+    // returns the remote process's exit code; the CLI propagates it as its own
+    // exit status. For an interactive `shell` the code is irrelevant (the
+    // session ends on stream close).
     let pump_result = pump_exec_session(
         &backend,
         device_id,
@@ -585,12 +588,26 @@ async fn run_exec(
         .send_pty_signal(device_id, session_id, 15, token)
         .await;
 
-    pump_result
+    let exit_code = pump_result?;
+    if !is_shell && let Some(code) = exit_code {
+        // Propagate the remote process's exit status as this process's own.
+        // std::process::exit runs no further destructors, but the session
+        // cleanup above already ran and stdout is flushed by the OS on exit.
+        std::process::exit(code);
+    }
+    Ok(())
 }
 
 /// Pump the exec session: forward output to the terminal and (for shell mode)
-/// forward local stdin to the remote PTY. Returns when the output stream
-/// closes (the session ended) or stdin reaches EOF.
+/// forward local stdin to the remote PTY. Returns when the session's
+/// [`ExecStreamEvent::Exited`] arrives (the process exited) or, for a shell,
+/// when stdin reaches EOF.
+///
+/// Returns `Ok(Some(code))` when a one-shot `exec` received the remote
+/// process's exit status (a shell-style code: `code` for a normal exit,
+/// `128 + signal` for a signal kill, `1` for an indeterminate exit). Returns
+/// `Ok(None)` for an interactive shell — its exit status is not the remote
+/// process's.
 ///
 /// `token` is re-presented with every `PtyWrite` so a caller authenticated
 /// only by a capability token (no on-node grant) can drive an interactive
@@ -599,26 +616,34 @@ async fn pump_exec_session(
     backend: &std::sync::Arc<cascade_backend_p2p::P2pBackend>,
     device_id: &str,
     session_id: u64,
-    stream: &mut tokio::sync::mpsc::UnboundedReceiver<cascade_p2p::exec_stream::ExecStreamFrame>,
+    stream: &mut tokio::sync::mpsc::UnboundedReceiver<cascade_p2p::exec_stream::ExecStreamEvent>,
     is_shell: bool,
     token: Option<String>,
-) -> Result<()> {
+) -> Result<Option<i32>> {
     use std::io::IsTerminal as _;
     use std::io::Write as _;
     use tokio::io::AsyncReadExt as _;
 
     if !is_shell {
         // One-shot exec: drain output to the terminal. The remote process's
-        // exit code is not carried on the exec data plane today (there is no
-        // exit frame), so the CLI cannot forward it; the session is considered
-        // done when the node closes the output stream.
+        // exit code arrives as an ExecStreamEvent::Exited control frame after
+        // the last output frame; the CLI propagates it as its own exit status.
         let stdout = std::io::stdout();
-        while let Some(frame) = stream.recv().await {
-            let mut handle = stdout.lock();
-            handle.write_all(&frame.bytes)?;
-            handle.flush()?;
+        while let Some(event) = stream.recv().await {
+            match event {
+                cascade_p2p::exec_stream::ExecStreamEvent::Output(frame) => {
+                    let mut handle = stdout.lock();
+                    handle.write_all(&frame.bytes)?;
+                    handle.flush()?;
+                }
+                cascade_p2p::exec_stream::ExecStreamEvent::Exited { .. } => {
+                    return Ok(event.to_exit_code());
+                }
+            }
         }
-        return Ok(());
+        // The stream closed without an Exited event (the node went away before
+        // delivering the exit frame). Treat it as a generic failure.
+        return Ok(Some(1));
     }
 
     // Interactive shell: drive a real raw-mode PTY. The local terminal is put
@@ -653,13 +678,16 @@ async fn pump_exec_session(
     loop {
         tokio::select! {
             // Output from the remote session.
-            frame = stream.recv() => match frame {
-                Some(frame) => {
+            event = stream.recv() => match event {
+                Some(cascade_p2p::exec_stream::ExecStreamEvent::Output(frame)) => {
                     let mut handle = stdout.lock();
                     handle.write_all(&frame.bytes)?;
                     handle.flush()?;
                 }
-                None => break,
+                // The remote process exited: end the shell session. The exit
+                // code is ignored for the interactive shell — its own exit
+                // status is not the remote process's.
+                Some(cascade_p2p::exec_stream::ExecStreamEvent::Exited { .. }) | None => break,
             },
             // Local stdin bytes -> remote PtyWrite. In raw mode each keystroke
             // arrives immediately; ^C arrives as 0x03 and the remote PTY raises
@@ -691,7 +719,7 @@ async fn pump_exec_session(
     }
 
     drop(raw);
-    Ok(())
+    Ok(None)
 }
 
 /// Restores the local terminal from raw mode when the shell session ends,

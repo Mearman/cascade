@@ -2794,3 +2794,97 @@ async fn heterogeneous_exec_capability_is_negotiated() {
         "A must see B as exec-incapable (B did not set advertise_exec)",
     );
 }
+
+/// An inbound `BepMessage::ExecExit` is routed to the exec-stream consumer
+/// registered for `(device_id, session)` as the
+/// [`ExecStreamEvent::Exited`] variant, carrying the process's exit code and
+/// signal. This is the manager-side half of the exit-code propagation chain.
+#[tokio::test]
+async fn handle_message_routes_exec_exit_to_consumer() {
+    use cascade_p2p::exec_stream::ExecStreamEvent;
+
+    let (_dir, engine) = make_engine("test");
+
+    // Register a consumer for session 42 from peer "PEER".
+    let mut consumer = engine.subscribe_exec_stream("PEER", 42).await;
+
+    let (outbound_tx, _outbound_rx) = mpsc::unbounded_channel::<BepMessage>();
+    let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<u8>>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let manage_pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ManageResult>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
+    // The peer advertised the exec domain.
+    let peer_domains = vec![CapabilityDomain::Exec];
+
+    engine
+        .handle_message(
+            "PEER",
+            CallerAuthentication::TlsVerified,
+            BepMessage::ExecExit {
+                session: 42,
+                code: Some(7),
+                signal: None,
+            },
+            &peer_domains,
+            &outbound_tx,
+            &pending,
+            &manage_pending,
+        )
+        .await
+        .expect("ExecExit must be handled without error");
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), consumer.recv())
+        .await
+        .expect("consumer must receive the Exited event")
+        .expect("channel must not close before delivery");
+    assert_eq!(
+        event,
+        ExecStreamEvent::Exited {
+            code: Some(7),
+            signal: None,
+        }
+    );
+}
+
+/// A `BepMessage::ExecExit` from a peer that did not advertise the exec domain
+/// is dropped (domain-violation) and never reaches the consumer.
+#[tokio::test]
+async fn handle_message_drops_exec_exit_without_exec_domain() {
+    let (_dir, engine) = make_engine("test");
+
+    let mut consumer = engine.subscribe_exec_stream("PEER", 1).await;
+
+    let (outbound_tx, _outbound_rx) = mpsc::unbounded_channel::<BepMessage>();
+    let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Vec<u8>>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let manage_pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ManageResult>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
+    // Peer advertised management only — no exec domain.
+    let peer_domains = vec![CapabilityDomain::Management];
+
+    engine
+        .handle_message(
+            "PEER",
+            CallerAuthentication::TlsVerified,
+            BepMessage::ExecExit {
+                session: 1,
+                code: Some(0),
+                signal: None,
+            },
+            &peer_domains,
+            &outbound_tx,
+            &pending,
+            &manage_pending,
+        )
+        .await
+        .expect("a dropped domain-violation frame is not an error");
+
+    // The consumer must not receive anything within a short window.
+    let result = tokio::time::timeout(std::time::Duration::from_millis(100), consumer.recv()).await;
+    assert!(
+        result.is_err() || matches!(result, Ok(None)),
+        "consumer must not receive an exit from a non-exec peer, got {result:?}",
+    );
+}
