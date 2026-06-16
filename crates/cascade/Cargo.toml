@@ -42,6 +42,7 @@ chrono.workspace = true
 data-encoding.workspace = true
 sha2.workspace = true
 async-trait = { workspace = true }
+crossterm = "0.29.0"
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["user"] }

@@ -337,12 +337,12 @@ fn exec_terminal_rows() -> u16 {
     terminal_size().map_or(DEFAULT_TERMINAL_ROWS, |(_, rows)| rows)
 }
 
-/// Read the terminal size from stdout, returning `None` when stdout is not a
-/// TTY or the platform has no terminal-size probe. On Unix, the raw ioctl is
-/// behind the `unsafe_code` ban the workspace enforces, so the default
-/// 80x24 is used and a resize is sent once the session is live.
-const fn terminal_size() -> Option<(u16, u16)> {
-    None
+/// Read the terminal size from the controlling terminal, returning `None`
+/// when stdout is not a TTY or the platform has no size probe. crossterm wraps
+/// the platform ioctl safely, so this replaces the prior fixed 80x24 fallback
+/// and lets the spawned PTY open at the real local size.
+fn terminal_size() -> Option<(u16, u16)> {
+    crossterm::terminal::size().ok()
 }
 
 /// Map a `--scope` argument string to a wire [`ManageScope`].
@@ -603,8 +603,9 @@ async fn pump_exec_session(
     is_shell: bool,
     token: Option<String>,
 ) -> Result<()> {
+    use std::io::IsTerminal as _;
     use std::io::Write as _;
-    use tokio::io::AsyncBufReadExt as _;
+    use tokio::io::AsyncReadExt as _;
 
     if !is_shell {
         // One-shot exec: drain output to the terminal. The remote process's
@@ -620,40 +621,88 @@ async fn pump_exec_session(
         return Ok(());
     }
 
-    // Interactive shell: multiplex stdin forwarding with output draining.
-    let stdin = tokio::io::stdin();
-    let reader = tokio::io::BufReader::new(stdin);
-    let mut lines = reader.lines();
+    // Interactive shell: drive a real raw-mode PTY. The local terminal is put
+    // into raw mode so keystrokes (including control bytes such as ^C as 0x03)
+    // are forwarded byte-for-byte and the local line discipline does not echo
+    // or line-buffer; the remote PTY interprets them. Output is rendered to the
+    // terminal and local resizes are forwarded, with raw mode restored on exit.
+    // When stdin is not a TTY (piped input) raw mode is skipped and stdin is
+    // forwarded as a byte stream instead.
+    let raw = if std::io::stdin().is_terminal() {
+        crossterm::terminal::enable_raw_mode().context("enabling raw mode for the remote shell")?;
+        Some(RawModeGuard)
+    } else {
+        None
+    };
+
+    // Forward local terminal resizes. `terminal::size()` reads the current size
+    // via ioctl without contending with the raw-byte stdin reader — unlike
+    // crossterm's event loop, which would consume keystrokes meant for the byte
+    // forwarder — so a light poll detects a resize shortly after it happens on
+    // every platform.
+    let mut last_size = terminal_size();
+    let mut size_tick = tokio::time::interval(std::time::Duration::from_millis(250));
+    // The interval's first tick fires immediately; consume it so we do not echo
+    // a redundant initial resize (the spawn already opened at the live size).
+    size_tick.tick().await;
+
+    let mut stdin = tokio::io::stdin();
+    let mut in_buf = [0u8; 4096];
     let stdout = std::io::stdout();
 
     loop {
         tokio::select! {
             // Output from the remote session.
-            frame = stream.recv() => {
-                if let Some(frame) = frame {
+            frame = stream.recv() => match frame {
+                Some(frame) => {
                     let mut handle = stdout.lock();
                     handle.write_all(&frame.bytes)?;
                     handle.flush()?;
-                } else {
-                    // The stream closed — the session ended.
-                    return Ok(());
                 }
-            }
-            // Local stdin -> remote PtyWrite.
-            line = lines.next_line() => {
-                if let Ok(Some(line)) = line {
-                    let mut bytes = line.into_bytes();
-                    bytes.push(b'\n');
-                    backend
-                        .send_pty_write(device_id, session_id, bytes, token.clone())
-                        .await
-                        .context("forwarding stdin to remote PTY")?;
+                None => break,
+            },
+            // Local stdin bytes -> remote PtyWrite. In raw mode each keystroke
+            // arrives immediately; ^C arrives as 0x03 and the remote PTY raises
+            // SIGINT for the child, so interrupt works without local handling.
+            n = stdin.read(&mut in_buf) => match n {
+                // Local stdin closed, or an unreadable stdin: end the session.
+                Ok(0) | Err(_) => break,
+                Ok(count) => {
+                    if let Some(chunk) = in_buf.get(..count) {
+                        backend
+                            .send_pty_write(device_id, session_id, chunk.to_vec(), token.clone())
+                            .await
+                            .context("forwarding stdin to remote PTY")?;
+                    }
                 }
-                // stdin closed (EOF) — the operator finished. Let the output
-                // drain continue; the session ends when the node closes the
-                // stream.
+            },
+            // Local terminal resized -> forward the new size.
+            _ = size_tick.tick() => {
+                if let Some(now) = terminal_size()
+                    && Some(now) != last_size
+                {
+                    last_size = Some(now);
+                    let _ = backend
+                        .send_pty_resize(device_id, session_id, now.0, now.1, token.clone())
+                        .await;
+                }
             }
         }
+    }
+
+    drop(raw);
+    Ok(())
+}
+
+/// Restores the local terminal from raw mode when the shell session ends,
+/// including on early returns or errors. crossterm's raw mode is a process-wide
+/// terminal attribute, so leaving it enabled would hand the operator back a
+/// broken terminal.
+struct RawModeGuard;
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
     }
 }
 
