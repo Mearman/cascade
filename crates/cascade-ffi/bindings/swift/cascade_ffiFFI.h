@@ -258,6 +258,16 @@ void uniffi_cascade_ffi_fn_free_cascadenode(uint64_t handle, RustCallStatus *_No
 uint64_t uniffi_cascade_ffi_fn_constructor_cascadenode_new(RustBuffer config_dir
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CASCADE_FFI_FN_METHOD_CASCADENODE_CREATE_DIR
+#define UNIFFI_FFIDEF_UNIFFI_CASCADE_FFI_FN_METHOD_CASCADENODE_CREATE_DIR
+uint64_t uniffi_cascade_ffi_fn_method_cascadenode_create_dir(uint64_t ptr, RustBuffer path
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CASCADE_FFI_FN_METHOD_CASCADENODE_DELETE
+#define UNIFFI_FFIDEF_UNIFFI_CASCADE_FFI_FN_METHOD_CASCADENODE_DELETE
+uint64_t uniffi_cascade_ffi_fn_method_cascadenode_delete(uint64_t ptr, RustBuffer path
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CASCADE_FFI_FN_METHOD_CASCADENODE_LIST_DIR
 #define UNIFFI_FFIDEF_UNIFFI_CASCADE_FFI_FN_METHOD_CASCADENODE_LIST_DIR
 uint64_t uniffi_cascade_ffi_fn_method_cascadenode_list_dir(uint64_t ptr, RustBuffer path
@@ -271,6 +281,11 @@ uint64_t uniffi_cascade_ffi_fn_method_cascadenode_pin(uint64_t ptr, RustBuffer p
 #ifndef UNIFFI_FFIDEF_UNIFFI_CASCADE_FFI_FN_METHOD_CASCADENODE_READ_FILE
 #define UNIFFI_FFIDEF_UNIFFI_CASCADE_FFI_FN_METHOD_CASCADENODE_READ_FILE
 uint64_t uniffi_cascade_ffi_fn_method_cascadenode_read_file(uint64_t ptr, RustBuffer path
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CASCADE_FFI_FN_METHOD_CASCADENODE_RENAME
+#define UNIFFI_FFIDEF_UNIFFI_CASCADE_FFI_FN_METHOD_CASCADENODE_RENAME
+uint64_t uniffi_cascade_ffi_fn_method_cascadenode_rename(uint64_t ptr, RustBuffer src, RustBuffer dst
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CASCADE_FFI_FN_METHOD_CASCADENODE_START
@@ -291,6 +306,11 @@ uint64_t uniffi_cascade_ffi_fn_method_cascadenode_stop(uint64_t ptr
 #ifndef UNIFFI_FFIDEF_UNIFFI_CASCADE_FFI_FN_METHOD_CASCADENODE_UNPIN
 #define UNIFFI_FFIDEF_UNIFFI_CASCADE_FFI_FN_METHOD_CASCADENODE_UNPIN
 uint64_t uniffi_cascade_ffi_fn_method_cascadenode_unpin(uint64_t ptr, RustBuffer path
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CASCADE_FFI_FN_METHOD_CASCADENODE_UPLOAD
+#define UNIFFI_FFIDEF_UNIFFI_CASCADE_FFI_FN_METHOD_CASCADENODE_UPLOAD
+uint64_t uniffi_cascade_ffi_fn_method_cascadenode_upload(uint64_t ptr, RustBuffer path, RustBuffer bytes
 );
 #endif
 #ifndef UNIFFI_FFIDEF_FFI_CASCADE_FFI_RUSTBUFFER_ALLOC
@@ -553,6 +573,18 @@ void ffi_cascade_ffi_rust_future_free_void(uint64_t handle
 void ffi_cascade_ffi_rust_future_complete_void(uint64_t handle, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CASCADE_FFI_CHECKSUM_METHOD_CASCADENODE_CREATE_DIR
+#define UNIFFI_FFIDEF_UNIFFI_CASCADE_FFI_CHECKSUM_METHOD_CASCADENODE_CREATE_DIR
+uint16_t uniffi_cascade_ffi_checksum_method_cascadenode_create_dir(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CASCADE_FFI_CHECKSUM_METHOD_CASCADENODE_DELETE
+#define UNIFFI_FFIDEF_UNIFFI_CASCADE_FFI_CHECKSUM_METHOD_CASCADENODE_DELETE
+uint16_t uniffi_cascade_ffi_checksum_method_cascadenode_delete(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CASCADE_FFI_CHECKSUM_METHOD_CASCADENODE_LIST_DIR
 #define UNIFFI_FFIDEF_UNIFFI_CASCADE_FFI_CHECKSUM_METHOD_CASCADENODE_LIST_DIR
 uint16_t uniffi_cascade_ffi_checksum_method_cascadenode_list_dir(void
@@ -568,6 +600,12 @@ uint16_t uniffi_cascade_ffi_checksum_method_cascadenode_pin(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CASCADE_FFI_CHECKSUM_METHOD_CASCADENODE_READ_FILE
 #define UNIFFI_FFIDEF_UNIFFI_CASCADE_FFI_CHECKSUM_METHOD_CASCADENODE_READ_FILE
 uint16_t uniffi_cascade_ffi_checksum_method_cascadenode_read_file(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CASCADE_FFI_CHECKSUM_METHOD_CASCADENODE_RENAME
+#define UNIFFI_FFIDEF_UNIFFI_CASCADE_FFI_CHECKSUM_METHOD_CASCADENODE_RENAME
+uint16_t uniffi_cascade_ffi_checksum_method_cascadenode_rename(void
     
 );
 #endif
@@ -592,6 +630,12 @@ uint16_t uniffi_cascade_ffi_checksum_method_cascadenode_stop(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CASCADE_FFI_CHECKSUM_METHOD_CASCADENODE_UNPIN
 #define UNIFFI_FFIDEF_UNIFFI_CASCADE_FFI_CHECKSUM_METHOD_CASCADENODE_UNPIN
 uint16_t uniffi_cascade_ffi_checksum_method_cascadenode_unpin(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CASCADE_FFI_CHECKSUM_METHOD_CASCADENODE_UPLOAD
+#define UNIFFI_FFIDEF_UNIFFI_CASCADE_FFI_CHECKSUM_METHOD_CASCADENODE_UPLOAD
+uint16_t uniffi_cascade_ffi_checksum_method_cascadenode_upload(void
     
 );
 #endif

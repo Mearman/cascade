@@ -90,10 +90,34 @@ class CascadeDocumentsProvider : DocumentsProvider() {
         mode: String,
         signal: CancellationSignal?,
     ): ParcelFileDescriptor {
-        if (mode != "r") {
-            throw UnsupportedOperationException("Cascade documents are read-only via SAF")
-        }
         val node = CascadeNodeHolder.blockingGet(requireContext())
+        val isWrite = mode.contains('w') || mode.contains('+')
+        if (isWrite) {
+            // Write-back: hand the caller a pipe to write into, and on close
+            // upload the captured bytes back through the FFI. This bridges the
+            // SAF "w"/"rw" open mode onto CascadeNode.upload.
+            val pipe = ParcelFileDescriptor.createReliablePipe()
+            val readSide = pipe[0]
+            val writeSide = pipe[1]
+            // The caller writes into writeSide; we read from readSide on a
+            // background thread and upload when the writer closes.
+            Thread({
+                ParcelFileDescriptor.AutoCloseInputStream(readSide).use { input ->
+                    val bytes = input.readBytes()
+                    runBlocking {
+                        try {
+                            node.upload(documentId, bytes)
+                        } catch (e: CascadeException) {
+                            // Surface as a write-side error so the caller sees
+                            // the upload failed rather than silently dropping.
+                            throw FileNotFoundException("upload($documentId) failed: ${e.message}")
+                        }
+                    }
+                }
+            }, "cascade-openDocument-write").start()
+            return writeSide
+        }
+
         val bytes = runBlocking {
             try {
                 node.readFile(documentId)

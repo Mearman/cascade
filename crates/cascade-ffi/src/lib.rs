@@ -78,6 +78,9 @@ pub enum CascadeError {
     /// A pin or unpin operation failed.
     #[error("pin error: {detail}")]
     Pin { detail: String },
+    /// A write operation (upload, create directory, delete, or rename) failed.
+    #[error("write error: {detail}")]
+    Write { detail: String },
 }
 
 /// A running Cascade node, wrapping a [`NativeEngine`].
@@ -251,6 +254,159 @@ impl CascadeNode {
                 detail: format!("unpin {path}: {e}"),
             })
     }
+
+    /// Upload a new file at `path` (a VFS-absolute path) with the given bytes.
+    ///
+    /// If a file already exists at `path` it is overwritten via the backend's
+    /// `update` verb; otherwise the `upload` verb creates it. The parent
+    /// directory's `FileId` is resolved by walking the backend for the parent
+    /// path, mirroring the `WebDAV` presenter's upload flow. Backends that ignore
+    /// the parent id (the local backend) accept a best-effort id harmlessly.
+    pub async fn upload(&self, path: String, bytes: Vec<u8>) -> Result<(), CascadeError> {
+        let tree = self.engine.vfs().clone();
+        let path = normalise_vfs_path(&path);
+        let (backend, rel) = {
+            let guard = tree.read().map_err(|_| CascadeError::Write {
+                detail: "VFS lock poisoned".to_owned(),
+            })?;
+            let (backend, rel) = guard.resolve(Path::new(&path));
+            (Arc::clone(backend), rel)
+        };
+
+        // Resolve the parent's FileId so cloud backends that address by id
+        // (Google Drive) can place the upload correctly. The local backend
+        // ignores this, so a failure to resolve the parent falls back to a
+        // root placeholder rather than failing the upload.
+        let parent_id = resolve_parent_id(&backend, &rel).await;
+        let rel_str = rel.to_string_lossy();
+        let existing = backend.metadata(&rel).await;
+
+        if let Ok(entry) = existing {
+            let file_id = cascade_engine::types::FileId(entry.id.0.clone());
+            backend
+                .update(&file_id, &bytes)
+                .await
+                .map_err(|e| CascadeError::Write {
+                    detail: format!("update {path}: {e}"),
+                })?;
+        } else {
+            backend
+                .upload(&rel, &bytes, &parent_id)
+                .await
+                .map_err(|e| CascadeError::Write {
+                    detail: format!("upload {path}: {e}"),
+                })?;
+        }
+        let _ = rel_str;
+        Ok(())
+    }
+
+    /// Create a directory at `path` (a VFS-absolute path).
+    pub async fn create_dir(&self, path: String) -> Result<(), CascadeError> {
+        let tree = self.engine.vfs().clone();
+        let path = normalise_vfs_path(&path);
+        let (backend, rel) = {
+            let guard = tree.read().map_err(|_| CascadeError::Write {
+                detail: "VFS lock poisoned".to_owned(),
+            })?;
+            let (backend, rel) = guard.resolve(Path::new(&path));
+            (Arc::clone(backend), rel)
+        };
+        backend
+            .create_dir(&rel)
+            .await
+            .map_err(|e| CascadeError::Write {
+                detail: format!("create_dir {path}: {e}"),
+            })?;
+        Ok(())
+    }
+
+    /// Delete the file or directory at `path` (a VFS-absolute path).
+    pub async fn delete(&self, path: String) -> Result<(), CascadeError> {
+        let tree = self.engine.vfs().clone();
+        let path = normalise_vfs_path(&path);
+        let (backend, rel) = {
+            let guard = tree.read().map_err(|_| CascadeError::Write {
+                detail: "VFS lock poisoned".to_owned(),
+            })?;
+            let (backend, rel) = guard.resolve(Path::new(&path));
+            (Arc::clone(backend), rel)
+        };
+        let entry = backend
+            .metadata(&rel)
+            .await
+            .map_err(|e| CascadeError::Write {
+                detail: format!("metadata {path}: {e}"),
+            })?;
+        backend
+            .delete(&entry)
+            .await
+            .map_err(|e| CascadeError::Write {
+                detail: format!("delete {path}: {e}"),
+            })?;
+        Ok(())
+    }
+
+    /// Rename or move `src` to `dst` (both VFS-absolute paths).
+    ///
+    /// Same-backend renames call the backend's `move_entry` directly;
+    /// cross-backend moves download from the source, upload to the destination,
+    /// and delete the original, matching [`cascade_engine::vfs::VfsTree::rename`].
+    pub async fn rename(&self, src: String, dst: String) -> Result<(), CascadeError> {
+        let tree = self.engine.vfs().clone();
+        let src_path = normalise_vfs_path(&src);
+        let dst_path = normalise_vfs_path(&dst);
+        let (src_backend, src_rel, dst_backend, dst_rel) = {
+            let guard = tree.read().map_err(|_| CascadeError::Write {
+                detail: "VFS lock poisoned".to_owned(),
+            })?;
+            let (src_backend, src_rel) = guard.resolve(Path::new(&src_path));
+            let (dst_backend, dst_rel) = guard.resolve(Path::new(&dst_path));
+            (
+                Arc::clone(src_backend),
+                src_rel,
+                Arc::clone(dst_backend),
+                dst_rel,
+            )
+        };
+
+        if Arc::ptr_eq(&src_backend, &dst_backend) {
+            src_backend
+                .move_entry(&src_rel, &dst_rel)
+                .await
+                .map_err(|e| CascadeError::Write {
+                    detail: format!("rename {src_path} -> {dst_path}: {e}"),
+                })?;
+        } else {
+            // Cross-backend move: download, upload, delete. Matches VfsTree::rename.
+            let entry = src_backend
+                .metadata(&src_rel)
+                .await
+                .map_err(|e| CascadeError::Write {
+                    detail: format!("metadata {src_path}: {e}"),
+                })?;
+            let data = src_backend
+                .download(&entry)
+                .await
+                .map_err(|e| CascadeError::Write {
+                    detail: format!("download {src_path}: {e}"),
+                })?;
+            let parent_id = resolve_parent_id(&dst_backend, &dst_rel).await;
+            dst_backend
+                .upload(&dst_rel, &data, &parent_id)
+                .await
+                .map_err(|e| CascadeError::Write {
+                    detail: format!("upload {dst_path}: {e}"),
+                })?;
+            src_backend
+                .delete(&entry)
+                .await
+                .map_err(|e| CascadeError::Write {
+                    detail: format!("delete {src_path}: {e}"),
+                })?;
+        }
+        Ok(())
+    }
 }
 
 /// List a directory through an already-resolved backend, reproducing the merge
@@ -275,6 +431,34 @@ async fn list_via_backend(
             detail: format!("list children of {backend_path}: {e}"),
         })?;
     Ok(cascade_engine::vfs::merge_listing(children, mount_names))
+}
+
+/// Resolve the [`cascade_engine::types::FileId`] of the parent directory of a
+/// backend-relative path, for the `parent_id` argument of [`Backend::upload`].
+///
+/// Cloud backends like Google Drive address nodes by opaque id, so an upload
+/// needs the parent's id rather than its path. The local backend ignores the
+/// parent id. A failure to resolve the parent (for example when the path is at
+/// the backend root) falls back to a `{backend_id}:root` placeholder rather
+/// than failing the upload, matching the `WebDAV` presenter's fallback. The
+/// function is infallible from the caller's perspective for that reason: the
+/// upload itself is what surfaces a real placement error.
+async fn resolve_parent_id(
+    backend: &Arc<dyn Backend>,
+    rel: &Path,
+) -> cascade_engine::types::FileId {
+    use cascade_engine::types::FileId;
+    let backend_id = backend.id().to_owned();
+    let Some(parent_path) = rel.parent() else {
+        return FileId(format!("{backend_id}:root"));
+    };
+    if parent_path.as_os_str().is_empty() {
+        return FileId(format!("{backend_id}:root"));
+    }
+    match backend.metadata(parent_path).await {
+        Ok(entry) => FileId(entry.id.0),
+        Err(_) => FileId(format!("{backend_id}:root")),
+    }
 }
 
 /// Build the local-files backend rooted at `files_dir`.
@@ -457,5 +641,114 @@ mod tests {
         node.unpin(format!("{NODE_MOUNT}/**"))
             .await
             .expect("unpin succeeds");
+    }
+
+    /// mkdir -> list -> upload -> read -> rename -> delete round-trip over the
+    /// local backend, exercising every new write verb end to end through the
+    /// same VFS resolve path the mobile surfaces use.
+    #[tokio::test]
+    async fn write_round_trip_mkdir_upload_read_rename_delete() {
+        let (_dir, _files, node) = node_with_files(&[]).await;
+
+        // mkdir
+        node.create_dir(format!("{NODE_MOUNT}/sub"))
+            .await
+            .expect("create_dir succeeds");
+        let entries = node
+            .list_dir(NODE_MOUNT.to_owned())
+            .await
+            .expect("list after mkdir");
+        let subdir = entries
+            .iter()
+            .find(|e| e.name == "sub")
+            .expect("sub listed");
+        assert!(subdir.is_dir, "sub is a directory");
+
+        // upload into sub
+        node.upload(format!("{NODE_MOUNT}/sub/note.txt"), b"first".to_vec())
+            .await
+            .expect("upload succeeds");
+        let bytes = node
+            .read_file(format!("{NODE_MOUNT}/sub/note.txt"))
+            .await
+            .expect("read after upload");
+        assert_eq!(bytes, b"first");
+
+        // rename
+        node.rename(
+            format!("{NODE_MOUNT}/sub/note.txt"),
+            format!("{NODE_MOUNT}/sub/renamed.txt"),
+        )
+        .await
+        .expect("rename succeeds");
+        let entries = node
+            .list_dir(format!("{NODE_MOUNT}/sub"))
+            .await
+            .expect("list sub after rename");
+        assert!(
+            entries.iter().any(|e| e.name == "renamed.txt"),
+            "renamed file present: {entries:?}"
+        );
+        assert!(
+            !entries.iter().any(|e| e.name == "note.txt"),
+            "old name gone: {entries:?}"
+        );
+
+        // delete
+        node.delete(format!("{NODE_MOUNT}/sub/renamed.txt"))
+            .await
+            .expect("delete succeeds");
+        let entries = node
+            .list_dir(format!("{NODE_MOUNT}/sub"))
+            .await
+            .expect("list sub after delete");
+        assert!(
+            entries.iter().all(|e| e.name != "renamed.txt"),
+            "file gone after delete: {entries:?}"
+        );
+    }
+
+    /// Overwriting an existing file via `upload` should replace its contents,
+    /// not error.
+    #[tokio::test]
+    async fn upload_overwrites_existing_file() {
+        let (_dir, _files, node) = node_with_files(&[("doc.txt", b"old")]).await;
+        node.upload(format!("{NODE_MOUNT}/doc.txt"), b"new".to_vec())
+            .await
+            .expect("overwrite upload succeeds");
+        let bytes = node
+            .read_file(format!("{NODE_MOUNT}/doc.txt"))
+            .await
+            .expect("read after overwrite");
+        assert_eq!(bytes, b"new");
+    }
+
+    #[tokio::test]
+    async fn delete_missing_is_write_error() {
+        let (_dir, _files, node) = node_with_files(&[]).await;
+        let err = node
+            .delete(format!("{NODE_MOUNT}/nope.txt"))
+            .await
+            .expect_err("delete missing errors");
+        assert!(
+            matches!(err, CascadeError::Write { .. }),
+            "Write variant: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_dir_accepts_leading_slash_path() {
+        let (_dir, _files, node) = node_with_files(&[]).await;
+        node.create_dir(format!("/{NODE_MOUNT}/d"))
+            .await
+            .expect("leading-slash create_dir succeeds");
+        let entries = node
+            .list_dir(NODE_MOUNT.to_owned())
+            .await
+            .expect("list after create_dir");
+        assert!(
+            entries.iter().any(|e| e.name == "d"),
+            "dir listed: {entries:?}"
+        );
     }
 }
