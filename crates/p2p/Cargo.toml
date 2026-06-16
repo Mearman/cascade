@@ -28,7 +28,7 @@ ed25519-dalek = { workspace = true }
 cascade-announce-wire = { version = "0.1.56", path = "../cascade-announce-wire" }
 ring = "0.17"
 x509-parser = "0.18"
-cascade-exec = { version = "0.1.128", path = "../exec", optional = true }
+cascade-exec = { version = "0.1.129", path = "../exec", optional = true }
 
 [features]
 ## Enable the announce-server discovery client ([`discovery::announce::AnnounceDiscovery`]).
