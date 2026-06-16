@@ -7,6 +7,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.131](https://github.com/Mearman/cascade/compare/cascade-web-api-v0.1.130...cascade-web-api-v0.1.131) - 2026-06-16
+
+### Added
+
+- *(engine)* compile vfs/engine/changefeed under the portable feature
+- *(engine)* mount backends uniformly under a neutral VFS root
+- *(auth)* PWA authentication via pairing code, shared secret, and device code
+- *(web-api)* add daemon HTTP JSON API for the v1 PWA
+
+### Other
+
+- release v0.1.130 [skip ci]
+- release v0.1.129 [skip ci]
+- release v0.1.128 [skip ci]
+- release v0.1.127 [skip ci]
+- release v0.1.126 [skip ci]
+- release v0.1.125 [skip ci]
+- release v0.1.124 [skip ci]
+- release v0.1.123 [skip ci]
+- release v0.1.122 [skip ci]
+- release v0.1.121 [skip ci]
+- release v0.1.120 [skip ci]
+- release v0.1.119 [skip ci]
+- release v0.1.118 [skip ci]
+- *(web-api)* cover route handler error/validation/auth paths
+- release v0.1.117 [skip ci]
+- release v0.1.116 [skip ci]
+- release v0.1.115 [skip ci]
+- release v0.1.114 [skip ci]
+- release v0.1.113 [skip ci]
+- release v0.1.112 [skip ci]
+- release v0.1.111 [skip ci]
+- release v0.1.110 [skip ci]
+- release v0.1.109 [skip ci]
+- release v0.1.108 [skip ci]
+- release v0.1.107 [skip ci]
+- release v0.1.106 [skip ci]
+- release v0.1.105 [skip ci]
+- release v0.1.104 [skip ci]
+- release v0.1.103 [skip ci]
+- release v0.1.102 [skip ci]
+- release v0.1.101 [skip ci]
+- release v0.1.100 [skip ci]
+- release v0.1.99 [skip ci]
+- release v0.1.98 [skip ci]
+- release v0.1.97 [skip ci]
+- release v0.1.96 [skip ci]
+- release v0.1.95 [skip ci]
+- release v0.1.94 [skip ci]
+- release v0.1.93 [skip ci]
+- release v0.1.92 [skip ci]
+- release v0.1.91 [skip ci]
+- release v0.1.90 [skip ci]
+- release v0.1.89 [skip ci]
+- release v0.1.88 [skip ci]
+- release v0.1.87 [skip ci]
+- release v0.1.86 [skip ci]
+- release v0.1.85 [skip ci]
+- release v0.1.84 [skip ci]
+- release v0.1.83 [skip ci]
+- release v0.1.82 [skip ci]
+- release v0.1.81 [skip ci]
+- *(engine)* port engine/cache/sync to portable traits for WASM
+- integrate max-file-length branch into main
+- *(presenters)* update all presenters to portable Backend trait signatures
+- release v0.1.79 [skip ci]
+- release v0.1.78 [skip ci]
+- release v0.1.77 [skip ci]
+- release v0.1.76 [skip ci]
+- release v0.1.75 [skip ci]
+- release v0.1.74 [skip ci]
+- release v0.1.73 [skip ci]
+- release v0.1.72 [skip ci]
+- release v0.1.71 [skip ci]
+- release v0.1.70 [skip ci]
+- *(web-api)* apply cargo fmt to web-api crate
+
 ## [0.1.130](https://github.com/Mearman/cascade/compare/cascade-web-api-v0.1.129...cascade-web-api-v0.1.130) - 2026-06-16
 
 ### Added
