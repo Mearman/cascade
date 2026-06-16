@@ -519,6 +519,37 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  # Verifies the iOS *archive* half of the IPA pipeline with no signing
+  # identity: `xcodebuild archive` builds a valid .xcarchive unsigned (only the
+  # final `exportArchive` step needs a profile). Runs always — no secrets — so
+  # the build path of release-ios-ipa is proven green, leaving only the signed
+  # export gated on the IOS_* secrets.
+  ios-archive-check:
+    name: iOS archive (unsigned)
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: "1.96.0"
+          targets: aarch64-apple-ios
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: ios-ffi
+      - name: Install xcodegen
+        run: brew install xcodegen
+      - name: Bootstrap (build FFI device slice, bindings, project)
+        run: ./swift/CascadeFileProvideriOS/bootstrap.sh
+      - name: Archive the app (unsigned)
+        run: >
+          xcodebuild
+          -project swift/CascadeFileProvideriOS/CascadeFileProvideriOS.xcodeproj
+          -scheme CascadeHostApp -sdk iphoneos -configuration Release
+          -archivePath "$RUNNER_TEMP/Cascade.xcarchive"
+          CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO DEVELOPMENT_TEAM=""
+          archive
+
   check:
     name: Check (${{ matrix.target }})
     timeout-minutes: 30

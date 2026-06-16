@@ -20,6 +20,11 @@ settings:
     CODE_SIGN_STYLE: Manual
 
 schemes:
+  CascadeHostApp:
+    build:
+      targets:
+        CascadeHostApp: all
+        CascadeFileProviderExt: all
   FileProviderLogicTests:
     build:
       targets:
