@@ -361,6 +361,53 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  # Attaches the ad-hoc-signed iOS Simulator app to the release — the
+  # counterpart to the Android APK, runnable in a booted simulator with no
+  # Apple account (unzip, then drag into the simulator). A real-device build is
+  # the separate, secrets-gated release-ios-ipa job.
+  release-ios-simulator:
+    name: Release iOS Simulator app
+    needs: release
+    if: needs.release.outputs.released == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 40
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ needs.release.outputs.version }}
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: ios-ffi
+      - name: Install xcodegen
+        run: brew install xcodegen
+      - name: Bootstrap (build FFI slices, generate bindings, generate project)
+        run: ./swift/CascadeFileProvideriOS/bootstrap.sh
+      - name: Build the extension (Simulator, ad-hoc signed)
+        run: >
+          xcodebuild
+          -project swift/CascadeFileProvideriOS/CascadeFileProvideriOS.xcodeproj
+          -target CascadeHostApp -sdk iphonesimulator -configuration Debug
+          ARCHS=arm64 ONLY_ACTIVE_ARCH=NO build
+      - name: Package the Simulator app
+        run: |
+          mkdir -p dist
+          ditto -c -k --keepParent \
+            swift/CascadeFileProvideriOS/build/Debug-iphonesimulator/CascadeHostApp.app \
+            dist/cascade-ios-simulator.zip
+          shasum -a 256 dist/cascade-ios-simulator.zip | awk '{print $1}' > dist/cascade-ios-simulator.zip.sha256
+      - name: Upload to release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        with:
+          tag_name: ${{ needs.release.outputs.version }}
+          files: dist/cascade-ios-simulator.zip*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   check:
     name: Check (${{ matrix.target }})
     timeout-minutes: 30

@@ -55,8 +55,10 @@ self-contained appex with the Rust engine compiled in — `otool -L` shows no
 
 ## Release artifacts
 
-CI uploads the ad-hoc-signed Simulator app as a per-run artifact
-(`cascade-ios-simulator-app`) — unzip and drag into a booted simulator.
+The ad-hoc-signed Simulator app is published two ways: as a per-run CI
+artifact (`cascade-ios-simulator-app`) and as a release asset
+(`cascade-ios-simulator.zip`) attached to every GitHub release. Either way,
+unzip and drag the `.app` into a booted simulator — no Apple account needed.
 
 A signed `.ipa` for real devices is built and attached to GitHub releases by
 the `release-ios-ipa` CI job, but only when these repository secrets are set
