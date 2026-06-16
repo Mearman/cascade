@@ -11,7 +11,7 @@ final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
     private let containerPath: String
 
     init(enumeratedItemIdentifier: NSFileProviderItemIdentifier) {
-        self.containerPath = FileProviderItem.path(forIdentifier: enumeratedItemIdentifier)
+        self.containerPath = FileProviderPath.path(forIdentifier: enumeratedItemIdentifier)
     }
 
     func invalidate() {}

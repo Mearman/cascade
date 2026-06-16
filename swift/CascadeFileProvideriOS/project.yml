@@ -19,6 +19,15 @@ settings:
     CODE_SIGNING_REQUIRED: NO
     CODE_SIGN_STYLE: Manual
 
+schemes:
+  FileProviderLogicTests:
+    build:
+      targets:
+        FileProviderLogicTests: all
+    test:
+      targets:
+        - FileProviderLogicTests
+
 targets:
   CascadeHostApp:
     type: application
@@ -66,3 +75,18 @@ targets:
           - "$(PROJECT_DIR)/../../target/aarch64-apple-ios-sim/release/libcascade_ffi.a"
           - "-framework"
           - "CoreFoundation"
+
+  # Hostless logic tests for the path <-> identifier mapping. Compiles
+  # FileProviderPath.swift + the tests standalone — no dependency on the
+  # extension target or the Rust FFI — so they run on the simulator without a
+  # host app or signing.
+  FileProviderLogicTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Extension/Sources/FileProviderPath.swift
+      - path: Tests/FileProviderPathTests.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: co.uk.mearman.cascade.ios.tests
+        GENERATE_INFOPLIST_FILE: YES

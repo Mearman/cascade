@@ -31,7 +31,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
             progress.completedUnitCount = 1
             return progress
         }
-        let path = FileProviderItem.path(forIdentifier: identifier)
+        let path = FileProviderPath.path(forIdentifier: identifier)
         let parent = (path as NSString).deletingLastPathComponent
         let name = (path as NSString).lastPathComponent
         let listPath = parent.isEmpty ? "/" : parent
@@ -61,7 +61,7 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         completionHandler: @escaping (URL?, NSFileProviderItem?, Error?) -> Void
     ) -> Progress {
         let progress = Progress(totalUnitCount: 1)
-        let path = FileProviderItem.path(forIdentifier: itemIdentifier)
+        let path = FileProviderPath.path(forIdentifier: itemIdentifier)
         Task {
             do {
                 let node = try await CascadeEngine.shared.node()

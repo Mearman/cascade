@@ -197,6 +197,16 @@ jobs:
           -project swift/CascadeFileProvideriOS/CascadeFileProvideriOS.xcodeproj
           -target CascadeHostApp -sdk iphonesimulator -configuration Debug
           ARCHS=arm64 ONLY_ACTIVE_ARCH=NO build
+      - name: Run the logic tests (Simulator)
+        # Hostless unit tests for the path<->identifier mapping; the macOS
+        # runner ships an iOS Simulator runtime (the dev machine does not), so
+        # this is where they actually execute.
+        run: >
+          xcodebuild
+          -project swift/CascadeFileProvideriOS/CascadeFileProvideriOS.xcodeproj
+          -scheme FileProviderLogicTests -sdk iphonesimulator
+          -destination 'platform=iOS Simulator,name=iPhone 16,arch=arm64'
+          -configuration Debug test
       - name: Package the Simulator app
         # The ad-hoc signed Simulator .app — drag into a booted simulator to run.
         # Not a device build: a real iPhone needs a signed .ipa (see release-ios-ipa).

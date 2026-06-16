@@ -20,20 +20,15 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
     var vfsPath: String { path }
 
     var itemIdentifier: NSFileProviderItemIdentifier {
-        FileProviderItem.identifier(forPath: path)
+        FileProviderPath.identifier(forPath: path)
     }
 
     var parentItemIdentifier: NSFileProviderItemIdentifier {
-        let parent = (path as NSString).deletingLastPathComponent
-        if parent.isEmpty || parent == "/" {
-            return .rootContainer
-        }
-        return FileProviderItem.identifier(forPath: parent)
+        FileProviderPath.identifier(forPath: FileProviderPath.parent(of: path))
     }
 
     var filename: String {
-        let last = (path as NSString).lastPathComponent
-        return last.isEmpty ? "/" : last
+        FileProviderPath.name(of: path)
     }
 
     var contentType: UTType {
@@ -42,24 +37,5 @@ final class FileProviderItem: NSObject, NSFileProviderItem {
 
     var capabilities: NSFileProviderItemCapabilities {
         isDirectory ? [.allowsContentEnumerating, .allowsReading] : [.allowsReading]
-    }
-
-    /// Map an opaque item identifier back to a VFS-absolute path.
-    ///
-    /// The root container maps to the VFS root; every other identifier carries
-    /// its path verbatim.
-    static func path(forIdentifier identifier: NSFileProviderItemIdentifier) -> String {
-        if identifier == .rootContainer {
-            return "/"
-        }
-        return identifier.rawValue
-    }
-
-    /// Map a VFS-absolute path to an opaque item identifier.
-    static func identifier(forPath path: String) -> NSFileProviderItemIdentifier {
-        if path.isEmpty || path == "/" {
-            return .rootContainer
-        }
-        return NSFileProviderItemIdentifier(path)
     }
 }
