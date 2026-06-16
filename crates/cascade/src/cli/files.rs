@@ -281,7 +281,10 @@ mod tests {
             "[backends]\n[backends.local]\ntype = \"local\"\nmount = \"/\"\n",
         )
         .unwrap();
-        let backend_toml = format!("root_path = \"{}\"\n", root.display());
+        // A TOML literal string (single quotes) so Windows backslashes in the
+        // temp path are not treated as escape sequences the way they would be
+        // in a basic (double-quoted) string.
+        let backend_toml = format!("root_path = '{}'\n", root.display());
         std::fs::write(dir.join("local.toml"), backend_toml).unwrap();
         CliContext {
             config_dir: dir.to_path_buf(),
