@@ -159,15 +159,11 @@ class CascadeDocumentsProvider : DocumentsProvider() {
     }
 
     private fun childDocId(parent: String, name: String): String =
-        if (parent == ROOT_DOC_ID) "/$name" else "$parent/$name"
+        DocIdLogic.childDocId(parent, name)
 
-    private fun parentOf(documentId: String): String {
-        val trimmed = documentId.trimEnd('/')
-        val idx = trimmed.lastIndexOf('/')
-        return if (idx <= 0) ROOT_DOC_ID else trimmed.substring(0, idx)
-    }
+    private fun parentOf(documentId: String): String = DocIdLogic.parentOf(documentId)
 
-    private fun nameOf(documentId: String): String = documentId.trimEnd('/').substringAfterLast('/')
+    private fun nameOf(documentId: String): String = DocIdLogic.nameOf(documentId)
 
     private fun mimeOf(name: String): String {
         val ext = name.substringAfterLast('.', "").lowercase()
@@ -180,4 +176,22 @@ class CascadeDocumentsProvider : DocumentsProvider() {
         sizeHint: Point,
         signal: CancellationSignal?,
     ) = null
+}
+
+/**
+ * Document-id path logic, extracted so it has a single source of truth and can
+ * be unit-tested on the JVM without an emulator. Document ids are VFS-absolute
+ * paths with the root represented as `/`.
+ */
+internal object DocIdLogic {
+    fun childDocId(parent: String, name: String): String =
+        if (parent == "/") "/$name" else "$parent/$name"
+
+    fun parentOf(documentId: String): String {
+        val trimmed = documentId.trimEnd('/')
+        val idx = trimmed.lastIndexOf('/')
+        return if (idx <= 0) "/" else trimmed.substring(0, idx)
+    }
+
+    fun nameOf(documentId: String): String = documentId.trimEnd('/').substringAfterLast('/')
 }
