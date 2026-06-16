@@ -298,3 +298,132 @@ fn build_local_backend(files_dir: &Path) -> Result<Arc<dyn Backend>, CascadeErro
         })?;
     Ok(Arc::from(backend))
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+mod tests {
+    //! Host-run unit tests for the FFI bridge. These build a real `NativeEngine`
+    //! over a local-files backend in a tempdir and exercise the same methods the
+    //! iOS File Provider and Android `DocumentsProvider` call, so a regression in
+    //! the mobile entry point fails CI rather than only surfacing on a device.
+
+    use super::*;
+
+    /// Build a node rooted at a fresh tempdir, pre-seeded with `files`, and
+    /// return the on-disk `files` dir so tests can seed more after construction.
+    async fn node_with_files(
+        files: &[(&str, &[u8])],
+    ) -> (tempfile::TempDir, PathBuf, Arc<CascadeNode>) {
+        let dir = tempfile::tempdir().unwrap();
+        let files_dir = dir.path().join(NODE_FILES_DIR);
+        std::fs::create_dir_all(&files_dir).unwrap();
+        for (name, contents) in files {
+            std::fs::write(files_dir.join(name), contents).unwrap();
+        }
+        let node = CascadeNode::new(dir.path().to_string_lossy().to_string())
+            .await
+            .expect("node builds");
+        (dir, files_dir, node)
+    }
+
+    #[tokio::test]
+    async fn new_creates_config_and_files_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("node");
+        let _node = CascadeNode::new(config_dir.to_string_lossy().to_string())
+            .await
+            .expect("node builds");
+        assert!(config_dir.is_dir(), "config dir created");
+        assert!(
+            config_dir.join(NODE_FILES_DIR).is_dir(),
+            "files subdir created"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_returns_valid_json_with_expected_shape() {
+        let (_dir, _files, node) = node_with_files(&[]).await;
+        let status = node.status().await;
+        let value: serde_json::Value = serde_json::from_str(&status).expect("status is valid JSON");
+        assert!(value["running"].is_boolean(), "running field present");
+        assert!(value["backends"].is_array(), "backends is an array");
+        assert!(value["cache"].is_object(), "cache object present");
+        assert!(
+            value["p2p_enabled"].is_boolean(),
+            "p2p_enabled field present"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_dir_lists_root_children() {
+        let (_dir, _files, node) =
+            node_with_files(&[("alpha.txt", b"aaa"), ("beta.bin", b"bbb")]).await;
+        let entries = node
+            .list_dir(NODE_MOUNT.to_owned())
+            .await
+            .expect("listing succeeds");
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains(&"alpha.txt"),
+            "alpha.txt in listing: {names:?}"
+        );
+        assert!(
+            names.contains(&"beta.bin"),
+            "beta.bin in listing: {names:?}"
+        );
+        let alpha = entries
+            .iter()
+            .find(|e| e.name == "alpha.txt")
+            .expect("alpha entry present");
+        assert!(!alpha.is_dir, "file is not a dir");
+    }
+
+    #[tokio::test]
+    async fn list_dir_marks_directories() {
+        let (_dir, files_dir, node) = node_with_files(&[]).await;
+        std::fs::create_dir(files_dir.join("subdir")).unwrap();
+        let entries = node
+            .list_dir(NODE_MOUNT.to_owned())
+            .await
+            .expect("listing succeeds");
+        let subdir = entries
+            .iter()
+            .find(|e| e.name == "subdir")
+            .expect("subdir in listing");
+        assert!(subdir.is_dir, "subdir marked as directory");
+    }
+
+    #[tokio::test]
+    async fn read_file_returns_contents() {
+        let (_dir, _files, node) = node_with_files(&[("doc.txt", b"hello cascade")]).await;
+        let bytes = node
+            .read_file(format!("{NODE_MOUNT}/doc.txt"))
+            .await
+            .expect("read succeeds");
+        assert_eq!(bytes, b"hello cascade");
+    }
+
+    #[tokio::test]
+    async fn read_file_missing_is_read_error() {
+        let (_dir, _files, node) = node_with_files(&[]).await;
+        let err = node
+            .read_file(format!("{NODE_MOUNT}/nope.txt"))
+            .await
+            .expect_err("missing file errors");
+        assert!(
+            matches!(err, CascadeError::Read { .. }),
+            "Read variant: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pin_and_unpin_round_trip() {
+        let (_dir, _files, node) = node_with_files(&[("doc.txt", b"x")]).await;
+        node.pin(format!("{NODE_MOUNT}/**"))
+            .await
+            .expect("pin succeeds");
+        node.unpin(format!("{NODE_MOUNT}/**"))
+            .await
+            .expect("unpin succeeds");
+    }
+}

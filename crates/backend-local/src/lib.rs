@@ -295,6 +295,48 @@ impl Backend for LocalBackend {
         Ok((changes, new_cursor))
     }
 
+    /// List the immediate children of a directory by its native id.
+    ///
+    /// The local backend serves the live filesystem — no manifest or sync cursor
+    /// is consulted — so on-demand presenters (and the mobile FFI node, which
+    /// drives listing directly without a sync runner) see current disk state.
+    /// `native_id` is a root-relative path (`"/"` for the backend root); it is
+    /// resolved under `self.root` the same way [`metadata`](Self::metadata) does.
+    async fn list_children(&self, native_id: &str) -> anyhow::Result<Vec<FileEntry>> {
+        let dir = self.absolute_path(Path::new(native_id));
+        let mut entries = Vec::new();
+        let mut reader = tokio::fs::read_dir(&dir).await?;
+        while let Some(child) = reader.next_entry().await? {
+            let child_path = child.path();
+            if manifest::should_skip_entry(&child_path, &self.root) {
+                continue;
+            }
+            let relative = child_path
+                .strip_prefix(&self.root)
+                .unwrap_or(&child_path)
+                .to_string_lossy()
+                .to_string();
+            let metadata = child.metadata().await?;
+            if metadata.is_dir() {
+                entries.push(self.dir_entry(&relative));
+            } else if metadata.is_file() {
+                let modified = metadata
+                    .modified()?
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                let state = FileState {
+                    path: relative,
+                    mtime_secs: i64::try_from(modified.as_secs()).unwrap_or(i64::MAX),
+                    mtime_nanos: modified.subsec_nanos(),
+                    size: metadata.len(),
+                    hash: manifest::hash_file(&child_path).await?,
+                };
+                entries.push(self.state_to_entry(&state, false));
+            }
+        }
+        Ok(entries)
+    }
+
     async fn metadata(&self, path: &Path) -> anyhow::Result<FileEntry> {
         let abs = self.absolute_path(path);
         if !abs.exists() {

@@ -38,3 +38,6 @@ path = "src/bin/uniffi-bindgen.rs"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = "3"
