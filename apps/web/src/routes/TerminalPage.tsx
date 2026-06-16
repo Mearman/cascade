@@ -17,7 +17,7 @@ interface ServerMessage {
 
 function isServerMessage(value: unknown): value is ServerMessage {
   if (typeof value !== 'object' || value === null) return false;
-  return 'type' in value && typeof (value as { type: unknown }).type === 'string';
+  return 'type' in value && typeof value.type === 'string';
 }
 
 export function TerminalPage() {
@@ -71,7 +71,7 @@ export function TerminalPage() {
     ws.onopen = () => {
       const spawn = {
         type: 'spawn',
-        shell: null as string | null,
+        shell: null,
         cols: term.cols,
         rows: term.rows,
       };
@@ -102,7 +102,7 @@ export function TerminalPage() {
         }
         case 'exited':
           setExited(true);
-          term.write(`\r\n[process exited${msg.code !== null && msg.code !== undefined ? ` code ${msg.code}` : ''}]\r\n`);
+          term.write(`\r\n[process exited${msg.code !== null && msg.code !== undefined ? ` code ${String(msg.code)}` : ''}]\r\n`);
           break;
         case 'error':
           setError(msg.message ?? 'Unknown error');
@@ -148,7 +148,6 @@ export function TerminalPage() {
       ws.close();
       term.dispose();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   function handleDisconnect() {

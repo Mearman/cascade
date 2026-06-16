@@ -263,7 +263,8 @@ describe('FilesPage in Connected mode', () => {
     });
 
     // Simulate file selection.
-    const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement;
+    const fileInput = container.querySelector<HTMLInputElement>('input[type="file"]');
+    if (fileInput === null) throw new Error('expected a file input to be rendered');
     const testFile = new File(['hello'], 'test.txt', { type: 'text/plain' });
     Object.defineProperty(fileInput, 'files', { value: [testFile], writable: false });
 

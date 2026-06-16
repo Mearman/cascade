@@ -302,7 +302,7 @@ export function FilesPage() {
 
   function handleDrop(e: DragEvent) {
     e.preventDefault();
-    if (e.dataTransfer?.files !== null && e.dataTransfer !== null) {
+    if (e.dataTransfer !== null) {
       void handleUploadFiles(e.dataTransfer.files);
     }
   }
