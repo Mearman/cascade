@@ -7,7 +7,7 @@
 //! configured backends.
 //!
 //! The verbs are thin: they resolve the backend for a path through the
-//! [`VfsTree`] and forward to the matching [`Backend`] operation
+//! [`cascade_engine::vfs::VfsTree`] and forward to the matching [`Backend`] operation
 //! (`read_dir`, `metadata`/`download`, `create_dir`, `upload`, `delete`,
 //! `move_entry`). Cross-backend copies and moves download from the source
 //! backend then upload to the destination, mirroring the cross-backend move
