@@ -2012,6 +2012,39 @@ async fn session_id_verb_authorised_over_session_scope_runs() {
 }
 
 #[tokio::test]
+async fn session_verb_ignores_node_wire_scope_when_session_scope_covered() {
+    // The manager sends a session-id-only verb (PtyWrite/Resize/Kill) with a
+    // node-wide wire scope as a placeholder — it cannot know the session's real
+    // folder, and the dispatcher resolves that from node state. The verb must
+    // still authorise when the caller's grant covers the session's stored scope:
+    // gating session verbs on the wire scope would make every interactive
+    // session unsatisfiable, because exec:pty is dangerous and can never be
+    // granted node-wide. (Before the fix this returned Unauthorised.)
+    let store = FakeStore::new(vec![grant(Capability::ExecPty, Scope::folder("/work"))])
+        .with_exec_session(7, Scope::folder("/work/reports"));
+    let executor = FakeExecutor::default();
+    let result = run_dispatch(
+        &store,
+        &executor,
+        &manager(),
+        ManageCommand::PtyWrite {
+            session: 7,
+            bytes: b"ls\n".to_vec(),
+        },
+        WireScope::Node,
+        None,
+        at(2026, 1, 1),
+    )
+    .await;
+    assert!(
+        matches!(result, ManageResult::Ok { .. }),
+        "a session verb with a node-wide wire scope must still authorise when \
+         the session's stored scope is covered, got {result:?}",
+    );
+    assert_eq!(executor.calls().len(), 1, "the write must run once");
+}
+
+#[tokio::test]
 async fn session_id_verb_on_unknown_session_is_refused() {
     // A verb naming a session that does not exist resolves to no scope; it
     // targets the node-wide scope, which the dangerous bar refuses, so it never

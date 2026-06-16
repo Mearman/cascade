@@ -10,6 +10,7 @@
 
 use std::io::Write as _;
 use std::path::{Path as FsPath, PathBuf};
+use std::sync::Arc;
 
 use axum::Json;
 use axum::Router;
@@ -17,7 +18,7 @@ use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use cascade_engine::manage::{Capability, Scope};
 use cascade_engine::types::{Change, DirEntry, FileEntry as EngineFileEntry, FileId};
 use serde::Deserialize;
@@ -46,6 +47,11 @@ pub fn routes() -> Router<AppState> {
                 .put(put_file)
                 .delete(delete_file),
         )
+        .route(
+            "/v1/folders/{folder}/dirs/{*path}",
+            post(create_dir_handler),
+        )
+        .route("/v1/folders/{folder}/move", post(move_entry_handler))
 }
 
 /// The VFS path base for a canonical folder id (`p2p-<name>` → `<name>`), the
@@ -377,6 +383,137 @@ async fn delete_file(
         .await
         .map_err(|e| ApiError::internal(format!("could not delete file: {e}")))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Request body for creating a directory.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct CreateDirBody {
+    /// Optional override for the directory name. When omitted, the leaf segment
+    /// of `{path}` is used.
+    name: Option<String>,
+}
+
+/// `POST /v1/folders/{folder}/dirs/{path}` — capability: `data:write`. Creates
+/// a directory at the given path.
+async fn create_dir_handler(
+    State(state): State<AppState>,
+    session: Session,
+    Path((folder, path)): Path<(String, String)>,
+    body: Option<Json<CreateDirBody>>,
+) -> Result<Response, ApiError> {
+    require_data_plane_ready(&state)?;
+    session.require(
+        &state,
+        Capability::DataWrite,
+        &Scope::folder(folder.clone()),
+    )?;
+    require_known_folder(&state, &folder)?;
+
+    let dir_name = body.and_then(|Json(b)| b.name).unwrap_or_else(|| {
+        FsPath::new(&path)
+            .file_name()
+            .map_or_else(|| path.clone(), |n| n.to_string_lossy().into_owned())
+    });
+
+    let base = folder_base(&folder);
+    let rel = base.join(path.trim_start_matches('/'));
+    let vfs = state.engine.vfs();
+    let (backend, backend_rel) = {
+        let tree = vfs
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (backend, backend_rel) = tree.resolve(&rel);
+        (backend.clone(), backend_rel)
+    };
+
+    // If the parent exists, use `create_dir_with_parent` to avoid a full walk;
+    // otherwise fall back to `create_dir`.
+    let parent_rel = backend_rel
+        .parent()
+        .map(FsPath::to_path_buf)
+        .unwrap_or_default();
+
+    let created = if parent_rel.as_os_str().is_empty() {
+        backend
+            .create_dir(&backend_rel)
+            .await
+            .map_err(|e| ApiError::internal(format!("could not create directory: {e}")))?
+    } else {
+        match backend.metadata(&parent_rel).await {
+            Ok(parent) => backend
+                .create_dir_with_parent(&dir_name, &FileId(parent.id.0.clone()))
+                .await
+                .map_err(|e| ApiError::internal(format!("could not create directory: {e}")))?,
+            Err(e) => {
+                return Err(ApiError::not_found(format!(
+                    "parent directory not found: {e}"
+                )));
+            }
+        }
+    };
+
+    Ok((
+        StatusCode::CREATED,
+        Json(engine_entry_to_schema(&path, &created)),
+    )
+        .into_response())
+}
+
+/// Request body for moving/renaming an entry.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct MoveEntryBody {
+    /// The source path within the folder.
+    from: String,
+    /// The destination path within the folder.
+    to: String,
+}
+
+/// `POST /v1/folders/{folder}/move` — capability: `data:write`. Moves or
+/// renames an entry from `from` to `to` within the folder.
+async fn move_entry_handler(
+    State(state): State<AppState>,
+    session: Session,
+    Path(folder): Path<String>,
+    Json(body): Json<MoveEntryBody>,
+) -> Result<Response, ApiError> {
+    require_data_plane_ready(&state)?;
+    session.require(
+        &state,
+        Capability::DataWrite,
+        &Scope::folder(folder.clone()),
+    )?;
+    require_known_folder(&state, &folder)?;
+
+    let base = folder_base(&folder);
+    let src_rel = base.join(body.from.trim_start_matches('/'));
+    let dst_rel = base.join(body.to.trim_start_matches('/'));
+    let vfs = state.engine.vfs();
+    let (backend, backend_src, backend_dst) = {
+        let tree = vfs
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (src_backend, src_rel) = tree.resolve(&src_rel);
+        let (dst_backend, dst_rel) = tree.resolve(&dst_rel);
+        if !Arc::ptr_eq(src_backend, dst_backend) {
+            return Err(ApiError::unprocessable(
+                "cross-backend moves are not supported through this route",
+            ));
+        }
+        (src_backend.clone(), src_rel, dst_rel)
+    };
+
+    let moved = backend
+        .move_entry(&backend_src, &backend_dst)
+        .await
+        .map_err(|e| ApiError::internal(format!("could not move entry: {e}")))?;
+
+    Ok((
+        StatusCode::OK,
+        Json(engine_entry_to_schema(&body.to, &moved)),
+    )
+        .into_response())
 }
 
 /// `GET /v1/folders/{folder}/archive` — capability: `data:read`. Streams a

@@ -138,18 +138,56 @@ impl LocalBackend {
         manifest.save(&self.manifest_path).await
     }
 
-    /// Convert a relative path to an absolute path under the root.
-    fn absolute_path(&self, relative: &Path) -> PathBuf {
-        // VFS paths are forward-slash rooted ("/foo/bar") on every OS. Strip the
-        // leading separator unconditionally so the result nests under `root`.
-        // Gating on `is_absolute()` was wrong on Windows: there "/foo" is not
-        // absolute (it has no drive prefix), so the strip was skipped and
-        // `join` resolved the path to the current drive's root — escaping the
-        // export and making writes land where reads could not find them.
-        // `strip_prefix("/")` matches the RootDir component on every platform; a
-        // path without a leading separator is kept as-is.
+    /// Resolve a VFS-relative path to a sandboxed absolute path under the
+    /// backend root, returning the absolute path and its normalised
+    /// VFS-relative form.
+    ///
+    /// VFS paths are forward-slash rooted on every OS; the leading separator is
+    /// stripped and the remainder joined under the root. `.` segments fold away
+    /// and `..` segments climb, but the instant a `..` would rise above the
+    /// root the path is rejected, so a value like
+    /// `/notes/../../../etc/passwd` fails loudly instead of being resolved by
+    /// the OS to a path outside the backend's sandbox. An embedded absolute
+    /// segment (a `RootDir` or Windows `Prefix` component) is rejected too.
+    fn resolve_under_root(&self, relative: &Path) -> anyhow::Result<(PathBuf, String)> {
+        use std::path::Component;
+
         let nested = relative.strip_prefix("/").unwrap_or(relative);
-        self.root.join(nested)
+
+        // Walk the relative components under the root, mirroring them into a
+        // normalised relative string. `components` and `abs` stay in lockstep:
+        // a `..` with a component to pop climbs within the sandbox; a `..` with
+        // nothing to pop would escape the root and is refused.
+        let mut abs = self.root.clone();
+        let mut components: Vec<String> = Vec::new();
+        for component in nested.components() {
+            match component {
+                Component::Normal(name) => {
+                    abs.push(name);
+                    if let Some(name) = name.to_str() {
+                        components.push(name.to_owned());
+                    }
+                }
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if components.pop().is_some() {
+                        abs.pop();
+                    } else {
+                        anyhow::bail!(
+                            "path '{}' escapes the local backend root",
+                            relative.display()
+                        );
+                    }
+                }
+                Component::RootDir | Component::Prefix(_) => {
+                    anyhow::bail!(
+                        "path '{}' escapes the local backend root",
+                        relative.display()
+                    );
+                }
+            }
+        }
+        Ok((abs, components.join("/")))
     }
 
     /// Convert a `FileState` into a `FileEntry`.
@@ -303,7 +341,7 @@ impl Backend for LocalBackend {
     /// `native_id` is a root-relative path (`"/"` for the backend root); it is
     /// resolved under `self.root` the same way [`metadata`](Self::metadata) does.
     async fn list_children(&self, native_id: &str) -> anyhow::Result<Vec<FileEntry>> {
-        let dir = self.absolute_path(Path::new(native_id));
+        let dir = self.resolve_under_root(Path::new(native_id))?.0;
         let mut entries = Vec::new();
         let mut reader = tokio::fs::read_dir(&dir).await?;
         while let Some(child) = reader.next_entry().await? {
@@ -338,16 +376,10 @@ impl Backend for LocalBackend {
     }
 
     async fn metadata(&self, path: &Path) -> anyhow::Result<FileEntry> {
-        let abs = self.absolute_path(path);
+        let (abs, relative) = self.resolve_under_root(path)?;
         if !abs.exists() {
             return Err(BackendError::NotFound(path.display().to_string()).into());
         }
-
-        let relative = abs
-            .strip_prefix(&self.root)
-            .unwrap_or(&abs)
-            .to_string_lossy()
-            .to_string();
 
         let metadata = tokio::fs::metadata(&abs).await?;
 
@@ -437,12 +469,7 @@ impl Backend for LocalBackend {
             anyhow::bail!("local backend is in upload-only mode");
         }
 
-        let abs = self.absolute_path(path);
-        let relative = abs
-            .strip_prefix(&self.root)
-            .unwrap_or(&abs)
-            .to_string_lossy()
-            .into_owned();
+        let (abs, relative) = self.resolve_under_root(path)?;
 
         // Ensure parent directory exists.
         if let Some(parent) = abs.parent() {
@@ -534,12 +561,7 @@ impl Backend for LocalBackend {
             anyhow::bail!("local backend is in upload-only mode");
         }
 
-        let abs = self.absolute_path(path);
-        let relative = abs
-            .strip_prefix(&self.root)
-            .unwrap_or(&abs)
-            .to_string_lossy()
-            .into_owned();
+        let (abs, relative) = self.resolve_under_root(path)?;
 
         tokio::fs::create_dir_all(&abs).await?;
 
@@ -592,8 +614,8 @@ impl Backend for LocalBackend {
             anyhow::bail!("local backend is in upload-only mode");
         }
 
-        let src_abs = self.absolute_path(src);
-        let dst_abs = self.absolute_path(dst);
+        let (src_abs, src_relative) = self.resolve_under_root(src)?;
+        let (dst_abs, dst_relative) = self.resolve_under_root(dst)?;
 
         if !src_abs.exists() {
             anyhow::bail!("source path not found: {}", src.display());
@@ -607,9 +629,6 @@ impl Backend for LocalBackend {
         tokio::fs::rename(&src_abs, &dst_abs).await?;
 
         // Update manifest: remove old, add new.
-        let src_relative = src.to_string_lossy().to_string();
-        let dst_relative = dst.to_string_lossy().to_string();
-
         let mut manifest = self.manifest.write().await;
         manifest.remove(&[&src_relative]);
 
@@ -690,6 +709,54 @@ mod tests {
         let config = make_config(dir.path().to_str().unwrap(), &[("mode", "invalid")]);
         let err = create_backend(&config).err().unwrap();
         assert!(err.to_string().contains("unknown"));
+    }
+
+    #[tokio::test]
+    async fn create_dir_rejects_path_that_escapes_root() {
+        // A `..` that climbs above the root must be refused before it reaches
+        // the filesystem, so the local backend cannot be used to write or read
+        // outside its sandbox.
+        let dir = tempfile::tempdir().unwrap();
+        let config = make_config(dir.path().to_str().unwrap(), &[]);
+        let backend = create_backend(&config).unwrap();
+        let err = backend
+            .create_dir(Path::new("/../escape"))
+            .await
+            .expect_err("a path escaping the root must be rejected");
+        assert!(err.to_string().contains("escapes"), "got: {err}");
+        assert!(
+            !dir.path().parent().unwrap().join("escape").exists(),
+            "nothing must be created outside the root"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_rejects_traversal_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = make_config(dir.path().to_str().unwrap(), &[]);
+        let backend = create_backend(&config).unwrap();
+        let err = backend
+            .metadata(Path::new("/../../../etc/passwd"))
+            .await
+            .expect_err("a traversal path must be rejected");
+        assert!(err.to_string().contains("escapes"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn non_escaping_parent_refs_fold_normally() {
+        // A `..` that stays within the root is normalisation, not an escape:
+        // `/a/../b` resolves to `/b`.
+        let dir = tempfile::tempdir().unwrap();
+        let config = make_config(dir.path().to_str().unwrap(), &[]);
+        let backend = create_backend(&config).unwrap();
+        backend
+            .create_dir(Path::new("/b"))
+            .await
+            .expect("create /b");
+        backend
+            .create_dir(Path::new("/a/../b"))
+            .await
+            .expect("/a/../b normalises to /b");
     }
 
     #[tokio::test]

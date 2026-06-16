@@ -16,7 +16,7 @@ fn open_db(ctx: &CliContext) -> Result<StateDb> {
 }
 
 /// Build a `CacheManager` over a freshly opened state database.
-fn make_manager(db: Arc<StateDb>) -> CacheManager<TokioRuntimeHandle> {
+pub fn make_manager(db: Arc<StateDb>) -> CacheManager<TokioRuntimeHandle> {
     let runtime = TokioRuntimeHandle::current();
     let storage = SqliteStorage::new(db, runtime.clone());
     CacheManager::new(Arc::new(storage), runtime, CacheManagerConfig::default())

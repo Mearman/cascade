@@ -12,6 +12,7 @@ import {
   LoginPage,
   SharesPage,
   SettingsPage,
+  TerminalPage,
   TokensPage,
 } from '@/routes';
 import { loadToken, hasApiBase, saveApiBase, getStoredMode, saveMode } from '@/auth';
@@ -326,6 +327,9 @@ export function App() {
             )} />
             <Route path="/files" component={() => (
               <RequireAuth><FilesPage /></RequireAuth>
+            )} />
+            <Route path="/terminal" component={() => (
+              <RequireAuth><TerminalPage /></RequireAuth>
             )} />
             <Route path="/grants" component={() => (
               <RequireAuth><GrantsPage /></RequireAuth>

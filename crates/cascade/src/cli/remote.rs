@@ -145,6 +145,34 @@ pub enum RemoteCommand {
         /// The folder scope the caller's `grant:admin` grant covers.
         scope: String,
     },
+    /// Run a one-shot command on the remote node under a PTY. The command's
+    /// stdout and stderr are streamed back and written to the terminal; the
+    /// CLI exits once the node closes the output stream. The exec data plane
+    /// does not yet carry the process exit code, so it is not reflected in the
+    /// CLI's own exit status.
+    ///
+    /// Requires the dangerous `exec:pty` capability over the session's
+    /// working directory, granted explicitly for a folder scope.
+    Exec {
+        /// The working directory the command runs in — the scope the
+        /// `exec:pty` grant covers.
+        cwd: Option<String>,
+        /// The command argv, passed after `--`.
+        argv: Vec<String>,
+    },
+    /// Open an interactive shell on the remote node under a PTY. Local stdin
+    /// is forwarded to the remote shell, output is rendered to the terminal,
+    /// and terminal resizes are forwarded.
+    ///
+    /// Requires the dangerous `exec:pty` capability over the session's
+    /// working directory, granted explicitly for a folder scope.
+    Shell {
+        /// The working directory the shell starts in — the scope the
+        /// `exec:pty` grant covers.
+        cwd: Option<String>,
+        /// The shell to launch (absent uses the node's default).
+        shell: Option<String>,
+    },
 }
 
 impl RemoteCommand {
@@ -220,6 +248,28 @@ impl RemoteCommand {
                 grant_id: *grant_id,
                 scope: scope_from_arg(scope),
             },
+            // Exec and Shell do not ride the simple `manage_remote` round-trip
+            // path: they spawn a PTY session, then pump stdin/stdout/stderr
+            // over the exec data plane. Their `to_wire` is the initial
+            // `PtySpawn` command; the exec/shell handlers in `run` drive the
+            // subsequent PtyWrite/PtyResize/PtyKill verbs and the stream loop
+            // directly.
+            Self::Exec { cwd, argv } => ManageCommand::PtySpawn {
+                shell: None,
+                argv: argv.clone(),
+                cwd: cwd.clone(),
+                env: Vec::new(),
+                cols: exec_terminal_cols(),
+                rows: exec_terminal_rows(),
+            },
+            Self::Shell { cwd, shell } => ManageCommand::PtySpawn {
+                shell: shell.clone(),
+                argv: Vec::new(),
+                cwd: cwd.clone(),
+                env: Vec::new(),
+                cols: exec_terminal_cols(),
+                rows: exec_terminal_rows(),
+            },
         }
     }
 
@@ -259,8 +309,40 @@ impl RemoteCommand {
             | Self::Stop { scope }
             | Self::GrantAdd { scope, .. }
             | Self::GrantRevoke { scope, .. } => scope_from_arg(scope),
+            // Exec/Shell: the dangerous `exec:pty` capability is never
+            // node-wide, so the advertised scope is the explicit `cwd` folder.
+            // When `cwd` is absent the node picks its default and authorises
+            // over that; advertise the root so a node-wide `exec:pty` grant
+            // (if one somehow existed) would not be the only thing matching.
+            Self::Exec { cwd, .. } | Self::Shell { cwd, .. } => {
+                scope_from_arg(cwd.as_deref().unwrap_or(ROOT_SCOPE))
+            }
         }
     }
+}
+
+/// Default terminal column count for a PTY spawn when the local terminal size
+/// cannot be probed (non-TTY stdout or a platform without a size ioctl).
+const DEFAULT_TERMINAL_COLS: u16 = 80;
+/// Default terminal row count for a PTY spawn.
+const DEFAULT_TERMINAL_ROWS: u16 = 24;
+
+/// Probe the current terminal's column count for a PTY spawn.
+fn exec_terminal_cols() -> u16 {
+    terminal_size().map_or(DEFAULT_TERMINAL_COLS, |(cols, _)| cols)
+}
+
+/// Probe the current terminal's row count for a PTY spawn.
+fn exec_terminal_rows() -> u16 {
+    terminal_size().map_or(DEFAULT_TERMINAL_ROWS, |(_, rows)| rows)
+}
+
+/// Read the terminal size from the controlling terminal, returning `None`
+/// when stdout is not a TTY or the platform has no size probe. crossterm wraps
+/// the platform ioctl safely, so this replaces the prior fixed 80x24 fallback
+/// and lets the spawned PTY open at the real local size.
+fn terminal_size() -> Option<(u16, u16)> {
+    crossterm::terminal::size().ok()
 }
 
 /// Map a `--scope` argument string to a wire [`ManageScope`].
@@ -405,6 +487,9 @@ fn open_p2p_backend(ctx: &CliContext) -> Result<P2pBackend> {
 /// authorisation denial is reported as such and the process exits with a
 /// non-zero status via the returned `Err`, distinguishing "the node refused
 /// you" from "the command ran and failed".
+///
+/// `Exec` and `Shell` take a separate path: they spawn a PTY session, then
+/// pump stdin/stdout/stderr over the exec data plane until the session exits.
 pub async fn run(
     ctx: &CliContext,
     device_id: &str,
@@ -415,11 +500,210 @@ pub async fn run(
         anyhow::bail!("remote requires a non-empty device id");
     }
     let backend = open_p2p_backend(ctx)?;
-    let result = backend
-        .manage_remote(device_id, command.to_wire(), command.wire_scope(), token)
+    match &command {
+        RemoteCommand::Exec { .. } | RemoteCommand::Shell { .. } => {
+            run_exec(ctx, device_id, command, token).await
+        }
+        _ => {
+            let result = backend
+                .manage_remote(device_id, command.to_wire(), command.wire_scope(), token)
+                .await
+                .with_context(|| format!("administering remote node {device_id}"))?;
+            render(device_id, &result)
+        }
+    }
+}
+
+/// `cascade remote <device-id> exec` / `shell`.
+///
+/// Spawns a PTY session on the remote node, then pumps I/O:
+///
+/// - The node's stdout/stderr (delivered as exec-stream frames) are written
+///   to the local terminal.
+/// - For `shell`, local stdin is forwarded to the node as `PtyWrite` commands
+///   via a `tokio::select!` loop multiplexed with the output stream.
+/// - For `exec` (one-shot), stdin is not forwarded; the command's output is
+///   drained and the CLI exits when the stream closes.
+///
+/// The session is always cleaned up: the consumer is unsubscribed and a
+/// `PtyKill` with SIGTERM is sent on exit, so a cancelled CLI does not leave
+/// an orphaned session on the node.
+async fn run_exec(
+    ctx: &CliContext,
+    device_id: &str,
+    command: RemoteCommand,
+    token: Option<String>,
+) -> Result<()> {
+    let backend = std::sync::Arc::new(open_p2p_backend(ctx)?);
+    let is_shell = matches!(command, RemoteCommand::Shell { .. });
+
+    // Send the PtySpawn, learn the session id. Clone the token here so the
+    // same credential can be re-presented to the session verbs (PtyWrite on
+    // stdin, the cleanup PtyKill) — a token-only caller has no on-node grant,
+    // so every follow-up request must carry it.
+    let spawn_result = backend
+        .manage_remote(
+            device_id,
+            command.to_wire(),
+            command.wire_scope(),
+            token.clone(),
+        )
         .await
-        .with_context(|| format!("administering remote node {device_id}"))?;
-    render(device_id, &result)
+        .with_context(|| format!("spawning exec session on {device_id}"))?;
+    let session_id = match spawn_result {
+        ManageResult::ExecSpawned { session } => session,
+        ManageResult::Ok { summary } => {
+            anyhow::bail!("unexpected Ok reply for exec spawn: {summary}");
+        }
+        ManageResult::Err { kind, message } => {
+            return Err(anyhow::anyhow!(
+                "exec spawn on {device_id} failed ({kind:?}): {message}"
+            ));
+        }
+    };
+
+    // Register the consumer now that the session id is known.
+    let mut stream = backend.subscribe_exec_stream(device_id, session_id).await;
+
+    // Drive the session: multiplex output draining with stdin forwarding
+    // (shell mode only) using tokio::select.
+    let pump_result = pump_exec_session(
+        &backend,
+        device_id,
+        session_id,
+        &mut stream,
+        is_shell,
+        token.clone(),
+    )
+    .await;
+
+    // Cleanup: unsubscribe the consumer and best-effort SIGTERM so a cancelled
+    // shell does not leave the PTY running on the node. The token is re-presented
+    // so a token-authenticated caller's cleanup signal is authorised too.
+    backend.unsubscribe_exec_stream(device_id, session_id).await;
+    let _ = backend
+        .send_pty_signal(device_id, session_id, 15, token)
+        .await;
+
+    pump_result
+}
+
+/// Pump the exec session: forward output to the terminal and (for shell mode)
+/// forward local stdin to the remote PTY. Returns when the output stream
+/// closes (the session ended) or stdin reaches EOF.
+///
+/// `token` is re-presented with every `PtyWrite` so a caller authenticated
+/// only by a capability token (no on-node grant) can drive an interactive
+/// session.
+async fn pump_exec_session(
+    backend: &std::sync::Arc<cascade_backend_p2p::P2pBackend>,
+    device_id: &str,
+    session_id: u64,
+    stream: &mut tokio::sync::mpsc::UnboundedReceiver<cascade_p2p::exec_stream::ExecStreamFrame>,
+    is_shell: bool,
+    token: Option<String>,
+) -> Result<()> {
+    use std::io::IsTerminal as _;
+    use std::io::Write as _;
+    use tokio::io::AsyncReadExt as _;
+
+    if !is_shell {
+        // One-shot exec: drain output to the terminal. The remote process's
+        // exit code is not carried on the exec data plane today (there is no
+        // exit frame), so the CLI cannot forward it; the session is considered
+        // done when the node closes the output stream.
+        let stdout = std::io::stdout();
+        while let Some(frame) = stream.recv().await {
+            let mut handle = stdout.lock();
+            handle.write_all(&frame.bytes)?;
+            handle.flush()?;
+        }
+        return Ok(());
+    }
+
+    // Interactive shell: drive a real raw-mode PTY. The local terminal is put
+    // into raw mode so keystrokes (including control bytes such as ^C as 0x03)
+    // are forwarded byte-for-byte and the local line discipline does not echo
+    // or line-buffer; the remote PTY interprets them. Output is rendered to the
+    // terminal and local resizes are forwarded, with raw mode restored on exit.
+    // When stdin is not a TTY (piped input) raw mode is skipped and stdin is
+    // forwarded as a byte stream instead.
+    let raw = if std::io::stdin().is_terminal() {
+        crossterm::terminal::enable_raw_mode().context("enabling raw mode for the remote shell")?;
+        Some(RawModeGuard)
+    } else {
+        None
+    };
+
+    // Forward local terminal resizes. `terminal::size()` reads the current size
+    // via ioctl without contending with the raw-byte stdin reader — unlike
+    // crossterm's event loop, which would consume keystrokes meant for the byte
+    // forwarder — so a light poll detects a resize shortly after it happens on
+    // every platform.
+    let mut last_size = terminal_size();
+    let mut size_tick = tokio::time::interval(std::time::Duration::from_millis(250));
+    // The interval's first tick fires immediately; consume it so we do not echo
+    // a redundant initial resize (the spawn already opened at the live size).
+    size_tick.tick().await;
+
+    let mut stdin = tokio::io::stdin();
+    let mut in_buf = [0u8; 4096];
+    let stdout = std::io::stdout();
+
+    loop {
+        tokio::select! {
+            // Output from the remote session.
+            frame = stream.recv() => match frame {
+                Some(frame) => {
+                    let mut handle = stdout.lock();
+                    handle.write_all(&frame.bytes)?;
+                    handle.flush()?;
+                }
+                None => break,
+            },
+            // Local stdin bytes -> remote PtyWrite. In raw mode each keystroke
+            // arrives immediately; ^C arrives as 0x03 and the remote PTY raises
+            // SIGINT for the child, so interrupt works without local handling.
+            n = stdin.read(&mut in_buf) => match n {
+                // Local stdin closed, or an unreadable stdin: end the session.
+                Ok(0) | Err(_) => break,
+                Ok(count) => {
+                    if let Some(chunk) = in_buf.get(..count) {
+                        backend
+                            .send_pty_write(device_id, session_id, chunk.to_vec(), token.clone())
+                            .await
+                            .context("forwarding stdin to remote PTY")?;
+                    }
+                }
+            },
+            // Local terminal resized -> forward the new size.
+            _ = size_tick.tick() => {
+                if let Some(now) = terminal_size()
+                    && Some(now) != last_size
+                {
+                    last_size = Some(now);
+                    let _ = backend
+                        .send_pty_resize(device_id, session_id, now.0, now.1, token.clone())
+                        .await;
+                }
+            }
+        }
+    }
+
+    drop(raw);
+    Ok(())
+}
+
+/// Restores the local terminal from raw mode when the shell session ends,
+/// including on early returns or errors. crossterm's raw mode is a process-wide
+/// terminal attribute, so leaving it enabled would hand the operator back a
+/// broken terminal.
+struct RawModeGuard;
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
 }
 
 /// Read a capability token's JSON from `path`, validating it parses as a token
@@ -660,6 +944,91 @@ mod tests {
                 Path::new("/nonexistent/s3.toml"),
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn exec_maps_argv_to_pty_spawn_over_cwd_scope() {
+        let cmd = RemoteCommand::Exec {
+            cwd: Some("/work".to_owned()),
+            argv: vec!["ls".to_owned(), "-la".to_owned()],
+        };
+        // Exec maps to a PtySpawn with the argv, the cwd as both the spawn
+        // working directory and the authorised scope, no shell override, and
+        // a default terminal size.
+        match cmd.to_wire() {
+            ManageCommand::PtySpawn {
+                shell,
+                argv,
+                cwd,
+                env,
+                ..
+            } => {
+                assert!(shell.is_none(), "exec does not override the shell");
+                assert_eq!(argv, vec!["ls".to_owned(), "-la".to_owned()]);
+                assert_eq!(cwd.as_deref(), Some("/work"));
+                assert!(env.is_empty(), "exec carries no extra env");
+            }
+            other => panic!("exec should map to PtySpawn, got {other:?}"),
+        }
+        // The dangerous exec:pty capability is never node-wide, so the
+        // advertised scope is the explicit cwd folder.
+        assert_eq!(
+            cmd.wire_scope(),
+            ManageScope::Folder {
+                path: "/work".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn exec_without_cwd_advertises_root_scope() {
+        let cmd = RemoteCommand::Exec {
+            cwd: None,
+            argv: vec!["uptime".to_owned()],
+        };
+        match cmd.to_wire() {
+            ManageCommand::PtySpawn { cwd, .. } => {
+                assert!(cwd.is_none());
+            }
+            other => panic!("exec should map to PtySpawn, got {other:?}"),
+        }
+        // No cwd given: advertise the root so the node's own scope resolution
+        // decides authorisation (the node will use its default cwd).
+        assert_eq!(
+            cmd.wire_scope(),
+            ManageScope::Folder {
+                path: ROOT_SCOPE.to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn shell_maps_to_pty_spawn_with_shell_override() {
+        let cmd = RemoteCommand::Shell {
+            cwd: Some("/home/user".to_owned()),
+            shell: Some("bash".to_owned()),
+        };
+        match cmd.to_wire() {
+            ManageCommand::PtySpawn {
+                shell,
+                argv,
+                cwd,
+                env,
+                ..
+            } => {
+                assert_eq!(shell.as_deref(), Some("bash"));
+                assert!(argv.is_empty(), "shell carries no argv");
+                assert_eq!(cwd.as_deref(), Some("/home/user"));
+                assert!(env.is_empty());
+            }
+            other => panic!("shell should map to PtySpawn, got {other:?}"),
+        }
+        assert_eq!(
+            cmd.wire_scope(),
+            ManageScope::Folder {
+                path: "/home/user".to_owned(),
+            }
         );
     }
 }

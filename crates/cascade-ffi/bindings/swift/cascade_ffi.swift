@@ -513,6 +513,16 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 public protocol CascadeNodeProtocol: AnyObject, Sendable {
     
     /**
+     * Create a directory at `path` (a VFS-absolute path).
+     */
+    func createDir(path: String) async throws 
+    
+    /**
+     * Delete the file or directory at `path` (a VFS-absolute path).
+     */
+    func delete(path: String) async throws 
+    
+    /**
      * List the entries of the directory at `path` (a VFS-absolute path).
      */
     func listDir(path: String) async throws  -> [DirEntry]
@@ -526,6 +536,15 @@ public protocol CascadeNodeProtocol: AnyObject, Sendable {
      * Read the full contents of the file at `path` (a VFS-absolute path).
      */
     func readFile(path: String) async throws  -> Data
+    
+    /**
+     * Rename or move `src` to `dst` (both VFS-absolute paths).
+     *
+     * Same-backend renames call the backend's `move_entry` directly;
+     * cross-backend moves download from the source, upload to the destination,
+     * and delete the original, matching [`cascade_engine::vfs::VfsTree::rename`].
+     */
+    func rename(src: String, dst: String) async throws 
     
     /**
      * Start the engine's background workers (cache eviction).
@@ -553,6 +572,17 @@ public protocol CascadeNodeProtocol: AnyObject, Sendable {
      * Unpin the path pattern. A no-op if no matching rule exists.
      */
     func unpin(path: String) async throws 
+    
+    /**
+     * Upload a new file at `path` (a VFS-absolute path) with the given bytes.
+     *
+     * If a file already exists at `path` it is overwritten via the backend's
+     * `update` verb; otherwise the `upload` verb creates it. The parent
+     * directory's `FileId` is resolved by walking the backend for the parent
+     * path, mirroring the `WebDAV` presenter's upload flow. Backends that ignore
+     * the parent id (the local backend) accept a best-effort id harmlessly.
+     */
+    func upload(path: String, bytes: Data) async throws 
     
 }
 /**
@@ -643,6 +673,46 @@ public convenience init(configDir: String)async throws  {
 
     
     /**
+     * Create a directory at `path` (a VFS-absolute path).
+     */
+open func createDir(path: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_cascade_ffi_fn_method_cascadenode_create_dir(
+                    self.uniffiCloneHandle(),
+                    FfiConverterString.lower(path)
+                )
+            },
+            pollFunc: ffi_cascade_ffi_rust_future_poll_void,
+            completeFunc: ffi_cascade_ffi_rust_future_complete_void,
+            freeFunc: ffi_cascade_ffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeCascadeError_lift
+        )
+}
+    
+    /**
+     * Delete the file or directory at `path` (a VFS-absolute path).
+     */
+open func delete(path: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_cascade_ffi_fn_method_cascadenode_delete(
+                    self.uniffiCloneHandle(),
+                    FfiConverterString.lower(path)
+                )
+            },
+            pollFunc: ffi_cascade_ffi_rust_future_poll_void,
+            completeFunc: ffi_cascade_ffi_rust_future_complete_void,
+            freeFunc: ffi_cascade_ffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeCascadeError_lift
+        )
+}
+    
+    /**
      * List the entries of the directory at `path` (a VFS-absolute path).
      */
 open func listDir(path: String)async throws  -> [DirEntry]  {
@@ -698,6 +768,30 @@ open func readFile(path: String)async throws  -> Data  {
             completeFunc: ffi_cascade_ffi_rust_future_complete_rust_buffer,
             freeFunc: ffi_cascade_ffi_rust_future_free_rust_buffer,
             liftFunc: FfiConverterData.lift,
+            errorHandler: FfiConverterTypeCascadeError_lift
+        )
+}
+    
+    /**
+     * Rename or move `src` to `dst` (both VFS-absolute paths).
+     *
+     * Same-backend renames call the backend's `move_entry` directly;
+     * cross-backend moves download from the source, upload to the destination,
+     * and delete the original, matching [`cascade_engine::vfs::VfsTree::rename`].
+     */
+open func rename(src: String, dst: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_cascade_ffi_fn_method_cascadenode_rename(
+                    self.uniffiCloneHandle(),
+                    FfiConverterString.lower(src),FfiConverterString.lower(dst)
+                )
+            },
+            pollFunc: ffi_cascade_ffi_rust_future_poll_void,
+            completeFunc: ffi_cascade_ffi_rust_future_complete_void,
+            freeFunc: ffi_cascade_ffi_rust_future_free_void,
+            liftFunc: { $0 },
             errorHandler: FfiConverterTypeCascadeError_lift
         )
 }
@@ -781,6 +875,32 @@ open func unpin(path: String)async throws   {
                 uniffi_cascade_ffi_fn_method_cascadenode_unpin(
                     self.uniffiCloneHandle(),
                     FfiConverterString.lower(path)
+                )
+            },
+            pollFunc: ffi_cascade_ffi_rust_future_poll_void,
+            completeFunc: ffi_cascade_ffi_rust_future_complete_void,
+            freeFunc: ffi_cascade_ffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeCascadeError_lift
+        )
+}
+    
+    /**
+     * Upload a new file at `path` (a VFS-absolute path) with the given bytes.
+     *
+     * If a file already exists at `path` it is overwritten via the backend's
+     * `update` verb; otherwise the `upload` verb creates it. The parent
+     * directory's `FileId` is resolved by walking the backend for the parent
+     * path, mirroring the `WebDAV` presenter's upload flow. Backends that ignore
+     * the parent id (the local backend) accept a best-effort id harmlessly.
+     */
+open func upload(path: String, bytes: Data)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_cascade_ffi_fn_method_cascadenode_upload(
+                    self.uniffiCloneHandle(),
+                    FfiConverterString.lower(path),FfiConverterData.lower(bytes)
                 )
             },
             pollFunc: ffi_cascade_ffi_rust_future_poll_void,
@@ -926,12 +1046,12 @@ public enum CascadeError: Swift.Error, Equatable, Hashable, Foundation.Localized
     /**
      * The node's config directory could not be created or prepared.
      *
-     * The field is named `detail` rather than `message` deliberately: UniFFI's
-     * Kotlin bindgen maps each error variant onto a subclass of
+     * The field is named `detail` rather than `message` deliberately: the
+     * Kotlin bindings generator maps each error variant onto a subclass of
      * `kotlin.Exception`, and a variant field literally called `message` collides
-     * with `Throwable.message`, producing Kotlin that does not compile. Swift has
-     * no such clash, so this rename only changes the (unread) field name on the
-     * Swift side.
+     * with `Throwable.message`, producing Kotlin that does not compile. Swift
+     * has no such clash, so this rename only changes the (unread) field name on
+     * the Swift side.
      */
     case Config(detail: String
     )
@@ -954,6 +1074,11 @@ public enum CascadeError: Swift.Error, Equatable, Hashable, Foundation.Localized
      * A pin or unpin operation failed.
      */
     case Pin(detail: String
+    )
+    /**
+     * A write operation (upload, create directory, delete, or rename) failed.
+     */
+    case Write(detail: String
     )
 
     
@@ -999,6 +1124,9 @@ public struct FfiConverterTypeCascadeError: FfiConverterRustBuffer {
         case 5: return .Pin(
             detail: try FfiConverterString.read(from: &buf)
             )
+        case 6: return .Write(
+            detail: try FfiConverterString.read(from: &buf)
+            )
 
          default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -1033,6 +1161,11 @@ public struct FfiConverterTypeCascadeError: FfiConverterRustBuffer {
         
         case let .Pin(detail):
             writeInt(&buf, Int32(5))
+            FfiConverterString.write(detail, into: &buf)
+            
+        
+        case let .Write(detail):
+            writeInt(&buf, Int32(6))
             FfiConverterString.write(detail, into: &buf)
             
         }
@@ -1142,6 +1275,12 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if (uniffi_cascade_ffi_checksum_method_cascadenode_create_dir() != 16941) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cascade_ffi_checksum_method_cascadenode_delete() != 41488) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cascade_ffi_checksum_method_cascadenode_list_dir() != 316) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -1149,6 +1288,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cascade_ffi_checksum_method_cascadenode_read_file() != 50188) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cascade_ffi_checksum_method_cascadenode_rename() != 47786) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cascade_ffi_checksum_method_cascadenode_start() != 56155) {
@@ -1161,6 +1303,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cascade_ffi_checksum_method_cascadenode_unpin() != 40623) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cascade_ffi_checksum_method_cascadenode_upload() != 27731) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cascade_ffi_checksum_constructor_cascadenode_new() != 48453) {

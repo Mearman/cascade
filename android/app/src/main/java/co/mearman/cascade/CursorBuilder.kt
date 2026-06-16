@@ -59,7 +59,11 @@ internal object CursorBuilder {
                 add(Document.COLUMN_DOCUMENT_ID, docId)
                 add(Document.COLUMN_DISPLAY_NAME, entry.name)
                 add(Document.COLUMN_MIME_TYPE, mimeOf(entry.name))
-                add(Document.COLUMN_FLAGS, 0)
+                // FLAG_SUPPORTS_WRITE is honoured via openDocument's write-back
+                // path, which uploads on close. Create/delete/rename need a
+                // custom SAF call surface the provider does not yet expose, so
+                // those flags are omitted to avoid advertising unsupported verbs.
+                add(Document.COLUMN_FLAGS, Document.FLAG_SUPPORTS_WRITE)
                 add(Document.COLUMN_SIZE, null)
             }
         }

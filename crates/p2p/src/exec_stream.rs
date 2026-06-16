@@ -50,6 +50,55 @@ const STREAM_STDOUT: u8 = 1;
 /// Wire discriminant for the stderr stream in an [`BepMessage::ExecStream`].
 const STREAM_STDERR: u8 = 2;
 
+/// Which live stream a decoded [`ExecStreamFrame`] carries, mirroring the wire
+/// discriminants without exposing the raw `u8` to manager-side consumers.
+///
+/// Distinct from [`cascade_exec::ExecStreamKind`] (which names the
+/// node-side provider's stream tag) so the wire-layer type stays in the p2p
+/// crate and the manager-side consumer does not depend on the exec crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireStreamKind {
+    /// Standard input (inbound to the process — only meaningful for writes).
+    Stdin,
+    /// Standard output.
+    Stdout,
+    /// Standard error.
+    Stderr,
+}
+
+impl WireStreamKind {
+    /// Decode a wire stream discriminant. Returns `None` for an unknown value
+    /// so a malformed frame surfaces as a protocol error rather than a silent
+    /// misroute.
+    #[must_use]
+    pub const fn from_wire(raw: u8) -> Option<Self> {
+        match raw {
+            STREAM_STDIN => Some(Self::Stdin),
+            STREAM_STDOUT => Some(Self::Stdout),
+            STREAM_STDERR => Some(Self::Stderr),
+            _ => None,
+        }
+    }
+}
+
+/// A decoded inbound exec-stream frame delivered to the manager-side consumer.
+///
+/// The session loop decodes the raw [`BepMessage::ExecStream`] wire frame into
+/// this typed value before handing it to the consumer registered via the
+/// backend layer's `SyncEngine::subscribe_exec_stream` (in `cascade-backend-p2p`,
+/// which depends on this crate; the registration therefore lives there rather
+/// than here, where the data-plane type is defined), so the consumer never sees
+/// the wire sequence number or raw discriminant.
+#[derive(Debug, Clone)]
+pub struct ExecStreamFrame {
+    /// The session the bytes belong to.
+    pub session: u64,
+    /// Which stream the bytes arrived on.
+    pub stream: WireStreamKind,
+    /// The raw stream bytes.
+    pub bytes: Vec<u8>,
+}
+
 /// Default credit window a consumer advertises, in bytes.
 ///
 /// Sized to the node-side output channel's buffering headroom: the local

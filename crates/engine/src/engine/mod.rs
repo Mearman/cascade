@@ -315,6 +315,13 @@ impl Engine<TokioRuntimeHandle, NativeClock> {
         self.exec = Some(exec);
         self
     }
+
+    /// The injected exec capability provider, when one was composed.
+    #[cfg(feature = "exec")]
+    #[must_use]
+    pub fn exec(&self) -> Option<&std::sync::Arc<dyn cascade_exec::ExecProvider>> {
+        self.exec.as_ref()
+    }
 }
 
 impl<R: RuntimeHandle, C: Clock> Engine<R, C> {

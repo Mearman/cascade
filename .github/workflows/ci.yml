@@ -366,7 +366,15 @@ jobs:
           arch: x86_64
           target: default
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
-          script: ./gradlew :app:connectedDebugAndroidTest --no-daemon
+          # Disable the package verifier before installing the test APK. The
+          # emulator's integrity verification stalls intermittently under load
+          # and surfaces as INSTALL_FAILED_VERIFICATION_FAILURE, which fails the
+          # instrumented test run before any test executes. There is nothing to
+          # verify on a self-signed debug APK on a throwaway emulator.
+          script: >-
+            adb shell settings put global package_verifier_enable 0 &&
+            adb shell settings put global verifier_verify_adb_installs 0 &&
+            ./gradlew :app:connectedDebugAndroidTest --no-daemon
           working-directory: android
 
   # Attaches the Android debug APK to the GitHub release. Runs only when the

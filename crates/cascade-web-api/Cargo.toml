@@ -7,8 +7,9 @@ description = "Typed HTTP JSON API the Cascade daemon serves for the PWA"
 
 [dependencies]
 cascade-engine = { path = "../engine" }
+cascade-exec = { path = "../exec" }
 cascade-p2p = { path = "../p2p" }
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.7", features = ["cors", "trace"] }
 serde.workspace = true
 serde_json.workspace = true

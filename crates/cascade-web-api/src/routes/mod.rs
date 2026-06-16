@@ -6,6 +6,7 @@ pub mod auth;
 pub mod backends;
 pub mod cache;
 pub mod config;
+pub mod exec;
 pub mod files;
 pub mod grants;
 pub mod health;

@@ -99,6 +99,15 @@ export interface FolderChildrenResponse {
   next_cursor: string | null;
 }
 
+export interface CreateDirBody {
+  name?: string;
+}
+
+export interface MoveEntryBody {
+  from: string;
+  to: string;
+}
+
 export interface EntryMetaResponse {
   name: string;
   kind: EntryKind;

@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod cache;
 pub mod config;
+pub mod files;
 pub mod grant;
 pub mod init;
 pub mod mount;
@@ -15,6 +16,7 @@ pub mod service;
 pub mod share;
 pub mod status;
 pub mod token;
+pub mod tui;
 
 use std::path::PathBuf;
 
@@ -262,6 +264,9 @@ pub enum Commands {
     /// Show mount status, cache usage, backend health
     Status,
 
+    /// Open an interactive terminal UI (status + file browser + pin)
+    Tui,
+
     /// Pin a file or directory (always available offline)
     Pin {
         /// Path to pin
@@ -413,6 +418,46 @@ pub enum Commands {
     Auth {
         #[command(subcommand)]
         command: AuthCommands,
+    },
+
+    /// List the immediate children of a directory (no mount required)
+    Ls {
+        /// Directory path
+        path: String,
+    },
+
+    /// Print a file's contents to stdout (no mount required)
+    Cat {
+        /// File path
+        path: String,
+    },
+
+    /// Create a directory (no mount required)
+    Mkdir {
+        /// Directory path
+        path: String,
+    },
+
+    /// Copy a file (no mount required)
+    Cp {
+        /// Source path
+        src: String,
+        /// Destination path
+        dst: String,
+    },
+
+    /// Move or rename an entry (no mount required)
+    Mv {
+        /// Source path
+        src: String,
+        /// Destination path
+        dst: String,
+    },
+
+    /// Delete a file or directory (no mount required)
+    Rm {
+        /// Path to delete
+        path: String,
     },
 }
 
@@ -651,6 +696,28 @@ pub enum RemoteCommands {
         #[command(subcommand)]
         command: RemoteGrantCommands,
     },
+
+    /// Run a one-shot command on the remote node (requires exec:pty grant)
+    Exec {
+        /// Working directory — the scope the exec:pty grant covers
+        #[arg(long)]
+        cwd: Option<String>,
+
+        /// The command and its arguments (after --)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        argv: Vec<String>,
+    },
+
+    /// Open an interactive shell on the remote node (requires exec:pty grant)
+    Shell {
+        /// Working directory — the scope the exec:pty grant covers
+        #[arg(long)]
+        cwd: Option<String>,
+
+        /// Shell to launch (absent uses the node's default)
+        #[arg(long)]
+        shell: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -828,6 +895,8 @@ impl RemoteCommands {
                     remote::RemoteCommand::GrantRevoke { grant_id, scope }
                 }
             },
+            Self::Exec { cwd, argv } => remote::RemoteCommand::Exec { cwd, argv },
+            Self::Shell { cwd, shell } => remote::RemoteCommand::Shell { cwd, shell },
         };
         Ok(command)
     }
@@ -924,6 +993,7 @@ impl Cli {
                 mount::start(ctx, None, false, None, false, mount::WebFlags::default()).await
             }
             Commands::Status => status::show(ctx),
+            Commands::Tui => tui::run(ctx).await,
             Commands::Pin { path } => cache::pin(ctx, &path).await,
             Commands::Unpin { path } => cache::unpin(ctx, &path).await,
             Commands::PinList => cache::pin_list(ctx).await,
@@ -1027,6 +1097,12 @@ impl Cli {
                 service::run(ctx, command.into_action(), request).await
             }
             Commands::Auth { command } => auth::pwa_auth(ctx, command).await,
+            Commands::Ls { path } => files::ls(ctx, &path).await,
+            Commands::Cat { path } => files::cat(ctx, &path).await,
+            Commands::Mkdir { path } => files::mkdir(ctx, &path).await,
+            Commands::Cp { src, dst } => files::cp(ctx, &src, &dst).await,
+            Commands::Mv { src, dst } => files::mv(ctx, &src, &dst).await,
+            Commands::Rm { path } => files::rm(ctx, &path).await,
         }
     }
 }

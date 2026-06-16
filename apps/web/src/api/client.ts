@@ -5,6 +5,8 @@ import type {
   ReadyResponse,
   FolderChildrenResponse,
   EntryMetaResponse,
+  CreateDirBody,
+  MoveEntryBody,
   ShareEntry,
   SharesResponse,
   CreateShareBody,
@@ -385,6 +387,18 @@ export class ApiClient {
         .then(() => bridge.deleteFiles(folder, [path]));
     }
     return this.request('DELETE', `/files/${encodeURIComponent(folder)}/entries/${encodeURIComponent(path)}`).then(() => undefined);
+  }
+
+  /** Create a directory. Connected mode only. */
+  createDir(folder: string, path: string, body?: CreateDirBody): Promise<EntryMetaResponse> {
+    return this.request('POST', `/folders/${encodeURIComponent(folder)}/dirs/${encodeURIComponent(path)}`, body ?? {})
+      .then((raw) => validated(raw, isEntryMetaResponse, 'create dir'));
+  }
+
+  /** Move or rename an entry. Connected mode only. */
+  moveEntry(folder: string, body: MoveEntryBody): Promise<EntryMetaResponse> {
+    return this.request('POST', `/folders/${encodeURIComponent(folder)}/move`, body)
+      .then((raw) => validated(raw, isEntryMetaResponse, 'move entry'));
   }
 
   // ─── Shares ───────────────────────────────────────────────────────────────

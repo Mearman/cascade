@@ -51,6 +51,7 @@ use cascade_p2p::block::BlockHash;
 use cascade_p2p::candidate::{Candidate, CandidateKind};
 use cascade_p2p::connection::ConnectionManager;
 use cascade_p2p::discovery::DiscoveredPeer;
+use cascade_p2p::exec_stream::ExecStreamFrame;
 use cascade_p2p::framed::{FramedPeer, FramedSession, SessionReader, SessionWriter};
 use cascade_p2p::identity::DeviceIdentity;
 use cascade_p2p::nat::{
@@ -721,6 +722,18 @@ pub struct SyncEngine {
     /// `data_plane_ready`: the bit may be flipped after the engine is
     /// constructed and its clone distributed to running session loops.
     advertise_exec: Arc<AtomicBool>,
+    /// Manager-side exec stream consumers, keyed by `(device_id, session_id)`.
+    ///
+    /// When a manager spawns a PTY or process on a remote node, the node
+    /// streams the session's stdout/stderr back as
+    /// [`BepMessage::ExecStream`] frames. This map holds the channel that
+    /// delivers those frames to the manager-side consumer (the CLI's exec /
+    /// shell commands). The session loop routes each inbound frame to the
+    /// matching consumer and sends a [`BepMessage::ExecStreamAck`] back so
+    /// the node's producer honours the backpressure window. A consumer that
+    /// drops its receiver is removed from the map on the next frame.
+    exec_stream_consumers:
+        Arc<Mutex<HashMap<(String, u64), mpsc::UnboundedSender<ExecStreamFrame>>>>,
 }
 
 impl std::fmt::Debug for SyncEngine {
@@ -789,6 +802,7 @@ impl SyncEngine {
             // not yet installed the exec provider leaves this false. Flip it
             // via `set_advertise_exec(true)` after the exec subsystem is ready.
             advertise_exec: Arc::new(AtomicBool::new(false)),
+            exec_stream_consumers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -2318,6 +2332,114 @@ impl SyncEngine {
             anyhow::bail!("no live session to device {device_id}");
         };
         handle.send_manage(command, scope, token).await
+    }
+
+    /// Register a receiver for inbound exec-stream frames from `device_id`
+    /// for `session_id`, returning the channel that delivers decoded frames.
+    ///
+    /// The session loop routes each [`BepMessage::ExecStream`] frame for the
+    /// named `(device_id, session_id)` pair to this receiver as a typed
+    /// [`ExecStreamFrame`], and sends a [`BepMessage::ExecStreamAck`] back so
+    /// the node's producer keeps flowing. A manager calls this *before*
+    /// sending the `PtySpawn` / `ProcSpawn` that mints `session_id`, so the
+    /// first output frame does not race the registration. Dropping the
+    /// receiver removes the entry on the next frame.
+    pub async fn subscribe_exec_stream(
+        &self,
+        device_id: &str,
+        session_id: u64,
+    ) -> mpsc::UnboundedReceiver<cascade_p2p::exec_stream::ExecStreamFrame> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut consumers = self.exec_stream_consumers.lock().await;
+        consumers.insert((device_id.to_owned(), session_id), tx);
+        rx
+    }
+
+    /// Remove a previously-registered exec stream consumer. Called when the
+    /// manager's exec / shell command exits, so a stale consumer does not
+    /// absorb frames for a session that has ended.
+    pub async fn unsubscribe_exec_stream(&self, device_id: &str, session_id: u64) {
+        let mut consumers = self.exec_stream_consumers.lock().await;
+        consumers.remove(&(device_id.to_owned(), session_id));
+    }
+
+    /// Send a `PtyWrite` management command to write `bytes` to the stdin of
+    /// `session_id` on `device_id`. The bytes travel as a management frame,
+    /// not as an [`BepMessage::ExecStream`] frame — the data plane carries
+    /// node-to-manager output only; stdin rides the control path.
+    ///
+    /// `token` is the same capability token presented to the spawning
+    /// `PtySpawn`: the node rebuilds the grant set from the on-node grants plus
+    /// the presented token on *every* management request, so a token-only
+    /// caller (no on-node grant) must re-present it here or the write is
+    /// rejected as unauthorised. The node ignores the advertised wire scope for
+    /// a session verb and authorises against the session's stored scope.
+    pub async fn send_pty_write(
+        &self,
+        device_id: &str,
+        session_id: u64,
+        bytes: Vec<u8>,
+        token: Option<String>,
+    ) -> Result<ManageResult> {
+        self.send_manage_request(
+            device_id,
+            ManageCommand::PtyWrite {
+                session: session_id,
+                bytes,
+            },
+            // The node authorises a session verb against the session's stored
+            // scope, not this advertised value; the wire scope is a placeholder
+            // the dispatcher does not gate session verbs on.
+            ManageScope::Node,
+            token,
+        )
+        .await
+    }
+
+    /// Send a `PtyResize` management command to resize the PTY of `session_id`
+    /// on `device_id` to `cols` x `rows`. See [`SyncEngine::send_pty_write`] for
+    /// the `token` parameter.
+    pub async fn send_pty_resize(
+        &self,
+        device_id: &str,
+        session_id: u64,
+        cols: u16,
+        rows: u16,
+        token: Option<String>,
+    ) -> Result<ManageResult> {
+        self.send_manage_request(
+            device_id,
+            ManageCommand::PtyResize {
+                session: session_id,
+                cols,
+                rows,
+            },
+            ManageScope::Node,
+            token,
+        )
+        .await
+    }
+
+    /// Send a `PtyKill` management command to signal `session_id` on
+    /// `device_id` with `signal`. See [`SyncEngine::send_pty_write`] for the
+    /// `token` parameter.
+    pub async fn send_pty_signal(
+        &self,
+        device_id: &str,
+        session_id: u64,
+        signal: i32,
+        token: Option<String>,
+    ) -> Result<ManageResult> {
+        self.send_manage_request(
+            device_id,
+            ManageCommand::PtyKill {
+                session: session_id,
+                signal,
+            },
+            ManageScope::Node,
+            token,
+        )
+        .await
     }
 }
 
