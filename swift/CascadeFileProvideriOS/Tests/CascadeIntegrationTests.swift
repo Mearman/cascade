@@ -41,9 +41,9 @@ final class CascadeIntegrationTests: XCTestCase {
         try await node.start()
 
         XCTAssertThrowsError(try await node.readFile(path: "/local/absent.txt")) { error in
-            // The FFI maps an engine error onto CascadeException; the read of a
+            // The FFI maps an engine error onto CascadeError; the read of a
             // missing file must surface an error, not an empty body or a crash.
-            XCTAssertTrue(error is CascadeException, "missing file is a CascadeException: \(error)")
+            XCTAssertTrue(error is CascadeError, "missing file is a CascadeError: \(error)")
         }
     }
 }
