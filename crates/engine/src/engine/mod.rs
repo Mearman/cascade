@@ -14,7 +14,7 @@ mod data_authority;
 mod manage_dispatch;
 mod operations;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "native", feature = "p2p"))]
 mod tests;
 
 use std::fmt;

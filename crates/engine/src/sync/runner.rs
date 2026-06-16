@@ -885,7 +885,7 @@ fn star_match(pattern: &str, path: &str) -> bool {
     true
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "native"))]
 mod tests {
     use super::*;
     use crate::backend::NullBackend;

@@ -127,6 +127,38 @@ jobs:
       - name: wasm-bindgen-test (cascade-p2p-webrtc)
         run: wasm-pack test --node crates/cascade-p2p-webrtc --features js-test-stub
 
+  # Builds, lints, and TESTS the engine under the `portable` feature (the
+  # wasm/mobile foundation). `cargo test --workspace` runs default features
+  # only, so without this the portable config — RuntimeHandle/StateStorage/
+  # HttpClient/FileSystem/Clock contracts and the wasm adapters — has no CI
+  # coverage and regresses silently. Bare `portable` is the wasm config; the
+  # `portable,p2p` and `portable,exec` builds guard the mobile cross-compile
+  # feature combinations (test-only, since those configs pull native back in).
+  portable:
+    name: Engine (portable)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: "1.96.0"
+          components: clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: portable
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build (portable)
+        run: cargo build -p cascade-engine --no-default-features --features portable
+      - name: Test (portable)
+        run: cargo test -p cascade-engine --no-default-features --features portable --lib
+      - name: Clippy (portable)
+        run: cargo clippy -p cascade-engine --no-default-features --features portable -- -D warnings
+      - name: Build (portable,p2p)
+        run: cargo build -p cascade-engine --no-default-features --features portable,p2p
+      - name: Build (portable,exec)
+        run: cargo build -p cascade-engine --no-default-features --features portable,exec
+
   source-length:
     name: Source file length
     runs-on: ubuntu-latest
