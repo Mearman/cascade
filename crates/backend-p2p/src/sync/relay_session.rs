@@ -1173,7 +1173,12 @@ impl SyncEngine {
                 );
                 Ok(())
             }
-            BepMessage::ExecStream { session, .. } | BepMessage::ExecStreamAck { session, .. } => {
+            BepMessage::ExecStream {
+                session,
+                seq,
+                stream,
+                bytes,
+            } => {
                 // A peer that did not advertise the exec capability domain must not
                 // send exec-stream frames. Drop with a domain-violation log rather
                 // than tearing the session down — the misconfigured peer can still
@@ -1187,16 +1192,73 @@ impl SyncEngine {
                     );
                     return Ok(());
                 }
-                // Live exec stdio is not routed through this message handler yet:
-                // the node-side stdio pump that binds these frames to an exec
-                // session is a later wiring step. Until then, drop the frame
-                // rather than fail the session — a peer that has not been handed a
-                // live session can present no authority to drive one.
+                // Manager-side routing: deliver stdout/stderr bytes to the
+                // consumer registered for this (peer, session) pair, then ack
+                // so the node's producer honours the backpressure window.
+                let Some(kind) = cascade_p2p::exec_stream::WireStreamKind::from_wire(stream) else {
+                    debug!(
+                        target: "cascade::backend::p2p",
+                        peer = %peer_device_id,
+                        session,
+                        stream,
+                        "dropping exec stream frame — unknown stream discriminant",
+                    );
+                    return Ok(());
+                };
+                let key = (peer_device_id.to_owned(), session);
+                let consumer_alive = {
+                    let consumers = self.exec_stream_consumers.lock().await;
+                    consumers.get(&key).is_some_and(|sender| {
+                        sender
+                            .send(cascade_p2p::exec_stream::ExecStreamFrame {
+                                session,
+                                stream: kind,
+                                bytes: bytes.clone(),
+                            })
+                            .is_ok()
+                    })
+                };
+                if !consumer_alive {
+                    debug!(
+                        target: "cascade::backend::p2p",
+                        peer = %peer_device_id,
+                        session,
+                        "dropping exec stream frame — no live consumer",
+                    );
+                    // Remove a dead consumer so the map does not leak.
+                    let mut consumers = self.exec_stream_consumers.lock().await;
+                    consumers.remove(&key);
+                }
+                // Ack every inbound frame so the producer's credit window
+                // refreshes, regardless of whether a consumer was live. A live
+                // consumer that fell behind would naturally delay this ack by
+                // not reading; here the consumer is an unbounded channel, so the
+                // ack is immediate and the window stays generous.
+                let _ = outbound.send(BepMessage::ExecStreamAck {
+                    session,
+                    ack_seq: seq,
+                    window: cascade_p2p::exec_stream::DEFAULT_CREDIT_WINDOW,
+                });
+                Ok(())
+            }
+            BepMessage::ExecStreamAck { .. } => {
+                // A peer that did not advertise the exec capability domain must not
+                // send exec-stream frames. Drop with a domain-violation log.
+                if !peer_domains.contains(&CapabilityDomain::Exec) {
+                    debug!(
+                        target: "cascade::backend::p2p",
+                        peer = %peer_device_id,
+                        "dropping exec stream ack — peer did not advertise exec capability",
+                    );
+                    return Ok(());
+                }
+                // The manager side does not produce exec output toward the node
+                // (stdin travels as PtyWrite management commands), so an inbound
+                // ack has no producer to free. Accept and drop it.
                 debug!(
                     target: "cascade::backend::p2p",
                     peer = %peer_device_id,
-                    session,
-                    "dropping exec stream frame — live stdio routing not yet wired",
+                    "received exec stream ack — manager side has no producer to free",
                 );
                 Ok(())
             }

@@ -1807,7 +1807,7 @@ fn create_backend(
 
 /// Rebuild backends from the main config in deterministic alphabetical order.
 /// Fails loudly on an empty or duplicate mount path.
-fn rebuild_backends(
+pub(super) fn rebuild_backends(
     main_config: &CascadeConfig,
     config_dir: &Path,
     shared_http: Arc<dyn cascade_engine::portable::HttpClient>,
@@ -1869,7 +1869,7 @@ fn rebuild_backends(
 }
 
 /// Load the top-level `config.toml` from the config directory.
-fn load_main_config(config_dir: &Path) -> Result<CascadeConfig> {
+pub(super) fn load_main_config(config_dir: &Path) -> Result<CascadeConfig> {
     let config_path = config_dir.join("config.toml");
     if config_path.exists() {
         let contents = std::fs::read_to_string(&config_path)
