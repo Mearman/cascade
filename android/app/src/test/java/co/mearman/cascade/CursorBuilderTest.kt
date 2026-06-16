@@ -55,6 +55,21 @@ class CursorBuilderTest {
     }
 
     @Test
+    fun childrenCursor_file_row_advertises_write_flag() {
+        // The provider honours FLAG_SUPPORTS_WRITE via openDocument's write-back
+        // path (upload on close), so the flag must be set on file rows.
+        val entries = listOf(DirEntry("report.txt", false))
+        val cursor = CursorBuilder.childrenCursor("/local", entries, null)
+        cursor.moveToPosition(0)
+        val flags =
+            cursor.getInt(cursor.getColumnIndexOrThrow(Document.COLUMN_FLAGS))
+        assertTrue(
+            "file advertises FLAG_SUPPORTS_WRITE: flags=$flags",
+            flags and Document.FLAG_SUPPORTS_WRITE != 0,
+        )
+    }
+
+    @Test
     fun rootDocumentCursor_is_a_directory() {
         val cursor = CursorBuilder.rootDocumentCursor("/", "Cascade", null)
         assertEquals(1, cursor.count)

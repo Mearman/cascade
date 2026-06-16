@@ -89,11 +89,27 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         request: NSFileProviderRequest,
         completionHandler: @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?) -> Void
     ) -> Progress {
-        // The current FFI surface is read-only (list, read, pin); creation is
-        // not yet bridged, so report it as unsupported rather than silently
-        // dropping the write.
-        completionHandler(nil, [], false, NSFileProviderError(.noSuchItem))
-        return Progress(totalUnitCount: 1)
+        let progress = Progress(totalUnitCount: 1)
+        let path = FileProviderPath.path(forIdentifier: itemTemplate.itemIdentifier)
+        let isDirectory = itemTemplate.contentType == .folder
+        Task {
+            do {
+                let node = try await CascadeEngine.shared.node()
+                if isDirectory {
+                    try await node.createDir(path: path)
+                } else {
+                    let bytes = try url.map { try Data(contentsOf: $0) } ?? Data()
+                    try await node.upload(path: path, bytes: bytes)
+                }
+                let item = FileProviderItem(path: path, isDirectory: isDirectory)
+                completionHandler(item, [], false, nil)
+                progress.completedUnitCount = 1
+            } catch {
+                completionHandler(nil, [], false, error)
+                progress.completedUnitCount = 1
+            }
+        }
+        return progress
     }
 
     func modifyItem(
@@ -105,8 +121,29 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         request: NSFileProviderRequest,
         completionHandler: @escaping (NSFileProviderItem?, NSFileProviderItemFields, Bool, Error?) -> Void
     ) -> Progress {
-        completionHandler(nil, [], false, NSFileProviderError(.noSuchItem))
-        return Progress(totalUnitCount: 1)
+        let progress = Progress(totalUnitCount: 1)
+        let path = FileProviderPath.path(forIdentifier: item.itemIdentifier)
+        // Replacing the file's contents is the only modification the extension
+        // bridges today; other changed fields (attributes, name) fall through.
+        Task {
+            do {
+                if let newContents {
+                    let node = try await CascadeEngine.shared.node()
+                    let bytes = try Data(contentsOf: newContents)
+                    try await node.upload(path: path, bytes: bytes)
+                }
+                let item = FileProviderItem(
+                    path: path,
+                    isDirectory: item.contentType == .folder
+                )
+                completionHandler(item, [], false, nil)
+                progress.completedUnitCount = 1
+            } catch {
+                completionHandler(nil, [], false, error)
+                progress.completedUnitCount = 1
+            }
+        }
+        return progress
     }
 
     func deleteItem(
@@ -116,8 +153,20 @@ final class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
         request: NSFileProviderRequest,
         completionHandler: @escaping (Error?) -> Void
     ) -> Progress {
-        completionHandler(NSFileProviderError(.noSuchItem))
-        return Progress(totalUnitCount: 1)
+        let progress = Progress(totalUnitCount: 1)
+        let path = FileProviderPath.path(forIdentifier: identifier)
+        Task {
+            do {
+                let node = try await CascadeEngine.shared.node()
+                try await node.delete(path: path)
+                completionHandler(nil)
+                progress.completedUnitCount = 1
+            } catch {
+                completionHandler(error)
+                progress.completedUnitCount = 1
+            }
+        }
+        return progress
     }
 
     func enumerator(

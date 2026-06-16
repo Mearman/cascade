@@ -749,11 +749,17 @@ internal object IntegrityCheckingUniffiLib {
         uniffiCheckApiChecksums(this)
     }
 
+    external fun uniffi_cascade_ffi_checksum_method_cascadenode_create_dir(): Short
+
+    external fun uniffi_cascade_ffi_checksum_method_cascadenode_delete(): Short
+
     external fun uniffi_cascade_ffi_checksum_method_cascadenode_list_dir(): Short
 
     external fun uniffi_cascade_ffi_checksum_method_cascadenode_pin(): Short
 
     external fun uniffi_cascade_ffi_checksum_method_cascadenode_read_file(): Short
+
+    external fun uniffi_cascade_ffi_checksum_method_cascadenode_rename(): Short
 
     external fun uniffi_cascade_ffi_checksum_method_cascadenode_start(): Short
 
@@ -762,6 +768,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_cascade_ffi_checksum_method_cascadenode_stop(): Short
 
     external fun uniffi_cascade_ffi_checksum_method_cascadenode_unpin(): Short
+
+    external fun uniffi_cascade_ffi_checksum_method_cascadenode_upload(): Short
 
     external fun uniffi_cascade_ffi_checksum_constructor_cascadenode_new(): Short
 
@@ -790,6 +798,16 @@ internal object UniffiLib {
 
     external fun uniffi_cascade_ffi_fn_constructor_cascadenode_new(`configDir`: RustBuffer.ByValue): Long
 
+    external fun uniffi_cascade_ffi_fn_method_cascadenode_create_dir(
+        `ptr`: Long,
+        `path`: RustBuffer.ByValue,
+    ): Long
+
+    external fun uniffi_cascade_ffi_fn_method_cascadenode_delete(
+        `ptr`: Long,
+        `path`: RustBuffer.ByValue,
+    ): Long
+
     external fun uniffi_cascade_ffi_fn_method_cascadenode_list_dir(
         `ptr`: Long,
         `path`: RustBuffer.ByValue,
@@ -805,6 +823,12 @@ internal object UniffiLib {
         `path`: RustBuffer.ByValue,
     ): Long
 
+    external fun uniffi_cascade_ffi_fn_method_cascadenode_rename(
+        `ptr`: Long,
+        `src`: RustBuffer.ByValue,
+        `dst`: RustBuffer.ByValue,
+    ): Long
+
     external fun uniffi_cascade_ffi_fn_method_cascadenode_start(`ptr`: Long): Long
 
     external fun uniffi_cascade_ffi_fn_method_cascadenode_status(`ptr`: Long): Long
@@ -814,6 +838,12 @@ internal object UniffiLib {
     external fun uniffi_cascade_ffi_fn_method_cascadenode_unpin(
         `ptr`: Long,
         `path`: RustBuffer.ByValue,
+    ): Long
+
+    external fun uniffi_cascade_ffi_fn_method_cascadenode_upload(
+        `ptr`: Long,
+        `path`: RustBuffer.ByValue,
+        `bytes`: RustBuffer.ByValue,
     ): Long
 
     external fun ffi_cascade_ffi_rustbuffer_alloc(
@@ -1030,6 +1060,12 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
 
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
+    if (lib.uniffi_cascade_ffi_checksum_method_cascadenode_create_dir() != 16941.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cascade_ffi_checksum_method_cascadenode_delete() != 41488.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cascade_ffi_checksum_method_cascadenode_list_dir() != 316.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1037,6 +1073,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cascade_ffi_checksum_method_cascadenode_read_file() != 50188.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cascade_ffi_checksum_method_cascadenode_rename() != 47786.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cascade_ffi_checksum_method_cascadenode_start() != 56155.toShort()) {
@@ -1049,6 +1088,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cascade_ffi_checksum_method_cascadenode_unpin() != 40623.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cascade_ffi_checksum_method_cascadenode_upload() != 27731.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cascade_ffi_checksum_constructor_cascadenode_new() != 48453.toShort()) {
@@ -1477,6 +1519,16 @@ public object FfiConverterByteArray : FfiConverterRustBuffer<ByteArray> {
  */
 public interface CascadeNodeInterface {
     /**
+     * Create a directory at `path` (a VFS-absolute path).
+     */
+    suspend fun `createDir`(`path`: kotlin.String)
+
+    /**
+     * Delete the file or directory at `path` (a VFS-absolute path).
+     */
+    suspend fun `delete`(`path`: kotlin.String)
+
+    /**
      * List the entries of the directory at `path` (a VFS-absolute path).
      */
     suspend fun `listDir`(`path`: kotlin.String): List<DirEntry>
@@ -1490,6 +1542,18 @@ public interface CascadeNodeInterface {
      * Read the full contents of the file at `path` (a VFS-absolute path).
      */
     suspend fun `readFile`(`path`: kotlin.String): kotlin.ByteArray
+
+    /**
+     * Rename or move `src` to `dst` (both VFS-absolute paths).
+     *
+     * Same-backend renames call the backend's `move_entry` directly;
+     * cross-backend moves download from the source, upload to the destination,
+     * and delete the original, matching [`cascade_engine::vfs::VfsTree::rename`].
+     */
+    suspend fun `rename`(
+        `src`: kotlin.String,
+        `dst`: kotlin.String,
+    )
 
     /**
      * Start the engine's background workers (cache eviction).
@@ -1517,6 +1581,20 @@ public interface CascadeNodeInterface {
      * Unpin the path pattern. A no-op if no matching rule exists.
      */
     suspend fun `unpin`(`path`: kotlin.String)
+
+    /**
+     * Upload a new file at `path` (a VFS-absolute path) with the given bytes.
+     *
+     * If a file already exists at `path` it is overwritten via the backend's
+     * `update` verb; otherwise the `upload` verb creates it. The parent
+     * directory's `FileId` is resolved by walking the backend for the parent
+     * path, mirroring the `WebDAV` presenter's upload flow. Backends that ignore
+     * the parent id (the local backend) accept a best-effort id harmlessly.
+     */
+    suspend fun `upload`(
+        `path`: kotlin.String,
+        `bytes`: kotlin.ByteArray,
+    )
 
     companion object
 }
@@ -1630,6 +1708,50 @@ open class CascadeNode :
     }
 
     /**
+     * Create a directory at `path` (a VFS-absolute path).
+     */
+    @Throws(CascadeException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `createDir`(`path`: kotlin.String) =
+        uniffiRustCallAsync(
+            callWithHandle { uniffiHandle ->
+                UniffiLib.uniffi_cascade_ffi_fn_method_cascadenode_create_dir(
+                    uniffiHandle,
+                    FfiConverterString.lower(`path`),
+                )
+            },
+            { future, callback, continuation -> UniffiLib.ffi_cascade_ffi_rust_future_poll_void(future, callback, continuation) },
+            { future, continuation -> UniffiLib.ffi_cascade_ffi_rust_future_complete_void(future, continuation) },
+            { future -> UniffiLib.ffi_cascade_ffi_rust_future_free_void(future) },
+            // lift function
+            { Unit },
+            // Error FFI converter
+            CascadeException.ErrorHandler,
+        )
+
+    /**
+     * Delete the file or directory at `path` (a VFS-absolute path).
+     */
+    @Throws(CascadeException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `delete`(`path`: kotlin.String) =
+        uniffiRustCallAsync(
+            callWithHandle { uniffiHandle ->
+                UniffiLib.uniffi_cascade_ffi_fn_method_cascadenode_delete(
+                    uniffiHandle,
+                    FfiConverterString.lower(`path`),
+                )
+            },
+            { future, callback, continuation -> UniffiLib.ffi_cascade_ffi_rust_future_poll_void(future, callback, continuation) },
+            { future, continuation -> UniffiLib.ffi_cascade_ffi_rust_future_complete_void(future, continuation) },
+            { future -> UniffiLib.ffi_cascade_ffi_rust_future_free_void(future) },
+            // lift function
+            { Unit },
+            // Error FFI converter
+            CascadeException.ErrorHandler,
+        )
+
+    /**
      * List the entries of the directory at `path` (a VFS-absolute path).
      */
     @Throws(CascadeException::class)
@@ -1694,6 +1816,35 @@ open class CascadeNode :
             // Error FFI converter
             CascadeException.ErrorHandler,
         )
+
+    /**
+     * Rename or move `src` to `dst` (both VFS-absolute paths).
+     *
+     * Same-backend renames call the backend's `move_entry` directly;
+     * cross-backend moves download from the source, upload to the destination,
+     * and delete the original, matching [`cascade_engine::vfs::VfsTree::rename`].
+     */
+    @Throws(CascadeException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `rename`(
+        `src`: kotlin.String,
+        `dst`: kotlin.String,
+    ) = uniffiRustCallAsync(
+        callWithHandle { uniffiHandle ->
+            UniffiLib.uniffi_cascade_ffi_fn_method_cascadenode_rename(
+                uniffiHandle,
+                FfiConverterString.lower(`src`),
+                FfiConverterString.lower(`dst`),
+            )
+        },
+        { future, callback, continuation -> UniffiLib.ffi_cascade_ffi_rust_future_poll_void(future, callback, continuation) },
+        { future, continuation -> UniffiLib.ffi_cascade_ffi_rust_future_complete_void(future, continuation) },
+        { future -> UniffiLib.ffi_cascade_ffi_rust_future_free_void(future) },
+        // lift function
+        { Unit },
+        // Error FFI converter
+        CascadeException.ErrorHandler,
+    )
 
     /**
      * Start the engine's background workers (cache eviction).
@@ -1786,6 +1937,37 @@ open class CascadeNode :
         )
 
     /**
+     * Upload a new file at `path` (a VFS-absolute path) with the given bytes.
+     *
+     * If a file already exists at `path` it is overwritten via the backend's
+     * `update` verb; otherwise the `upload` verb creates it. The parent
+     * directory's `FileId` is resolved by walking the backend for the parent
+     * path, mirroring the `WebDAV` presenter's upload flow. Backends that ignore
+     * the parent id (the local backend) accept a best-effort id harmlessly.
+     */
+    @Throws(CascadeException::class)
+    @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE")
+    override suspend fun `upload`(
+        `path`: kotlin.String,
+        `bytes`: kotlin.ByteArray,
+    ) = uniffiRustCallAsync(
+        callWithHandle { uniffiHandle ->
+            UniffiLib.uniffi_cascade_ffi_fn_method_cascadenode_upload(
+                uniffiHandle,
+                FfiConverterString.lower(`path`),
+                FfiConverterByteArray.lower(`bytes`),
+            )
+        },
+        { future, callback, continuation -> UniffiLib.ffi_cascade_ffi_rust_future_poll_void(future, callback, continuation) },
+        { future, continuation -> UniffiLib.ffi_cascade_ffi_rust_future_complete_void(future, continuation) },
+        { future -> UniffiLib.ffi_cascade_ffi_rust_future_free_void(future) },
+        // lift function
+        { Unit },
+        // Error FFI converter
+        CascadeException.ErrorHandler,
+    )
+
+    /**
      * @suppress
      */
     companion object
@@ -1867,12 +2049,12 @@ sealed class CascadeException : kotlin.Exception() {
     /**
      * The node's config directory could not be created or prepared.
      *
-     * The field is named `detail` rather than `message` deliberately: UniFFI's
-     * Kotlin bindgen maps each error variant onto a subclass of
+     * The field is named `detail` rather than `message` deliberately: the
+     * Kotlin bindings generator maps each error variant onto a subclass of
      * `kotlin.Exception`, and a variant field literally called `message` collides
-     * with `Throwable.message`, producing Kotlin that does not compile. Swift has
-     * no such clash, so this rename only changes the (unread) field name on the
-     * Swift side.
+     * with `Throwable.message`, producing Kotlin that does not compile. Swift
+     * has no such clash, so this rename only changes the (unread) field name on
+     * the Swift side.
      */
     class Config(
         val `detail`: kotlin.String,
@@ -1921,6 +2103,16 @@ sealed class CascadeException : kotlin.Exception() {
             get() = "detail=${ `detail` }"
     }
 
+    /**
+     * A write operation (upload, create directory, delete, or rename) failed.
+     */
+    class Write(
+        val `detail`: kotlin.String,
+    ) : CascadeException() {
+        override val message
+            get() = "detail=${ `detail` }"
+    }
+
     companion object ErrorHandler : UniffiRustCallStatusErrorHandler<CascadeException> {
         override fun lift(error_buf: RustBuffer.ByValue): CascadeException = FfiConverterTypeCascadeError.lift(error_buf)
     }
@@ -1962,6 +2154,12 @@ public object FfiConverterTypeCascadeError : FfiConverterRustBuffer<CascadeExcep
                 )
             }
 
+            6 -> {
+                CascadeException.Write(
+                    FfiConverterString.read(buf),
+                )
+            }
+
             else -> {
                 throw RuntimeException("invalid error enum value, something is very wrong!!")
             }
@@ -1994,6 +2192,12 @@ public object FfiConverterTypeCascadeError : FfiConverterRustBuffer<CascadeExcep
             )
 
             is CascadeException.Pin -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL +
+                    FfiConverterString.allocationSize(value.`detail`)
+            )
+
+            is CascadeException.Write -> (
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
                 4UL +
                     FfiConverterString.allocationSize(value.`detail`)
@@ -2031,6 +2235,12 @@ public object FfiConverterTypeCascadeError : FfiConverterRustBuffer<CascadeExcep
 
             is CascadeException.Pin -> {
                 buf.putInt(5)
+                FfiConverterString.write(value.`detail`, buf)
+                Unit
+            }
+
+            is CascadeException.Write -> {
+                buf.putInt(6)
                 FfiConverterString.write(value.`detail`, buf)
                 Unit
             }
