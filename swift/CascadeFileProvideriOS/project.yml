@@ -34,6 +34,13 @@ schemes:
     test:
       targets:
         - CascadeIntegrationTests
+  FileProviderRegistrationE2ETests:
+    build:
+      targets:
+        FileProviderRegistrationE2ETests: all
+    test:
+      targets:
+        - FileProviderRegistrationE2ETests
 
 targets:
   CascadeHostApp:
@@ -120,5 +127,21 @@ targets:
           - "$(PROJECT_DIR)/../../target/aarch64-apple-ios-sim/release/libcascade_ffi.a"
           - "-framework"
           - "CoreFoundation"
+    dependencies:
+      - target: CascadeHostApp
+
+  # On-Simulator e2e for the File Provider extension: registers a domain via
+  # NSFileProviderManager and enumerates through the OS-routed enumerator. The
+  # OS proxies to the installed extension, so this target needs no FFI linkage
+  # of its own — just FileProvider + XCTest, hosted by the app.
+  FileProviderRegistrationE2ETests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests/FileProviderRegistrationE2ETests.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: co.uk.mearman.cascade.ios.fpe2e
+        GENERATE_INFOPLIST_FILE: YES
     dependencies:
       - target: CascadeHostApp
