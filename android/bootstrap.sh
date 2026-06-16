@@ -35,6 +35,10 @@ build() {
     cargo build -p cascade-ffi --target "$target" --release --manifest-path "$repo/Cargo.toml"
   mkdir -p "$here/app/src/main/jniLibs/$abi"
   cp "$repo/target/$target/release/libcascade_ffi.so" "$here/app/src/main/jniLibs/$abi/libcascade_ffi.so"
+  # Strip debug symbols so the APK (and the ADB install over a flaky emulator
+  # link) is as small as possible. gradle's own strip step cannot strip Rust
+  # archives, so do it here with the NDK's llvm-strip.
+  "$tc/llvm-strip" --strip-debug "$here/app/src/main/jniLibs/$abi/libcascade_ffi.so"
 }
 
 build "arm64-v8a" "aarch64-linux-android" "aarch64-linux-android"

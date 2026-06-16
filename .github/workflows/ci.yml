@@ -328,6 +328,7 @@ jobs:
           api-level: 34
           arch: x86_64
           target: default
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
           script: ./gradlew :app:connectedDebugAndroidTest --no-daemon
           working-directory: android
 
