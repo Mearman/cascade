@@ -187,6 +187,12 @@ jobs:
         with:
           key: ios-ffi
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Cache Homebrew
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/Library/Caches/Homebrew
+          key: homebrew-${{ runner.os }}-xcodegen
+          restore-keys: homebrew-${{ runner.os }}-
       - name: Install xcodegen
         run: brew install xcodegen
       - name: Bootstrap (build FFI slices, generate bindings, generate project)
@@ -264,12 +270,28 @@ jobs:
         run: |
           echo "ANDROID_NDK=$(ls -d "$ANDROID_SDK_ROOT"/ndk/*/ | sort -V | tail -1)" >> "$GITHUB_ENV"
           echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
+      - name: Cache Gradle
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('android/**/*.gradle*', 'android/gradle/wrapper/gradle-wrapper.properties', 'android/gradle.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+      - name: Cache Android SDK platform and build-tools
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ${{ env.ANDROID_SDK_ROOT }}/platforms/android-34
+            ${{ env.ANDROID_SDK_ROOT }}/build-tools/34.0.0
+          key: android-sdk-34-bt34-${{ runner.os }}
       - name: Ensure the SDK platform and build-tools the app targets
         shell: bash
         run: |
           # `set +o pipefail` so `yes` getting SIGPIPE when sdkmanager exits
           # (the runner default is `-o pipefail`) does not fail the step; the
-          # pipeline's status is then sdkmanager's own exit code.
+          # pipeline's status is then sdkmanager's own exit code. Idempotent:
+          # already-installed packages (restored from cache) are a fast no-op.
           set +o pipefail
           yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0" >/dev/null
       - name: Bootstrap (cross-compile the .so slices into jniLibs)
@@ -315,6 +337,21 @@ jobs:
         run: |
           echo "ANDROID_NDK=$(ls -d "$ANDROID_SDK_ROOT"/ndk/*/ | sort -V | tail -1)" >> "$GITHUB_ENV"
           echo "sdk.dir=$ANDROID_SDK_ROOT" > android/local.properties
+      - name: Cache Gradle
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('android/**/*.gradle*', 'android/gradle/wrapper/gradle-wrapper.properties', 'android/gradle.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+      - name: Cache Android SDK platform and build-tools
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ${{ env.ANDROID_SDK_ROOT }}/platforms/android-34
+            ${{ env.ANDROID_SDK_ROOT }}/build-tools/34.0.0
+          key: android-sdk-34-bt34-${{ runner.os }}
       - name: Ensure the SDK platform and build-tools the app targets
         shell: bash
         run: |
@@ -359,6 +396,21 @@ jobs:
         run: |
           echo "ANDROID_NDK=$(ls -d "$ANDROID_SDK_ROOT"/ndk/*/ | sort -V | tail -1)" >> "$GITHUB_ENV"
           echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
+      - name: Cache Gradle
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('android/**/*.gradle*', 'android/gradle/wrapper/gradle-wrapper.properties', 'android/gradle.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+      - name: Cache Android SDK platform and build-tools
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ${{ env.ANDROID_SDK_ROOT }}/platforms/android-34
+            ${{ env.ANDROID_SDK_ROOT }}/build-tools/34.0.0
+          key: android-sdk-34-bt34-${{ runner.os }}
       - name: Ensure the SDK platform and build-tools the app targets
         shell: bash
         run: |
@@ -494,6 +546,12 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: ios-ffi
+      - name: Cache Homebrew
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/Library/Caches/Homebrew
+          key: homebrew-${{ runner.os }}-xcodegen
+          restore-keys: homebrew-${{ runner.os }}-
       - name: Install xcodegen
         run: brew install xcodegen
       - name: Bootstrap (build FFI slices, generate bindings, generate project)
@@ -537,6 +595,12 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: ios-ffi
+      - name: Cache Homebrew
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/Library/Caches/Homebrew
+          key: homebrew-${{ runner.os }}-xcodegen
+          restore-keys: homebrew-${{ runner.os }}-
       - name: Install xcodegen
         run: brew install xcodegen
       - name: Bootstrap (build FFI device slice, bindings, project)
