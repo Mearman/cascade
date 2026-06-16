@@ -17,6 +17,7 @@ android {
             // Ship the ABIs we cross-compile the engine for.
             abiFilters 'arm64-v8a', 'x86_64'
         }
+        testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
     }
 
     buildTypes {
@@ -60,4 +61,6 @@ dependencies {
     implementation 'net.java.dev.jna:jna:5.14.0@aar'
     testImplementation 'junit:junit:4.13.2'
     testImplementation 'org.robolectric:robolectric:4.13'
+    androidTestImplementation 'androidx.test:runner:1.6.2'
+    androidTestImplementation 'androidx.test.ext:junit:1.2.1'
 }
