@@ -40,9 +40,13 @@ final class CascadeIntegrationTests: XCTestCase {
         let node = try await CascadeNode(configDir: configDir)
         try await node.start()
 
-        XCTAssertThrowsError(try await node.readFile(path: "/local/absent.txt")) { error in
-            // The FFI maps an engine error onto CascadeError; the read of a
-            // missing file must surface an error, not an empty body or a crash.
+        // XCTAssertThrowsError's autoclosure cannot hold `await`, so drive the
+        // async throw by hand. The FFI maps an engine error onto CascadeError;
+        // the read of a missing file must surface an error, not an empty body.
+        do {
+            _ = try await node.readFile(path: "/local/absent.txt")
+            XCTFail("reading a missing file should throw")
+        } catch {
             XCTAssertTrue(error is CascadeError, "missing file is a CascadeError: \(error)")
         }
     }
