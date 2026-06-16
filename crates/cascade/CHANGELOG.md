@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.140](https://github.com/Mearman/cascade/compare/cascade-v0.1.139...cascade-v0.1.140) - 2026-06-16
+
+### Other
+
+- Propagate the remote exec exit code over the P2P exec plane ([#34](https://github.com/Mearman/cascade/pull/34))
+
 ## [0.1.139](https://github.com/Mearman/cascade/compare/cascade-v0.1.138...cascade-v0.1.139) - 2026-06-16
 
 ### Other
