@@ -14,6 +14,10 @@ const apiMock = vi.hoisted(() => ({
   rawRequest: vi.fn(),
   backends: vi.fn(),
   folderChildren: vi.fn(),
+  uploadFile: vi.fn(),
+  createDir: vi.fn(),
+  moveEntry: vi.fn(),
+  deleteFile: vi.fn(),
 }));
 
 vi.mock('@/api/client', () => ({ api: apiMock }));
@@ -58,6 +62,10 @@ beforeEach(() => {
   apiMock.rawRequest.mockReset();
   apiMock.backends.mockReset();
   apiMock.folderChildren.mockReset();
+  apiMock.uploadFile.mockReset();
+  apiMock.createDir.mockReset();
+  apiMock.moveEntry.mockReset();
+  apiMock.deleteFile.mockReset();
 });
 
 afterEach(() => {
@@ -194,6 +202,76 @@ describe('FilesPage in Connected mode', () => {
     }));
     const { container } = renderWithMode(RuntimeMode.Connected);
     expect(container.querySelector('[role="status"]')).not.toBeNull();
+  });
+
+  it('shows upload and new-folder actions for P2P backends', async () => {
+    const p2pBackends: BackendEntry[] = [
+      {
+        id: 'b1',
+        name: 'Shared',
+        folder_id: 'folder-1',
+        mount_path: '/Shared',
+        healthy: true,
+      },
+    ];
+    apiMock.backends.mockResolvedValue({ backends: p2pBackends });
+    apiMock.folderChildren.mockResolvedValue({
+      folder: 'folder-1',
+      path: '',
+      entries: [],
+      next_cursor: null,
+    });
+
+    const { findByText } = renderWithMode(RuntimeMode.Connected);
+
+    const uploadBtn = await findByText('Upload');
+    expect(uploadBtn).toBeTruthy();
+    const newFolderBtn = await findByText('New folder');
+    expect(newFolderBtn).toBeTruthy();
+  });
+
+  it('uploads files via the file input and refreshes', async () => {
+    const p2pBackends: BackendEntry[] = [
+      {
+        id: 'b1',
+        name: 'Shared',
+        folder_id: 'folder-1',
+        mount_path: '/Shared',
+        healthy: true,
+      },
+    ];
+    apiMock.backends.mockResolvedValue({ backends: p2pBackends });
+    apiMock.folderChildren.mockResolvedValue({
+      folder: 'folder-1',
+      path: '',
+      entries: [],
+      next_cursor: null,
+    });
+    apiMock.uploadFile.mockResolvedValue({
+      name: 'test.txt',
+      kind: 'file' as const,
+      size: 5,
+      mtime: null,
+      etag: null,
+    });
+
+    const { container } = renderWithMode(RuntimeMode.Connected);
+
+    // Wait for the toolbar to render.
+    await waitFor(() => {
+      expect(container.querySelector('input[type="file"]')).not.toBeNull();
+    });
+
+    // Simulate file selection.
+    const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement;
+    const testFile = new File(['hello'], 'test.txt', { type: 'text/plain' });
+    Object.defineProperty(fileInput, 'files', { value: [testFile], writable: false });
+
+    fileInput.dispatchEvent(new Event('change'));
+
+    await waitFor(() => {
+      expect(apiMock.uploadFile).toHaveBeenCalledWith('folder-1', 'test.txt', testFile);
+    });
   });
 });
 

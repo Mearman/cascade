@@ -20,6 +20,7 @@ const NAV_LINKS: readonly NavLink[] = [
   { href: '/shares', label: 'Shares', connectedOnly: true },
   { href: '/grants', label: 'Grants', connectedOnly: true },
   { href: '/tokens', label: 'Tokens', connectedOnly: true },
+  { href: '/terminal', label: 'Terminal', connectedOnly: true },
   { href: '/settings', label: 'Settings', connectedOnly: false },
 ] as const;
 

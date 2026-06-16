@@ -1171,3 +1171,221 @@ async fn revoked_token_is_rejected() {
     assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {body}");
     assert_error_code(&body, "unauthorised");
 }
+
+// ── File write-op route tests (create-dir, move) ──────────────────────────────
+
+fn authed_put(
+    uri: &str,
+    token: &CapabilityToken,
+    bearer_device: &DeviceId,
+    body: &[u8],
+) -> Request<Body> {
+    Request::builder()
+        .method("PUT")
+        .uri(uri)
+        .header(header::AUTHORIZATION, bearer(token))
+        .header(BEARER_DEVICE_HEADER, bearer_device.as_str())
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(body.to_vec()))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn create_dir_requires_data_write() {
+    let h = Harness::new();
+    let node = h.node_id();
+    h.set_ready();
+    // status:read does not satisfy data:write.
+    let token = h.issue(
+        "sr",
+        &node,
+        Capability::StatusRead,
+        Scope::folder("p2p-shared"),
+    );
+    let req = authed_post(
+        "/v1/folders/p2p-shared/dirs/subdir",
+        &token,
+        &node,
+        &serde_json::json!({}),
+    );
+    let (status, _, body) = h.send(req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {body}");
+    assert_error_code(&body, "unauthorised");
+}
+
+#[tokio::test]
+async fn create_dir_requires_data_plane_ready() {
+    let h = Harness::new();
+    let node = h.node_id();
+    let token = h.issue(
+        "dw",
+        &node,
+        Capability::DataWrite,
+        Scope::folder("p2p-shared"),
+    );
+    let req = authed_post(
+        "/v1/folders/p2p-shared/dirs/subdir",
+        &token,
+        &node,
+        &serde_json::json!({}),
+    );
+    let (status, _, body) = h.send(req).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {body}");
+    assert_error_code(&body, "data_plane_not_ready");
+}
+
+#[tokio::test]
+async fn create_dir_unknown_folder_returns_404() {
+    let h = Harness::new();
+    let node = h.node_id();
+    h.set_ready();
+    // Scope to the unknown folder so the capability check passes, then the
+    // known-folder check produces the 404.
+    let token = h.issue(
+        "dw",
+        &node,
+        Capability::DataWrite,
+        Scope::folder("p2p-unknown"),
+    );
+    let req = authed_post(
+        "/v1/folders/p2p-unknown/dirs/subdir",
+        &token,
+        &node,
+        &serde_json::json!({}),
+    );
+    let (status, _, body) = h.send(req).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "body: {body}");
+    assert_error_code(&body, "not_found");
+}
+
+#[tokio::test]
+async fn move_entry_requires_data_write() {
+    let h = Harness::new();
+    let node = h.node_id();
+    h.set_ready();
+    let token = h.issue(
+        "sr",
+        &node,
+        Capability::StatusRead,
+        Scope::folder("p2p-shared"),
+    );
+    let req = authed_post(
+        "/v1/folders/p2p-shared/move",
+        &token,
+        &node,
+        &serde_json::json!({"from": "a.txt", "to": "b.txt"}),
+    );
+    let (status, _, body) = h.send(req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {body}");
+    assert_error_code(&body, "unauthorised");
+}
+
+#[tokio::test]
+async fn move_entry_requires_data_plane_ready() {
+    let h = Harness::new();
+    let node = h.node_id();
+    let token = h.issue(
+        "dw",
+        &node,
+        Capability::DataWrite,
+        Scope::folder("p2p-shared"),
+    );
+    let req = authed_post(
+        "/v1/folders/p2p-shared/move",
+        &token,
+        &node,
+        &serde_json::json!({"from": "a.txt", "to": "b.txt"}),
+    );
+    let (status, _, body) = h.send(req).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {body}");
+    assert_error_code(&body, "data_plane_not_ready");
+}
+
+#[tokio::test]
+async fn put_file_requires_data_write() {
+    let h = Harness::new();
+    let node = h.node_id();
+    h.set_ready();
+    let token = h.issue(
+        "sr",
+        &node,
+        Capability::StatusRead,
+        Scope::folder("p2p-shared"),
+    );
+    let req = authed_put(
+        "/v1/files/p2p-shared/entries/test.txt",
+        &token,
+        &node,
+        b"hello",
+    );
+    let (status, _, body) = h.send(req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {body}");
+    assert_error_code(&body, "unauthorised");
+}
+
+#[tokio::test]
+async fn put_file_requires_data_plane_ready() {
+    let h = Harness::new();
+    let node = h.node_id();
+    let token = h.issue(
+        "dw",
+        &node,
+        Capability::DataWrite,
+        Scope::folder("p2p-shared"),
+    );
+    let req = authed_put(
+        "/v1/files/p2p-shared/entries/test.txt",
+        &token,
+        &node,
+        b"hello",
+    );
+    let (status, _, body) = h.send(req).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {body}");
+    assert_error_code(&body, "data_plane_not_ready");
+}
+
+// ── Exec websocket route tests ────────────────────────────────────────────────
+//
+// The websocket upgrade (`WebSocketUpgrade` extractor) requires a live HTTP
+// connection with the `OnUpgrade` hyper extension, which `oneshot` testing
+// does not provide. A request through `oneshot` hits the 426
+// `ConnectionNotUpgradable` rejection before the handler body (where token
+// verification runs) is reached. These tests therefore verify the route is
+// registered (not 404) and that the websocket upgrade path is active.
+
+#[tokio::test]
+async fn exec_ws_route_is_registered() {
+    // The route exists: a GET without any websocket headers returns a
+    // websocket-upgrade rejection (not 404), proving the route is wired.
+    let h = Harness::new();
+    let req = Request::builder()
+        .method("GET")
+        .uri("/v1/exec/ws")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _, _body) = h.send(req).await;
+    assert_ne!(status, StatusCode::NOT_FOUND, "route should be registered");
+}
+
+#[tokio::test]
+async fn exec_ws_with_upgrade_headers_returns_not_404() {
+    // Even with websocket upgrade headers, the route is matched and the
+    // websocket extractor processes the request (returning 426 in oneshot
+    // because there is no real connection upgrade). This confirms the route
+    // and its extractor chain are wired correctly.
+    let h = Harness::new();
+    let node = h.node_id();
+    let token = h.issue("sr", &node, Capability::StatusRead, Scope::Node);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/v1/exec/ws")
+        .header(header::AUTHORIZATION, bearer(&token))
+        .header("upgrade", "websocket")
+        .header("connection", "upgrade")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .header("sec-websocket-version", "13")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _, _body) = h.send(req).await;
+    assert_ne!(status, StatusCode::NOT_FOUND, "route should be registered");
+}

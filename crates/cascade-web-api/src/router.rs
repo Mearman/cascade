@@ -34,6 +34,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(routes::health::routes())
         .merge(routes::session::routes())
         .merge(routes::files::routes())
+        .merge(routes::exec::routes())
         .merge(routes::shares::routes())
         .merge(routes::tokens::routes())
         .merge(routes::grants::routes())
