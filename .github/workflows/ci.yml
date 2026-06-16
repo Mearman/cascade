@@ -207,6 +207,15 @@ jobs:
           -scheme FileProviderLogicTests -sdk iphonesimulator
           -destination 'platform=iOS Simulator,name=iPhone 16,arch=arm64'
           -configuration Debug test
+      - name: Run the integration tests (Simulator)
+        # Drives the REAL CascadeNode through the FFI on the simulator — the
+        # FFI -> engine -> local-backend stack on the actual iOS target.
+        run: >
+          xcodebuild
+          -project swift/CascadeFileProvideriOS/CascadeFileProvideriOS.xcodeproj
+          -scheme CascadeIntegrationTests -sdk iphonesimulator
+          -destination 'platform=iOS Simulator,name=iPhone 16,arch=arm64'
+          -configuration Debug test
       - name: Package the Simulator app
         # The ad-hoc signed Simulator .app — drag into a booted simulator to run.
         # Not a device build: a real iPhone needs a signed .ipa (see release-ios-ipa).
