@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.139](https://github.com/Mearman/cascade/compare/cascade-v0.1.138...cascade-v0.1.139) - 2026-06-16
+
+### Other
+
+- Fill the read-only UI gaps: web/mobile/CLI writes, exec, TUI ([#33](https://github.com/Mearman/cascade/pull/33))
+
 ## [0.1.138](https://github.com/Mearman/cascade/compare/cascade-v0.1.137...cascade-v0.1.138) - 2026-06-16
 
 ### Other

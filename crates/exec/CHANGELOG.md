@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.139](https://github.com/Mearman/cascade/compare/cascade-exec-v0.1.138...cascade-exec-v0.1.139) - 2026-06-16
+
+### Added
+
+- *(exec)* make session kill and teardown race-free for the data plane
+- *(exec)* add crates/exec — PTY and process capability provider
+
+### Fixed
+
+- *(exec)* de-flake the Windows process-event tests
+- *(exec)* use cmd on Windows in the PTY spawn test
+- *(docs)* resolve two broken intra-doc links
+
+### Other
+
+- release v0.1.138 [skip ci]
+- release v0.1.137 [skip ci]
+- release v0.1.136 [skip ci]
+- release v0.1.135 [skip ci]
+- release v0.1.134 [skip ci]
+- release v0.1.133 [skip ci]
+- release v0.1.132 [skip ci]
+- release v0.1.131 [skip ci]
+- release v0.1.130 [skip ci]
+- release v0.1.129 [skip ci]
+- release v0.1.128 [skip ci]
+- release v0.1.127 [skip ci]
+- release v0.1.126 [skip ci]
+- release v0.1.125 [skip ci]
+- release v0.1.124 [skip ci]
+- release v0.1.123 [skip ci]
+- release v0.1.122 [skip ci]
+- release v0.1.121 [skip ci]
+
 ## [0.1.138](https://github.com/Mearman/cascade/compare/cascade-exec-v0.1.137...cascade-exec-v0.1.138) - 2026-06-16
 
 ### Added

@@ -7,6 +7,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.139](https://github.com/Mearman/cascade/compare/cascade-p2p-webrtc-v0.1.138...cascade-p2p-webrtc-v0.1.139) - 2026-06-16
+
+### Added
+
+- *(wasm)* add wasm-bindgen-test lane for browser bridge crates
+- *(wasm)* add browser File System Access and WebRTC transport crates
+
+### Other
+
+- release v0.1.138 [skip ci]
+- release v0.1.137 [skip ci]
+- release v0.1.136 [skip ci]
+- release v0.1.135 [skip ci]
+- release v0.1.134 [skip ci]
+- release v0.1.133 [skip ci]
+- release v0.1.132 [skip ci]
+- release v0.1.131 [skip ci]
+- release v0.1.130 [skip ci]
+- release v0.1.129 [skip ci]
+- release v0.1.128 [skip ci]
+- release v0.1.127 [skip ci]
+- release v0.1.126 [skip ci]
+- release v0.1.125 [skip ci]
+- release v0.1.124 [skip ci]
+- release v0.1.123 [skip ci]
+- release v0.1.122 [skip ci]
+- release v0.1.121 [skip ci]
+- release v0.1.120 [skip ci]
+- release v0.1.119 [skip ci]
+- release v0.1.118 [skip ci]
+- release v0.1.117 [skip ci]
+- release v0.1.116 [skip ci]
+- release v0.1.115 [skip ci]
+- release v0.1.114 [skip ci]
+- release v0.1.113 [skip ci]
+- release v0.1.112 [skip ci]
+- release v0.1.111 [skip ci]
+- release v0.1.110 [skip ci]
+- release v0.1.109 [skip ci]
+- release v0.1.108 [skip ci]
+- release v0.1.107 [skip ci]
+- release v0.1.106 [skip ci]
+- release v0.1.105 [skip ci]
+- release v0.1.104 [skip ci]
+- release v0.1.103 [skip ci]
+- release v0.1.102 [skip ci]
+- release v0.1.101 [skip ci]
+- release v0.1.100 [skip ci]
+- *(wasm)* correct the wasm-pack test invocation in the crate docs
+- release v0.1.99 [skip ci]
+- release v0.1.98 [skip ci]
+- release v0.1.97 [skip ci]
+- *(p2p-webrtc)* make the config and error surface natively testable
+- release v0.1.96 [skip ci]
+- release v0.1.95 [skip ci]
+- release v0.1.94 [skip ci]
+- release v0.1.93 [skip ci]
+- release v0.1.92 [skip ci]
+- release v0.1.91 [skip ci]
+- release v0.1.90 [skip ci]
+- release v0.1.89 [skip ci]
+- release v0.1.88 [skip ci]
+- release v0.1.87 [skip ci]
+- release v0.1.86 [skip ci]
+- release v0.1.85 [skip ci]
+- release v0.1.84 [skip ci]
+- release v0.1.83 [skip ci]
+- release v0.1.82 [skip ci]
+- release v0.1.81 [skip ci]
+- release v0.1.80 [skip ci]
+- release v0.1.79 [skip ci]
+- release v0.1.78 [skip ci]
+- release v0.1.77 [skip ci]
+- release v0.1.76 [skip ci]
+
 ## [0.1.138](https://github.com/Mearman/cascade/compare/cascade-p2p-webrtc-v0.1.137...cascade-p2p-webrtc-v0.1.138) - 2026-06-16
 
 ### Added
