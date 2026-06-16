@@ -695,9 +695,11 @@ mod tests {
 
         provider.proc_kill(id).await.unwrap();
 
-        // Wait for the exit task to clean up the proc_sessions entry.
+        // Wait for the exit task to clean up the proc_sessions entry. Generous
+        // headroom for slow/loaded CI runners; a true failure to clean up still
+        // trips this, just later.
         let inner_arc = Arc::clone(&provider.inner);
-        let result = tokio::time::timeout(Duration::from_secs(3), async move {
+        let result = tokio::time::timeout(Duration::from_secs(30), async move {
             loop {
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 let inner = inner_arc.lock().unwrap();
@@ -741,7 +743,10 @@ mod tests {
 
         let mut collected = Vec::new();
         let mut exited = false;
-        let drain = tokio::time::timeout(Duration::from_secs(3), async {
+        // Generous headroom: this drains in milliseconds locally, but a loaded
+        // CI runner (Windows especially) can stall the child's spawn/exit
+        // delivery for seconds. A true hang still fails, just later.
+        let drain = tokio::time::timeout(Duration::from_secs(30), async {
             while let Some(event) = rx.recv().await {
                 match event {
                     ExecEvent::Output { bytes, .. } => collected.extend_from_slice(&bytes),
