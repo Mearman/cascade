@@ -51,7 +51,7 @@ use cascade_p2p::block::BlockHash;
 use cascade_p2p::candidate::{Candidate, CandidateKind};
 use cascade_p2p::connection::ConnectionManager;
 use cascade_p2p::discovery::DiscoveredPeer;
-use cascade_p2p::exec_stream::ExecStreamFrame;
+use cascade_p2p::exec_stream::ExecStreamEvent;
 use cascade_p2p::framed::{FramedPeer, FramedSession, SessionReader, SessionWriter};
 use cascade_p2p::identity::DeviceIdentity;
 use cascade_p2p::nat::{
@@ -727,13 +727,16 @@ pub struct SyncEngine {
     /// When a manager spawns a PTY or process on a remote node, the node
     /// streams the session's stdout/stderr back as
     /// [`BepMessage::ExecStream`] frames. This map holds the channel that
-    /// delivers those frames to the manager-side consumer (the CLI's exec /
-    /// shell commands). The session loop routes each inbound frame to the
-    /// matching consumer and sends a [`BepMessage::ExecStreamAck`] back so
-    /// the node's producer honours the backpressure window. A consumer that
-    /// drops its receiver is removed from the map on the next frame.
+    /// delivers those frames (as [`ExecStreamEvent`] items — both
+    /// [`ExecStreamEvent::Output`] byte frames and the terminal
+    /// [`ExecStreamEvent::Exited`] carrying the process exit status) to the
+    /// manager-side consumer (the CLI's exec / shell commands). The session
+    /// loop routes each inbound frame to the matching consumer and sends a
+    /// [`BepMessage::ExecStreamAck`] back so the node's producer honours the
+    /// backpressure window. A consumer that drops its receiver is removed from
+    /// the map on the next frame.
     exec_stream_consumers:
-        Arc<Mutex<HashMap<(String, u64), mpsc::UnboundedSender<ExecStreamFrame>>>>,
+        Arc<Mutex<HashMap<(String, u64), mpsc::UnboundedSender<ExecStreamEvent>>>>,
 }
 
 impl std::fmt::Debug for SyncEngine {
@@ -2339,16 +2342,18 @@ impl SyncEngine {
     ///
     /// The session loop routes each [`BepMessage::ExecStream`] frame for the
     /// named `(device_id, session_id)` pair to this receiver as a typed
-    /// [`ExecStreamFrame`], and sends a [`BepMessage::ExecStreamAck`] back so
-    /// the node's producer keeps flowing. A manager calls this *before*
-    /// sending the `PtySpawn` / `ProcSpawn` that mints `session_id`, so the
-    /// first output frame does not race the registration. Dropping the
-    /// receiver removes the entry on the next frame.
+    /// [`ExecStreamEvent::Output`], sends a [`BepMessage::ExecStreamAck`] back
+    /// so the node's producer keeps flowing, and delivers the terminal
+    /// [`BepMessage::ExecExit`] as [`ExecStreamEvent::Exited`] so a one-shot
+    /// `exec` pump can exit with the remote process's exit code. A manager
+    /// calls this *before* sending the `PtySpawn` / `ProcSpawn` that mints
+    /// `session_id`, so the first output frame does not race the registration.
+    /// Dropping the receiver removes the entry on the next frame.
     pub async fn subscribe_exec_stream(
         &self,
         device_id: &str,
         session_id: u64,
-    ) -> mpsc::UnboundedReceiver<cascade_p2p::exec_stream::ExecStreamFrame> {
+    ) -> mpsc::UnboundedReceiver<cascade_p2p::exec_stream::ExecStreamEvent> {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut consumers = self.exec_stream_consumers.lock().await;
         consumers.insert((device_id.to_owned(), session_id), tx);

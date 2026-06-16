@@ -8,7 +8,11 @@
       "message": {
         "kind": "Handshake",
         "protocol_version": 1,
-        "domains": ["content", "management", "exec"]
+        "domains": [
+          "content",
+          "management",
+          "exec"
+        ]
       },
       "wire_hex": "00000018000000110000000100000003000000000000000100000002"
     },
@@ -27,7 +31,10 @@
           "cols": 80,
           "rows": 24
         },
-        "scope": { "kind": "folder", "path": "/work" },
+        "scope": {
+          "kind": "folder",
+          "path": "/work"
+        },
         "token": null
       },
       "wire_hex": "000000540000000f00000000000000010000000d00000001000000072f62696e2f7368000000000000000001000000052f776f726b00000000000000000000500000001800000001000000052f776f726b00000000000000"
@@ -38,8 +45,14 @@
       "message": {
         "kind": "ManageRequest",
         "request_id": 2,
-        "command": { "kind": "ProcKill", "session": 7 },
-        "scope": { "kind": "folder", "path": "/work" },
+        "command": {
+          "kind": "ProcKill",
+          "session": 7
+        },
+        "scope": {
+          "kind": "folder",
+          "path": "/work"
+        },
         "token": null
       },
       "wire_hex": "0000002c0000000f000000000000000200000013000000000000000700000001000000052f776f726b00000000000000"
@@ -50,7 +63,10 @@
       "message": {
         "kind": "ManageResponse",
         "request_id": 1,
-        "result": { "kind": "ExecSpawned", "session": 42 }
+        "result": {
+          "kind": "ExecSpawned",
+          "session": 42
+        }
       },
       "wire_hex": "0000001800000010000000000000000100000002000000000000002a"
     },
@@ -76,6 +92,28 @@
         "window": 65536
       },
       "wire_hex": "0000001800000013000000000000002a000000000000000100010000"
+    },
+    {
+      "name": "exec_exit_code",
+      "msg_type": 23,
+      "message": {
+        "kind": "ExecExit",
+        "session": 42,
+        "code": 42,
+        "signal": null
+      },
+      "wire_hex": "0000001800000017000000000000002a000000010000002a00000000"
+    },
+    {
+      "name": "exec_exit_signal",
+      "msg_type": 23,
+      "message": {
+        "kind": "ExecExit",
+        "session": 7,
+        "code": null,
+        "signal": 9
+      },
+      "wire_hex": "00000018000000170000000000000007000000000000000100000009"
     },
     {
       "name": "oplog_have",
@@ -104,7 +142,10 @@
         "kind": "OplogData",
         "peer": "PEER",
         "from_seq": 1,
-        "ops_hex": ["6f7032", "6f7033"]
+        "ops_hex": [
+          "6f7032",
+          "6f7033"
+        ]
       },
       "wire_hex": "00000028000000160000000450454552000000000000000100000002000000036f703200000000036f703300"
     }

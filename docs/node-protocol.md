@@ -188,6 +188,7 @@ some) followed, when present, by the value.
 | 20   | `OplogHave`        | oplog         | yes    |
 | 21   | `OplogRequest`     | oplog         | yes    |
 | 22   | `OplogData`        | oplog (envelope) |  yes |
+| 23   | `ExecExit`         | exec          | yes    |
 
 Transport frames (the handshake itself, keepalive, NAT-traversal, and relay
 frames) are domain-independent: every peer speaks them regardless of the
@@ -195,8 +196,8 @@ negotiated capability set. The remaining frames are governed by the domain in th
 table; the receiver refuses an inbound frame whose domain is not in the
 negotiated set. (Exec *control* travels as `management` frames and is governed by
 the management domain plus the exec capability grant, not by the exec domain
-mapping; the exec domain governs only the `ExecStream`/`ExecStreamAck` stdio
-frames.)
+mapping; the exec domain governs only the `ExecStream`/`ExecStreamAck`/
+`ExecExit` stdio frames.)
 
 ### Handshake (type 17)
 
@@ -245,6 +246,18 @@ Body: `u64 session`, `u64 ack_seq` (highest contiguous sequence accepted), `u32
 window` (credit, in bytes, the consumer will accept past `ack_seq`). The producer
 must not send beyond the window.
 
+### Exec exit (`ExecExit`, type 23)
+
+Body: `u64 session`, `Option<i32> code` (presence sentinel `0`=absent / `1`=present
+then `i32`), `Option<i32> signal` (same encoding). Sent exactly once by the node's
+exec output pump after the last `ExecStream` output frame, on the session's
+terminal exit. It is a single control frame, not credit-gated: it carries no
+sequence number and the manager routes it to the exec-stream consumer registered
+for `(device_id, session)` without acking. Exactly one of `code`/`signal` is
+present for a normal Unix exit; both absent means the exit status was
+indeterminate (the CLI maps that to exit code `1`). A signal-killed process
+carries `signal`; the CLI maps it to `128 + signal` per the shell convention.
+
 ### Oplog sync (types 20–22)
 
 - `OplogHave` (20): string `peer`, `u64 head_seq`.
@@ -274,8 +287,8 @@ consumed by every implementation's CI:
   human and the lowercase hex of its full `[len][type][body]` frame. A conformant
   codec must decode the hex to the message and re-encode the message to exactly
   the same hex. Covers the handshake, the exec `ManageCommand` verbs, the
-  `ExecStream`/`ExecStreamAck` stdio frames, and the oplog frames (with arbitrary
-  opaque entry bytes, since the entry payload is not frozen).
+  `ExecStream`/`ExecStreamAck`/`ExecExit` stdio frames, and the oplog frames
+  (with arbitrary opaque entry bytes, since the entry payload is not frozen).
 - `handshake.v1.json` — for each `(local domains, peer domains)` pair, the
   expected negotiated set and the domains whose frames the local node must refuse
   from that peer. Drives the heterogeneous-peer and graceful-degradation rules,

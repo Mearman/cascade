@@ -89,7 +89,7 @@ impl WireStreamKind {
 /// which depends on this crate; the registration therefore lives there rather
 /// than here, where the data-plane type is defined), so the consumer never sees
 /// the wire sequence number or raw discriminant.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecStreamFrame {
     /// The session the bytes belong to.
     pub session: u64,
@@ -97,6 +97,64 @@ pub struct ExecStreamFrame {
     pub stream: WireStreamKind,
     /// The raw stream bytes.
     pub bytes: Vec<u8>,
+}
+
+/// One item delivered to the manager-side exec-stream consumer over its
+/// subscription channel.
+///
+/// The consumer channel (handed out by `SyncEngine::subscribe_exec_stream`) used
+/// to carry only [`ExecStreamFrame`] byte payloads; the terminal
+/// [`BepMessage::ExecExit`] control frame is now delivered through the same
+/// channel as the [`Self::Exited`] variant, so a one-shot `exec` pump can exit
+/// with the remote process's exit code rather than only learning the session
+/// ended when the byte stream closes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecStreamEvent {
+    /// A chunk of stdout/stderr bytes for the session.
+    Output(ExecStreamFrame),
+    /// The session's process exited. `code` is the normal exit code (if any);
+    /// `signal` is the POSIX signal that killed it (if any). Exactly one is
+    /// `Some` for a normal Unix exit; both `None` means the exit status was
+    /// indeterminate. A consumer that wants a shell-style exit status maps a
+    /// signal-killed process to `128 + signal`.
+    Exited {
+        /// The process exit code, if it exited normally.
+        code: Option<i32>,
+        /// The POSIX signal number that terminated the process, if killed by a
+        /// signal.
+        signal: Option<i32>,
+    },
+}
+
+impl ExecStreamEvent {
+    /// The exit status a one-shot `exec` should propagate, following the shell
+    /// convention: a normal exit yields `code`, a signal-killed process yields
+    /// `128 + signal`, and an indeterminate exit (neither set) yields the
+    /// generic failure status `1`.
+    #[must_use]
+    pub const fn to_exit_code(&self) -> Option<i32> {
+        match self {
+            Self::Output(_) => None,
+            Self::Exited { code, signal } => Some(exit_code_from_code_signal(*code, *signal)),
+        }
+    }
+}
+
+/// Map an optional exit `code` and optional `signal` to a shell-style process
+/// exit status. Exposed so the CLI's one-shot `exec` and tests share one
+/// definition.
+///
+/// - `code` present -> `code`.
+/// - `code` absent, `signal` present -> `128 + signal`.
+/// - both absent -> `1` (generic failure: the process exited without a
+///   determinable status).
+#[must_use]
+pub const fn exit_code_from_code_signal(code: Option<i32>, signal: Option<i32>) -> i32 {
+    match (code, signal) {
+        (Some(c), _) => c,
+        (None, Some(s)) => 128 + s,
+        (None, None) => 1,
+    }
 }
 
 /// Default credit window a consumer advertises, in bytes.
@@ -238,9 +296,12 @@ impl ExecStreamCredit {
 ///
 /// Returns when the session's output channel closes (the session ended and all
 /// pumps dropped their senders) or an [`ExecEvent::Exited`] arrives, whichever
-/// comes first. An `Exited` event ends the stream cleanly: the function returns
-/// `Ok(())` without tearing down the shared writer, leaving the caller to send a
-/// `Close` or continue using the session for other traffic.
+/// comes first. An `Exited` event ends the stream cleanly: the pump sends a
+/// single [`BepMessage::ExecExit`] control frame carrying the process's exit
+/// code and signal (NOT credit-gated — it is one terminal frame sent after the
+/// last output frame), then returns `Ok(())` without tearing down the shared
+/// writer, leaving the caller to send a `Close` or continue using the session
+/// for other traffic.
 pub async fn pump_session_output<W: TransportWriter>(
     session: ExecSessionId,
     mut events: tokio::sync::mpsc::Receiver<ExecEvent>,
@@ -280,7 +341,26 @@ pub async fn pump_session_output<W: TransportWriter>(
                 credit.record_sent(seq, sent_bytes).await;
                 seq = seq.wrapping_add(1);
             }
-            ExecEvent::Exited { .. } => return Ok(()),
+            ExecEvent::Exited { code, signal } => {
+                // Terminal control frame: send exactly once, after the last
+                // output frame. It is NOT credit-gated — it carries no sequence
+                // number and the manager routes it to the consumer without
+                // acking, so it must not be throttled by a slow consumer's
+                // window (the session is over; the only remaining business is
+                // to deliver the exit status).
+                let exit_frame = BepMessage::ExecExit {
+                    session: session.0,
+                    code,
+                    signal,
+                };
+                writer
+                    .lock()
+                    .await
+                    .send(&exit_frame)
+                    .await
+                    .context("sending exec exit frame")?;
+                return Ok(());
+            }
         }
     }
     Ok(())
@@ -441,4 +521,62 @@ where
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_code_normal_exit_yields_code() {
+        assert_eq!(exit_code_from_code_signal(Some(0), None), 0);
+        assert_eq!(exit_code_from_code_signal(Some(42), None), 42);
+        assert_eq!(exit_code_from_code_signal(Some(-1), None), -1);
+    }
+
+    #[test]
+    fn exit_code_signal_kill_yields_128_plus_signal() {
+        assert_eq!(exit_code_from_code_signal(None, Some(9)), 137);
+        assert_eq!(exit_code_from_code_signal(None, Some(15)), 143);
+        assert_eq!(exit_code_from_code_signal(None, Some(2)), 130);
+    }
+
+    #[test]
+    fn exit_code_indeterminate_yields_generic_failure() {
+        assert_eq!(exit_code_from_code_signal(None, None), 1);
+    }
+
+    #[test]
+    fn exit_code_code_takes_precedence_over_signal() {
+        // A normal exit code wins even if a signal is also carried (defensive:
+        // the node sets exactly one for a real Unix exit, but the mapping must
+        // not panic or surprise if both are present).
+        assert_eq!(exit_code_from_code_signal(Some(3), Some(9)), 3);
+    }
+
+    #[test]
+    fn event_to_exit_code_is_none_for_output() {
+        let frame = ExecStreamFrame {
+            session: 1,
+            stream: WireStreamKind::Stdout,
+            bytes: Vec::new(),
+        };
+        assert_eq!(ExecStreamEvent::Output(frame).to_exit_code(), None);
+    }
+
+    #[test]
+    fn event_to_exit_code_maps_exited() {
+        let exited = ExecStreamEvent::Exited {
+            code: Some(42),
+            signal: None,
+        };
+        assert_eq!(exited.to_exit_code(), Some(42));
+
+        let killed = ExecStreamEvent::Exited {
+            code: None,
+            signal: Some(9),
+        };
+        assert_eq!(killed.to_exit_code(), Some(137));
+    }
 }

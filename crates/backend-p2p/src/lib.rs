@@ -798,7 +798,7 @@ impl P2pBackend {
         &self,
         device_id: &str,
         session_id: u64,
-    ) -> tokio::sync::mpsc::UnboundedReceiver<cascade_p2p::exec_stream::ExecStreamFrame> {
+    ) -> tokio::sync::mpsc::UnboundedReceiver<cascade_p2p::exec_stream::ExecStreamEvent> {
         self.sync.subscribe_exec_stream(device_id, session_id).await
     }
 
