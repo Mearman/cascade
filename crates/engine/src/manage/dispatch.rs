@@ -1163,6 +1163,6 @@ fn caller_can_delegate(
     Delegation::Permitted(bound)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "p2p", feature = "exec"))]
 #[path = "dispatch_tests.rs"]
 mod tests;
