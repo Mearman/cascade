@@ -35,11 +35,11 @@ class DocumentsProviderInstrumentedTest {
     @Test
     fun queryChildDocuments_listsSeededFile() {
         val ctx = InstrumentationRegistry.getInstrumentation().targetContext
-        // Seed a file under the node's files root (the provider mounts the local
-        // backend there under the `local` prefix), then list the `local`
-        // document's children through the provider and assert the file appears.
-        val filesDir = ctx.filesDir
-        java.io.File(filesDir, "e2e-probe.txt").writeText("hello e2e")
+        // The node mounts the local backend over <configDir>/files (its files
+        // root); configDir is the app's filesDir. Seed there, then list the
+        // `local` document's children through the provider and assert it appears.
+        val filesRoot = java.io.File(ctx.filesDir, "files").apply { mkdirs() }
+        java.io.File(filesRoot, "e2e-probe.txt").writeText("hello e2e")
 
         // The local backend is mounted at "/local"; list its children. (The root
         // document "/" lists the mount points, so its child is "local".)
