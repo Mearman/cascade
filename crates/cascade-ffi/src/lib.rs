@@ -185,6 +185,7 @@ impl CascadeNode {
         // async, so resolve the routing and injection set under the guard, release
         // it, then await the backend — the same discipline the engine's own
         // presenters follow to avoid holding a std lock across an await point.
+        let path = normalise_vfs_path(&path);
         let (backend, backend_path, mount_names) = {
             let guard = tree.read().map_err(|_| CascadeError::Listing {
                 detail: "VFS lock poisoned".to_owned(),
@@ -208,6 +209,7 @@ impl CascadeNode {
     /// Read the full contents of the file at `path` (a VFS-absolute path).
     pub async fn read_file(&self, path: String) -> Result<Vec<u8>, CascadeError> {
         let tree = self.engine.vfs().clone();
+        let path = normalise_vfs_path(&path);
         let (backend, rel) = {
             let guard = tree.read().map_err(|_| CascadeError::Read {
                 detail: "VFS lock poisoned".to_owned(),
@@ -297,6 +299,19 @@ fn build_local_backend(files_dir: &Path) -> Result<Arc<dyn Backend>, CascadeErro
             detail: format!("build local backend: {e}"),
         })?;
     Ok(Arc::from(backend))
+}
+
+/// Strip leading slashes from a caller-supplied VFS path.
+///
+/// The engine stores mount prefixes relative (see `mount_prefix_from_str`,
+/// which strips leading slashes), and `VfsTree::resolve` matches by
+/// `strip_prefix` — so an absolute path like `/local` would not match the
+/// `local` prefix and fall through to the neutral root. Mobile callers (the
+/// iOS File Provider, which encodes paths into item identifiers) pass
+/// leading-slash paths, so normalise at this boundary to match the prefix
+/// form, the way the desktop presenters do.
+fn normalise_vfs_path(path: &str) -> String {
+    path.trim_start_matches('/').to_owned()
 }
 
 #[cfg(test)]
@@ -391,6 +406,23 @@ mod tests {
             .find(|e| e.name == "subdir")
             .expect("subdir in listing");
         assert!(subdir.is_dir, "subdir marked as directory");
+    }
+
+    #[tokio::test]
+    async fn list_dir_accepts_leading_slash_path() {
+        // Mobile callers (the iOS File Provider) pass leading-slash VFS paths
+        // like "/local". The bridge normalises them to match the relative mount
+        // prefix, so this must list the backend root, not fall through to the
+        // empty neutral root.
+        let (_dir, _files, node) = node_with_files(&[("a.txt", b"a")]).await;
+        let entries = node
+            .list_dir(format!("/{NODE_MOUNT}"))
+            .await
+            .expect("leading-slash path lists");
+        assert!(
+            entries.iter().any(|e| e.name == "a.txt"),
+            "root file listed: {entries:?}"
+        );
     }
 
     #[tokio::test]
