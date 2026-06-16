@@ -16,6 +16,7 @@ pub mod service;
 pub mod share;
 pub mod status;
 pub mod token;
+pub mod tui;
 
 use std::path::PathBuf;
 
@@ -262,6 +263,9 @@ pub enum Commands {
 
     /// Show mount status, cache usage, backend health
     Status,
+
+    /// Open an interactive terminal UI (status + file browser + pin)
+    Tui,
 
     /// Pin a file or directory (always available offline)
     Pin {
@@ -989,6 +993,7 @@ impl Cli {
                 mount::start(ctx, None, false, None, false, mount::WebFlags::default()).await
             }
             Commands::Status => status::show(ctx),
+            Commands::Tui => tui::run(ctx).await,
             Commands::Pin { path } => cache::pin(ctx, &path).await,
             Commands::Unpin { path } => cache::unpin(ctx, &path).await,
             Commands::PinList => cache::pin_list(ctx).await,

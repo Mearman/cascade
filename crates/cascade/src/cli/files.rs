@@ -28,7 +28,7 @@ use super::mount::{load_main_config, rebuild_backends};
 /// Build a fresh native engine from the on-disk config, exactly as the daemon
 /// does at startup. The engine owns its own state database handle and VFS tree;
 /// no mount is performed and no presenter is registered.
-fn build_engine(ctx: &CliContext) -> Result<NativeEngine> {
+pub fn build_engine(ctx: &CliContext) -> Result<NativeEngine> {
     let main_config = load_main_config(&ctx.config_dir)?;
     let shared_http: Arc<dyn cascade_engine::portable::HttpClient> =
         Arc::new(cascade_engine::portable::native::ReqwestClient::new());
@@ -60,9 +60,10 @@ fn resolve_in_vfs(engine: &NativeEngine, path: &Path) -> (Arc<dyn Backend>, Path
 }
 
 /// `cascade ls <path>` — list the immediate children of a directory.
-pub async fn ls(ctx: &CliContext, path: &str) -> Result<()> {
-    let engine = build_engine(ctx)?;
-    let (backend, backend_path) = resolve_in_vfs(&engine, Path::new(path));
+/// List the entries at `path` through the engine's VFS, sorted by name. Used
+/// by `ls` and the TUI's file browser alike so both present the same view.
+pub async fn list_dir(engine: &NativeEngine, path: &str) -> Result<Vec<DirEntry>> {
+    let (backend, backend_path) = resolve_in_vfs(engine, Path::new(path));
     let backend_path_str = path_to_str(&backend_path);
     let native_id = resolve_listing_native_id(backend.as_ref(), &backend_path_str).await?;
     let children = backend.list_children(&native_id).await?;
@@ -74,6 +75,12 @@ pub async fn ls(ctx: &CliContext, path: &str) -> Result<()> {
         })
         .collect();
     entries.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(entries)
+}
+
+pub async fn ls(ctx: &CliContext, path: &str) -> Result<()> {
+    let engine = build_engine(ctx)?;
+    let entries = list_dir(&engine, path).await?;
     if entries.is_empty() {
         println!("(empty)");
     } else {
