@@ -385,7 +385,7 @@ dependencies = [
 
 [[package]]
 name = "cascade"
-version = "0.1.123"
+version = "0.1.124"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -424,7 +424,7 @@ dependencies = [
 
 [[package]]
 name = "cascade-announce-wire"
-version = "0.1.123"
+version = "0.1.124"
 dependencies = [
  "data-encoding",
  "ed25519-dalek",
@@ -438,7 +438,7 @@ dependencies = [
 
 [[package]]
 name = "cascade-backend-fsaccess"
-version = "0.1.123"
+version = "0.1.124"
 dependencies = [
  "js-sys",
  "serde",
@@ -451,7 +451,7 @@ dependencies = [
 
 [[package]]
 name = "cascade-backend-gdrive"
-version = "0.1.123"
+version = "0.1.124"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -473,7 +473,7 @@ dependencies = [
 
 [[package]]
 name = "cascade-backend-local"
-version = "0.1.123"
+version = "0.1.124"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -494,7 +494,7 @@ dependencies = [
 
 [[package]]
 name = "cascade-backend-p2p"
-version = "0.1.123"
+version = "0.1.124"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -517,7 +517,7 @@ dependencies = [
 
 [[package]]
 name = "cascade-backend-s3"
-version = "0.1.123"
+version = "0.1.124"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -537,7 +537,7 @@ dependencies = [
 
 [[package]]
 name = "cascade-config"
-version = "0.1.123"
+version = "0.1.124"
 dependencies = [
  "anyhow",
  "bytesize",
@@ -552,7 +552,7 @@ dependencies = [
 
 [[package]]
 name = "cascade-engine"
-version = "0.1.123"
+version = "0.1.124"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -581,7 +581,7 @@ dependencies = [
 
 [[package]]
 name = "cascade-exec"
-version = "0.1.123"
+version = "0.1.124"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -596,7 +596,7 @@ dependencies = [
 
 [[package]]
 name = "cascade-expr"
-version = "0.1.123"
+version = "0.1.124"
 dependencies = [
  "anyhow",
  "chrono",
@@ -609,7 +609,7 @@ dependencies = [
 
 [[package]]
 name = "cascade-ffi"
-version = "0.1.123"
+version = "0.1.124"
 dependencies = [
  "anyhow",
  "cascade-backend-local",
@@ -624,7 +624,7 @@ dependencies = [
 
 [[package]]
 name = "cascade-p2p"
-version = "0.1.123"
+version = "0.1.124"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -657,7 +657,7 @@ dependencies = [
 
 [[package]]
 name = "cascade-p2p-webrtc"
-version = "0.1.123"
+version = "0.1.124"
 dependencies = [
  "js-sys",
  "serde",
@@ -669,7 +669,7 @@ dependencies = [
 
 [[package]]
 name = "cascade-presenter-fileprovider"
-version = "0.1.123"
+version = "0.1.124"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -687,7 +687,7 @@ dependencies = [
 
 [[package]]
 name = "cascade-presenter-fskit"
-version = "0.1.123"
+version = "0.1.124"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -703,7 +703,7 @@ dependencies = [
 
 [[package]]
 name = "cascade-presenter-fuse"
-version = "0.1.123"
+version = "0.1.124"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -719,7 +719,7 @@ dependencies = [
 
 [[package]]
 name = "cascade-presenter-nfs"
-version = "0.1.123"
+version = "0.1.124"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -738,7 +738,7 @@ dependencies = [
 
 [[package]]
 name = "cascade-presenter-projfs"
-version = "0.1.123"
+version = "0.1.124"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -751,7 +751,7 @@ dependencies = [
 
 [[package]]
 name = "cascade-presenter-webdav"
-version = "0.1.123"
+version = "0.1.124"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -775,7 +775,7 @@ dependencies = [
 
 [[package]]
 name = "cascade-relay-server"
-version = "0.1.123"
+version = "0.1.124"
 dependencies = [
  "anyhow",
  "axum",
@@ -798,7 +798,7 @@ dependencies = [
 
 [[package]]
 name = "cascade-wasm"
-version = "0.1.123"
+version = "0.1.124"
 dependencies = [
  "anyhow",
  "cascade-config",
@@ -815,7 +815,7 @@ dependencies = [
 
 [[package]]
 name = "cascade-web-api"
-version = "0.1.123"
+version = "0.1.124"
 dependencies = [
  "async-trait",
  "axum",
