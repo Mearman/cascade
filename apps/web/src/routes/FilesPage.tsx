@@ -74,6 +74,13 @@ export function FilesPage() {
   const [loadingBackends, setLoadingBackends] = useState(true);
   const [loadingEntries, setLoadingEntries] = useState(false);
 
+  // Connected-mode write state
+  const [uploading, setUploading] = useState(false);
+  const [newFolderName, setNewFolderName] = useState<string | null>(null);
+  const [renaming, setRenaming] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState('');
+  const [busy, setBusy] = useState(false);
+
   // Connected-mode state
   const [backends, setBackends] = useState<BackendEntry[]>([]);
   const [selectedFolder, setSelectedFolder] = useState<string | null>(null);
@@ -250,6 +257,119 @@ export function FilesPage() {
     }
   }
 
+  // ── Write actions (Connected mode) ──────────────────────────────────────
+
+  function refreshEntries() {
+    if (selectedFolder === null) return;
+    setLoadingEntries(true);
+    api.folderChildren(selectedFolder, currentPath)
+      .then((r) => {
+        setEntries(r.entries);
+        setNextCursor(r.next_cursor);
+        setError(null);
+      })
+      .catch((err: unknown) => { setError(err instanceof Error ? err.message : String(err)); })
+      .finally(() => { setLoadingEntries(false); });
+  }
+
+  async function handleUploadFiles(files: FileList | File[]) {
+    if (selectedFolder === null) return;
+    const list = Array.from(files);
+    if (list.length === 0) return;
+    setUploading(true);
+    setBusy(true);
+    try {
+      for (const file of list) {
+        const targetPath = currentPath === '' ? file.name : `${currentPath}/${file.name}`;
+        await api.uploadFile(selectedFolder, targetPath, file);
+      }
+      refreshEntries();
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setUploading(false);
+      setBusy(false);
+    }
+  }
+
+  function handleFileInput(e: Event) {
+    const target = e.target;
+    if (!(target instanceof HTMLInputElement) || target.files === null) return;
+    void handleUploadFiles(target.files);
+    target.value = '';
+  }
+
+  function handleDrop(e: DragEvent) {
+    e.preventDefault();
+    if (e.dataTransfer?.files !== null && e.dataTransfer !== null) {
+      void handleUploadFiles(e.dataTransfer.files);
+    }
+  }
+
+  function handleDragOver(e: DragEvent) {
+    e.preventDefault();
+  }
+
+  async function handleCreateFolder() {
+    if (selectedFolder === null || newFolderName === null || newFolderName.trim() === '') return;
+    setBusy(true);
+    try {
+      const dirPath = currentPath === '' ? newFolderName.trim() : `${currentPath}/${newFolderName.trim()}`;
+      await api.createDir(selectedFolder, dirPath);
+      setNewFolderName(null);
+      refreshEntries();
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleDelete(entry: FileEntry) {
+    if (selectedFolder === null) return;
+    if (!window.confirm(`Delete ${entry.name}?`)) return;
+    setBusy(true);
+    try {
+      const entryPath = currentPath === '' ? entry.name : `${currentPath}/${entry.name}`;
+      await api.deleteFile(selectedFolder, entryPath);
+      refreshEntries();
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function startRename(entry: FileEntry) {
+    setRenaming(entry.name);
+    setRenameValue(entry.name);
+  }
+
+  async function handleRename(entry: FileEntry) {
+    if (selectedFolder === null || renaming === null) return;
+    const newName = renameValue.trim();
+    if (newName === '' || newName === entry.name) {
+      setRenaming(null);
+      return;
+    }
+    setBusy(true);
+    try {
+      const fromPath = currentPath === '' ? entry.name : `${currentPath}/${entry.name}`;
+      const toPath = currentPath === '' ? newName : `${currentPath}/${newName}`;
+      await api.moveEntry(selectedFolder, { from: fromPath, to: toPath });
+      setRenaming(null);
+      refreshEntries();
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   // ── Navigation (WASM mode) ──────────────────────────────────────────────
 
   function navigateWasm(child: WasmChild) {
@@ -404,8 +524,57 @@ export function FilesPage() {
         )
       ) : (
         <>
+          <div class="file-toolbar">
+            <label class="upload-btn">
+              <input
+                type="file"
+                multiple
+                onChange={(e) => { handleFileInput(e); }}
+                disabled={busy}
+                style={{ display: 'none' }}
+              />
+              <span>{uploading ? 'Uploading...' : 'Upload'}</span>
+            </label>
+            {newFolderName === null ? (
+              <button
+                class="secondary"
+                onClick={() => { setNewFolderName(''); }}
+                disabled={busy}
+              >
+                New folder
+              </button>
+            ) : (
+              <span class="inline-form">
+                <input
+                  type="text"
+                  value={newFolderName}
+                  placeholder="Folder name"
+                  onInput={(e) => {
+                    const t = e.target;
+                    if (t instanceof HTMLInputElement) setNewFolderName(t.value);
+                  }}
+                  autoFocus
+                />
+                <button
+                  onClick={() => { void handleCreateFolder(); }}
+                  disabled={busy || newFolderName.trim() === ''}
+                >
+                  Create
+                </button>
+                <button class="secondary" onClick={() => { setNewFolderName(null); }}>
+                  Cancel
+                </button>
+              </span>
+            )}
+          </div>
+
+          <div
+            class="file-drop-zone"
+            onDrop={(e) => { handleDrop(e); }}
+            onDragOver={(e) => { handleDragOver(e); }}
+          >
           {entries.length === 0 ? (
-            <p class="muted">Empty directory.</p>
+            <p class="muted">Empty directory. Drop files here or use Upload.</p>
           ) : (
             <>
               <table class="file-table">
@@ -414,23 +583,67 @@ export function FilesPage() {
                     <th>Name</th>
                     <th>Size</th>
                     <th>Modified</th>
+                    <th>Actions</th>
                   </tr>
                 </thead>
                 <tbody>
                   {entries.map((entry) => (
                     <tr key={entry.name}>
                       <td>
-                        <button
-                          class="name-btn"
-                          onClick={() => { navigate(entry); }}
-                          disabled={entry.kind !== 'directory'}
-                        >
-                          {entry.kind === 'directory' ? '📁 ' : '📄 '}
-                          {entry.name}
-                        </button>
+                        {renaming === entry.name ? (
+                          <span class="inline-form">
+                            <input
+                              type="text"
+                              value={renameValue}
+                              onInput={(e) => {
+                                const t = e.target;
+                                if (t instanceof HTMLInputElement) setRenameValue(t.value);
+                              }}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') void handleRename(entry);
+                                if (e.key === 'Escape') setRenaming(null);
+                              }}
+                              autoFocus
+                            />
+                            <button onClick={() => { void handleRename(entry); }} disabled={busy}>
+                              OK
+                            </button>
+                          </span>
+                        ) : (
+                          <button
+                            class="name-btn"
+                            onClick={() => { navigate(entry); }}
+                            disabled={entry.kind !== 'directory'}
+                          >
+                            {entry.kind === 'directory' ? '📁 ' : '📄 '}
+                            {entry.name}
+                          </button>
+                        )}
                       </td>
                       <td>{entry.size !== null ? formatBytes(entry.size) : '—'}</td>
                       <td>{entry.mtime !== null ? new Date(entry.mtime).toLocaleString() : '—'}</td>
+                      <td class="action-cell">
+                        {renaming === entry.name ? null : (
+                          <>
+                            <button
+                              class="action-btn"
+                              title="Rename"
+                              onClick={() => { startRename(entry); }}
+                              disabled={busy}
+                            >
+                              Rename
+                            </button>
+                            <button
+                              class="action-btn danger"
+                              title="Delete"
+                              onClick={() => { void handleDelete(entry); }}
+                              disabled={busy}
+                            >
+                              Delete
+                            </button>
+                          </>
+                        )}
+                      </td>
                     </tr>
                   ))}
                 </tbody>
@@ -442,6 +655,7 @@ export function FilesPage() {
               )}
             </>
           )}
+          </div>
         </>
       )}
     </div>
