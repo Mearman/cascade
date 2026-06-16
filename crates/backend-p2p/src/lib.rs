@@ -792,6 +792,60 @@ impl P2pBackend {
             .await
     }
 
+    /// Register a receiver for inbound exec-stream frames from `device_id`
+    /// for `session_id`. See [`SyncEngine::subscribe_exec_stream`].
+    pub async fn subscribe_exec_stream(
+        &self,
+        device_id: &str,
+        session_id: u64,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<cascade_p2p::exec_stream::ExecStreamFrame> {
+        self.sync.subscribe_exec_stream(device_id, session_id).await
+    }
+
+    /// Remove a previously-registered exec stream consumer.
+    pub async fn unsubscribe_exec_stream(&self, device_id: &str, session_id: u64) {
+        self.sync
+            .unsubscribe_exec_stream(device_id, session_id)
+            .await;
+    }
+
+    /// Send a `PtyWrite` command to write `bytes` to the stdin of `session_id`
+    /// on `device_id`.
+    pub async fn send_pty_write(
+        &self,
+        device_id: &str,
+        session_id: u64,
+        bytes: Vec<u8>,
+    ) -> Result<ManageResult> {
+        self.sync.send_pty_write(device_id, session_id, bytes).await
+    }
+
+    /// Send a `PtyResize` command to resize the PTY of `session_id` on
+    /// `device_id` to `cols` x `rows`.
+    pub async fn send_pty_resize(
+        &self,
+        device_id: &str,
+        session_id: u64,
+        cols: u16,
+        rows: u16,
+    ) -> Result<ManageResult> {
+        self.sync
+            .send_pty_resize(device_id, session_id, cols, rows)
+            .await
+    }
+
+    /// Send a `PtyKill` command to signal `session_id` on `device_id`.
+    pub async fn send_pty_signal(
+        &self,
+        device_id: &str,
+        session_id: u64,
+        signal: i32,
+    ) -> Result<ManageResult> {
+        self.sync
+            .send_pty_signal(device_id, session_id, signal)
+            .await
+    }
+
     /// Resolve a peer device id to a reachable socket address.
     ///
     /// A statically-configured peer wins — its address is known without a
