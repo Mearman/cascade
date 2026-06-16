@@ -84,9 +84,11 @@ impl WireStreamKind {
 /// A decoded inbound exec-stream frame delivered to the manager-side consumer.
 ///
 /// The session loop decodes the raw [`BepMessage::ExecStream`] wire frame into
-/// this typed value before handing it to the consumer registered via
-/// [`SyncEngine::subscribe_exec_stream`](crate::SyncEngine::subscribe_exec_stream),
-/// so the consumer never sees the wire sequence number or raw discriminant.
+/// this typed value before handing it to the consumer registered via the
+/// backend layer's `SyncEngine::subscribe_exec_stream` (in `cascade-backend-p2p`,
+/// which depends on this crate; the registration therefore lives there rather
+/// than here, where the data-plane type is defined), so the consumer never sees
+/// the wire sequence number or raw discriminant.
 #[derive(Debug, Clone)]
 pub struct ExecStreamFrame {
     /// The session the bytes belong to.
