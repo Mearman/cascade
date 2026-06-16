@@ -2367,11 +2367,19 @@ impl SyncEngine {
     /// `session_id` on `device_id`. The bytes travel as a management frame,
     /// not as an [`BepMessage::ExecStream`] frame — the data plane carries
     /// node-to-manager output only; stdin rides the control path.
+    ///
+    /// `token` is the same capability token presented to the spawning
+    /// `PtySpawn`: the node rebuilds the grant set from the on-node grants plus
+    /// the presented token on *every* management request, so a token-only
+    /// caller (no on-node grant) must re-present it here or the write is
+    /// rejected as unauthorised. The node ignores the advertised wire scope for
+    /// a session verb and authorises against the session's stored scope.
     pub async fn send_pty_write(
         &self,
         device_id: &str,
         session_id: u64,
         bytes: Vec<u8>,
+        token: Option<String>,
     ) -> Result<ManageResult> {
         self.send_manage_request(
             device_id,
@@ -2379,24 +2387,25 @@ impl SyncEngine {
                 session: session_id,
                 bytes,
             },
-            // The node re-resolves the session's real scope from its own state,
-            // so the advertised scope is a best-effort declaration the node
-            // cross-checks. Carry the node-wide scope here: a PtyWrite is
-            // authorised against the session's stored scope, not this value.
+            // The node authorises a session verb against the session's stored
+            // scope, not this advertised value; the wire scope is a placeholder
+            // the dispatcher does not gate session verbs on.
             ManageScope::Node,
-            None,
+            token,
         )
         .await
     }
 
     /// Send a `PtyResize` management command to resize the PTY of `session_id`
-    /// on `device_id` to `cols` x `rows`.
+    /// on `device_id` to `cols` x `rows`. See [`send_pty_write`] for the
+    /// `token` parameter.
     pub async fn send_pty_resize(
         &self,
         device_id: &str,
         session_id: u64,
         cols: u16,
         rows: u16,
+        token: Option<String>,
     ) -> Result<ManageResult> {
         self.send_manage_request(
             device_id,
@@ -2406,18 +2415,20 @@ impl SyncEngine {
                 rows,
             },
             ManageScope::Node,
-            None,
+            token,
         )
         .await
     }
 
     /// Send a `PtyKill` management command to signal `session_id` on
-    /// `device_id` with `signal`.
+    /// `device_id` with `signal`. See [`send_pty_write`] for the `token`
+    /// parameter.
     pub async fn send_pty_signal(
         &self,
         device_id: &str,
         session_id: u64,
         signal: i32,
+        token: Option<String>,
     ) -> Result<ManageResult> {
         self.send_manage_request(
             device_id,
@@ -2426,7 +2437,7 @@ impl SyncEngine {
                 signal,
             },
             ManageScope::Node,
-            None,
+            token,
         )
         .await
     }

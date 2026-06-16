@@ -810,14 +810,18 @@ impl P2pBackend {
     }
 
     /// Send a `PtyWrite` command to write `bytes` to the stdin of `session_id`
-    /// on `device_id`.
+    /// on `device_id`. `token` is re-presented so a token-only caller is
+    /// authorised; see [`SyncEngine::send_pty_write`].
     pub async fn send_pty_write(
         &self,
         device_id: &str,
         session_id: u64,
         bytes: Vec<u8>,
+        token: Option<String>,
     ) -> Result<ManageResult> {
-        self.sync.send_pty_write(device_id, session_id, bytes).await
+        self.sync
+            .send_pty_write(device_id, session_id, bytes, token)
+            .await
     }
 
     /// Send a `PtyResize` command to resize the PTY of `session_id` on
@@ -828,9 +832,10 @@ impl P2pBackend {
         session_id: u64,
         cols: u16,
         rows: u16,
+        token: Option<String>,
     ) -> Result<ManageResult> {
         self.sync
-            .send_pty_resize(device_id, session_id, cols, rows)
+            .send_pty_resize(device_id, session_id, cols, rows, token)
             .await
     }
 
@@ -840,9 +845,10 @@ impl P2pBackend {
         device_id: &str,
         session_id: u64,
         signal: i32,
+        token: Option<String>,
     ) -> Result<ManageResult> {
         self.sync
-            .send_pty_signal(device_id, session_id, signal)
+            .send_pty_signal(device_id, session_id, signal, token)
             .await
     }
 

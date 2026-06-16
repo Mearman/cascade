@@ -147,7 +147,9 @@ pub enum RemoteCommand {
     },
     /// Run a one-shot command on the remote node under a PTY. The command's
     /// stdout and stderr are streamed back and written to the terminal; the
-    /// CLI exits with the process's exit code.
+    /// CLI exits once the node closes the output stream. The exec data plane
+    /// does not yet carry the process exit code, so it is not reflected in the
+    /// CLI's own exit status.
     ///
     /// Requires the dangerous `exec:pty` capability over the session's
     /// working directory, granted explicitly for a folder scope.
@@ -535,9 +537,17 @@ async fn run_exec(
     let backend = std::sync::Arc::new(open_p2p_backend(ctx)?);
     let is_shell = matches!(command, RemoteCommand::Shell { .. });
 
-    // Send the PtySpawn, learn the session id.
+    // Send the PtySpawn, learn the session id. Clone the token here so the
+    // same credential can be re-presented to the session verbs (PtyWrite on
+    // stdin, the cleanup PtyKill) — a token-only caller has no on-node grant,
+    // so every follow-up request must carry it.
     let spawn_result = backend
-        .manage_remote(device_id, command.to_wire(), command.wire_scope(), token)
+        .manage_remote(
+            device_id,
+            command.to_wire(),
+            command.wire_scope(),
+            token.clone(),
+        )
         .await
         .with_context(|| format!("spawning exec session on {device_id}"))?;
     let session_id = match spawn_result {
@@ -557,13 +567,23 @@ async fn run_exec(
 
     // Drive the session: multiplex output draining with stdin forwarding
     // (shell mode only) using tokio::select.
-    let pump_result =
-        pump_exec_session(&backend, device_id, session_id, &mut stream, is_shell).await;
+    let pump_result = pump_exec_session(
+        &backend,
+        device_id,
+        session_id,
+        &mut stream,
+        is_shell,
+        token.clone(),
+    )
+    .await;
 
     // Cleanup: unsubscribe the consumer and best-effort SIGTERM so a cancelled
-    // shell does not leave the PTY running on the node.
+    // shell does not leave the PTY running on the node. The token is re-presented
+    // so a token-authenticated caller's cleanup signal is authorised too.
     backend.unsubscribe_exec_stream(device_id, session_id).await;
-    let _ = backend.send_pty_signal(device_id, session_id, 15).await;
+    let _ = backend
+        .send_pty_signal(device_id, session_id, 15, token)
+        .await;
 
     pump_result
 }
@@ -571,18 +591,26 @@ async fn run_exec(
 /// Pump the exec session: forward output to the terminal and (for shell mode)
 /// forward local stdin to the remote PTY. Returns when the output stream
 /// closes (the session ended) or stdin reaches EOF.
+///
+/// `token` is re-presented with every `PtyWrite` so a caller authenticated
+/// only by a capability token (no on-node grant) can drive an interactive
+/// session.
 async fn pump_exec_session(
     backend: &std::sync::Arc<cascade_backend_p2p::P2pBackend>,
     device_id: &str,
     session_id: u64,
     stream: &mut tokio::sync::mpsc::UnboundedReceiver<cascade_p2p::exec_stream::ExecStreamFrame>,
     is_shell: bool,
+    token: Option<String>,
 ) -> Result<()> {
     use std::io::Write as _;
     use tokio::io::AsyncBufReadExt as _;
 
     if !is_shell {
-        // One-shot exec: drain output to the terminal.
+        // One-shot exec: drain output to the terminal. The remote process's
+        // exit code is not carried on the exec data plane today (there is no
+        // exit frame), so the CLI cannot forward it; the session is considered
+        // done when the node closes the output stream.
         let stdout = std::io::stdout();
         while let Some(frame) = stream.recv().await {
             let mut handle = stdout.lock();
@@ -617,7 +645,7 @@ async fn pump_exec_session(
                     let mut bytes = line.into_bytes();
                     bytes.push(b'\n');
                     backend
-                        .send_pty_write(device_id, session_id, bytes)
+                        .send_pty_write(device_id, session_id, bytes, token.clone())
                         .await
                         .context("forwarding stdin to remote PTY")?;
                 }

@@ -748,8 +748,27 @@ where
     // payload-derived target stops a caller pinning `/personal` under a `/work`
     // grant by lying in the wire `scope` field, and keeping the wire-scope check
     // preserves the contract that the advertised scope is also honoured.
+    //
+    // Session-id-only exec verbs are the exception: they carry no payload path,
+    // so their only meaningful target is the scope the session was spawned under
+    // (resolved above from node state). The wire `scope` a manager sends for a
+    // PtyWrite/Resize/Kill is a placeholder — the manager cannot know the
+    // session's real folder — so requiring it to be covered would be
+    // unsatisfiable for a dangerous capability (`exec:pty` is never granted
+    // node-wide, and a session verb advertised as `Scope::Node` could therefore
+    // never authorise). The session scope is the authoritative confinement, set
+    // at spawn when the caller was authorised over it, so authorising over it
+    // alone is both necessary and sufficient.
+    let session_verb = matches!(
+        &command,
+        ManageCommand::PtyWrite { .. }
+            | ManageCommand::PtyResize { .. }
+            | ManageCommand::PtyKill { .. }
+            | ManageCommand::ProcSignal { .. }
+            | ManageCommand::ProcKill { .. }
+    );
     let capability_authorised = authorises(&grants, caller, capability, &target_scope, now)
-        && authorises(&grants, caller, capability, &scope, now);
+        && (session_verb || authorises(&grants, caller, capability, &scope, now));
 
     // GrantAdd carries a second, stricter gate: the grant being delegated must
     // be a subset of what the caller itself holds. Holding `grant:admin` is not

@@ -2,8 +2,12 @@
 //! bidirectional websocket.
 //!
 //! The route is `GET /v1/exec/ws` (the websocket upgrade). It requires the
-//! `exec:pty` capability over a node-wide scope — the terminal is not
-//! folder-scoped, so the caller must hold the explicit grant.
+//! dangerous `exec:pty` capability over the folder the terminal opens in (the
+//! `folder` query parameter, which becomes the PTY's working directory). A
+//! dangerous capability is never satisfied by a node-wide grant, and a
+//! root-folder scope counts as node-wide, so `folder` must name a real
+//! subdirectory the caller's grant covers — a terminal cannot be opened
+//! node-wide.
 //!
 //! The wire protocol is JSON text frames: the client sends
 //! `{"type":"spawn","shell":null,"cols":80,"rows":24}` to start a session,
@@ -39,6 +43,11 @@ pub fn routes() -> Router<AppState> {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ExecWsQuery {
+    /// The folder the terminal opens in — the PTY's working directory and the
+    /// scope the `exec:pty` capability is authorised over. Must be a real
+    /// subdirectory (not the root), because a dangerous capability is never
+    /// satisfied node-wide. Required.
+    pub folder: Option<String>,
     /// Optional shell override. When omitted the provider picks a default.
     pub shell: Option<String>,
     /// Initial terminal width in columns.
@@ -100,11 +109,12 @@ fn to_text(msg: &ServerMessage) -> Message {
     )
 }
 
-/// `GET /v1/exec/ws` — websocket upgrade. Capability: `exec:pty`.
+/// `GET /v1/exec/ws` — websocket upgrade. Capability: `exec:pty` over the
+/// `folder` query parameter.
 ///
-/// The exec:pty capability is dangerous — it grants remote code execution. It
-/// is never satisfied by a node-wide wildcard scope; the caller must hold an
-/// explicit grant.
+/// The exec:pty capability is dangerous — it grants code execution. It is
+/// never satisfied by a node-wide (or root-folder) grant, so the caller must
+/// hold an explicit grant over the named subdirectory the terminal opens in.
 ///
 /// Because the browser's `WebSocket` API cannot send custom headers, the
 /// capability token and bearer-device id are passed as query parameters
@@ -118,7 +128,12 @@ pub async fn exec_ws_handler(
 ) -> Result<Response, ApiError> {
     let claims = verify_ws_token(&state, &query)?;
 
-    // Re-run the management-plane authorisation for exec:pty over the node
+    // The terminal opens in `folder`: the PTY's working directory and the scope
+    // the dangerous `exec:pty` capability is authorised over. A root folder
+    // counts as node-wide and so can never satisfy a dangerous capability.
+    let (folder, scope) = resolve_exec_folder_scope(&query)?;
+
+    // Re-run the management-plane authorisation for exec:pty over the folder
     // scope, the same check `Session::require` makes.
     let now = Utc::now();
     let mut grants = state
@@ -131,7 +146,7 @@ pub async fn exec_ws_handler(
         &grants,
         &claims.bearer,
         Capability::ExecPty,
-        &Scope::Node,
+        &scope,
         now,
     ) {
         let holds_capability = grants.iter().any(|g| {
@@ -139,12 +154,12 @@ pub async fn exec_ws_handler(
         });
         if holds_capability {
             return Err(ApiError::forbidden(format!(
-                "caller holds {} but not over the node scope",
+                "caller holds {} but not over folder {folder}",
                 Capability::ExecPty.as_wire()
             )));
         }
         return Err(ApiError::unauthorised(format!(
-            "caller's verified claims do not satisfy the required capability {}",
+            "caller's verified claims do not satisfy {} over folder {folder}",
             Capability::ExecPty.as_wire()
         )));
     }
@@ -155,7 +170,31 @@ pub async fn exec_ws_handler(
         .ok_or_else(|| ApiError::unavailable("no exec provider configured on this node"))?
         .clone();
 
-    Ok(ws.on_upgrade(move |socket| run_terminal(socket, exec)))
+    Ok(ws.on_upgrade(move |socket| run_terminal(socket, exec, folder)))
+}
+
+/// Resolve the folder a terminal opens in and the [`Scope`] to authorise
+/// `exec:pty` over, extracted from the handler so the gate (folder required,
+/// non-root) is testable without a live websocket upgrade.
+///
+/// Returns the folder string (to seed the PTY's working directory) and the
+/// matching folder scope. A missing or blank folder is an authentication
+/// failure; a root folder is forbidden because it normalises to node-wide and
+/// a dangerous capability is never satisfied node-wide.
+fn resolve_exec_folder_scope(query: &ExecWsQuery) -> Result<(String, Scope), ApiError> {
+    let folder = query
+        .folder
+        .as_ref()
+        .filter(|f| !f.trim().is_empty())
+        .ok_or_else(|| ApiError::unauthorised("folder query parameter is required"))?;
+    let scope = Scope::folder(folder.clone());
+    if scope.is_node_wide() {
+        return Err(ApiError::forbidden(format!(
+            "{} requires a specific folder scope; a terminal cannot be opened node-wide",
+            Capability::ExecPty.as_wire()
+        )));
+    }
+    Ok((folder.clone(), scope))
 }
 
 /// Verify the capability token presented as a query parameter, mirroring the
@@ -199,9 +238,13 @@ fn verify_ws_token(state: &AppState, query: &ExecWsQuery) -> Result<TokenClaims,
         .cloned()
 }
 
-/// Drive the websocket: spawn the PTY, forward client keystrokes as pty writes,
-/// and forward PTY output to the client.
-async fn run_terminal(mut socket: WebSocket, exec: Arc<dyn cascade_exec::ExecProvider>) {
+/// Drive the websocket: spawn the PTY in `cwd`, forward client keystrokes as
+/// pty writes, and forward PTY output to the client.
+async fn run_terminal(
+    mut socket: WebSocket,
+    exec: Arc<dyn cascade_exec::ExecProvider>,
+    cwd: String,
+) {
     // Wait for the initial Spawn message before creating the PTY.
     let spawn_msg = match socket.recv().await {
         Some(Ok(Message::Text(text))) => serde_json::from_str::<ClientMessage>(&text).ok(),
@@ -220,7 +263,7 @@ async fn run_terminal(mut socket: WebSocket, exec: Arc<dyn cascade_exec::ExecPro
     let spec = cascade_exec::PtySpec {
         shell,
         argv: Vec::new(),
-        cwd: None,
+        cwd: Some(cwd),
         env: Vec::new(),
         cols,
         rows,
@@ -245,8 +288,11 @@ async fn run_terminal(mut socket: WebSocket, exec: Arc<dyn cascade_exec::ExecPro
         }))
         .await;
 
-    // Subscribe to output events from the PTY.
+    // Subscribe to output events from the PTY. If subscription fails the session
+    // was already spawned, so kill it before bailing — otherwise the orphaned
+    // PTY would keep running on the node with no consumer.
     let Some(mut event_rx) = exec.subscribe(session_id) else {
+        let _ = exec.pty_kill(session_id, 15).await;
         let _ = socket
             .send(to_text(&ServerMessage::Error {
                 message: "could not subscribe to PTY output".to_owned(),
@@ -319,4 +365,59 @@ async fn run_terminal(mut socket: WebSocket, exec: Arc<dyn cascade_exec::ExecPro
 
     // Clean up: ensure the session is killed if the client disconnects.
     let _ = exec.pty_kill(session_id, 15).await;
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn query(folder: Option<&str>) -> ExecWsQuery {
+        ExecWsQuery {
+            folder: folder.map(str::to_owned),
+            shell: None,
+            cols: None,
+            rows: None,
+            token: None,
+            bearer: None,
+        }
+    }
+
+    #[test]
+    fn missing_folder_is_unauthorised() {
+        let err = resolve_exec_folder_scope(&query(None)).expect_err("missing folder must reject");
+        assert_eq!(err.code, ErrorCode::Unauthorised);
+    }
+
+    #[test]
+    fn blank_folder_is_unauthorised() {
+        let err =
+            resolve_exec_folder_scope(&query(Some("   "))).expect_err("blank folder must reject");
+        assert_eq!(err.code, ErrorCode::Unauthorised);
+    }
+
+    #[test]
+    fn root_folder_is_forbidden_as_node_wide() {
+        // A dangerous capability is never satisfied node-wide, and the root
+        // folder normalises to node-wide, so the gate must forbid it rather
+        // than advertise a scope no grant could ever cover. (A blank/empty
+        // folder is caught earlier as a missing-folder auth failure.)
+        for root in ["/", "//", "/."] {
+            let err = resolve_exec_folder_scope(&query(Some(root)))
+                .expect_err("a root folder must be forbidden");
+            assert_eq!(
+                err.code,
+                ErrorCode::Forbidden,
+                "root {root:?} should be node-wide-forbidden"
+            );
+        }
+    }
+
+    #[test]
+    fn real_folder_resolves_to_a_non_node_wide_scope() {
+        let (folder, scope) = resolve_exec_folder_scope(&query(Some("work")))
+            .expect("a real subdirectory is a valid terminal folder");
+        assert_eq!(folder, "work");
+        assert!(!scope.is_node_wide());
+    }
 }
