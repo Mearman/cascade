@@ -23,7 +23,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring"]
 rustls-pemfile = "2"
 if-addrs = { workspace = true }
 reqwest = { workspace = true, optional = true }
-mainline = { version = "6.2.0", default-features = false, features = ["async", "node"], optional = true }
+mainline = { version = "7.0.0", default-features = false, features = ["async", "node"], optional = true }
 ed25519-dalek = { workspace = true }
 cascade-announce-wire = { version = "0.1.56", path = "../cascade-announce-wire" }
 ring = "0.17"
