@@ -5,7 +5,6 @@ import android.database.MatrixCursor
 import android.graphics.Point
 import android.os.CancellationSignal
 import android.os.ParcelFileDescriptor
-import android.provider.DocumentsContract.Document
 import android.provider.DocumentsContract.Root
 import android.provider.DocumentsProvider
 import kotlinx.coroutines.runBlocking
@@ -34,14 +33,6 @@ class CascadeDocumentsProvider : DocumentsProvider() {
             Root.COLUMN_FLAGS,
             Root.COLUMN_ICON,
         )
-
-        val DEFAULT_DOCUMENT_PROJECTION = arrayOf(
-            Document.COLUMN_DOCUMENT_ID,
-            Document.COLUMN_DISPLAY_NAME,
-            Document.COLUMN_MIME_TYPE,
-            Document.COLUMN_FLAGS,
-            Document.COLUMN_SIZE,
-        )
     }
 
     override fun onCreate(): Boolean = true
@@ -59,10 +50,8 @@ class CascadeDocumentsProvider : DocumentsProvider() {
     }
 
     override fun queryDocument(documentId: String, projection: Array<out String>?): Cursor {
-        val result = MatrixCursor(projection ?: DEFAULT_DOCUMENT_PROJECTION)
         if (documentId == ROOT_DOC_ID) {
-            addDirRow(result, ROOT_DOC_ID, "Cascade")
-            return result
+            return CursorBuilder.rootDocumentCursor(ROOT_DOC_ID, "Cascade", projection)
         }
         // To describe a leaf, list its parent and find the matching entry. This
         // keeps the provider honest: every document it reports came from the
@@ -77,8 +66,7 @@ class CascadeDocumentsProvider : DocumentsProvider() {
                 throw FileNotFoundException("listDir($parent) failed: ${e.message}")
             }
         } ?: throw FileNotFoundException("no such document: $documentId")
-        addEntryRow(result, documentId, entry)
-        return result
+        return CursorBuilder.documentCursor(documentId, entry, projection)
     }
 
     override fun queryChildDocuments(
@@ -86,7 +74,6 @@ class CascadeDocumentsProvider : DocumentsProvider() {
         projection: Array<out String>?,
         sortOrder: String?,
     ): Cursor {
-        val result = MatrixCursor(projection ?: DEFAULT_DOCUMENT_PROJECTION)
         val node = CascadeNodeHolder.blockingGet(requireContext())
         val entries: List<DirEntry> = runBlocking {
             try {
@@ -95,10 +82,7 @@ class CascadeDocumentsProvider : DocumentsProvider() {
                 throw FileNotFoundException("listDir($parentDocumentId) failed: ${e.message}")
             }
         }
-        for (entry in entries) {
-            addEntryRow(result, childDocId(parentDocumentId, entry.name), entry)
-        }
-        return result
+        return CursorBuilder.childrenCursor(parentDocumentId, entries, projection)
     }
 
     override fun openDocument(
@@ -134,42 +118,9 @@ class CascadeDocumentsProvider : DocumentsProvider() {
         return readSide
     }
 
-    private fun addDirRow(cursor: MatrixCursor, docId: String, displayName: String) {
-        cursor.newRow().apply {
-            add(Document.COLUMN_DOCUMENT_ID, docId)
-            add(Document.COLUMN_DISPLAY_NAME, displayName)
-            add(Document.COLUMN_MIME_TYPE, Document.MIME_TYPE_DIR)
-            add(Document.COLUMN_FLAGS, 0)
-            add(Document.COLUMN_SIZE, null)
-        }
-    }
-
-    private fun addEntryRow(cursor: MatrixCursor, docId: String, entry: DirEntry) {
-        if (entry.isDir) {
-            addDirRow(cursor, docId, entry.name)
-        } else {
-            cursor.newRow().apply {
-                add(Document.COLUMN_DOCUMENT_ID, docId)
-                add(Document.COLUMN_DISPLAY_NAME, entry.name)
-                add(Document.COLUMN_MIME_TYPE, mimeOf(entry.name))
-                add(Document.COLUMN_FLAGS, 0)
-                add(Document.COLUMN_SIZE, null)
-            }
-        }
-    }
-
-    private fun childDocId(parent: String, name: String): String =
-        DocIdLogic.childDocId(parent, name)
-
     private fun parentOf(documentId: String): String = DocIdLogic.parentOf(documentId)
 
     private fun nameOf(documentId: String): String = DocIdLogic.nameOf(documentId)
-
-    private fun mimeOf(name: String): String {
-        val ext = name.substringAfterLast('.', "").lowercase()
-        val map = android.webkit.MimeTypeMap.getSingleton()
-        return map.getMimeTypeFromExtension(ext) ?: "application/octet-stream"
-    }
 
     override fun openDocumentThumbnail(
         documentId: String,

@@ -27,6 +27,13 @@ schemes:
     test:
       targets:
         - FileProviderLogicTests
+  CascadeIntegrationTests:
+    build:
+      targets:
+        CascadeIntegrationTests: all
+    test:
+      targets:
+        - CascadeIntegrationTests
 
 targets:
   CascadeHostApp:
@@ -90,3 +97,28 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: co.uk.mearman.cascade.ios.tests
         GENERATE_INFOPLIST_FILE: YES
+
+  # Integration tests that drive the REAL CascadeNode through the UniFFI
+  # bindings on the simulator — exercising FFI -> engine -> local backend end
+  # to end on the iOS target. Hosted by the app (the async FFI needs a run
+  # loop), with the same static-lib linkage the extension uses.
+  CascadeIntegrationTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests/CascadeIntegrationTests.swift
+      - path: Extension/Sources/cascade_ffi.swift
+      - path: Extension/FFI
+        buildPhase: none
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: co.uk.mearman.cascade.ios.itests
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_INCLUDE_PATHS: "$(SRCROOT)/Extension/FFI"
+        "OTHER_LDFLAGS[sdk=iphonesimulator*]":
+          - "-force_load"
+          - "$(PROJECT_DIR)/../../target/aarch64-apple-ios-sim/release/libcascade_ffi.a"
+          - "-framework"
+          - "CoreFoundation"
+    dependencies:
+      - target: CascadeHostApp
