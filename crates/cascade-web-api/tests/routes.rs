@@ -1349,7 +1349,7 @@ async fn put_file_requires_data_plane_ready() {
 // The websocket upgrade (`WebSocketUpgrade` extractor) requires a live HTTP
 // connection with the `OnUpgrade` hyper extension, which `oneshot` testing
 // does not provide. A request through `oneshot` hits the 426
-// `ConnectionNotUpgradable` rejection before the handler body (where token
+// `ConnectionNotUpgradable` rejection before the handler body (where ticket
 // verification runs) is reached. These tests therefore verify the route is
 // registered (not 404) and that the websocket upgrade path is active.
 
@@ -1387,5 +1387,150 @@ async fn exec_ws_with_upgrade_headers_returns_not_404() {
         .body(Body::empty())
         .unwrap();
     let (status, _, _body) = h.send(req).await;
+    assert_ne!(status, StatusCode::NOT_FOUND, "route should be registered");
+}
+
+// ── Exec ticket route tests ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn exec_ticket_without_auth_returns_401() {
+    let h = Harness::new();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/exec/ticket")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"folder":"work"}"#))
+        .unwrap();
+    let (status, _, body) = h.send(req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {body}");
+    assert_error_code(&body, "unauthorised");
+}
+
+#[tokio::test]
+async fn exec_ticket_without_folder_returns_422() {
+    let h = Harness::new();
+    let node = h.node_id();
+    let token = h.issue("exec", &node, Capability::ExecPty, Scope::folder("work"));
+    let req = authed_post("/v1/exec/ticket", &token, &node, &serde_json::json!({}));
+    let (status, _, body) = h.send(req).await;
+    // Missing folder field: axum's Json extractor returns 422 for a missing
+    // required field before the handler runs.
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+}
+
+#[tokio::test]
+async fn exec_ticket_without_exec_capability_returns_401() {
+    let h = Harness::new();
+    let node = h.node_id();
+    // A token with only status:read cannot satisfy exec:pty.
+    let token = h.issue("sr", &node, Capability::StatusRead, Scope::Node);
+    let req = authed_post(
+        "/v1/exec/ticket",
+        &token,
+        &node,
+        &serde_json::json!({"folder": "work"}),
+    );
+    let (status, _, body) = h.send(req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "body: {body}");
+    assert_error_code(&body, "unauthorised");
+}
+
+#[tokio::test]
+async fn exec_ticket_with_node_wide_exec_returns_403() {
+    // A dangerous capability is never satisfied node-wide, even if the bearer
+    // holds a node-wide exec:pty grant. The folder must be a real subdirectory.
+    let h = Harness::new();
+    let node = h.node_id();
+    let token = h.issue("exec-node", &node, Capability::ExecPty, Scope::Node);
+    let req = authed_post(
+        "/v1/exec/ticket",
+        &token,
+        &node,
+        &serde_json::json!({"folder": "/"}),
+    );
+    let (status, _, body) = h.send(req).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+    assert_error_code(&body, "forbidden");
+}
+
+#[tokio::test]
+async fn exec_ticket_with_right_capability_and_folder_succeeds() {
+    let h = Harness::new();
+    let node = h.node_id();
+    let token = h.issue("exec", &node, Capability::ExecPty, Scope::folder("work"));
+    let req = authed_post(
+        "/v1/exec/ticket",
+        &token,
+        &node,
+        &serde_json::json!({"folder": "work"}),
+    );
+    let (status, _, body) = h.send(req).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(
+        body.get("ticket").and_then(Value::as_str).is_some(),
+        "expected ticket in body: {body}"
+    );
+    assert!(
+        body.get("expires_at").and_then(Value::as_str).is_some(),
+        "expected expires_at in body: {body}"
+    );
+}
+
+#[tokio::test]
+async fn exec_ticket_wrong_folder_scope_returns_403() {
+    // The bearer holds exec:pty over "work" but asks for a ticket for "other".
+    let h = Harness::new();
+    let node = h.node_id();
+    let token = h.issue("exec", &node, Capability::ExecPty, Scope::folder("work"));
+    let req = authed_post(
+        "/v1/exec/ticket",
+        &token,
+        &node,
+        &serde_json::json!({"folder": "other"}),
+    );
+    let (status, _, body) = h.send(req).await;
+    // Holds the capability but not over "other" -> forbidden.
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+    assert_error_code(&body, "forbidden");
+}
+
+#[tokio::test]
+async fn exec_ticket_is_stored_and_single_use() {
+    // Issue a ticket via the HTTP route, then redeem it twice through the
+    // store on AppState. The first redeem succeeds; the second fails because
+    // the ticket is single-use.
+    let h = Harness::new();
+    let node = h.node_id();
+    let token = h.issue("exec", &node, Capability::ExecPty, Scope::folder("work"));
+    let req = authed_post(
+        "/v1/exec/ticket",
+        &token,
+        &node,
+        &serde_json::json!({"folder": "work"}),
+    );
+    let (status, _, body) = h.send(req).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    let ticket = body
+        .get("ticket")
+        .and_then(Value::as_str)
+        .expect("ticket in body")
+        .to_owned();
+
+    let first = h.state.exec_tickets.redeem(&ticket);
+    assert!(first.is_ok(), "first redeem should succeed");
+    let second = h.state.exec_tickets.redeem(&ticket);
+    assert!(second.is_err(), "second redeem should fail (single-use)");
+}
+
+#[tokio::test]
+async fn exec_ticket_route_is_registered() {
+    let h = Harness::new();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/exec/ticket")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _, _body) = h.send(req).await;
+    // Not 404: the route is wired. (401 or 422 is fine.)
     assert_ne!(status, StatusCode::NOT_FOUND, "route should be registered");
 }
