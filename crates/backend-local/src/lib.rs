@@ -638,7 +638,15 @@ impl Backend for LocalBackend {
             .modified()?
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
-        let hash = manifest::hash_file(&dst_abs).await?;
+        let is_dir = metadata.is_dir();
+        // Only files have a content hash; hashing a directory fails with EISDIR
+        // (you cannot read a directory as a file), matching `metadata`/`create_dir`
+        // which never hash directories.
+        let hash = if is_dir {
+            String::new()
+        } else {
+            manifest::hash_file(&dst_abs).await?
+        };
 
         let new_state = FileState {
             path: dst_relative.clone(),
@@ -653,7 +661,7 @@ impl Backend for LocalBackend {
 
         tracing::debug!(src = %src_relative, dst = %dst_relative, "moved");
 
-        Ok(self.state_to_entry(&new_state, metadata.is_dir()))
+        Ok(self.state_to_entry(&new_state, is_dir))
     }
 
     async fn poll_interval(&self) -> Option<Duration> {
@@ -757,6 +765,26 @@ mod tests {
             .create_dir(Path::new("/a/../b"))
             .await
             .expect("/a/../b normalises to /b");
+    }
+
+    #[tokio::test]
+    async fn move_entry_renames_a_directory() {
+        // Renaming a directory must not fail: move_entry used to hash the
+        // destination unconditionally, and hashing a directory fails with
+        // EISDIR (you cannot read a directory as a file).
+        let dir = tempfile::tempdir().unwrap();
+        let config = make_config(dir.path().to_str().unwrap(), &[]);
+        let backend = create_backend(&config).unwrap();
+        backend
+            .create_dir(Path::new("/folder"))
+            .await
+            .expect("create /folder");
+        backend
+            .move_entry(Path::new("/folder"), Path::new("/renamed"))
+            .await
+            .expect("rename a directory");
+        assert!(dir.path().join("renamed").is_dir(), "renamed dir exists");
+        assert!(!dir.path().join("folder").exists(), "old dir is gone");
     }
 
     #[tokio::test]

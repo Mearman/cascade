@@ -59,11 +59,7 @@ internal object CursorBuilder {
                 add(Document.COLUMN_DOCUMENT_ID, docId)
                 add(Document.COLUMN_DISPLAY_NAME, entry.name)
                 add(Document.COLUMN_MIME_TYPE, mimeOf(entry.name))
-                // FLAG_SUPPORTS_WRITE is honoured via openDocument's write-back
-                // path, which uploads on close. Create/delete/rename need a
-                // custom SAF call surface the provider does not yet expose, so
-                // those flags are omitted to avoid advertising unsupported verbs.
-                add(Document.COLUMN_FLAGS, Document.FLAG_SUPPORTS_WRITE)
+                add(Document.COLUMN_FLAGS, flagsForFile())
                 add(Document.COLUMN_SIZE, null)
             }
         }
@@ -74,10 +70,32 @@ internal object CursorBuilder {
             add(Document.COLUMN_DOCUMENT_ID, docId)
             add(Document.COLUMN_DISPLAY_NAME, displayName)
             add(Document.COLUMN_MIME_TYPE, Document.MIME_TYPE_DIR)
-            add(Document.COLUMN_FLAGS, 0)
+            add(Document.COLUMN_FLAGS, flagsForDir())
             add(Document.COLUMN_SIZE, null)
         }
     }
+
+    /**
+     * Flags advertised on a file row. `FLAG_SUPPORTS_WRITE` is honoured via
+     * [CascadeDocumentsProvider.openDocument]'s write-back path (upload on
+     * close). `FLAG_SUPPORTS_DELETE` and `FLAG_SUPPORTS_RENAME` are honoured by
+     * the provider's `deleteDocument`/`renameDocument` overrides.
+     */
+    fun flagsForFile(): Int =
+        Document.FLAG_SUPPORTS_WRITE or
+            Document.FLAG_SUPPORTS_DELETE or
+            Document.FLAG_SUPPORTS_RENAME
+
+    /**
+     * Flags advertised on a directory row. `FLAG_DIR_SUPPORTS_CREATE` lets the
+     * Files app offer "new folder"/"new file", honoured by the provider's
+     * `createDocument` override (folders via `create_dir`, files via an empty
+     * upload). Directories are also deletable and renamable.
+     */
+    fun flagsForDir(): Int =
+        Document.FLAG_DIR_SUPPORTS_CREATE or
+            Document.FLAG_SUPPORTS_DELETE or
+            Document.FLAG_SUPPORTS_RENAME
 
     /** Infer a MIME type from a filename's extension, falling back to a stream. */
     fun mimeOf(name: String): String {

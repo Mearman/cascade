@@ -42,6 +42,7 @@ pub mod router;
 pub mod routes;
 pub mod schemas;
 pub mod state;
+pub mod ticket;
 
 pub use error::{ApiError, ErrorCode};
 pub use router::{RouterHandle, build_router, serve};
