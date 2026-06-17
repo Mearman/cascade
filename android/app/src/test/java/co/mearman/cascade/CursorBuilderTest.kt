@@ -2,6 +2,7 @@ package co.mearman.cascade
 
 import android.provider.DocumentsContract.Document
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -74,6 +75,67 @@ class CursorBuilderTest {
         val cursor = CursorBuilder.rootDocumentCursor("/", "Cascade", null)
         assertEquals(1, cursor.count)
         assertEquals(Document.MIME_TYPE_DIR, stringAt(cursor, 0, Document.COLUMN_MIME_TYPE))
+    }
+
+    @Test
+    fun childrenCursor_dir_row_advertises_create_delete_rename_flags() {
+        // Directory rows advertise FLAG_DIR_SUPPORTS_CREATE (so the Files app
+        // offers new folder/file), plus FLAG_SUPPORTS_DELETE and
+        // FLAG_SUPPORTS_RENAME, all of which the provider overrides honour.
+        val entries = listOf(DirEntry("Projects", true))
+        val cursor = CursorBuilder.childrenCursor("/local", entries, null)
+        cursor.moveToPosition(0)
+        val flags =
+            cursor.getInt(cursor.getColumnIndexOrThrow(Document.COLUMN_FLAGS))
+        assertTrue(
+            "dir advertises FLAG_DIR_SUPPORTS_CREATE: flags=$flags",
+            flags and Document.FLAG_DIR_SUPPORTS_CREATE != 0,
+        )
+        assertTrue(
+            "dir advertises FLAG_SUPPORTS_DELETE: flags=$flags",
+            flags and Document.FLAG_SUPPORTS_DELETE != 0,
+        )
+        assertTrue(
+            "dir advertises FLAG_SUPPORTS_RENAME: flags=$flags",
+            flags and Document.FLAG_SUPPORTS_RENAME != 0,
+        )
+    }
+
+    @Test
+    fun childrenCursor_file_row_advertises_delete_and_rename_flags() {
+        // File rows advertise FLAG_SUPPORTS_WRITE (write-back on close) plus the
+        // delete and rename verbs the provider overrides honour.
+        val entries = listOf(DirEntry("report.txt", false))
+        val cursor = CursorBuilder.childrenCursor("/local", entries, null)
+        cursor.moveToPosition(0)
+        val flags =
+            cursor.getInt(cursor.getColumnIndexOrThrow(Document.COLUMN_FLAGS))
+        assertTrue(
+            "file advertises FLAG_SUPPORTS_DELETE: flags=$flags",
+            flags and Document.FLAG_SUPPORTS_DELETE != 0,
+        )
+        assertTrue(
+            "file advertises FLAG_SUPPORTS_RENAME: flags=$flags",
+            flags and Document.FLAG_SUPPORTS_RENAME != 0,
+        )
+        assertFalse(
+            "file does not advertise FLAG_DIR_SUPPORTS_CREATE: flags=$flags",
+            flags and Document.FLAG_DIR_SUPPORTS_CREATE != 0,
+        )
+    }
+
+    @Test
+    fun rootDocumentCursor_advertises_create_flag() {
+        // The root document is a directory; it should advertise create so the
+        // user can create top-level entries via the Files app.
+        val cursor = CursorBuilder.rootDocumentCursor("/", "Cascade", null)
+        cursor.moveToPosition(0)
+        val flags =
+            cursor.getInt(cursor.getColumnIndexOrThrow(Document.COLUMN_FLAGS))
+        assertTrue(
+            "root advertises FLAG_DIR_SUPPORTS_CREATE: flags=$flags",
+            flags and Document.FLAG_DIR_SUPPORTS_CREATE != 0,
+        )
     }
 
     @Test
