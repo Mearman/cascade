@@ -5,10 +5,14 @@ import android.database.MatrixCursor
 import android.graphics.Point
 import android.os.CancellationSignal
 import android.os.ParcelFileDescriptor
+import android.provider.DocumentsContract
+import android.provider.DocumentsContract.Document
 import android.provider.DocumentsContract.Root
 import android.provider.DocumentsProvider
+import android.util.Log
 import kotlinx.coroutines.runBlocking
 import uniffi.cascade_ffi.CascadeException
+import uniffi.cascade_ffi.CascadeNode
 import uniffi.cascade_ffi.DirEntry
 import java.io.FileNotFoundException
 
@@ -19,12 +23,19 @@ import java.io.FileNotFoundException
  * as the set of mounted backend prefixes (the in-process node mounts a single
  * local backend under the `local` prefix). Listings call [CascadeNode.listDir] and
  * file reads call [CascadeNode.readFile]; nothing here is faked.
+ *
+ * Write verbs (create/delete/rename) are wired through the same node's
+ * [CascadeNode.createDir]/[CascadeNode.delete]/[CascadeNode.rename]. Their
+ * availability is advertised on each cursor row by [CursorBuilder.flagsForDir] /
+ * [CursorBuilder.flagsForFile] so the Files app surfaces the actions.
  */
 class CascadeDocumentsProvider : DocumentsProvider() {
 
     private companion object {
+        const val TAG = "CascadeProvider"
         const val ROOT_ID = "cascade"
         const val ROOT_DOC_ID = "/"
+        const val AUTHORITY = "co.mearman.cascade.documents"
 
         val DEFAULT_ROOT_PROJECTION = arrayOf(
             Root.COLUMN_ROOT_ID,
@@ -93,24 +104,30 @@ class CascadeDocumentsProvider : DocumentsProvider() {
         val node = CascadeNodeHolder.blockingGet(requireContext())
         val isWrite = mode.contains('w') || mode.contains('+')
         if (isWrite) {
-            // Write-back: hand the caller a pipe to write into, and on close
-            // upload the captured bytes back through the FFI. This bridges the
-            // SAF "w"/"rw" open mode onto CascadeNode.upload.
+            // Write-back: hand the caller the write end of a reliable pipe and,
+            // on a background thread, drain the read end into upload(). The
+            // reliable pipe carries the comm channel that closeWithError()
+            // writes to, so an upload failure can be propagated back to the
+            // caller rather than vanishing into the thread's uncaught handler.
             val pipe = ParcelFileDescriptor.createReliablePipe()
             val readSide = pipe[0]
             val writeSide = pipe[1]
-            // The caller writes into writeSide; we read from readSide on a
-            // background thread and upload when the writer closes.
             Thread({
                 ParcelFileDescriptor.AutoCloseInputStream(readSide).use { input ->
                     val bytes = input.readBytes()
-                    runBlocking {
-                        try {
-                            node.upload(documentId, bytes)
-                        } catch (e: CascadeException) {
-                            // Surface as a write-side error so the caller sees
-                            // the upload failed rather than silently dropping.
-                            throw FileNotFoundException("upload($documentId) failed: ${e.message}")
+                    try {
+                        runBlocking { node.upload(documentId, bytes) }
+                    } catch (e: CascadeException) {
+                        // The caller has already closed its write end by the time
+                        // we get here, so it believes the write succeeded. Log
+                        // loudly, and push the failure across the reliable-pipe
+                        // comm channel so any caller observing checkError()
+                        // sees it. closeWithError() throws IOException, which we
+                        // swallow here only because the failure has already been
+                        // recorded via Log.e and the pipe status.
+                        Log.e(TAG, "write-back upload failed for $documentId: ${e.message}", e)
+                        runCatching {
+                            readSide.closeWithError("upload($documentId) failed: ${e.message}")
                         }
                     }
                 }
@@ -134,12 +151,82 @@ class CascadeDocumentsProvider : DocumentsProvider() {
             ParcelFileDescriptor.AutoCloseOutputStream(writeSide).use { out ->
                 try {
                     out.write(bytes)
-                } catch (_: Exception) {
-                    // The reader closed early; nothing to recover.
+                } catch (e: Exception) {
+                    // The reader closed early; the upload path owns write-back
+                    // errors, this is just the read-side stream draining.
+                    Log.w(TAG, "read-side stream interrupted for $documentId: ${e.message}")
                 }
             }
         }, "cascade-openDocument").start()
         return readSide
+    }
+
+    override fun createDocument(
+        parentDocumentId: String,
+        displayName: String,
+        mimeType: String,
+    ): String {
+        val node = CascadeNodeHolder.blockingGet(requireContext())
+        val childDocId = DocIdLogic.childDocId(parentDocumentId, displayName)
+        runBlocking {
+            try {
+                if (Document.MIME_TYPE_DIR == mimeType) {
+                    node.createDir(childDocId)
+                } else {
+                    // SAF lets the user create a new (empty) file; model that as
+                    // an upload of zero bytes so the node's backend creates it.
+                    node.upload(childDocId, ByteArray(0))
+                }
+            } catch (e: CascadeException) {
+                throw IllegalStateException(
+                    "createDocument($childDocId, mime=$mimeType) failed: ${e.message}",
+                    e,
+                )
+            }
+        }
+        notifyChange(childDocId)
+        return childDocId
+    }
+
+    override fun deleteDocument(documentId: String) {
+        val node = CascadeNodeHolder.blockingGet(requireContext())
+        runBlocking {
+            try {
+                node.delete(documentId)
+            } catch (e: CascadeException) {
+                throw IllegalStateException("deleteDocument($documentId) failed: ${e.message}", e)
+            }
+        }
+        notifyChange(documentId)
+    }
+
+    override fun renameDocument(documentId: String, displayName: String): String {
+        val node = CascadeNodeHolder.blockingGet(requireContext())
+        val parent = parentOf(documentId)
+        val newDocId = DocIdLogic.childDocId(parent, displayName)
+        runBlocking {
+            try {
+                node.rename(documentId, newDocId)
+            } catch (e: CascadeException) {
+                throw IllegalStateException(
+                    "renameDocument($documentId -> $newDocId) failed: ${e.message}",
+                    e,
+                )
+            }
+        }
+        notifyChange(documentId)
+        notifyChange(newDocId)
+        return newDocId
+    }
+
+    /**
+     * Tell the system the subtree rooted at [documentId] changed so the Files
+     * app re-queries and shows the new state. Uses the standard
+     * `notifyChange` URI for a document so any open cursor is invalidated.
+     */
+    private fun notifyChange(documentId: String) {
+        val uri = DocumentsContract.buildDocumentUri(AUTHORITY, documentId)
+        context?.contentResolver?.notifyChange(uri, null)
     }
 
     private fun parentOf(documentId: String): String = DocIdLogic.parentOf(documentId)
