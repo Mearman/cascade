@@ -1,13 +1,22 @@
-//! Terminal websocket route — drives the engine's exec provider (PTY) over a
-//! bidirectional websocket.
+//! Terminal websocket route and ticket-issue route — drives the engine's exec
+//! provider (PTY) over a bidirectional websocket.
 //!
-//! The route is `GET /v1/exec/ws` (the websocket upgrade). It requires the
-//! dangerous `exec:pty` capability over the folder the terminal opens in (the
-//! `folder` query parameter, which becomes the PTY's working directory). A
-//! dangerous capability is never satisfied by a node-wide grant, and a
-//! root-folder scope counts as node-wide, so `folder` must name a real
-//! subdirectory the caller's grant covers — a terminal cannot be opened
-//! node-wide.
+//! The browser cannot set custom headers on a `WebSocket` upgrade, so the
+//! long-lived capability token (which grants remote code execution) cannot ride
+//! in an `Authorization` header the way every other HTTP route sends it. Passing
+//! it as a `?token=` query parameter put it in the websocket URL, where it lands
+//! in access logs, proxy logs, and browser history. The ticket exchange fixes
+//! that:
+//!
+//! 1. The browser `POST /v1/exec/ticket` with `Authorization: Bearer` (which
+//!    `fetch` CAN set) and the `folder`. The handler authenticates through the
+//!    normal `Session` extractor, re-runs the `exec:pty` folder-scope
+//!    authorisation, and on success mints a short-lived (30s), single-use,
+//!    opaque ticket bound to the verified authority.
+//! 2. The browser opens the websocket with `?ticket=<opaque>` and `?folder=`.
+//!    The websocket handler looks up the ticket, rejects if
+//!    missing/expired/already-used, marks it used (single-use), and authorises
+//!    using the authority captured at issue time.
 //!
 //! The wire protocol is JSON text frames: the client sends
 //! `{"type":"spawn","shell":null,"cols":80,"rows":24}` to start a session,
@@ -19,24 +28,36 @@
 
 use std::sync::Arc;
 
+use axum::Json;
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::response::Response;
-use axum::routing::get;
-use cascade_engine::manage::{
-    Capability, CapabilityToken, DeviceId, ManageGrantStore, Scope, TokenClaims, TokenVerifyError,
-};
+use axum::routing::{get, post};
+use cascade_engine::manage::{Capability, Grant, ManageGrantStore, Scope, authorises};
 use chrono::Utc;
-use data_encoding::BASE64;
 use serde::{Deserialize, Serialize};
 
-use crate::error::{ApiError, ErrorCode};
+use crate::auth::Session;
+use crate::error::ApiError;
 use crate::state::AppState;
+use crate::ticket::{TicketAuthority, TicketError};
 
 /// Register the exec routes.
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/v1/exec/ws", get(exec_ws_handler))
+    Router::new()
+        .route("/v1/exec/ws", get(exec_ws_handler))
+        .route("/v1/exec/ticket", post(issue_ticket))
+}
+
+/// The request body for `POST /v1/exec/ticket`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TicketRequest {
+    /// The folder the terminal opens in — the PTY's working directory and the
+    /// scope the `exec:pty` capability is authorised over. Must be a real
+    /// subdirectory (not the root). Required.
+    pub folder: String,
 }
 
 /// Query parameters for the websocket upgrade.
@@ -54,13 +75,8 @@ pub struct ExecWsQuery {
     pub cols: Option<u16>,
     /// Initial terminal height in rows.
     pub rows: Option<u16>,
-    /// Base64-encoded capability token JSON (the browser WebSocket API cannot
-    /// send custom headers, so the credential rides as a query param). Required.
-    pub token: Option<String>,
-    /// The bearer device id (same as the `X-Cascade-Bearer-Device` header,
-    /// passed as a query param because the browser cannot set headers on a
-    /// WebSocket upgrade). Required.
-    pub bearer: Option<String>,
+    /// The opaque, single-use ticket from `POST /v1/exec/ticket`. Required.
+    pub ticket: Option<String>,
 }
 
 /// Messages the client sends over the websocket.
@@ -109,48 +125,122 @@ fn to_text(msg: &ServerMessage) -> Message {
     )
 }
 
-/// `GET /v1/exec/ws` — websocket upgrade. Capability: `exec:pty` over the
-/// `folder` query parameter.
+/// `POST /v1/exec/ticket` — exchange the authenticated session for a
+/// short-lived, single-use ticket that the websocket upgrade can accept.
 ///
-/// The exec:pty capability is dangerous — it grants code execution. It is
-/// never satisfied by a node-wide (or root-folder) grant, so the caller must
-/// hold an explicit grant over the named subdirectory the terminal opens in.
+/// The caller authenticates through the normal `Session` extractor
+/// (`Authorization: Bearer` + `X-Cascade-Bearer-Device`). The handler
+/// re-runs the `exec:pty` folder-scope authorisation — the same check the
+/// websocket handler used to run inline — and on success mints an opaque
+/// ticket bound to the verified bearer and folder scope. The ticket is valid
+/// for ~30 seconds and may be redeemed exactly once.
+pub async fn issue_ticket(
+    State(state): State<AppState>,
+    session: Session,
+    Json(body): Json<TicketRequest>,
+) -> Result<Json<crate::ticket::TicketResponse>, ApiError> {
+    // Resolve and validate the folder scope before authorising.
+    let (folder, scope) = resolve_folder_scope(&body.folder)?;
+
+    // Re-run the management-plane authorisation for exec:pty over the folder
+    // scope, the same check `Session::require` makes for other routes.
+    let now = Utc::now();
+    let mut grants = state
+        .engine
+        .manage_grants()
+        .map_err(|e| ApiError::internal(format!("could not read grants: {e}")))?;
+    grants.push(session.claims.to_grant());
+
+    if !authorises(&grants, session.caller(), Capability::ExecPty, &scope, now) {
+        let holds_capability = grants.iter().any(|g: &Grant| {
+            g.grantee == *session.caller()
+                && g.capability == Capability::ExecPty
+                && !g.is_expired(now)
+        });
+        if holds_capability {
+            return Err(ApiError::forbidden(format!(
+                "caller holds {} but not over folder {folder}",
+                Capability::ExecPty.as_wire()
+            )));
+        }
+        return Err(ApiError::unauthorised(format!(
+            "caller's verified claims do not satisfy {} over folder {folder}",
+            Capability::ExecPty.as_wire()
+        )));
+    }
+
+    let authority = TicketAuthority {
+        bearer: session.claims.bearer,
+        capability: Capability::ExecPty,
+        scope,
+    };
+
+    let response = state.exec_tickets.issue(authority).map_err(|e| match e {
+        TicketError::Random(msg) => ApiError::internal(format!("could not issue ticket: {msg}")),
+        TicketError::LockPoisoned => ApiError::internal("ticket store lock poisoned"),
+        TicketError::NotFound | TicketError::Expired => {
+            ApiError::internal("unexpected ticket store state on issue")
+        }
+    })?;
+
+    Ok(Json(response))
+}
+
+/// `GET /v1/exec/ws` — websocket upgrade. Authorised by a single-use ticket
+/// from `POST /v1/exec/ticket`.
 ///
-/// Because the browser's `WebSocket` API cannot send custom headers, the
-/// capability token and bearer-device id are passed as query parameters
-/// (`?token=<base64>` and via the `X-Cascade-Bearer-Device` header when
-/// possible, or the `bearer` query param as a fallback). The token is verified
-/// the same way the HTTP `Session` extractor verifies it.
+/// The exec:pty capability is dangerous — it grants code execution. The
+/// authority to open a terminal was verified at ticket-issue time (through the
+/// normal HTTP `Session` path), and the ticket is single-use and short-lived.
+/// At redeem the handler verifies the ticket is valid, that the `folder`
+/// matches the one the ticket was bound to, and that the bearer's grant has
+/// not been revoked in the window between issue and redeem.
 pub async fn exec_ws_handler(
     State(state): State<AppState>,
     Query(query): Query<ExecWsQuery>,
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
-    let claims = verify_ws_token(&state, &query)?;
+    let ticket_str = query
+        .ticket
+        .as_ref()
+        .filter(|t| !t.trim().is_empty())
+        .ok_or_else(|| ApiError::unauthorised("ticket query parameter is required"))?;
+
+    // Redeem the ticket (single-use: removed atomically on lookup).
+    let authority = state.exec_tickets.redeem(ticket_str).map_err(|e| match e {
+        TicketError::NotFound | TicketError::Expired => {
+            ApiError::unauthorised("ticket is missing, expired, or already used")
+        }
+        TicketError::LockPoisoned => ApiError::internal("ticket store lock poisoned"),
+        TicketError::Random(msg) => ApiError::internal(msg),
+    })?;
 
     // The terminal opens in `folder`: the PTY's working directory and the scope
     // the dangerous `exec:pty` capability is authorised over. A root folder
     // counts as node-wide and so can never satisfy a dangerous capability.
     let (folder, scope) = resolve_exec_folder_scope(&query)?;
 
-    // Re-run the management-plane authorisation for exec:pty over the folder
-    // scope, the same check `Session::require` makes.
+    // The ticket was bound to a specific folder at issue time; a mismatch means
+    // the client is trying to use a ticket for a different folder.
+    if authority.scope != scope {
+        return Err(ApiError::forbidden(format!(
+            "ticket was issued for a different folder than {folder}"
+        )));
+    }
+
+    // Defence in depth: re-check the live grant set in case a grant was revoked
+    // between issue and redeem. The ticket captured the bearer; we verify that
+    // bearer still holds exec:pty over this folder.
     let now = Utc::now();
-    let mut grants = state
+    let grants = state
         .engine
         .manage_grants()
         .map_err(|e| ApiError::internal(format!("could not read grants: {e}")))?;
-    grants.push(claims.to_grant());
-
-    if !cascade_engine::manage::authorises(
-        &grants,
-        &claims.bearer,
-        Capability::ExecPty,
-        &scope,
-        now,
-    ) {
-        let holds_capability = grants.iter().any(|g| {
-            g.grantee == claims.bearer && g.capability == Capability::ExecPty && !g.is_expired(now)
+    if !authorises(&grants, &authority.bearer, Capability::ExecPty, &scope, now) {
+        let holds_capability = grants.iter().any(|g: &Grant| {
+            g.grantee == authority.bearer
+                && g.capability == Capability::ExecPty
+                && !g.is_expired(now)
         });
         if holds_capability {
             return Err(ApiError::forbidden(format!(
@@ -171,6 +261,27 @@ pub async fn exec_ws_handler(
         .clone();
 
     Ok(ws.on_upgrade(move |socket| run_terminal(socket, exec, folder)))
+}
+
+/// Resolve a folder string to the folder path and the matching [`Scope`],
+/// rejecting missing/blank (auth failure) and root (forbidden — normalises to
+/// node-wide, which a dangerous capability can never satisfy) values.
+///
+/// Returns the folder string (to seed the PTY's working directory) and the
+/// matching folder scope.
+fn resolve_folder_scope(folder: &str) -> Result<(String, Scope), ApiError> {
+    let trimmed = folder.trim();
+    if trimmed.is_empty() {
+        return Err(ApiError::unauthorised("folder is required"));
+    }
+    let scope = Scope::folder(trimmed.to_owned());
+    if scope.is_node_wide() {
+        return Err(ApiError::forbidden(format!(
+            "{} requires a specific folder scope; a terminal cannot be opened node-wide",
+            Capability::ExecPty.as_wire()
+        )));
+    }
+    Ok((folder.to_owned(), scope))
 }
 
 /// Resolve the folder a terminal opens in and the [`Scope`] to authorise
@@ -195,47 +306,6 @@ fn resolve_exec_folder_scope(query: &ExecWsQuery) -> Result<(String, Scope), Api
         )));
     }
     Ok((folder.clone(), scope))
-}
-
-/// Verify the capability token presented as a query parameter, mirroring the
-/// `Session` extractor's verification path.
-fn verify_ws_token(state: &AppState, query: &ExecWsQuery) -> Result<TokenClaims, ApiError> {
-    let token_str = query
-        .token
-        .as_ref()
-        .ok_or_else(|| ApiError::unauthorised("token query parameter is required"))?;
-    let bearer_str = query
-        .bearer
-        .as_ref()
-        .ok_or_else(|| ApiError::unauthorised("bearer query parameter is required"))?;
-
-    let json = BASE64
-        .decode(token_str.as_bytes())
-        .map_err(|_| ApiError::unauthorised("token query parameter is not valid base64"))?;
-    let token: CapabilityToken = serde_json::from_slice(&json)
-        .map_err(|e| ApiError::unauthorised(format!("could not parse capability token: {e}")))?;
-
-    let connected_device = DeviceId::new(bearer_str.clone());
-
-    let node_device_id = state.identity.device_id().clone();
-    let revoked = state
-        .engine
-        .manage_revoked_token_ids()
-        .map_err(|e| ApiError::internal(format!("could not read token revocation list: {e}")))?;
-    let is_revoked = |id: &str| revoked.contains(id);
-
-    token
-        .verify(&node_device_id, &connected_device, Utc::now(), &is_revoked)
-        .map_err(|e| match &e {
-            TokenVerifyError::BearerMismatch { .. } => ApiError::new(
-                ErrorCode::BearerMismatch,
-                format!("presented capability token rejected: {e}"),
-            ),
-            other => {
-                ApiError::unauthorised(format!("presented capability token rejected: {other}"))
-            }
-        })
-        .cloned()
 }
 
 /// Drive the websocket: spawn the PTY in `cwd`, forward client keystrokes as
@@ -303,7 +373,7 @@ async fn run_terminal(
 
     loop {
         tokio::select! {
-            // Client → PTY: input, resize, signal.
+            // Client -> PTY: input, resize, signal.
             msg = socket.recv() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
@@ -335,7 +405,7 @@ async fn run_terminal(
                     _ => {}
                 }
             }
-            // PTY → client: output, exit.
+            // PTY -> client: output, exit.
             event = event_rx.recv() => {
                 let Some(event) = event else { break };
                 let msg = match event {
@@ -371,6 +441,7 @@ async fn run_terminal(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::error::ErrorCode;
 
     fn query(folder: Option<&str>) -> ExecWsQuery {
         ExecWsQuery {
@@ -378,8 +449,7 @@ mod tests {
             shell: None,
             cols: None,
             rows: None,
-            token: None,
-            bearer: None,
+            ticket: None,
         }
     }
 
@@ -408,7 +478,7 @@ mod tests {
             assert_eq!(
                 err.code,
                 ErrorCode::Forbidden,
-                "root {root:?} should be node-wide-forbidden"
+                "root {root:?} should be node wide forbidden"
             );
         }
     }

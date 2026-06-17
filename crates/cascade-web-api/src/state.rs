@@ -14,6 +14,8 @@ use cascade_engine::manage::DeviceId;
 use cascade_p2p::identity::DeviceIdentity;
 use chrono::{DateTime, Utc};
 
+use crate::ticket::TicketStore;
+
 /// Default bind address — loopback only, the contract's documented default.
 pub const DEFAULT_BIND: &str = "127.0.0.1:7842";
 /// Default server-side request timeout in seconds (one hour) — bounds the only
@@ -173,6 +175,10 @@ pub struct AppState {
     pub bind: Arc<BindConfig>,
     /// The F3 readiness state.
     pub readiness: Readiness,
+    /// Short-lived, single-use exec tickets — the bridge between the
+    /// authenticated HTTP path (which can set headers) and the websocket
+    /// upgrade (which cannot).
+    pub exec_tickets: Arc<TicketStore>,
 }
 
 impl std::fmt::Debug for AppState {
@@ -199,6 +205,7 @@ impl AppState {
             identity: Arc::new(identity),
             bind: Arc::new(bind),
             readiness,
+            exec_tickets: Arc::new(TicketStore::new()),
         }
     }
 }
