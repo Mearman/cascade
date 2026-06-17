@@ -163,8 +163,8 @@ class CascadeDocumentsProvider : DocumentsProvider() {
 
     override fun createDocument(
         parentDocumentId: String,
-        displayName: String,
         mimeType: String,
+        displayName: String,
     ): String {
         val node = CascadeNodeHolder.blockingGet(requireContext())
         val childDocId = DocIdLogic.childDocId(parentDocumentId, displayName)
