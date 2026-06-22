@@ -8,7 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
-portable-pty= "0.8"
+portable-pty= "0.9"
 serde.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["process", "io-util", "sync", "rt", "macros"] }
