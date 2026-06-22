@@ -435,7 +435,7 @@ jobs:
           cp android/app/build/outputs/apk/debug/app-debug.apk dist/cascade-android.apk
           shasum -a 256 dist/cascade-android.apk | awk '{print $1}' > dist/cascade-android.apk.sha256
       - name: Upload to release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
           tag_name: ${{ needs.release.outputs.version }}
           files: dist/cascade-android.apk*
@@ -525,7 +525,7 @@ jobs:
           mkdir -p dist && cp "$RUNNER_TEMP"/ipa/*.ipa dist/cascade-ios.ipa
       - name: Upload to release
         if: steps.signing.outputs.have == 'true'
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
           tag_name: ${{ needs.release.outputs.version }}
           files: swift/CascadeFileProvideriOS/dist/cascade-ios.ipa
@@ -578,7 +578,7 @@ jobs:
             dist/cascade-ios-simulator.zip
           shasum -a 256 dist/cascade-ios-simulator.zip | awk '{print $1}' > dist/cascade-ios-simulator.zip.sha256
       - name: Upload to release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
           tag_name: ${{ needs.release.outputs.version }}
           files: dist/cascade-ios-simulator.zip*
@@ -1324,7 +1324,7 @@ jobs:
           tar czf cascade-aarch64-macos.tar.gz cascade
           shasum -a 256 cascade-aarch64-macos.tar.gz | awk '{print $1}' > cascade-aarch64-macos.tar.gz.sha256
       - name: Upload to release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
           tag_name: ${{ needs.release.outputs.version }}
           files: dist/cascade-aarch64-macos.tar.gz*
@@ -1398,7 +1398,7 @@ jobs:
           tar czf cascade-x86_64-macos.tar.gz cascade
           shasum -a 256 cascade-x86_64-macos.tar.gz | awk '{print $1}' > cascade-x86_64-macos.tar.gz.sha256
       - name: Upload to release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
           tag_name: ${{ needs.release.outputs.version }}
           files: dist/cascade-x86_64-macos.tar.gz*
@@ -1471,7 +1471,7 @@ jobs:
           tar czf cascade-x86_64-linux.tar.gz cascade
           sha256sum cascade-x86_64-linux.tar.gz | awk '{print $1}' > cascade-x86_64-linux.tar.gz.sha256
       - name: Upload to release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
           tag_name: ${{ needs.release.outputs.version }}
           files: dist/cascade-x86_64-linux.tar.gz*
@@ -1550,7 +1550,7 @@ jobs:
           tar czf cascade-aarch64-linux.tar.gz cascade
           sha256sum cascade-aarch64-linux.tar.gz | awk '{print $1}' > cascade-aarch64-linux.tar.gz.sha256
       - name: Upload to release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
           tag_name: ${{ needs.release.outputs.version }}
           files: dist/cascade-aarch64-linux.tar.gz*
@@ -1624,7 +1624,7 @@ jobs:
           $hash = (Get-FileHash -Algorithm SHA256 dist/cascade-x86_64-windows.zip).Hash.ToLower()
           $hash | Out-File -Encoding ascii -NoNewline dist/cascade-x86_64-windows.zip.sha256
       - name: Upload to release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
           tag_name: ${{ needs.release.outputs.version }}
           files: dist/cascade-x86_64-windows.zip*
